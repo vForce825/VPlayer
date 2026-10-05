@@ -217,6 +217,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     private var participants: [UInt64: HLSInitialParticipant] = [:]
     private var initializationKeys: [UInt64: HLSResourceKey] = [:]
     private var records: [UInt64: [HLSValidatedSegment]] = [:]
+    // One immutable scalar per current rendition; committed with its first playlist.
+    private var advertisedTargetDurations: [UInt64: Int64] = [:]
     private struct WriterSlot {
         let source: SegmentedFMP4CallbackContext
         let relay: SegmentReportRelay
@@ -513,7 +515,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             let chosen: [UInt64: [HLSValidatedSegment]]
             let lastSequence: UInt64
             if sequence == 0 {
-                if initialWindowMinimumSeconds == 6 {
+                // A caller's buffer preference is not evidence that this source is
+                // finite. Only authenticated EOF may expose a short final prefix.
+                let shortFinalPrefix = initialWindowMinimumSeconds != 6
+                    && eofLastSequence.map { $0 < 5 } == true
+                if !shortFinalPrefix {
                     guard participants.keys.allSatisfy({
                         (records[$0]?.count ?? 0) >= 6
                     }) else { return .waiting }
@@ -533,30 +539,13 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                         lastSequence = 6
                     }
                 } else {
-                    let availableCount = participants.keys.map {
-                        records[$0]?.count ?? 0
-                    }.min() ?? 0
-                    guard availableCount >= 3 else { return .waiting }
-                    var initial: [UInt64: [HLSValidatedSegment]]?
-                    for count in 3...min(availableCount, 7) {
-                        let candidate = records.mapValues { Array($0.prefix(count)) }
-                        if try allAtLeastStartupMinimum(candidate) {
-                            initial = candidate
-                            break
-                        }
-                    }
-                    guard let initial else {
-                        if availableCount >= 7 {
-                            throw HLSPublicationFailure.initialWindowInvariant
-                        }
-                        return .waiting
-                    }
-                    chosen = initial
-                    guard let initialLastSequence = initial.values.first?.last?
-                        .receipt.logicalSequence else {
-                        throw HLSPublicationFailure.initialWindowInvariant
-                    }
-                    lastSequence = initialLastSequence
+                    guard let terminal = eofLastSequence else { throw HLSPublicationFailure.initialWindowInvariant }
+                    let finite = records.mapValues { $0.filter { $0.receipt.logicalSequence <= terminal } }
+                    guard try allAtLeastStartupMinimum(finite) else { return .waiting }
+                    // Include the complete authenticated terminal prefix in this
+                    // first snapshot, so it can never appear as a short live list.
+                    chosen = finite
+                    lastSequence = terminal
                 }
             } else {
                 let ready = participants.keys.allSatisfy { records[$0]?.contains(where: { $0.receipt.logicalSequence == nextLogicalSequence }) == true }
@@ -569,38 +558,16 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 // 已验收共同 segment；准确终段才附加唯一 ENDLIST。
                 lastSequence = ready ? nextLogicalSequence : nextLogicalSequence - 1
                 let available = records.mapValues { $0.filter { $0.receipt.logicalSequence <= lastSequence } }
-                if initialWindowMinimumSeconds == 6 {
-                    let six = available.mapValues { Array($0.suffix(6)) }
-                    if try allAtLeastSix(six) {
-                        chosen = six
-                    } else {
-                        let seven = available.mapValues { Array($0.suffix(7)) }
-                        guard seven.values.allSatisfy({ $0.count == 7 }),
-                              try allAtLeastSix(seven) else {
-                            throw HLSPublicationFailure.initialWindowInvariant
-                        }
-                        chosen = seven
-                    }
+                let six = available.mapValues { Array($0.suffix(6)) }
+                if try allAtLeastSix(six) {
+                    chosen = six
                 } else {
-                    let availableCount = available.values.map(\.count).min() ?? 0
-                    guard availableCount >= 3 else { return .waiting }
-                    let preferredCount = min(availableCount, 6)
-                    let preferred = available.mapValues {
-                        Array($0.suffix(preferredCount))
+                    let seven = available.mapValues { Array($0.suffix(7)) }
+                    guard seven.values.allSatisfy({ $0.count == 7 }),
+                          try allAtLeastSix(seven) else {
+                        throw HLSPublicationFailure.initialWindowInvariant
                     }
-                    if try allAtLeastStartupMinimum(preferred) {
-                        chosen = preferred
-                    } else {
-                        let seven = available.mapValues { Array($0.suffix(7)) }
-                        guard seven.values.allSatisfy({ $0.count == 7 }),
-                              try allAtLeastStartupMinimum(seven) else {
-                            if finishing {
-                                throw HLSPublicationFailure.initialWindowInvariant
-                            }
-                            return .waiting
-                        }
-                        chosen = seven
-                    }
+                    chosen = seven
                 }
                 let span = declaration.video.flatMap { chosen[$0.participantID]?.last?.commonDuration } ?? HLSChecked.one
                 let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(span))
@@ -654,6 +621,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 let effectivePlaybackHorizons = try frozenEffectivePlaybackHorizons(
                     normalized, writesEndList: writesEndList)
                 var media: [UInt64: HLSPlaylistSnapshot] = [:]
+                var targets: [UInt64: Int64] = [:]
                 var newDiscontinuities = discontinuitySequences
                 for id in participants.keys.sorted() {
                     let segments = normalized[id]!
@@ -661,8 +629,12 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     let removedDiscontinuities = (records[id] ?? []).filter { $0.discontinuity && $0.receipt.logicalSequence < first }.count
                     let discontinuitySequence = try HLSChecked.add(discontinuitySequences[id] ?? 0, UInt64(removedDiscontinuities))
                     newDiscontinuities[id] = discontinuitySequence
+                    let target = try advertisedTargetDurations[id]
+                        ?? HLSPlaylistSerializer.requiredTargetDuration(segments: segments)
+                    targets[id] = target
                     let representation = try HLSPlaylistSerializer.media(segments: segments, declaration: declarationFor(id),
-                        discontinuitySequence: discontinuitySequence, anchor: anchor, endList: writesEndList)
+                        discontinuitySequence: discontinuitySequence, anchor: anchor, endList: writesEndList,
+                        advertisedTargetDuration: target)
                     _serializationCount += 1
                     media[id] = HLSPlaylistSnapshot(identity: UUID(), version: newSequence, representation: representation,
                         logicalSequences: segments.map { $0.receipt.logicalSequence }, resources: segments.map(\.key),
@@ -676,6 +648,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     media: media, master: master, records: normalized, now: now)
                 let clockAnchor = try publicationClock?.prepareCommit(logical: now)
                 try store.commit(authority)
+                advertisedTargetDurations = targets
                 sequence = newSequence
                 nextLogicalSequence = nextSequence
                 previousInstant = now
@@ -1347,9 +1320,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             outputLifecycleEpoch: lifecycle, participantGeneration: generation ?? participantGeneration, publicationSequence: sequence,
             previousPublishInstant: previousInstant, absoluteDeadline: deadline, participantVector: vector)
     }
-    // The non-six mode retains the original 3...7 segment scan and exact sums.
-    // A four-second preference raises only the verified duration floor; it does
-    // not require six seconds from finite sources or relax any publication cap.
+    // A shorter configured floor applies only to the complete authenticated EOF
+    // prefix. It never authorizes a short live playlist or a partial EOF drain.
     private func allAtLeastStartupMinimum(_ chosen: [UInt64: [HLSValidatedSegment]]) throws -> Bool {
         try chosen.values.allSatisfy { segments in
             guard segments.count >= 3 else { return false }
@@ -1359,12 +1331,17 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         }
     }
     private func allAtLeastSix(_ chosen: [UInt64: [HLSValidatedSegment]]) throws -> Bool {
-        try chosen.values.allSatisfy { segments in
+        try chosen.allSatisfy { entry in
+            let (id, segments) = entry
             guard segments.count >= 6 else { return false }
             let duration = try segments.reduce(HLSChecked.zero) {
                 try $0.adding($1.receipt.presentationRange.duration)
             }
-            return try HLSChecked.compare(duration, HLSChecked.six) >= 0
+            let minimum = try HLSPlaylistSerializer.requiredTargetDuration(segments: segments)
+            let target = advertisedTargetDurations[id] ?? minimum
+            guard target >= minimum else { throw HLSPublicationFailure.invalidDuration }
+            let required = try HLSChecked.multiply(target, 3)
+            return try HLSChecked.compare(duration, .init(value: required, timescale: 1)) >= 0
         }
     }
     private func samples(_ segments: [HLSValidatedSegment]) -> [HLSBandwidthSample] {

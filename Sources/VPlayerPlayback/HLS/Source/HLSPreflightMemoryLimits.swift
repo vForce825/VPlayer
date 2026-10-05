@@ -28,7 +28,8 @@ public enum HLSPreflightMemoryLimits {
     // TS emitted chunks remain <=256 KiB and all parser input <=8 MiB. Only SPS
     // header bytes (<=256 KiB) are copied for video facts, never a large AU.
     // No stream-info or video decoding. After demux cleanup,
-    // one ADTS-only AAC format decoder uses <=48 MiB audited fixed workspace,
+    // one ADTS-only AAC format decoder has a 48 MiB source-audit workspace
+    // allowance (not a measured or allocator-enforced native peak),
     // <=8 AUs/64 KiB and <=1 MiB cumulative gated output. No decoder overlap;
     // all other explicit formats remain parser-only. Retires after all cleanup.
     // factsRetention: up to 128 media fact sets, 32 tracks each, <=1 MiB of copied

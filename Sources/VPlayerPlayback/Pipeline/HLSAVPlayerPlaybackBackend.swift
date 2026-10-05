@@ -61,6 +61,40 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     typealias CoordinatorFactory = (AVPlayerItemReplacementBundle) async throws
         -> AVPlayerItemCoordinator
 
+    typealias SourceBundleBuilderFactory = @Sendable (URL, HLSOwnedSourcePlan?) throws -> any HLSOutputItemBundleBuilding
+    private var sourceDependencies: HLSNativeSourceDependencies?
+    private var sessionLease: HomePodAVPlayerSession.Lease?
+    private var sourceBuilderFactory: SourceBundleBuilderFactory?
+    private var sourceEventSink: @Sendable (PlaybackPipelineEvent) -> Void = { _ in }
+    private var sourceScope: OutputLifecycleEpoch?
+    private var ownedSource: HLSOwnedSourcePlan?
+    private var sourceProxy: HLSProxySession?
+    private var nativeAdapter: NativeHLSPlaybackBackend?
+    private var sourceBuilder: (any HLSOutputItemBundleBuilding)?
+    private var sourceActivation: ActivationEpoch?
+    private var sourceFailureDelivered: OutputLifecycleEpoch?
+    private var sourceFailureMetadata: HLSRuntimeFailureMetadataOwner?
+    private var sourceFailureTask: Task<Void, Never>?
+    private var pendingCompatibleOwner: HLSOwnedSourcePlan?
+    private var audioRejection: HLSGeneratedAudioRejection?
+    private var sourceBundleCalls = 0
+
+    func configureSourceRouting(dependencies: HLSNativeSourceDependencies, sessionLease: HomePodAVPlayerSession.Lease,
+                                builderFactory: @escaping SourceBundleBuilderFactory,
+                                eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) {
+        lock.withLock {
+            precondition(sourceDependencies == nil && bundle == nil && preparingBundle == nil)
+            precondition(sessionLease.backend == identity)
+            sourceDependencies = dependencies; self.sessionLease = sessionLease
+            sourceBuilderFactory = builderFactory; sourceEventSink = eventSink
+        }
+    }
+    var routedTransportForTesting: HLSPlaybackPlan.Transport? { lock.withLock { ownedSource?.plan.transport } }
+    var generatedBundleCallsForTesting: Int { lock.withLock { sourceBundleCalls } }
+    #if DEBUG
+    var nativeCoordinatorForTesting: NativeHLSItemCoordinator? { lock.withLock { nativeAdapter?.coordinator } }
+    #endif
+
     /// legacy 注入路径在 construction 时已有 coordinator；系统路径则必须等同一 bundle
     /// 的 prefix/server/evidence 就绪后才创建，避免用第二台 server 的 evidence 安装 item。
     private var coordinator: AVPlayerItemCoordinator?
@@ -146,19 +180,21 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
 
     var isAudioOnly: Bool {
         audioOnlySelector != nil || lock.withLock {
-            bundle?.isAudioOnly ?? preparingBundle?.isAudioOnly ?? false
+            if nativeAdapter != nil, let ownedSource { return ownedSource.facts.media.allSatisfy { $0.video == nil } }
+            return bundle?.isAudioOnly ?? preparingBundle?.isAudioOnly ?? false
         }
     }
 
     var presentation: PlaybackPresentation? { presentationContext.map(PlaybackPresentation.avPlayer) }
 
-    var outputItemGeneration: UInt64? { lock.withLock { bundle?.itemGeneration } }
+    var outputItemGeneration: UInt64? { lock.withLock { nativeAdapter?.itemGeneration ?? bundle?.itemGeneration } }
 
     func preparedMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
-        lock.withLock { bundle?.preparedMediaInformation(for: lifecycle) }
+        lock.withLock { nativeAdapter?.metadata.snapshot(for: lifecycle) ?? bundle?.preparedMediaInformation(for: lifecycle) }
     }
 
     func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        if sourceDependencies != nil { try await prepareRouted(invocation: invocation); return }
         let maximumAttemptCount = audioOnlySelector == nil ? 2 : 1
         var completedAttemptCount = 0
         while completedAttemptCount < maximumAttemptCount {
@@ -246,6 +282,15 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("hls_c_inst_pre")
                     #endif
+                    if let owned = self.lock.withLock({ self.ownedSource }) {
+                        createdCoordinator.setInstallationMutation { operation in
+                            try invocation.performCurrentPreparationMutation {
+                                guard owned.source.withCurrentResolution(owner: owned.plan.owner, generation: owned.source.generation, operation: {
+                                    operation(); return true
+                                }) == true else { throw HLSSourceError.staleResolution }
+                            }
+                        }
+                    }
                     try createdCoordinator.install(next.replacement.request)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("hls_c_inst_ok")
@@ -309,6 +354,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         guard invocation.revalidateCurrentPreparation() else { throw CancellationError() }
+        let scope = lock.withLock { (sourceScope, ownedSource, sourceFailureDelivered) }
+        if scope.0 == invocation.outputLifecycleEpoch {
+            guard scope.2 != invocation.outputLifecycleEpoch else { throw HLSSourceError.staleResolution }
+            if let owned = scope.1, !owned.isCurrent { throw HLSSourceError.staleResolution }
+        }
     }
 
     private func makeNextBundle(
@@ -336,7 +386,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("hls_makeBundle")
             #endif
-            return try await bundleBuilder.makeBundle(invocation: invocation)
+            let builder = lock.withLock { () -> any HLSOutputItemBundleBuilding in
+                if sourceDependencies != nil { sourceBundleCalls += 1 }
+                return sourceBuilder ?? bundleBuilder
+            }
+            return try await builder.makeBundle(invocation: invocation)
         }
     }
 
@@ -344,6 +398,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     /// presentation。新 lifecycle 必须真正重开上游、安装新 generation 并完成 rate-0
     /// prepare；只重新绑定 invocation 会把已结束的旧 item 永久留在最后一帧。
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        if sourceDependencies != nil { try await prepareRouted(invocation: invocation); return }
         guard let coordinator = lock.withLock({ self.coordinator }),
               lock.withLock({ bundle == nil && preparingBundle == nil }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
@@ -401,6 +456,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     }
 
     func requestWatchdogRecovery(activation: ActivationEpoch) async -> Bool {
+        if let native = lock.withLock({ nativeAdapter }) {
+            guard await native.coordinator.currentActivation == activation else { return false }
+            return backendPublicationReplacementAuthoritySlot.requestWatchdogRecovery(activation: activation)
+        }
         guard let coordinator = lock.withLock({ self.coordinator }) else { return false }
         return await coordinator.requestWatchdogRecovery(activation: activation)
     }
@@ -408,6 +467,12 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     func activateOutput(
         invocation: ControlTaskRegistry.BackendPositiveRateInvocation
     ) async throws {
+        if sourceDependencies != nil { lock.withLock { sourceActivation = invocation.activation } }
+        if let native = lock.withLock({ nativeAdapter }) {
+            try await native.coordinator.activate(invocation)
+            lock.withLock { if activationTime == nil { activationTime = .now } }
+            return
+        }
         guard let coordinator = lock.withLock({ self.coordinator }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
@@ -427,6 +492,17 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     func suspendOutput(
         invocation: ControlTaskRegistry.BackendSuspendInvocation
     ) async -> BackendSuspendResult {
+        lock.withLock { sourceActivation = nil }
+        if let native = lock.withLock({ nativeAdapter }) {
+            do {
+                let receipt = try await native.coordinator.stop(invocation)
+                let attestation = try await MainActor.run {
+                    try AVPlayerBackendQuiescenceAttestation.native(receipt, invocation: invocation, coordinator: native.coordinator)
+                }
+                lock.withLock { latestReceipt = receipt }
+                return .quiescent(.avPlayer(attestation))
+            } catch { return .requiresRetirement }
+        }
         #if DEBUG
         PlaybackDiagnosticTracker.shared.append("cap_hls_suspend_begin")
         #endif
@@ -457,6 +533,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     }
 
     func retireOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        if sourceDependencies != nil { return await retireRouted(epoch: epoch) }
+        return await retireGeneratedOutput(epoch: epoch)
+    }
+
+    private func retireGeneratedOutput(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
         #if DEBUG
         PlaybackDiagnosticTracker.shared.append("cap_hls_retire_begin")
         #endif
@@ -535,6 +616,212 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
         #if DEBUG
         PlaybackDiagnosticTracker.shared.append("cap_hls_retire_confirmed")
         #endif
+        return .confirmedLocalOutputStopped
+    }
+
+    private func prepareRouted(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        try validatePreparation(invocation)
+        guard let dependencies = sourceDependencies, let lease = sessionLease else { throw HLSSourceError.unboundOwner }
+        let failureMetadata = try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)
+        guard try invocation.performCurrentPreparationMutation({
+            try lock.withLock {
+                guard ownedSource == nil, nativeAdapter == nil, sourceProxy == nil, sourceBuilder == nil,
+                      bundle == nil, preparingBundle == nil, sourceFailureTask == nil else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+                sourceScope = invocation.outputLifecycleEpoch; sourceFailureDelivered = nil
+                sourceFailureMetadata = failureMetadata; sourceActivation = nil; pendingCompatibleOwner = nil
+            }
+        }) else { throw CancellationError() }
+        do {
+            var owned = try await dependencies.prepare(invocation: invocation)
+            try validatePreparation(invocation)
+            if lock.withLock({ audioRejection?.matches(owned) == true }) {
+                let compatible = owned.usingCompatibleAudio(); owned.retireGeneratedAttempt(); owned = compatible
+            }
+            try installSource(owned, invocation: invocation)
+            let managed = !dependencies.context.headers.isEmpty || dependencies.context.explicitExpiry != nil
+            if owned.plan.transport == .proxy || (owned.plan.transport == .generated && managed) {
+                let original = owned
+                let proxy = try await HLSByteProxy.start(source: owned.source, lifecycle: invocation.outputLifecycleEpoch,
+                    resolver: owned.resolver, sourceRetention: owned.sourceCharge, manifestAuthority: owned.makeProxyManifestAuthority(),
+                    useGeneratedSelectedService: owned.plan.transport == .generated,
+                    failure: { [weak self] error in self?.sourceTransportFailed(error, source: original, invocation: invocation) })
+                do {
+                    try validatePreparation(invocation)
+                    guard try invocation.performCurrentPreparationMutation({ self.lock.withLock { self.sourceProxy = proxy } }) else { throw CancellationError() }
+                } catch { _ = await proxy.retire(); throw error }
+            }
+            if owned.plan.transport == .generated {
+                try await prepareGeneratedSource(owned, invocation: invocation)
+            } else {
+                let original = owned
+                let coordinator = try await MainActor.run {
+                    try NativeHLSItemCoordinator(driver: lease.driver, inspector: dependencies.makeInspector(lease.driver),
+                        owned: original, invocation: invocation,
+                        metadataChanged: { activation in await invocation.deliverNativeMediaInformation(activation: activation, invalidated: activation == nil) },
+                        failure: { [weak self] error, _ in self?.sourceTransportFailed(error, source: original, invocation: invocation) })
+                }
+                let native = NativeHLSPlaybackBackend(owned: owned, coordinator: coordinator,
+                    proxy: lock.withLock { sourceProxy }, lifecycle: invocation.outputLifecycleEpoch)
+                guard try invocation.performCurrentPreparationMutation({ self.lock.withLock { self.nativeAdapter = native } }) else { throw CancellationError() }
+                try await native.prepare()
+                try validatePreparation(invocation)
+            }
+        } catch {
+            let native = lock.withLock { nativeAdapter }
+            let installed = await native?.coordinator.hasInstalledItem ?? false
+            let noGraph = lock.withLock { bundle == nil && preparingBundle == nil }
+            if !installed && noGraph {
+                let nativeJoined = await native?.coordinator.retire() ?? true
+                let owned = lock.withLock { ownedSource }
+                await owned?.resolver.invalidate()
+                let proxy = lock.withLock { sourceProxy }
+                let proxyJoined = await proxy?.retire() ?? true
+                if nativeJoined && proxyJoined {
+                    await clearSourceOwnership()
+                    prepareFailureRetirementProof.record(lifecycle: invocation.outputLifecycleEpoch,
+                        producerRetirementConfirmed: true, playerInstallationAttempted: false)
+                }
+            }
+            throw error
+        }
+    }
+
+    private func installSource(_ owned: HLSOwnedSourcePlan, invocation: ControlTaskRegistry.BackendPrepareInvocation) throws {
+        owned.installGenerationRecovery { [weak self, weak owned] in
+            guard let self, let owned else { return false }
+            return self.requestSourceGeneration(owned, invocation: invocation)
+        }
+        owned.installCompatibleAudioRecovery { [weak self, weak owned] in
+            guard let self, let owned else { return false }
+            return self.requestCompatibleAudio(owned, invocation: invocation)
+        }
+        guard try invocation.performCurrentPreparationMutation({
+            guard owned.source.withCurrentResolution(owner: owned.plan.owner, generation: owned.source.generation, operation: {
+                self.lock.withLock { self.ownedSource = owned; self.pendingCompatibleOwner = nil }
+                return true
+            }) == true else { throw HLSSourceError.staleResolution }
+        }) else { throw CancellationError() }
+    }
+    private func installSourceBuilder(_ owned: HLSOwnedSourcePlan) throws {
+        guard let sourceBuilderFactory else { throw HLSSourceError.unboundOwner }
+        let input = lock.withLock { sourceProxy?.itemURL } ?? owned.plan.selectedServiceURL ?? owned.source.context.entryURL
+        let builder = try sourceBuilderFactory(input, owned)
+        lock.withLock { sourceBuilder = builder }
+    }
+    private func prepareGeneratedSource(_ initial: HLSOwnedSourcePlan, invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        var owned = initial
+        try installSourceBuilder(owned)
+        do { try await prepareSingleAttempt(invocation: invocation); return }
+        catch let failure as HLSPrepareAttemptFailure {
+            let accepted = lock.withLock { pendingCompatibleOwner === owned }
+            guard accepted, failure.producerRetirementConfirmed, !failure.playerInstallationAttempted,
+                  !Task.isCancelled, invocation.revalidateCurrentPreparation() else {
+                prepareFailureRetirementProof.record(lifecycle: invocation.outputLifecycleEpoch,
+                    producerRetirementConfirmed: failure.producerRetirementConfirmed, playerInstallationAttempted: failure.playerInstallationAttempted)
+                throw failure.underlying
+            }
+            // Exactly one compatible attempt, after the rejected graph physically
+            // joined. Same source/proxy/facts/deadline; no resolve or nested loop.
+            let compatible = owned.usingCompatibleAudio()
+            owned.retireGeneratedAttempt(); owned = compatible
+            try installSource(owned, invocation: invocation)
+            try installSourceBuilder(owned)
+        }
+        do { try await prepareSingleAttempt(invocation: invocation) }
+        catch let failure as HLSPrepareAttemptFailure {
+            prepareFailureRetirementProof.record(lifecycle: invocation.outputLifecycleEpoch,
+                producerRetirementConfirmed: failure.producerRetirementConfirmed, playerInstallationAttempted: failure.playerInstallationAttempted)
+            throw failure.underlying
+        }
+    }
+    private func requestSourceGeneration(_ owned: HLSOwnedSourcePlan, invocation: ControlTaskRegistry.BackendPrepareInvocation) -> Bool {
+        guard owned.isCurrent, let executor = invocation.sharedControlExecutor else { return false }
+        return executor.sync {
+            guard let activation = lock.withLock({ ownedSource === owned ? sourceActivation : nil }),
+                  backendPublicationReplacementAuthoritySlot.currentAuthority() === invocation.replacementAuthority else { return false }
+            return invocation.replacementAuthority.requestWatchdogRecovery(activation: activation)
+        }
+    }
+    private func requestCompatibleAudio(_ owned: HLSOwnedSourcePlan, invocation: ControlTaskRegistry.BackendPrepareInvocation) -> Bool {
+        guard let rejection = owned.audioRejectionRecord(), let executor = invocation.sharedControlExecutor else { return false }
+        return executor.sync {
+            var previous: HLSGeneratedAudioRejection?
+            let prepared = (try? invocation.performCurrentPreparationMutation {
+                guard try owned.source.withCurrentResolution(owner: owned.plan.owner, generation: owned.source.generation, operation: {
+                    try self.lock.withLock {
+                        guard self.ownedSource === owned, self.preparingBundle != nil, self.bundle == nil,
+                              self.pendingCompatibleOwner == nil else { throw HLSSourceError.staleResolution }
+                        previous = self.audioRejection; self.audioRejection = rejection; self.pendingCompatibleOwner = owned
+                        return true
+                    }
+                }) == true else { throw HLSSourceError.staleResolution }
+            }) == true
+            if prepared { withExtendedLifetime(previous) {}; return true }
+            guard owned.isCurrent, let activation = lock.withLock({ ownedSource === owned ? sourceActivation : nil }),
+                  backendPublicationReplacementAuthoritySlot.currentAuthority() === invocation.replacementAuthority,
+                  invocation.replacementAuthority.requestWatchdogRecovery(activation: activation) else { return false }
+            // This original executor serializes acceptance and the latch before
+            // any successor can pass its Registry preparation admission.
+            lock.withLock { previous = audioRejection; audioRejection = rejection }
+            withExtendedLifetime(previous) {}
+            return true
+        }
+    }
+    private func sourceTransportFailed(_ error: HLSSourceError, source: HLSOwnedSourcePlan,
+                                       invocation: ControlTaskRegistry.BackendPrepareInvocation) {
+        // Proxy ownership survives an AAC attempt replacement; transport scope is
+        // the original source owner/generation, not the retired graph object.
+        let admitted = lock.withLock { () -> (ActivationEpoch?, HLSRuntimeFailureMetadataOwner)? in
+            guard sourceScope == invocation.outputLifecycleEpoch, let current = ownedSource,
+                  current.plan.owner == source.plan.owner, current.source.generation == source.source.generation,
+                  sourceFailureDelivered != invocation.outputLifecycleEpoch, let metadata = sourceFailureMetadata else { return nil }
+            sourceFailureDelivered = invocation.outputLifecycleEpoch
+            return (sourceActivation, metadata)
+        }
+        guard let admitted else { return }
+        if let activation = admitted.0, invocation.replacementAuthority.requestWatchdogRecovery(activation: activation) { return }
+        lock.withLock {
+            // Creation and publication share the ownership lock. Retirement can
+            // never miss a task that has already begun a receiver actor hop.
+            guard sourceScope == invocation.outputLifecycleEpoch, sourceFailureTask == nil else { return }
+            sourceFailureTask = Task { [weak self] in
+                await invocation.deliverNativeMediaInformation(activation: admitted.0, invalidated: true)
+                guard let self, !Task.isCancelled,
+                      self.lock.withLock({ self.sourceScope == invocation.outputLifecycleEpoch }) else { return }
+                self.sourceEventSink(.backendFailed(PlaybackErrorDiagnostics.snapshot(error),
+                    prepareScope: .init(ticket: invocation.ticket), metadataOwner: admitted.1))
+            }
+        }
+    }
+    private func clearSourceOwnership() async {
+        // Close callback admission and detach every alias atomically; releases and
+        // callback joins happen outside the ownership lock.
+        let retired = lock.withLock {
+            let result = (sourceFailureTask, ownedSource, nativeAdapter, sourceProxy, sourceBuilder,
+                          sourceFailureMetadata, pendingCompatibleOwner)
+            sourceScope = nil; sourceActivation = nil
+            sourceFailureTask = nil; sourceFailureDelivered = nil; pendingCompatibleOwner = nil
+            ownedSource = nil; nativeAdapter = nil; sourceProxy = nil; sourceBuilder = nil; sourceFailureMetadata = nil
+            return result
+        }
+        retired.0?.cancel(); await retired.0?.value
+        retired.1?.retireGeneratedAttempt()
+        withExtendedLifetime(retired) {}
+    }
+    private func retireRouted(epoch: OutputLifecycleEpoch) async -> BackendTeardownResult {
+        guard epoch.backendIdentity == identity else { return .unconfirmed }
+        let native = lock.withLock { nativeAdapter }
+        if let native {
+            guard native.itemGeneration == epoch.outputNonce, await native.retire() else { return .unconfirmed }
+        } else {
+            guard case .confirmedLocalOutputStopped = await retireGeneratedOutput(epoch: epoch) else { return .unconfirmed }
+            let source = lock.withLock { ownedSource }
+            await source?.resolver.invalidate()
+            let proxy = lock.withLock { sourceProxy }
+            guard await proxy?.retire() ?? true else { return .unconfirmed }
+        }
+        await clearSourceOwnership()
+        lock.withLock { latestReceipt = nil; activationTime = nil; logSnapshotCache = nil }
         return .confirmedLocalOutputStopped
     }
 

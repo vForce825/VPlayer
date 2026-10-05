@@ -1743,6 +1743,14 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         publishMediaInformation(snapshot.information)
     }
 
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) {
+        // Recheck after the notifier's actor hop. A queued old activation cannot
+        // republish or clear a successor's current metadata.
+        guard registry.nativeMetadataScopeIsCurrent(lifecycle: lifecycle, activation: activation, invalidated: invalidated) else { return }
+        if invalidated { invalidatePreparedMediaInformation(for: lifecycle) }
+        else { refreshPreparedMediaInformation(for: lifecycle) }
+    }
+
     func invalidatePreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) {
         guard mediaInformationLifecycle == lifecycle,
               let run = admittedRun, isCurrent(run),

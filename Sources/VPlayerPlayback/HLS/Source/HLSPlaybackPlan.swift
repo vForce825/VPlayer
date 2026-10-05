@@ -89,13 +89,16 @@ public struct HLSCompatibilityFacts: Sendable, CustomStringConvertible, CustomRe
     public let complete: Bool
     public let inspectedBytes: Int
     public let formatFingerprint: Data
-    public init(source: ResolvedPlaybackSource, media: [HLSMediaFacts], complete: Bool, inspectedBytes: Int) {
+    public let initializationReceipts: HLSInitializationReceipts
+    public init(source: ResolvedPlaybackSource, media: [HLSMediaFacts], complete: Bool, inspectedBytes: Int,
+                initializationReceipts: HLSInitializationReceipts = .empty) {
         owner = source.context.owner; resolutionGeneration = source.generation
         self.media = media; self.complete = complete; self.inspectedBytes = inspectedBytes
+        self.initializationReceipts = initializationReceipts
         var components: [String] = []
         if case let .hls(graph) = source.topology {
             for document in graph.orderedDocuments where document.kind == .master {
-                for variant in document.variants {
+                for variant in document.variants + document.iframeVariants {
                     components.append("variant:\(variant.url.path)")
                     components += variant.attributes.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }
                 }
@@ -128,6 +131,7 @@ public struct HLSOutputCapabilities: Sendable {
     public let videoProfiles: [VideoCodec: Set<Int32>]
     public let videoFormats: [HLSVideoCapability]
     public let nativeAudioCodecs: Set<AudioCodec>
+    public let nativeAudioAdmissionCandidates: [HLSNativeAudioAdmissionCandidate]
     public let compressedAudioCodecs: Set<AudioCodec>
     public let verifiedCompressedAudioConfigurations: [HLSVerifiedCompressedAudioConfiguration]
     public let compressedAudioAdmissionCandidates: [HLSCompressedAudioAdmissionCandidate]
@@ -135,11 +139,13 @@ public struct HLSOutputCapabilities: Sendable {
     public let supportsGenerated: Bool
     public let supportsInBandClosedCaptions: Bool
     public init(videoProfiles: [VideoCodec: Set<Int32>] = [:], videoFormats: [HLSVideoCapability] = [],
-                nativeAudioCodecs: Set<AudioCodec> = [], compressedAudioCodecs: Set<AudioCodec> = [],
+                nativeAudioCodecs: Set<AudioCodec> = [], nativeAudioAdmissionCandidates: [HLSNativeAudioAdmissionCandidate] = [],
+                compressedAudioCodecs: Set<AudioCodec> = [],
                 verifiedCompressedAudioConfigurations: [HLSVerifiedCompressedAudioConfiguration] = [],
                 compressedAudioAdmissionCandidates: [HLSCompressedAudioAdmissionCandidate] = [],
                 supportsWebVTT: Bool = false, supportsGenerated: Bool = false, supportsInBandClosedCaptions: Bool = false) {
         self.videoProfiles = videoProfiles; self.videoFormats = videoFormats; self.nativeAudioCodecs = nativeAudioCodecs
+        self.nativeAudioAdmissionCandidates = nativeAudioAdmissionCandidates
         self.compressedAudioCodecs = compressedAudioCodecs; self.verifiedCompressedAudioConfigurations = verifiedCompressedAudioConfigurations
         self.compressedAudioAdmissionCandidates = compressedAudioAdmissionCandidates
         self.supportsWebVTT = supportsWebVTT; self.supportsGenerated = supportsGenerated; self.supportsInBandClosedCaptions = supportsInBandClosedCaptions

@@ -977,6 +977,10 @@ private actor SeededLibrarySeeder {
         guard !didSeed else { return }
         didSeed = true
         let now = Date()
+        if ProcessInfo.processInfo.arguments.contains("-ui-card-focus-diagnostics") {
+            try await seedFocusDiagnostics(now: now)
+            return
+        }
 
         do {
             // Channel identity hashes the stream URL, so every fixture channel
@@ -1065,6 +1069,42 @@ private actor SeededLibrarySeeder {
         } catch {
             throw ErrorDiagnosticSnapshot(error)
         }
+    }
+
+    /// Entirely synthetic, offline long-list fixture. Stable URLs and explicit
+    /// UI identifiers let the probe distinguish revisiting a card from new data.
+    /// Equal content keeps layout height/width independent of channel metadata.
+    private func seedFocusDiagnostics(now: Date) async throws {
+        let profile = try await repository.createProfile(
+            SourceProfileInput(
+                name: "焦点滚动诊断",
+                m3uURLString: "https://focus-probe.invalid/playlist.m3u",
+                epgURLString: "https://focus-probe.invalid/epg.xml",
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            ).validated(),
+            now: now
+        )
+        let channels = (0..<80).map { index in
+            let identifier = String(format: "%03d", index)
+            return Channel(
+                sourceProfileID: profile.id,
+                displayName: "合成频道",
+                streamURL: URL(string: "https://focus-probe.invalid/channel/\(identifier)")!,
+                tvgID: nil,
+                tvgName: nil,
+                logoURL: nil,
+                groupTitle: "诊断分组 \(index / 20 + 1)",
+                attributes: [
+                    "ui-test-id": "channel.focus-probe.\(identifier)",
+                    "ui-card-focus-probe": "true"
+                ],
+                order: index
+            )
+        }
+        try await repository.installPlaylist(
+            profileID: profile.id, channels: channels, fetchedAt: now
+        )
     }
 
     private static func epgData(now: Date) -> Data {

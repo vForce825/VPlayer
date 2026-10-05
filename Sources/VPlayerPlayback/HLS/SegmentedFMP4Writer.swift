@@ -2155,6 +2155,22 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private let compressedFormatConfiguration: CompressedAudioFormatConfiguration?
     private let ownershipLimits: SegmentedFMP4WriterOwnershipLimits
     private let recordAppendFailureOrdinal: Int?
+#if DEBUG
+    private var nativeInputAliasObserver: (@Sendable (CMBlockBuffer) -> Void)?
+
+    /// Bounded regression observation of the actual paid block. Install once
+    /// before start; the normal path has no closure or additional native owner.
+    func observeNativeInputAliasesForTesting(
+        _ observer: @escaping @Sendable (CMBlockBuffer) -> Void
+    ) throws {
+        try withLane {
+            guard state == .idle, nativeInputAliasObserver == nil else {
+                throw SegmentedFMP4WriterFailure.illegalState
+            }
+            nativeInputAliasObserver = observer
+        }
+    }
+#endif
     private let relay: SegmentReportRelay
     private let lane: DispatchQueue
     private let laneKey = DispatchSpecificKey<UUID>()
@@ -2656,6 +2672,74 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         } catch {
             ticket.abort(binding: binding, session: boundarySession)
             _ = attempt.relinquishAfterAbort()
+            throw error
+        }
+    }
+
+    /// Service proofs retain raw source PTS; only the private timeline mapping
+    /// translates native samples and boundary identity into the same output time.
+    func appendMappedCompressedAwaitingReadiness(
+        _ submission: CompressedAudioWriterSubmission,
+        timed: HLSTimedAudioAccessUnit,
+        coordinator: AudioServiceSemanticCoordinator,
+        boundary: SegmentBoundaryCoordinator,
+        nativeTail: DolbyAudioPayloadLifetime
+    ) async throws {
+        try Task.checkCancellation()
+        guard boundary.session === boundarySession,
+              timed.validatesCompressedSubmission(submission),
+              let frozen = compressedFormatConfiguration,
+              frozen == submission.formatConfiguration,
+              let lastUse = submission.accessUnit.writerLastUseReceipt,
+              coordinator.hasCompressedWriterSubmissionCapacity else {
+            throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
+        }
+        let ownerBindingMatches: Bool
+        switch submission.admissionIdentity {
+        case let .directCompressed(owner, _, _), let .eac3Aggregation(owner, _, _):
+            switch owner {
+            case let .audioVideo(lifecycle, item, epoch, participant, rendition),
+                 let .audioOnly(lifecycle, _, _, item, epoch, participant, rendition):
+                ownerBindingMatches = lifecycle == binding.outputLifecycleEpoch && item == binding.itemGeneration
+                    && epoch == binding.mediaEpoch && participant == binding.publicationParticipantID
+                    && rendition == binding.renditionIdentity
+            }
+        case .decoder: ownerBindingMatches = false
+        }
+        guard ownerBindingMatches else { throw SegmentedFMP4WriterFailure.compressedIdentityMismatch }
+        let expected = CompressedAudioWriterExpectedIdentity(codec: frozen.codec,
+            admissionIdentity: submission.admissionIdentity, formatConfiguration: frozen)
+        guard expected.accepts(submission),
+              trackKind == (frozen.codec == .ac3 ? .ac3 : .eac3) else {
+            throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
+        }
+        let ticket = try boundary.issueMappedCompressedAudioAppend(submission, timed: timed, writerBinding: binding)
+        do {
+            let identity = try SegmentBoundaryCoordinator.mappedCompressedIdentity(submission, timed: timed)
+            let sample = try makeCompressedSampleBuffer(submission.accessUnit,
+                presentationStart: timed.timing.presentationTimeStamp.cmTime, nativeTail: nativeTail)
+            let operation = try withLane {
+                var admission = try preflightTypedIsolated(sample, ticket: ticket,
+                    sampleIdentity: identity, readinessFailurePolicy: .awaiting)
+                defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                return try beginAwaitingAppendIsolated(sample, ticket: ticket, sampleIdentity: identity,
+                    ownership: FMP4InputOwnership {
+                        _ = coordinator.finishCompressedAudioWriterLastUse(lastUse)
+                    }, validatesSource: { _ in
+                        timed.validatesCompressedSubmission(submission) && expected.accepts(submission)
+                    }, admission: &admission, claimOwnership: {
+                        guard timed.validatesCompressedSubmission(submission),
+                              coordinator.claimCompressedAudioWriterSubmission(submission, expectedIdentity: expected) else {
+                            throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
+                        }
+                    })
+            }
+            try await completeAwaitingAppend(operation)
+            guard timed.validatesCompressedSubmission(submission) else {
+                throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
+            }
+        } catch {
+            ticket.abort(binding: binding, session: boundarySession)
             throw error
         }
     }
@@ -3821,6 +3905,14 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         guard try NativeSampleFacts.freeze(native) == NativeSampleFacts.freeze(sample) else {
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
         }
+#if DEBUG
+        if let nativeInputAliasObserver {
+            guard let block = CMSampleBufferGetDataBuffer(native) else {
+                throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+            }
+            nativeInputAliasObserver(block)
+        }
+#endif
         return native
     }
 
@@ -4075,7 +4167,16 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             pendingPumpInputs: trackKind == .aac ? 32 : 0, interleavedInputs: 2,
             maximumInputBytes: maximum, pendingOutputCallbacks: Self.pendingCallbackCapacity)
         let byteCapacity = trackKind == .video ? FMP4WriterLimits.video.writerHardByteCount : FMP4WriterLimits.audio.writerHardByteCount
-        guard reserve.fits(inputCapacity: ownershipLimits.hardCapacity, evidenceCapacity: inputEvidenceCapacity,
+        // Match private callback-authorized store limits before a one-shot claim:
+        // six seconds of admitted <=60p video fits384; <=48k AAC fits320.
+        // Larger/unknown cadence does not become another physical window.
+        let metadataCapacity = min(inputEvidenceCapacity, trackKind == .video ? 384 : (trackKind == .aac ? 320 : 256))
+        guard WriterDecodeCoveragePolicy.accepts(trackKind: trackKind,
+                samplesPerSecond: rate, samplesPerAccessUnit: samplesPerInput,
+                segmentInputCount: segment.segmentInputCount) else {
+            throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+        }
+        guard reserve.fits(inputCapacity: ownershipLimits.hardCapacity, evidenceCapacity: metadataCapacity,
             inputByteCapacity: byteCapacity, outputCallbackCapacity: Self.pendingCallbackCapacity) else {
             rolloverReason = .rejectUnsupported
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
@@ -5013,7 +5114,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     }
 
     private func makeCompressedSampleBuffer(
-        _ accessUnit: CompressedAudioAccessUnit
+        _ accessUnit: CompressedAudioAccessUnit,
+        presentationStart: CMTime? = nil,
+        nativeTail: DolbyAudioPayloadLifetime? = nil
     ) throws -> CMSampleBuffer {
         let payload = accessUnit.payload
         let charge = payload.count.addingReportingOverflow(HLSOwnedBlockAdmission.fixedOwnerMetadataBytes)
@@ -5021,9 +5124,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             bytes: payload.count, applicationBytes: charge.partialValue) else {
             throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
         }
-        let lifetime = WriterInputLifetime { [admission = compressedBackingAdmission, lease] in
+        let lifetime = WriterInputLifetime { [admission = compressedBackingAdmission, lease, nativeTail] in
             lease.release()
-            withExtendedLifetime(admission) {}
+            withExtendedLifetime((admission, nativeTail)) {}
         }
         let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(copying: payload, lifetime: lifetime)
         var timing = CMSampleTimingInfo(
@@ -5031,7 +5134,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 value: Int64(accessUnit.sampleCount),
                 timescale: accessUnit.sampleRate
             ),
-            presentationTimeStamp: accessUnit.presentationStart,
+            presentationTimeStamp: presentationStart ?? accessUnit.presentationStart,
             decodeTimeStamp: .invalid
         )
         var size = payload.count

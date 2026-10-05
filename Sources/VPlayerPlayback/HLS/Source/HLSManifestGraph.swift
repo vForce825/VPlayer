@@ -61,6 +61,7 @@ public struct HLSManifestGraph: Sendable, CustomStringConvertible, CustomReflect
         public let rawData: Data
         public let kind: Kind
         public let variants: [Variant]
+        public let iframeVariants: [Variant]
         public let renditions: [Rendition]
         public let references: [Reference]
         public let segments: [Segment]
@@ -105,7 +106,7 @@ private struct SourceManifestParser {
         _ = try PlaybackSourceOrigin(url)
         guard data.count <= Graph.maximumPlaylistBytes else { throw HLSSourceError.byteLimit }
         guard data.starts(with: Data("#EXTM3U".utf8)), String(data: data, encoding: .utf8) != nil else { throw HLSSourceError.malformedManifest }
-        var variants: [Graph.Variant] = [], renditions: [Graph.Rendition] = [], references: [Graph.Reference] = [], segments: [Graph.Segment] = []
+        var variants: [Graph.Variant] = [], iframeVariants: [Graph.Variant] = [], renditions: [Graph.Rendition] = [], references: [Graph.Reference] = [], segments: [Graph.Segment] = []
         var unsupported: Set<String> = []
         var pendingVariant: [String: String]?
         var pendingRange: String?
@@ -163,7 +164,9 @@ private struct SourceManifestParser {
                         renditions.append(.init(url: ref?.url, attributes: fields.mapValues(\.value)))
                     } else {
                         guard let uri = fields["URI"] else { throw HLSSourceError.malformedManifest }
-                        references.append(try reference(uri.value, span: uri.span, kind: .iframe))
+                        let ref = try reference(uri.value, span: uri.span, kind: .iframe)
+                        references.append(ref)
+                        iframeVariants.append(.init(url: ref.url, attributes: fields.mapValues(\.value)))
                     }
                     master = true
                 case "#EXT-X-MAP":
@@ -217,7 +220,7 @@ private struct SourceManifestParser {
         }
         guard pendingVariant == nil, pendingRange == nil, master != media else { throw HLSSourceError.malformedManifest }
         return Graph.Document(responseURL: url, rawData: data, kind: master ? .master : .media, variants: variants,
-            renditions: renditions, references: references, segments: segments, unsupportedFeatures: unsupported)
+            iframeVariants: iframeVariants, renditions: renditions, references: references, segments: segments, unsupportedFeatures: unsupported)
     }
     private func reference(_ text: String, span: Range<Int>, kind: Graph.ReferenceKind, allowUnsupportedScheme: Bool = false) throws -> Graph.Reference {
         guard !text.isEmpty, text.utf8.count <= 8_192, !text.unicodeScalars.contains(where: { $0.value <= 32 || $0.value == 127 }),

@@ -426,7 +426,7 @@ final class HLSPublisherTests: XCTestCase {
     }
 
     func testLiveGateFollowsVaryingRealSegmentDurationsAcrossOneBurst() async throws {
-        let durations = [1, 3, 2, 4, 2, 1, 3].map { Task19.time(Int64($0)) }
+        let durations = [4, 4, 4, 4, 4, 4, 4, 2, 1, 3].map { Task19.time(Int64($0)) }
         let clock = ManualPlaybackClock(90 * UInt64(Task19.second))
         let timing = try HLSNaturalEndPublicationClock.make(
             clock: clock, usesAbsoluteMonotonicTime: true)
@@ -435,8 +435,11 @@ final class HLSPublisherTests: XCTestCase {
             plannedSegmentDurations: durations)
         defer { h.publisher.close(); timing.stopWaiting() }
         let origin = Int64(clock.nowNanoseconds)
-        try await h.offerBoth(count: 3, now: origin)
-        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences, [0, 1, 2])
+        try await h.offerBoth(count: 6, now: origin)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences, Array(0...5))
+        let initialTargets = try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+            playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+        }
         try await h.offerBoth(count: 4, now: origin)
         XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 4)
         var elapsed: Int64 = 0
@@ -446,14 +449,54 @@ final class HLSPublisherTests: XCTestCase {
             clock.set(UInt64(origin + elapsed - 1))
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
                 now: timing.now().logical), .waiting)
-            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(2 + offset))
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(5 + offset))
             clock.advance(nanoseconds: 1)
             XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
                 now: timing.now().logical), .published)
-            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(3 + offset))
-            XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(6 + offset))
+            let visible = try XCTUnwrap(h.publisher.visible)
+            XCTAssertTrue(visible.media.values.allSatisfy { (6...7).contains($0.logicalSequences.count) })
+            XCTAssertEqual(visible.media.mapValues { playlist in
+                playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+            }, initialTargets, "A live playlist target is immutable across sliding windows")
+            XCTAssertFalse(visible.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
         }
         XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 0)
+    }
+
+    func testSlidingWindowKeepsInitialTargetAfterLongestSegmentLeaves() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 6 * Task19.second,
+            plannedSegmentDurations: (Array(repeating: 4, count: 6) + Array(repeating: 3, count: 7))
+                .map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        let initial = try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+            playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+        }
+        for index in 1...7 {
+            try await h.offerBoth(count: 1, now: Int64((index - 1) * 3) * Task19.second)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: Int64(index * 3) * Task19.second), .published)
+            XCTAssertEqual(try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+                playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+            }, initial)
+        }
+    }
+
+    func testLaterOverTargetSegmentCannotChangePreviouslyAdvertisedTarget() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 6 * Task19.second,
+            plannedSegmentDurations: [2, 2, 2, 2, 2, 2, 3].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        let previous = try XCTUnwrap(h.publisher.visible)
+        XCTAssertTrue(try XCTUnwrap(previous.media[1]).text.contains("#EXT-X-TARGETDURATION:2\n"))
+        try await h.offerBoth(count: 1)
+        XCTAssertThrowsError(try h.publisher.publish(ticket: h.publisher.ticket, now: 3 * Task19.second)) {
+            XCTAssertEqual($0 as? HLSPublicationFailure, .invalidDuration)
+        }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, previous.publicationSequence)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.raw, previous.media[1]?.raw)
+        XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14)
     }
 
     func testLiveClockCoalescesCapacitySignalAcrossRearmWithoutInlineReentry() throws {
@@ -900,37 +943,98 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(h.tracks[2]?.relay.usage.unpublishedLogicalSegmentCount, 0)
     }
 
-    func testInitialThreeSecondWindowPublishesBeforeSixSegmentSteadyState() async throws {
-        let h = try await Task19Harness(initialWindowMinimumSeconds: 3)
-        try await h.offer(participant: 1, count: 3)
-        XCTAssertNil(h.publisher.visible)
-
-        try await h.offer(participant: 2, count: 3)
-
-        let visible = try XCTUnwrap(h.publisher.visible)
-        XCTAssertEqual(
-            visible.media.mapValues(\.logicalSequences),
-            [1: Array(0...2), 2: Array(0...2)]
-        )
-        XCTAssertEqual(visible.coverage.logicalSequences, Array(0...2))
-        XCTAssertFalse(visible.coverage.isSixSegmentWindowEligible)
+    func testConfiguredThreeOrFourSecondsCannotShortenALiveSixSegmentWindow() async throws {
+        for preference in [3, 4] {
+            let h = try await Task19Harness(initialWindowMinimumSeconds: preference)
+            defer { h.publisher.close() }
+            try await h.offerBoth(count: 5)
+            XCTAssertNil(h.publisher.visible, "A buffer preference is not finite-source evidence")
+            try await h.offer(participant: 1, count: 1)
+            XCTAssertNil(h.publisher.visible, "Every participant must supply the common six segments")
+            try await h.offer(participant: 2, count: 1)
+            let first = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(first.media.mapValues(\.logicalSequences), [1: Array(0...5), 2: Array(0...5)])
+            XCTAssertTrue(first.coverage.isSixSegmentWindowEligible)
+            XCTAssertTrue(first.media.values.allSatisfy { !$0.isFinal && !$0.text.contains("#EXT-X-ENDLIST") })
+        }
     }
 
-    func testInitialFourSecondWindowRequiresEachTrackWithoutWaitingForSix() async throws {
-        let h = try await Task19Harness(initialWindowMinimumSeconds: 4)
-        try await h.offerBoth(count: 3)
-        XCTAssertNil(h.publisher.visible, "Three seconds must not satisfy the four-second mode")
-        try await h.offer(participant: 1, count: 1)
-        XCTAssertNil(h.publisher.visible, "Every participant must independently cover four seconds")
-        try await h.offer(participant: 2, count: 1)
-        let first = try XCTUnwrap(h.publisher.visible)
-        XCTAssertEqual(first.media.mapValues(\.logicalSequences), [1: Array(0...3), 2: Array(0...3)])
-        XCTAssertEqual(first.coverage.logicalSequences, Array(0...3))
-        XCTAssertFalse(first.coverage.isSixSegmentWindowEligible)
+    func testShortConfiguredPrefixRequiresAuthenticatedEOFAndPublishesOnlyFinalPlaylist() async throws {
+        for count in [3, 4, 5] {
+            let preference = count == 3 ? 3 : 4
+            let h = try await Task19Harness(initialWindowMinimumSeconds: preference,
+                terminalLogicalSequence: UInt64(count - 1))
+            defer { h.publisher.close() }
+            try await h.offerBoth(count: count)
+            XCTAssertNil(h.publisher.visible, "Even a terminal writer needs the explicit common EOF transaction")
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 0, naturalEnd: true), .published)
+            let final = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(final.media.mapValues(\.logicalSequences),
+                [1: Array(0..<UInt64(count)), 2: Array(0..<UInt64(count))])
+            XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertFalse(final.coverage.isSixSegmentWindowEligible)
+        }
+        let unfinished = try await Task19Harness(initialWindowMinimumSeconds: 3)
+        defer { unfinished.publisher.close() }
+        try await unfinished.offerBoth(count: 3)
+        XCTAssertThrowsError(try unfinished.publisher.publish(ticket: unfinished.publisher.ticket, now: 0, naturalEnd: true))
+        XCTAssertNil(unfinished.publisher.visible, "A caller boolean cannot replace terminal writer authority")
+    }
+
+    func testSixSecondGOPRetainsSixSegmentsAndBoundedReadinessAsWindowSlides() async throws {
+        let durations = Array(repeating: Task19.time(6), count: 18)
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 12 * Task19.second,
+            initialWindowMinimumSeconds: 3, plannedSegmentDurations: durations)
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 5)
+        XCTAssertNil(h.publisher.visible, "Thirty seconds in five segments does not satisfy the live six-segment contract")
         try await h.offerBoth(count: 1)
-        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
-        XCTAssertEqual(h.publisher.visible?.media.mapValues(\.logicalSequences),
-                       [1: Array(0...4), 2: Array(0...4)])
+        XCTAssertEqual(h.publisher.visible?.coverage.participants.first?.ranges.last?.end, Task19.time(36))
+        for index in 1...12 {
+            let now = Int64(index * 6) * Task19.second
+            try await h.offerBoth(count: 1, now: now - 6 * Task19.second)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: now), .published)
+            let visible = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(visible.media.mapValues(\.logicalSequences),
+                [1: Array(UInt64(index)...UInt64(index + 5)), 2: Array(UInt64(index)...UInt64(index + 5))])
+            for playlist in visible.media.values {
+                let target = try XCTUnwrap(playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") })
+                let targetSeconds = try XCTUnwrap(Int(target.split(separator: ":")[1]))
+                let total = playlist.text.split(separator: "\n").filter { $0.hasPrefix("#EXTINF:") }
+                    .compactMap { Double($0.dropFirst(8).dropLast()) }.reduce(0, +)
+                XCTAssertGreaterThanOrEqual(total, Double(3 * targetSeconds))
+            }
+            h.store.sweep(now: now)
+            XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14)
+            XCTAssertLessThanOrEqual(h.store.usage.segmentCount, 96)
+            XCTAssertLessThanOrEqual(h.store.usage.residentBytes + h.store.usage.reservedBytes, 688 * 1_048_576)
+        }
+    }
+
+    func testSeventhSegmentSatisfiesActualAudioTargetDurationWithoutExpandingWindowCap() async throws {
+        let h = try await Task19Harness(plannedSegmentDurations: [1, 1, 1, 1, 1, 2, 2].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        XCTAssertNil(h.publisher.visible,
+            "The physical AAC segment slightly over two seconds advertises target3 and needs nine seconds")
+        try await h.offerBoth(count: 1)
+        let visible = try XCTUnwrap(h.publisher.visible)
+        XCTAssertEqual(visible.media.mapValues(\.logicalSequences), [1: Array(0...6), 2: Array(0...6)])
+        XCTAssertTrue(try XCTUnwrap(visible.media[2]).text.contains("#EXT-X-TARGETDURATION:3\n"))
+        XCTAssertTrue(visible.media.values.allSatisfy { !$0.isFinal })
+        XCTAssertEqual(h.publisher.retainedReadinessCount, 14)
+    }
+
+    func testLongGOPTargetFloorFailsBeforeAnyEighthWindowSegmentIsNeeded() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 12 * Task19.second,
+            plannedSegmentDurations: [1, 1, 1, 1, 1, 6, 1].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        XCTAssertNil(h.publisher.visible, "Six records with eleven seconds cannot cover three six-second targets")
+        await assertTask19ThrowsError(try await h.offerBoth(count: 1))
+        XCTAssertNil(h.publisher.visible)
+        XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14,
+            "An incompatible variable-duration window must fail inside the existing seven-record bound")
     }
 
     func testInitialWindowBoundsTrackSkewInsteadOfAbsoluteVideoSequence() async throws {

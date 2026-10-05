@@ -718,7 +718,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     init(
         lifecycle: OutputLifecycleEpoch,
         publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
-        initialWindowMinimumSeconds: Int = 3,
+        initialWindowMinimumSeconds: Int = 6,
         publicationClock: (any PlaybackMonotonicClock)? = nil,
         failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in },
         generatedSource: (any HLSGeneratedSourceContext)? = nil,

@@ -13,6 +13,7 @@ public struct CompressedAudioFrame: Sendable {
     public let duration: CMTime
     public let frameSampleCount: Int32
     let sourceProof: CompressedAudioSourceProof?
+    let dolbyProof: DolbyAudioFrameProof?
     // Paid data ownership alone confers no compressed-writer authority.
     private let payloadOwnership: HLSAudioCopyTail?
 
@@ -34,6 +35,7 @@ public struct CompressedAudioFrame: Sendable {
         self.frameSampleCount = frameSampleCount
         sourceProof = nil
         payloadOwnership = nil
+        dolbyProof = nil
     }
 
     init(id: UInt64, payload: Data, codec: AudioCodec, generation: MediaGeneration,
@@ -43,6 +45,7 @@ public struct CompressedAudioFrame: Sendable {
         self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
         self.frameSampleCount = frameSampleCount; self.sourceProof = sourceProof
         payloadOwnership = nil
+        dolbyProof = nil
     }
 
     init(id: UInt64, payload: Data, codec: AudioCodec, generation: MediaGeneration,
@@ -52,6 +55,15 @@ public struct CompressedAudioFrame: Sendable {
         self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
         self.frameSampleCount = frameSampleCount; sourceProof = nil
         self.payloadOwnership = payloadOwnership
+        dolbyProof = nil
+    }
+    init(id: UInt64, payload: Data, codec: AudioCodec, generation: MediaGeneration,
+         presentationTimeStamp: CMTime, duration: CMTime, frameSampleCount: Int32,
+         dolbyProof: DolbyAudioFrameProof) {
+        self.id = id; self.payload = payload; self.codec = codec; self.generation = generation
+        self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
+        self.frameSampleCount = frameSampleCount; self.dolbyProof = dolbyProof
+        sourceProof = nil; payloadOwnership = nil
     }
 }
 

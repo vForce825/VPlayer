@@ -237,6 +237,42 @@ final class AACPassthroughTests: XCTestCase {
         XCTAssertTrue(config.validates(unit))
     }
 
+    func testFramingCapacityAndCancellationPropagateInsteadOfDecodeBreakOrWaiting() throws {
+        let copies = HLSAudioCopyOwnership(maximumCompressedBytes: 8_192,
+            maximumPCMBytes: 8_192, capacity: 8)
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        var held: [HLSDataPlaneAdmission.Lease] = []
+        for _ in 0..<8 { held.append(try XCTUnwrap(copies.framing.acquire(bytes: 1))) }
+        XCTAssertThrowsError(try timeline.consume(.packet(Self.packet(Data([0x21]))))) { error in
+            XCTAssertEqual(error as? HLSAudioCopyAdmissionFailure, .capacityExceeded)
+        }
+        XCTAssertEqual(copies.framing.usage.count, 8)
+        held.forEach { $0.release() }; held.removeAll()
+        timeline.retireCompressedGeneration()
+        XCTAssertEqual(copies.framing.usage.bytes, 0)
+
+        let cancelled = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        _ = try cancelled.consume(.tracks(Self.tracks()))
+        copies.cancel()
+        XCTAssertThrowsError(try cancelled.consume(.packet(Self.packet(Data([0x21]))))) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+    }
+
+    func testSourceMetadataCapacityDoesNotBecomeCodecRejection() throws {
+        let copies = HLSAudioCopyOwnership(maximumCompressedBytes: 2_048,
+            maximumPCMBytes: 8_192, capacity: 8)
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        XCTAssertThrowsError(try timeline.consume(.packet(Self.packet(Data([0x21]))))) { error in
+            XCTAssertEqual(error as? HLSAudioCopyAdmissionFailure, .capacityExceeded)
+        }
+        timeline.retireCompressedGeneration()
+        XCTAssertEqual(copies.compressedInput.usage.bytes, 0)
+        XCTAssertEqual(copies.framing.usage.bytes, 0)
+    }
+
     private static func facts(priming: HLSSourceAudioPriming = .notSignaledPreserveTimestamps) -> HLSSourceAudioFacts {
         .init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2, channelMask: 3,
             decoderConfiguration: Data([0x11, 0x90]), priming: priming,

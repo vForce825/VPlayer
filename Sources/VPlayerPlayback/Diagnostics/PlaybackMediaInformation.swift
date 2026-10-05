@@ -57,4 +57,12 @@ struct PlaybackPreparedMediaInformation: Sendable, Equatable {
 protocol PlaybackBackendMediaInformationReceiving: AnyObject, Sendable {
     func refreshPreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) async
     func invalidatePreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) async
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) async
+}
+
+extension PlaybackBackendMediaInformationReceiving {
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) async {
+        if invalidated { await invalidatePreparedMediaInformation(for: lifecycle) }
+        else { await refreshPreparedMediaInformation(for: lifecycle) }
+    }
 }

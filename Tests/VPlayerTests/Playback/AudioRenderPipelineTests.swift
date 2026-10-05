@@ -6505,27 +6505,32 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let factory = LivePCMAudioDecoderFactory(hlsCopyOwnership: ownership)
         let tracks = try AssemblerTestFixtures.audioTracks(extradata: Data([0x11, 0x90]))
         var assemblerEvents: [AudioAssemblerEvent] = []
-        let assembler = try CompressedAudioAssembler(
-            trackSet: tracks,
-            generationProvider: { MediaGeneration(rawValue: 1) },
-            eventSink: { assemblerEvents.append($0) },
-            formatState: AssemblyFormatState(trackSet: tracks),
-            hlsCopyOwnership: ownership
-        )
-        try assembler.push(AssemblerTestFixtures.audioPacket(data: Data([0x21, 0x22]), codec: .aac))
         do {
-            let decoder = try factory.makeDecoder(codec: .aac, extradata: Data([0x12, 0x10]))
-            withExtendedLifetime(decoder) {
-                XCTAssertFalse(assemblerEvents.isEmpty, "assembler 必须实际创建并使用 injected framer")
+            let assembler = try CompressedAudioAssembler(
+                trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) },
+                eventSink: { assemblerEvents.append($0) },
+                formatState: AssemblyFormatState(trackSet: tracks),
+                hlsCopyOwnership: ownership
+            )
+            try assembler.push(AssemblerTestFixtures.audioPacket(data: Data([0x21, 0x22]), codec: .aac))
+            do {
+                let decoder = try factory.makeDecoder(codec: .aac, extradata: Data([0x12, 0x10]))
+                withExtendedLifetime(decoder) {
+                    XCTAssertFalse(assemblerEvents.isEmpty, "assembler 必须实际创建并使用 injected framer")
+                }
             }
+            #if DEBUG
+            let events = ownership.copyEvents
+            XCTAssertFalse(events.isEmpty, "DEBUG 组件接缝必须看到真实 admission")
+            XCTAssertTrue(events.allSatisfy(\.wasChargedBeforeCopy))
+            #else
+            XCTFail("该组件注入接缝证据必须在 DEBUG admission 观测下执行")
+            #endif
         }
-        #if DEBUG
-        let events = ownership.copyEvents
-        XCTAssertFalse(events.isEmpty, "DEBUG 组件接缝必须看到真实 admission")
-        XCTAssertTrue(events.allSatisfy(\.wasChargedBeforeCopy))
-        #else
-        XCTFail("该组件注入接缝证据必须在 DEBUG admission 观测下执行")
-        #endif
+        XCTAssertGreaterThan(ledger.chargedBytes, 0,
+            "Emitted frame aliases retain their real paid backing after assembler destruction")
+        assemblerEvents.removeAll()
         XCTAssertEqual(ledger.chargedBytes, 0)
     }
 

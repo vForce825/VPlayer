@@ -159,6 +159,17 @@ struct CompressedAudioPayloadSeal: @unchecked Sendable {
     }
 }
 
+/// Value-only release identity. A native tail need not retain the submitted AU's
+/// candidate authorization, timeline, producer, or graph to release its leases.
+struct CompressedAudioWriterLastUseReceipt: Sendable {
+    let owner: AudioServiceBranchTransferOwnerIdentity
+    let leases: FixedEAC3MemberVector<AudioServiceBranchLeaseIdentity>
+    fileprivate init(owner: AudioServiceBranchTransferOwnerIdentity,
+                     leases: FixedEAC3MemberVector<AudioServiceBranchLeaseIdentity>) {
+        self.owner = owner; self.leases = leases
+    }
+}
+
 struct CompressedAudioAccessUnit: @unchecked Sendable {
     let kind: CompressedAudioAccessUnitKind
     let codec: AudioCodec
@@ -185,6 +196,17 @@ struct CompressedAudioAccessUnit: @unchecked Sendable {
 
     var directInputBacking: AudioServiceInputBacking? {
         payloadSeal.directInputBacking
+    }
+
+    var writerLastUseReceipt: CompressedAudioWriterLastUseReceipt? {
+        if let bundle = directBundleIdentity, let lease = directLeaseIdentity,
+           let leases = try? FixedEAC3MemberVector([lease]) {
+            return .init(owner: .compressedAccessUnit(bundle), leases: leases)
+        }
+        if let bundle = eac3BundleIdentity, let aggregationProof {
+            return .init(owner: .eac3AccessUnit(bundle), leases: aggregationProof.orderedAggregationLeaseIdentities)
+        }
+        return nil
     }
 
     var writerSubmission: CompressedAudioWriterSubmission {

@@ -100,6 +100,16 @@ final class HLSOwnedProxyManifestAuthority: @unchecked Sendable {
         }
     }
 
+    func generatedServiceEndpoint() throws -> (url: URL, role: HLSProxyManifestRole) {
+        guard owned.plan.transport == .generated, let selected = owned.plan.selectedServiceURL,
+              let graph, let document = graph.document(for: selected), document.kind == .media,
+              let role = originalRoles[document.responseURL] else { throw HLSSourceError.incompleteEvidence }
+        // selectedMediaFacts additionally checks the original plan fingerprint,
+        // owner and canonical response alias. A caller cannot pass an arbitrary URL.
+        _ = try owned.selectedMediaFacts()
+        return (selected, role)
+    }
+
     private struct RenewalState {
         let deadline: UInt64
         let budget: HLSProxyBudget

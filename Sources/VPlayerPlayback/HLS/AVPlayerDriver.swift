@@ -110,7 +110,7 @@ struct AVPlayerDriverAdmission: Sendable {
 
 /// 实际交给SDK的callback持有本租约；执行、取消和driver退休均不提前归还。
 final class AVPlayerSDKCallbackLease: @unchecked Sendable {
-    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio }
+    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio, nativeObservation }
     nonisolated(unsafe) private static var occupied: UInt8 = 0
     private let slot: UInt8
     let kind: Kind
@@ -586,6 +586,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     nonisolated fileprivate static let creationLock = PreparationStorageLock()
     nonisolated(unsafe) private static var admissionGeneration: UInt64 = 0
     nonisolated(unsafe) private static var admissionReferences: UInt16 = 0
+    nonisolated(unsafe) private static var nativeTailWaiter: (UInt64, CheckedContinuation<Void, Never>)?
 
     nonisolated fileprivate static func isAdmissionActiveLocked(_ admission: AVPlayerDriverAdmission) -> Bool {
         admissionReferences > 0 && admissionGeneration == admission.generation
@@ -600,6 +601,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     nonisolated fileprivate static func releaseAdmissionLocked(_ admission: AVPlayerDriverAdmission) {
         precondition(isAdmissionActiveLocked(admission), "只能归还准确原driver准入引用，不能下溢或消费后继世代")
         admissionReferences -= 1
+        // Driver + hub are the two canonical owners. Every additional reference
+        // is an original SDK callback/credit whose physical tail must retire.
+        if admissionReferences == 2, let waiter = nativeTailWaiter, waiter.0 == admission.generation {
+            nativeTailWaiter = nil
+            waiter.1.resume()
+        }
     }
 
     static func make(
@@ -659,6 +666,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private var accessLogObserver: NSObjectProtocol?
     private var errorLogObserver: NSObjectProtocol?
     private var logRefreshTask: Task<Void, Never>?
+    private var nativeTailJoinTask: Task<Void, Never>?
     private let logReader: any AVPlayerLogReading
     private var systemAudioTransitionInFlight = false
     private var pausedResumeCallbackPool: AVPlayerSDKCallbackCreditPool?
@@ -849,22 +857,55 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
     var fixedTimerCount: Int { 0 }
 
-    func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
-        guard !systemAudioTransitionInFlight else {
-            throw AVPlayerItemCoordinatorFailure.operationInFlight
+    func nativeCurrentItem(_ identity: AVPlayerItemInstanceIdentity) -> AVPlayerItem? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { return nil }
+        return item
+    }
+
+    func joinNativeCallbackTails() async {
+        if let nativeTailJoinTask { await nativeTailJoinTask.value; return }
+        let task = Task { [self] in
+            let logs = logRefreshTask
+            logs?.cancel()
+            await logs?.value
+            await withCheckedContinuation { continuation in
+                let ready = Self.creationLock.withLock { () -> Bool in
+                    precondition(Self.isAdmissionActiveLocked(eventHub.admission))
+                    if Self.admissionReferences == 2 { return true }
+                    precondition(Self.nativeTailWaiter == nil)
+                    Self.nativeTailWaiter = (eventHub.admission.generation, continuation)
+                    return false
+                }
+                if ready { continuation.resume() }
+            }
         }
+        nativeTailJoinTask = task
+        await task.value
+        nativeTailJoinTask = nil
+    }
+
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
+        try install(url: url, identity: identity, admission: { operation in operation(); return true })
+    }
+
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {
+        guard !systemAudioTransitionInFlight else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        // These can deliver/cancel callbacks and must precede the Registry lock.
         cancelAllWaiters()
         installationResourceContextReservation = nil
         eventHub.releaseInstallationResourceContext()
         player.pause()
         player.automaticallyWaitsToMinimizeStalling = true
         let installed = AVPlayerItem(url: url)
-        installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(
-            configured: preferredForwardBufferDuration)
+        installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(configured: preferredForwardBufferDuration)
         installed.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-        player.replaceCurrentItem(with: installed)
-        item = installed
-        currentItemIdentity = identity
+        // No app observer is installed on the new item yet. Only the exact SDK
+        // mutation and driver identity CAS run under the original prepare fence.
+        guard try admission({
+            player.replaceCurrentItem(with: installed)
+            item = installed
+            currentItemIdentity = identity
+        }) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         eventHub.activate(identity)
         logSnapshotCache.activate(item: identity, objectIdentity: ObjectIdentifier(installed))
     }
@@ -962,6 +1003,25 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                                    actualTime: try ExactMediaTime(player.currentTime()))
     }
 
+    func seekNative(to time: ExactMediaTime, item identity: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime {
+        guard currentItemIdentity == identity else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        try await awaitPausedResumeOperationCredit(item: identity)
+        let callbackLease = try reserveSDKCallbackLease(.seek)
+        let gate = prepareWait
+        let token = try gate.begin(.seek)
+        defer { gate.retire(token) }
+        let succeeded = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.install(continuation, token: token)
+                player.seek(to: time.cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { success in
+                    callbackLease.assertRegistered(); gate.resolve(.success(success), token: token)
+                }
+            }
+        } onCancel: { gate.resolve(.failure(CancellationError()), token: token) }
+        guard succeeded, nativeCurrentItem(identity) != nil else { throw AVPlayerItemCoordinatorFailure.seekMismatch }
+        return try ExactMediaTime(player.currentTime())
+    }
+
     func waitForLoadedTimeRanges(item identity: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
                                  covering requested: ExactMediaInterval) async throws
@@ -1014,6 +1074,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.preroll)
         let gate = prepareWait
         let token = try gate.begin(.preroll)

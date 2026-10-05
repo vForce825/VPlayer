@@ -1155,32 +1155,75 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(relay.usage.unpublishedLogicalSegmentCount, 0)
     }
 
-    func testDefaultRemuxSuccessorPreservesPendingInputUntilPredecessorAliasesLeaveHeadroom() async throws {
-        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 80_700,
-            frames: (0...720).map { .init(pts: 600 + Int64($0), dts: 600 + Int64($0), isIDR: $0 % 360 == 0) },
-            frameDuration: CMTime(value: 1, timescale: 60), frameTimestampTimescale: 60,
-            maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+    func testDefaultNativeInputObservationDoesNotRetainPaidBacking() throws {
         let factory = Task17FakeSystemWriterFactory()
+        let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(epochStart: .zero,
+            videoMode: .passthrough))
+        let fixture = try Task17Fixtures.realH264Sample()
+        let writer = try Task17Fixtures.makeWriter(seed: 80_690, kind: .video,
+            sourceFormatHint: fixture.format, boundary: boundary, factory: factory,
+            ownershipLimits: nil, releaseTransfersImmediately: true)
+        defer { _ = writer.cancel() }
+        try writer.start(at: .zero)
+#if DEBUG
+        XCTAssertThrowsError(try writer.observeNativeInputAliasesForTesting { _ in
+            XCTFail("an observer installed after start must never run")
+        })
+#endif
+        try XCTUnwrap(factory.lastWriter).setRetainsInputs(false)
+        let output = Task17Fixtures.videoOutput(fixture: fixture, generation: 1,
+            accessUnitID: 1, sequenceNumber: 1)
+        try writer.appendVideo(output,
+            ticket: boundary.issueVideoAppend(for: output, writerBinding: writer.binding))
+        XCTAssertEqual(writer.usage.inputAllocationCount, 1)
+        XCTAssertEqual(writer.usage.inputReleaseCount, 1)
+        XCTAssertEqual(writer.usage.liveInputCount, 0,
+            "the default path must not retain the paid wrapper after the adapter releases it")
+    }
+
+#if DEBUG
+    func testDefaultRemuxSuccessorPreservesPendingInputUntilPredecessorAliasesLeaveHeadroom() async throws {
+        let nativeVideo = try Task17NativeRetentionFixtures.h264()
+        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 80_700,
+            frames: (0...720).map { .init(pts: 600 + Int64($0), dts: 600 + Int64($0), isIDR: true) },
+            frameDuration: CMTime(value: 1, timescale: 60), frameTimestampTimescale: 60,
+            parameterSetsOverride: nativeVideo.parameterSets,
+            idrOverride: nativeVideo.idr,
+            minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+        let factory = AVAssetSegmentedFMP4SystemWriterFactory()
         var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: 80_700, kind: .video,
             writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
             boundary: fixture.boundary, factory: factory, ownershipLimits: nil, releaseTransfersImmediately: true)
         weak var weakFirst = first
-        let drain = try Task17InspectionWindowDrain(writer: XCTUnwrap(first))
+        let aliases = Task17RetainedNativeInputAliases(capacity: 720)
+        defer { aliases.releaseAll() }
+        try first!.observeNativeInputAliasesForTesting { aliases.retainReference(to: $0) }
+        XCTAssertThrowsError(try first!.observeNativeInputAliasesForTesting { _ in })
         try first!.start(at: CMTime(value: 10, timescale: 1))
+        XCTAssertThrowsError(try first!.observeNativeInputAliasesForTesting { _ in })
         for index in 0..<720 {
             let input = try fixture.builder.makeSubmission(for: fixture.timed[index], admission: fixture.admissions[index])
-            try first!.appendRemuxVideo(input,
+            try await first!.appendRemuxVideoAwaitingReadiness(input,
                 ticket: fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: first!.binding))
+            if index == 360 {
+                // Wait for the first real segment callback before accumulating
+                // the next segment's evidence; all 361 input aliases stay held.
+                for _ in 0..<1_000 where first!.usage.mediaCallbackCount == 0 {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                XCTAssertEqual(first!.usage.mediaCallbackCount, 1)
+                guard first!.usage.mediaCallbackCount == 1 else {
+                    throw SegmentedFMP4WriterFailure.systemFailure
+                }
+            }
         }
-        let native = try XCTUnwrap(factory.lastWriter)
-        var aliases = try (0..<720).map { try native.makeInputBlockAlias(at: $0) }
+        XCTAssertEqual(aliases.count, 720)
         let pending = try fixture.builder.makeSubmission(for: fixture.timed[720], admission: fixture.admissions[720])
-        XCTAssertThrowsError(try first!.appendRemuxVideo(pending,
+        await assertWriterThrowsError(try await first!.appendRemuxVideoAwaitingReadiness(pending,
             ticket: fixture.boundary.issueRemuxVideoAppend(for: pending, writerBinding: first!.binding))) {
             XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
         }
-        _ = try await first!.finish()
-        try drain.closeAfterTerminal(XCTUnwrap(first))
         let continuation = try await first!.finishWriterWindow()
         first = nil
         XCTAssertNil(weakFirst)
@@ -1210,7 +1253,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertNil(ticket.committedBoundary)
         XCTAssertNil(next.terminalReceipt)
         XCTAssertEqual(aliases.count, 720)
-        aliases.removeAll()
+        aliases.releaseAll()
         XCTAssertEqual(next.usage.liveInputCount, 0)
         // A materialized remux attempt could not be reclaimed here. This retries
         // the exact pending AU, on the same already-created successor writer.
@@ -1228,8 +1271,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
     func testCompressedLive384EnvelopeSurvivesPredecessorFinishDeinitAndRejects385th() async throws {
         for kind in [SegmentedFMP4TrackKind.ac3, .eac3] {
             let seed: UInt64 = kind == .ac3 ? 80_200 : 80_300
-            let ac3 = kind == .ac3 ? try Task17AC3Harness(seed: seed) : nil
-            let eac3 = kind == .eac3 ? try Task17EAC3Harness(seed: seed) : nil
+            let ac3Frame = kind == .ac3 ? try await Task17NativeRetentionFixtures.ac3Frame() : nil
+            let eac3Frames = kind == .eac3 ? try Task17NativeRetentionFixtures.eac3Frames() : nil
+            let ac3 = kind == .ac3 ? try Task17AC3Harness(seed: seed, fixtureFrame: ac3Frame) : nil
+            let eac3 = kind == .eac3 ? try Task17EAC3Harness(seed: seed, fixtureFrames: eac3Frames) : nil
             let semantic = ac3?.coordinator ?? eac3!.coordinator
             func unit(_ index: Int) throws -> CompressedAudioAccessUnit {
                 let pts = CMTime(value: Int64(index * 1_536), timescale: 48_000)
@@ -1237,15 +1282,17 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 return try eac3!.makeSixMemberAccessUnit(presentationBase: pts)
             }
             let firstUnit = try unit(0)
-            let format = try Task17Fixtures.compressedAudioFormat(for: firstUnit)
+            let format = try Task17NativeRetentionFixtures.audioFormat(for: firstUnit)
             let boundary = try SegmentBoundaryCoordinator(mode: .audioOnly(epochStart: .zero))
-            let factory = Task17FakeSystemWriterFactory()
+            let factory = AVAssetSegmentedFMP4SystemWriterFactory()
             var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: seed,
                 kind: kind, sourceFormatHint: format, boundary: boundary,
                 compressedFormatConfiguration: firstUnit.formatConfiguration, factory: factory,
                 ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 384), releaseTransfersImmediately: true)
             weak var weakFirst = first
-            let drain = try Task17InspectionWindowDrain(writer: XCTUnwrap(first))
+            let aliases = Task17RetainedNativeInputAliases(capacity: 32)
+            defer { aliases.releaseAll() }
+            try first!.observeNativeInputAliasesForTesting { aliases.retainReference(to: $0) }
             let binding = first!.binding
             try boundary.registerAudioRendition(binding.renditionIdentity,
                 accessUnit: kind == .ac3 ? .ac3(sampleRate: 48_000)
@@ -1255,18 +1302,15 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             for index in 0..<32 {
                 let input = index == 0 ? firstUnit : try unit(index)
                 oldUnits.append(input)
-                try first!.appendCompressed(input.writerSubmission, coordinator: semantic,
+                try await first!.appendCompressedAwaitingReadiness(input.writerSubmission, coordinator: semantic,
                     ticket: boundary.issueCompressedAudioAppend(for: input, writerBinding: binding))
             }
-            let oldNative = try XCTUnwrap(factory.lastWriter)
-            var aliases = try (0..<32).map { try oldNative.makeInputBlockAlias(at: $0) }
+            XCTAssertEqual(aliases.count, 32)
             let pending = try unit(32)
-            XCTAssertThrowsError(try first!.appendCompressed(pending.writerSubmission, coordinator: semantic,
+            await assertWriterThrowsError(try await first!.appendCompressedAwaitingReadiness(pending.writerSubmission, coordinator: semantic,
                 ticket: boundary.issueCompressedAudioAppend(for: pending, writerBinding: binding))) {
                 XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
             }
-            _ = try await first!.finish()
-            try drain.closeAfterTerminal(XCTUnwrap(first))
             let continuation = try await first!.finishWriterWindow()
             first = nil
             XCTAssertNil(weakFirst)
@@ -1301,7 +1345,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             XCTAssertNil(rejectedTicket.committedBoundary)
             XCTAssertNil(next.terminalReceipt)
             XCTAssertEqual(aliases.count, 32)
-            aliases.removeAll()
+            aliases.releaseAll()
             XCTAssertEqual(semantic.liveCompressedWriterSubmissionCount, 352)
             for old in oldUnits {
                 let leases = old.aggregationProof?.orderedAggregationLeaseIdentities.values
@@ -1318,6 +1362,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             XCTAssertEqual(semantic.claimedCompressedWriterSubmissionCount, 385)
         }
     }
+#endif
 
     func testDefaultWriterChecksPhysicalHeadroomAfterFlushAndFinishesWithoutEmptyFragment() async throws {
         for releaseOnFlush in [true, false] {
@@ -8394,24 +8439,122 @@ private final class Task17WeakSystemWriter: @unchecked Sendable {
     init(_ value: Task17FakeSystemWriter) { self.value = value }
 }
 
-/// Inspection adapters cannot bind native publication identity. This helper
-/// attaches the genuine writer-created context to its own relay, and closes only
-/// after production terminal. It does not construct or replace a drain receipt.
-private final class Task17InspectionWindowDrain {
-    private let relay: SegmentReportRelay
-    init(writer: SegmentedFMP4Writer) throws {
-        let fields = Mirror(reflecting: writer).children
-        relay = try XCTUnwrap(fields.first { $0.label == "relay" }?.value as? SegmentReportRelay)
-        let source = try XCTUnwrap(fields.first { $0.label == "callbackContext" }?.value as? SegmentedFMP4CallbackContext)
-        try relay.bindPublicationSource(source)
+#if DEBUG
+private enum Task17NativeRetentionFixtures {
+    static func h264() throws -> (parameterSets: [Data], idr: Data) {
+        let bytes = try FixtureLoader.data("Video/h264-yuv420p-one-frame.h264")
+        let scan = try AnnexBScanner.scan(bytes, codec: .h264)
+        XCTAssertEqual(scan.randomAccessKind, .h264IDR)
+        var offset = 0
+        var idr: Data?
+        while offset + 4 <= scan.lengthPrefixedData.count {
+            let size = scan.lengthPrefixedData[offset..<(offset + 4)]
+                .reduce(0) { ($0 << 8) | Int($1) }
+            offset += 4
+            guard size > 0, size <= scan.lengthPrefixedData.count - offset else {
+                throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+            }
+            let nal = scan.lengthPrefixedData.subdata(in: offset..<(offset + size))
+            if nal[0] & 0x1F == 5 { idr = nal }
+            offset += size
+        }
+        XCTAssertEqual(offset, scan.lengthPrefixedData.count)
+        return (scan.parameterSets, try XCTUnwrap(idr))
     }
-    func closeAfterTerminal(_ writer: SegmentedFMP4Writer) throws {
-        let terminal = try XCTUnwrap(writer.terminalReceipt)
-        XCTAssertEqual(terminal.terminalReason, .finished)
-        relay.closePublications()
-        relay.notifyPublicationDrainIfReady()
+
+    static func ac3Frame() async throws -> Data {
+        let asset = AVURLAsset(url: try FixtureLoader.url("ac3-48k-5point1.mov"))
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(tracks.first), outputSettings: nil)
+        guard reader.canAdd(output) else { throw SegmentedFMP4WriterFailure.invalidSystemConfiguration }
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        let next = try await provider.next()
+        let sample = try makeOwnedReaderFixtureSample(copying: XCTUnwrap(next))
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        let size = CMSampleBufferGetSampleSize(sample, at: 0)
+        guard size > 0, size <= CMBlockBufferGetDataLength(block) else {
+            throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+        }
+        var bytes = Data(count: size)
+        let status = bytes.withUnsafeMutableBytes {
+            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+        }
+        try Task17Fixtures.check(status)
+        let inspection = try AC3FrameInspector.inspect(bytes)
+        XCTAssertEqual(inspection.sampleRate, 48_000)
+        XCTAssertEqual(inspection.channelCount, 6)
+        return bytes
+    }
+
+    static func eac3Frames() throws -> [Data] {
+        let bytes = try FixtureLoader.data("eac3-main-6x1block-5.1.eac3")
+        var offset = 0
+        var frames: [Data] = []
+        while frames.count < 6 {
+            guard offset + 4 <= bytes.count, bytes[offset] == 0x0B, bytes[offset + 1] == 0x77 else {
+                throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+            }
+            let size = 2 * ((((Int(bytes[offset + 2]) << 8) | Int(bytes[offset + 3])) & 0x07FF) + 1)
+            guard size <= bytes.count - offset else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
+            let frame = bytes.subdata(in: offset..<(offset + size))
+            let inspection = try EAC3FrameInspector.inspect(frame)
+            XCTAssertEqual(inspection.sampleRate, 48_000)
+            XCTAssertEqual(inspection.channelCount, 6)
+            XCTAssertEqual(inspection.blockCount, 1)
+            XCTAssertEqual(inspection.convsync, frames.isEmpty)
+            frames.append(frame)
+            offset += size
+        }
+        return frames
+    }
+
+    static func audioFormat(for unit: CompressedAudioAccessUnit) throws -> CMFormatDescription {
+        try AudioFormatDescriptionBuilder.make(SystemCompressedAudioFormat(
+            profileID: unit.codec == .ac3 ? .ac3 : .eac3, codec: unit.codec,
+            formatID: unit.codec == .ac3 ? kAudioFormatAC3 : kAudioFormatEnhancedAC3,
+            sampleRate: 48_000, channelCount: 6, framesPerPacket: 1_536,
+            layout: .tag(kAudioChannelLayoutTag_MPEG_5_1_A,
+                equivalentBitmap: AudioChannelBitmap(rawValue: 0x3F)),
+            magicCookie: unit.formatConfiguration.serializedBox)).description
     }
 }
+#endif
+
+#if DEBUG
+/// Holds bounded references to the actual paid native input blocks. No sample,
+/// writer, callback context, continuation or publication receipt is retained.
+private final class Task17RetainedNativeInputAliases: @unchecked Sendable {
+    private let lock = NSLock()
+    private let capacity: Int
+    private var aliases: [CMBlockBuffer] = []
+    init(capacity: Int) { self.capacity = capacity }
+    var count: Int { lock.withLock { aliases.count } }
+
+    func retainReference(to block: CMBlockBuffer) {
+        lock.withLock {
+            guard aliases.count < capacity else {
+                XCTFail("native input observation exceeded its fixture bound")
+                return
+            }
+            var alias: CMBlockBuffer?
+            let status = CMBlockBufferCreateWithBufferReference(allocator: kCFAllocatorDefault,
+                referenceBuffer: block, offsetToData: 0, dataLength: CMBlockBufferGetDataLength(block),
+                flags: 0, blockBufferOut: &alias)
+            XCTAssertEqual(status, noErr)
+            guard status == noErr, let alias else {
+                XCTFail("could not retain an actual native input reference")
+                return
+            }
+            aliases.append(alias)
+        }
+    }
+
+    func releaseAll() { lock.withLock { aliases.removeAll() } }
+}
+#endif
 
 private final class Task17BoundaryRegistry: @unchecked Sendable {
     static let shared = Task17BoundaryRegistry()
@@ -9092,10 +9235,12 @@ private enum Task17Fixtures {
         frameDuration: CMTime = CMTime(value: 1, timescale: 30),
         frameTimestampTimescale: CMTimeScale = 1_000,
         parameterSetsOverride: [Data]? = nil,
+        idrOverride: Data? = nil,
         inBandParameterSetsOverride: [Data]? = nil,
         includeHDRMetadata: Bool = true,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
         boundaryVideoMode: SegmentVideoBoundaryMode = .passthrough,
+        minimumPassthroughInterval: CMTime? = nil,
         maximumPassthroughInterval: CMTime? = nil
     ) throws -> RemuxFixture {
         precondition(frames.first?.isIDR == true)
@@ -9107,7 +9252,7 @@ private enum Task17Fixtures {
         case .h264:
             parameterSets = parameterSetsOverride
                 ?? [AssemblerTestFixtures.h264SPS, AssemblerTestFixtures.h264PPS]
-            idr = Data([0x65, 0xB8])
+            idr = idrOverride ?? Data([0x65, 0xB8])
             nonIDR = Data([0x61, 0xE0])
             metadataNALUnits = []
         case .hevc:
@@ -9219,6 +9364,7 @@ private enum Task17Fixtures {
             mode: .audioVideo(
                 epochStart: CMTime(value: 10, timescale: 1),
                 videoMode: boundaryVideoMode,
+                minimumPassthroughInterval: minimumPassthroughInterval,
                 maximumPassthroughInterval: maximumPassthroughInterval
             )
         )
@@ -10185,27 +10331,31 @@ final class Task17AC3Harness {
     private let source: AudioTrackDescriptor
     private let seed: UInt64
     private let sampleRate: Int32
-    private let fscod: UInt8
+    private let frame: Data
+    private let channelCount: Int32
+    private let nativeMask: UInt64
     private var nextIdentity: UInt64
     private var nextBundleNonce: UInt64
     private var timeline: HLSTimelineCoordinator?
     private var cachedAuthorization: CompressedAudioCandidatePlanAuthorization?
 
-    convenience init(seed: UInt64) throws {
+    convenience init(seed: UInt64, fixtureFrame: Data? = nil) throws {
         try self.init(
             seed: seed,
             admission: .directCompressed(
                 Task17Fixtures.compressedOwner(seed: seed),
                 branchGeneration: seed + 10,
                 admissionFenceRevision: seed + 11
-            )
+            ),
+            fixtureFrame: fixtureFrame
         )
     }
 
     init(
         seed: UInt64,
         admission: AudioBranchAdmissionIdentity,
-        sampleRate: Int32 = 48_000
+        sampleRate: Int32 = 48_000,
+        fixtureFrame: Data? = nil
     ) throws {
         guard case .directCompressed = admission else {
             throw AudioServiceSemanticFailure.invalidInputUnit
@@ -10215,7 +10365,16 @@ final class Task17AC3Harness {
         }
         self.seed = seed
         self.sampleRate = sampleRate
-        self.fscod = fscod
+        let frame = fixtureFrame ?? AssemblerTestFixtures.syntheticAC3Frame(
+            fscod: fscod, frmsizecod: 20, bsmod: 0)
+        let inspected = try AC3FrameInspector.inspect(frame)
+        guard inspected.sampleRate == sampleRate,
+              inspected.channelCount == (fixtureFrame == nil ? 2 : 6) else {
+            throw AudioServiceSemanticFailure.invalidInputUnit
+        }
+        self.frame = frame
+        channelCount = inspected.channelCount
+        nativeMask = fixtureFrame == nil ? 3 : 0x60F
         nextIdentity = seed + 100
         nextBundleNonce = seed + 500
         source = AudioTrackDescriptor(
@@ -10223,7 +10382,7 @@ final class Task17AC3Harness {
             codec: .ac3,
             timeBase: MediaRational(num: 1, den: 48_000)!,
             sampleRate: sampleRate,
-            channelLayout: .init(channelCount: 2, nativeMask: 3),
+            channelLayout: .init(channelCount: channelCount, nativeMask: nativeMask),
             extradata: Data(),
             metadata: .init(role: .main, service: .independentMain, dispositions: [.default])
         )
@@ -10237,16 +10396,14 @@ final class Task17AC3Harness {
             sharedControlExecutor: Task17Fixtures.controlExecutor()
         )
         let first = makeUnit(
-            bytes: AssemblerTestFixtures.syntheticAC3Frame(
-                fscod: fscod, frmsizecod: 20, bsmod: 0),
+            bytes: frame,
             presentationTimeStamp: .zero
         )
         _ = try coordinator.establishReceipt(selectedProgramID: 7, firstInputUnit: first)
     }
 
     func makeAccessUnit(presentationTimeStamp: CMTime) throws -> CompressedAudioAccessUnit {
-        let bytes = AssemblerTestFixtures.syntheticAC3Frame(
-            fscod: fscod, frmsizecod: 20, bsmod: 0)
+        let bytes = frame
         let unit = makeUnit(bytes: bytes, presentationTimeStamp: presentationTimeStamp)
         let validation = try coordinator.installValidation(for: unit)
         let proof = try coordinator.makeProof(for: unit, validationNonce: validation)
@@ -10288,14 +10445,16 @@ final class Task17AC3Harness {
         if let cachedAuthorization { return cachedAuthorization }
         let binding = try XCTUnwrap(coordinator.bindCompressedOutputPlan())
         let parserSampleRate = sampleRate
+        let parserChannelCount = channelCount
+        let parserNativeMask = nativeMask
         let parser = ScriptedFFmpegParserFactory { handle, _, bytes, pts, _, _ in
             try handle.emit(AssemblerTestFixtures.parsedAudioFrame(
                 bytes: bytes,
                 pts: pts,
                 sampleRate: parserSampleRate,
-                channels: 2,
+                channels: parserChannelCount,
                 frameSamples: 1_536,
-                nativeMask: 3
+                nativeMask: parserNativeMask
             ))
         }
         let value = HLSTimelineCoordinator(
@@ -10330,7 +10489,7 @@ final class Task17AC3Harness {
             presentationTimeStamp: presentationTimeStamp,
             parserSampleCount: 1_536,
             parserSampleRate: sampleRate,
-            parserChannelLayout: .init(channelCount: 2, nativeMask: 3),
+            parserChannelLayout: .init(channelCount: channelCount, nativeMask: nativeMask),
             containerMarkedCorrupt: false
         )
     }
@@ -10347,6 +10506,9 @@ final class Task17EAC3Harness {
     let admission: AudioBranchAdmissionIdentity
     private let source: AudioTrackDescriptor
     private let seed: UInt64
+    private let fixtureFrames: [Data]?
+    private let channelCount: Int32
+    private let nativeMask: UInt64
     private var nextIdentity: UInt64
     private var timeline: HLSTimelineCoordinator?
     private var leases: [AudioServiceBranchLeaseIdentity] = []
@@ -10357,29 +10519,43 @@ final class Task17EAC3Harness {
         leases.map(coordinator.branchLeaseState)
     }
 
-    convenience init(seed: UInt64) throws {
+    convenience init(seed: UInt64, fixtureFrames: [Data]? = nil) throws {
         try self.init(
             seed: seed,
             admission: .eac3Aggregation(
                 Task17Fixtures.compressedOwner(seed: seed),
                 branchGeneration: seed + 10,
                 admissionFenceRevision: seed + 11
-            )
+            ),
+            fixtureFrames: fixtureFrames
         )
     }
 
-    init(seed: UInt64, admission: AudioBranchAdmissionIdentity) throws {
+    init(seed: UInt64, admission: AudioBranchAdmissionIdentity, fixtureFrames: [Data]? = nil) throws {
         guard case .eac3Aggregation = admission else {
             throw AudioServiceSemanticFailure.invalidInputUnit
         }
         self.seed = seed
+        self.fixtureFrames = fixtureFrames
+        channelCount = fixtureFrames == nil ? 2 : 6
+        nativeMask = fixtureFrames == nil ? 3 : 0x60F
+        if let fixtureFrames {
+            guard fixtureFrames.count == 6 else { throw AudioServiceSemanticFailure.invalidInputUnit }
+            for (index, bytes) in fixtureFrames.enumerated() {
+                let inspection = try EAC3FrameInspector.inspect(bytes)
+                guard inspection.sampleRate == 48_000, inspection.channelCount == 6,
+                      inspection.blockCount == 1, inspection.convsync == (index == 0) else {
+                    throw AudioServiceSemanticFailure.invalidInputUnit
+                }
+            }
+        }
         nextIdentity = seed + 100
         source = AudioTrackDescriptor(
             streamIndex: 1,
             codec: .eac3,
             timeBase: MediaRational(num: 1, den: 48_000)!,
             sampleRate: 48_000,
-            channelLayout: .init(channelCount: 2, nativeMask: 3),
+            channelLayout: .init(channelCount: channelCount, nativeMask: nativeMask),
             extradata: Data(),
             metadata: .init(role: .main, service: .independentMain, dispositions: [.default])
         )
@@ -10392,15 +10568,15 @@ final class Task17EAC3Harness {
             compressedOutputAdmissionAuthority: admission,
             sharedControlExecutor: Task17Fixtures.controlExecutor()
         )
-        let frame = Task17EAC3Fixture.make(blockCount: 6, convsync: nil)
+        let frame = fixtureFrames?.first ?? Task17EAC3Fixture.make(blockCount: 6, convsync: nil)
         _ = try coordinator.establishReceipt(
             selectedProgramID: 7,
-            firstInputUnit: makeUnit(bytes: frame, blockCount: 6, presentationTimeStamp: .zero)
+            firstInputUnit: makeUnit(bytes: frame, blockCount: fixtureFrames == nil ? 6 : 1, presentationTimeStamp: .zero)
         )
     }
 
     func makeSixMemberAccessUnit(presentationBase: CMTime = .zero) throws -> CompressedAudioAccessUnit {
-        let frame = Task17EAC3Fixture.make(blockCount: 6, convsync: nil)
+        let frame = fixtureFrames?.first ?? Task17EAC3Fixture.make(blockCount: 6, convsync: nil)
         let authorization = try makeAuthorization(
             frame: frame,
             origin: presentationBase)
@@ -10412,7 +10588,7 @@ final class Task17EAC3Harness {
         var output: CompressedAudioAccessUnit?
         var admittedProofs: [AdmittedAudioServiceInputUnitProof] = []
         for index in 0..<6 {
-            let bytes = Task17EAC3Fixture.make(blockCount: 1, convsync: index == 0)
+            let bytes = fixtureFrames?[index] ?? Task17EAC3Fixture.make(blockCount: 1, convsync: index == 0)
             let unit = makeUnit(
                 bytes: bytes,
                 blockCount: 1,
@@ -10455,14 +10631,17 @@ final class Task17EAC3Harness {
     private func makeAuthorization(frame: Data, origin: CMTime) throws -> CompressedAudioCandidatePlanAuthorization {
         if let cachedAuthorization { return cachedAuthorization }
         let binding = try XCTUnwrap(coordinator.bindCompressedOutputPlan())
+        let parserChannelCount = channelCount
+        let parserNativeMask = nativeMask
+        let parserSampleCount: Int32 = fixtureFrames == nil ? 1_536 : 256
         let parser = ScriptedFFmpegParserFactory { handle, _, bytes, pts, _, _ in
             try handle.emit(AssemblerTestFixtures.parsedAudioFrame(
                 bytes: bytes,
                 pts: pts,
                 sampleRate: 48_000,
-                channels: 2,
-                frameSamples: 1_536,
-                nativeMask: 3
+                channels: parserChannelCount,
+                frameSamples: parserSampleCount,
+                nativeMask: parserNativeMask
             ))
         }
         let value = HLSTimelineCoordinator(
@@ -10501,7 +10680,7 @@ final class Task17EAC3Harness {
             presentationTimeStamp: presentationTimeStamp,
             parserSampleCount: Int32(blockCount * 256),
             parserSampleRate: 48_000,
-            parserChannelLayout: .init(channelCount: 2, nativeMask: 3),
+            parserChannelLayout: .init(channelCount: channelCount, nativeMask: nativeMask),
             containerMarkedCorrupt: false
         )
     }

@@ -130,6 +130,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
             replacementAuthority.preparationRoute(ticket: ticket)
         }
 
+        func deliverNativeMediaInformation(activation: ActivationEpoch?, invalidated: Bool) async {
+            guard let registry = replacementAuthority.registry,
+                  registry.nativeMetadataScopeIsCurrent(lifecycle: outputLifecycleEpoch, activation: activation, invalidated: invalidated) else { return }
+            await registry.mediaInformationReceiver()?.updateNativeMediaInformation(
+                for: outputLifecycleEpoch, activation: activation, invalidated: invalidated)
+        }
+
         /// Preparation may continue while paused, but never after its original
         /// work command has been revoked, replaced or handed to cleanup.
         func revalidateCurrentPreparation() -> Bool {
@@ -5214,6 +5221,20 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
     private func mediaInformationReceiver() -> (any PlaybackBackendMediaInformationReceiving)? {
         executor.sync { terminalReceiver as? any PlaybackBackendMediaInformationReceiving }
+    }
+
+    func nativeMetadataScopeIsCurrent(lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) -> Bool {
+        (try? transaction { _ in
+            guard let context = authority.outputContext, let backend = authority.ownedBackendResources,
+                  backend.lifecycle == lifecycle, backend.identity == lifecycle.backendIdentity,
+                  context.candidateBackendIdentity == lifecycle.backendIdentity else { return false }
+            if let activation {
+                return context.activation == activation && (context.interval?.activation == activation ||
+                    (invalidated && context.suspend?.priorActivation == activation))
+            }
+            return context.interval == nil && (context.activation == nil ||
+                (invalidated && context.suspend?.lifecycle == lifecycle))
+        }) == true
     }
 
     /// A nil result means stale/unsafe, while a scoped nil information value is

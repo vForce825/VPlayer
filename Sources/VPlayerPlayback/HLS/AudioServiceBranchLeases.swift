@@ -1373,19 +1373,14 @@ extension AudioServiceSemanticCoordinator {
     /// Only the final native input use releases the exact claimed AU as one CAS.
     /// Physical writer terminal/rollover does not reset the shared live gate.
     func finishCompressedAudioWriterSubmission(_ submission: CompressedAudioWriterSubmission) -> Int {
+        guard let receipt = submission.accessUnit.writerLastUseReceipt else { return 0 }
+        return finishCompressedAudioWriterLastUse(receipt)
+    }
+
+    func finishCompressedAudioWriterLastUse(_ receipt: CompressedAudioWriterLastUseReceipt) -> Int {
         let decision: (count: Int, ownerships: [AudioServiceInputUnitOwnership]) = withAudioServiceCAS {
-            let expectedOwner: AudioServiceBranchTransferOwnerIdentity
-            let leaseIdentities: [AudioServiceBranchLeaseIdentity]
-            switch submission.bundleIdentity {
-            case let .direct(bundle):
-                guard let lease = submission.accessUnit.directLeaseIdentity else { return (0, []) }
-                expectedOwner = .compressedAccessUnit(bundle)
-                leaseIdentities = [lease]
-            case let .eac3(bundle):
-                guard let proof = submission.accessUnit.aggregationProof else { return (0, []) }
-                expectedOwner = .eac3AccessUnit(bundle)
-                leaseIdentities = proof.orderedAggregationLeaseIdentities.values
-            }
+            let expectedOwner = receipt.owner
+            let leaseIdentities = receipt.leases.values
 
             var entries: [(
                 proof: AdmittedAudioServiceInputUnitProof,
@@ -1460,6 +1455,12 @@ extension AudioServiceSemanticCoordinator {
                 }
                 if lease.state.isReleasableByRetirement {
                     releaseRecord(lease, proof: proof, gate: participation.gate)
+                }
+                // The claimed owner is immutable and sufficient for last-use
+                // release. Do not retain timeline authorization through aliases.
+                if lease.writerClaimed || lease.state == .released {
+                    lease.compressedAuthorization = nil
+                    participation.compressedAuthorization = nil
                 }
             }
             let ownership = takeOwnershipForReleaseIfFinished(proof)

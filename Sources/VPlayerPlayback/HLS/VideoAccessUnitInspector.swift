@@ -139,7 +139,43 @@ struct VideoSequenceParameterSetProof: Sendable, Hashable {
     let range: DemuxColorRange?
 }
 
+struct SourceVideoSequenceFormat {
+    let tier: VideoCodecTier
+    let frameRate: MediaRational?
+    let primaries: DemuxColorPrimaries?
+    let transfer: DemuxColorTransfer?
+    let matrix: DemuxColorMatrix?
+    let progressiveSourceFlag: Bool?
+    let interlacedSourceFlag: Bool?
+}
+
 enum VideoSequenceParameterSetInspector {
+    /// Factual preflight accessors reuse the bounded SPS grammar. They do not
+    /// create generated-media eligibility or reinterpret unknown scan as progressive.
+    static func sourceFormat(_ bytes: [UInt8], codec: VideoCodec) throws -> SourceVideoSequenceFormat {
+        try bytes.withUnsafeBytes { buffer in
+            if codec == .h264 {
+                _ = try inspectH264(bytes)
+                let parsed = try parseH264SPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer))
+                return SourceVideoSequenceFormat(tier: .main, frameRate: parsed.vui.frameRate,
+                    primaries: parsed.vui.primaries, transfer: parsed.vui.transfer, matrix: parsed.vui.matrix,
+                    progressiveSourceFlag: parsed.frameMBSOnly, interlacedSourceFlag: nil)
+            }
+            guard bytes.count > 3, bytes[3] & 0xC0 == 0 else { throw VideoAccessUnitInspectionError.unsupportedSyntax }
+            _ = try inspectHEVC(bytes)
+            let parsed = try parseHEVCSPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer))
+            return SourceVideoSequenceFormat(tier: parsed.tier,
+                frameRate: parsed.vui.pocProportionalToTiming == true ? parsed.vui.frameRate : nil,
+                primaries: parsed.vui.primaries, transfer: parsed.vui.transfer, matrix: parsed.vui.matrix,
+                progressiveSourceFlag: parsed.vui.progressiveSourceFlag, interlacedSourceFlag: parsed.vui.interlacedSourceFlag)
+        }
+    }
+    static func sourceScanFlags(_ bytes: [UInt8], codec: VideoCodec) throws -> (progressiveOnly: Bool, interlacedOnly: Bool) {
+        let format = try sourceFormat(bytes, codec: codec)
+        if codec == .h264 { return (format.progressiveSourceFlag == true, false) }
+        return (format.progressiveSourceFlag == true && format.interlacedSourceFlag == false,
+                format.interlacedSourceFlag == true && format.progressiveSourceFlag == false)
+    }
     static func inspectH264(_ bytes: [UInt8]) throws -> VideoSequenceParameterSetProof {
         try bytes.withUnsafeBytes { buffer in
             guard buffer.count > 1,
@@ -392,6 +428,7 @@ fileprivate struct ParsedVUI: Sendable, Hashable {
     var interlacedSourceFlag: Bool? = nil
     var sampleAspectRatio: MediaRational? = nil
     var frameRate: MediaRational? = nil
+    var pocProportionalToTiming: Bool? = nil
     var range: DemuxColorRange? = nil
     var primaries: DemuxColorPrimaries? = nil
     var transfer: DemuxColorTransfer? = nil
@@ -1978,7 +2015,8 @@ private func parseHEVCVUI(
         let numUnitsInTick = UInt32(try reader.readBits(32))
         let timeScale = UInt32(try reader.readBits(32))
         var tickDivisor: UInt64 = 1
-        if try reader.readFlag() {
+        result.pocProportionalToTiming = try reader.readFlag()
+        if result.pocProportionalToTiming == true {
             tickDivisor = try checkedAdd(UInt64(try reader.readUE()), 1)
         }
         result.frameRate = try makeMediaRational(

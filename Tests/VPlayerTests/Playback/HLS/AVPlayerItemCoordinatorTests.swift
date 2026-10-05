@@ -11242,7 +11242,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             ? audioPackets.prefix(while: { $0.object.logicalSequence < terminalSequence }).count
             : max(audioPackets.count, videoPackets.count)
         if startupPrefix {
-            guard packetCount >= 3, packetCount <= 7,
+            // Eight encoded audio seconds and the seven-block A/V seed already
+            // supply six/seven genuine nonterminal segments. Never include the
+            // terminal tail or synthesize EOF just to satisfy live startup.
+            guard packetCount >= 6, packetCount <= 7,
                   avSeed == nil || (videoPackets.count >= packetCount
                     && (0..<packetCount).allSatisfy({
                         videoPackets[$0].object.logicalSequence == audioPackets[$0].object.logicalSequence
@@ -11306,8 +11309,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
         XCTAssertTrue(snapshot.aacRenditionBindings[participant] === binding, file: file, line: line)
         XCTAssertNil(binding.endpointAuthority, file: file, line: line)
         XCTAssertNil(binding.sealedHTTPReceipt, file: file, line: line)
+        XCTAssertTrue(snapshot.coverage.isSixSegmentWindowEligible, file: file, line: line)
         XCTAssertTrue(snapshot.media.values.allSatisfy {
-            !$0.text.contains("#EXT-X-ENDLIST")
+            (6...7).contains($0.logicalSequences.count)
+                && !$0.text.contains("#EXT-X-ENDLIST")
         }, file: file, line: line)
         let endpoint = (avSeed?.endpointAuthority ?? seed.endpointAuthority).receipt
         XCTAssertFalse(snapshot.media[participant]?.resources.contains(endpoint.terminalMedia.key) == true,

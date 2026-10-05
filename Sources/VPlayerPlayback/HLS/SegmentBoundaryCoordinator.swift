@@ -643,6 +643,27 @@ final class SegmentBoundaryCoordinator {
         }
     }
 
+    func issueMappedCompressedAudioAppend(_ submission: CompressedAudioWriterSubmission,
+                                         timed: HLSTimedAudioAccessUnit,
+                                         writerBinding: FMP4WriterBinding) throws -> SegmentBoundaryAppendTicket {
+        let identity = try Self.mappedCompressedIdentity(submission, timed: timed)
+        return try lock.withLock {
+            let decision = try decideAudio(rendition: writerBinding.renditionIdentity,
+                at: timed.timing.presentationTimeStamp.cmTime)
+            return try makeTicket(decision, binding: writerBinding, sampleIdentity: identity)
+        }
+    }
+
+    static func mappedCompressedIdentity(_ submission: CompressedAudioWriterSubmission,
+                                         timed: HLSTimedAudioAccessUnit) throws -> SegmentBoundarySampleIdentity {
+        guard timed.validatesCompressedSubmission(submission) else { throw SegmentBoundaryFailure.ticketMismatch }
+        let unit = submission.accessUnit
+        return .compressed(codec: unit.codec, sampleRate: unit.sampleRate, channelCount: unit.channelCount,
+            sampleCount: unit.sampleCount, formatConfiguration: unit.formatConfiguration,
+            admission: unit.admissionIdentity, payload: unit.payloadIdentity, range: unit.payloadRange,
+            digest: unit.payloadDigest, presentationStart: timed.timing.presentationTimeStamp)
+    }
+
     static func videoIdentity(
         _ output: HLSVideoEncodedOutput
     ) throws -> SegmentBoundarySampleIdentity {

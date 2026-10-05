@@ -69,6 +69,8 @@ enum AVPlayerPreparationFence: String, Sendable, CaseIterable {
     case coverage, seek, loadedTimeRanges, preroll, preparedCAS, positiveRateAdmission
 }
 
+typealias AVPlayerInstallationMutation = (_ operation: () -> Void) throws -> Bool
+
 @MainActor
 protocol AVPlayerDriving: AnyObject {
     var disconnectedFromSystemAudio: Bool { get }
@@ -84,6 +86,9 @@ protocol AVPlayerDriving: AnyObject {
     var activeWaiterCount: Int { get }
     var fixedTimerCount: Int { get }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws
+    func joinNativeCallbackTails() async
+    func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime
     func waitUntilReady(item: AVPlayerItemInstanceIdentity) async throws -> AVPlayerItemInstanceIdentity
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws
@@ -140,6 +145,16 @@ protocol AVPlayerDriving: AnyObject {
 }
 
 extension AVPlayerDriving {
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {
+        // A legacy injected driver has not promised callback-safe installation.
+        // Native/source-backed tests must implement this exact mutation seam.
+        throw AVPlayerItemCoordinatorFailure.staleIdentity
+    }
+    func joinNativeCallbackTails() async {}
+    func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime {
+        throw AVPlayerItemCoordinatorFailure.seekMismatch
+    }
+
     func playbackClockObservation(item: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation {
         .staleItem
     }
@@ -635,6 +650,16 @@ final class AVPlayerBackendQuiescenceAttestation: @unchecked Sendable {
         self.backendIdentity = backendIdentity
         self.receipt = receipt
         self.preparedPreserved = preparedPreserved
+    }
+}
+
+extension AVPlayerBackendQuiescenceAttestation {
+    @MainActor static func native(_ receipt: AVPlayerQuiescenceReceipt,
+        invocation: ControlTaskRegistry.BackendSuspendInvocation, coordinator: NativeHLSItemCoordinator) throws -> AVPlayerBackendQuiescenceAttestation {
+        guard coordinator.accepts(receipt), receipt.suspendTicket == invocation.suspendTicket,
+              receipt.closeClaim == invocation.closeClaim else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        return .init(invocation: invocation, backendIdentity: receipt.item.outputLifecycleEpoch.backendIdentity,
+            receipt: receipt, preparedPreserved: coordinator.isPrepared)
     }
 }
 
@@ -1204,6 +1229,12 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             allocationIdentityCount: Int(retainedGraphReservation.allocationIdentityCount))
     }
 
+    private var installationMutation: AVPlayerInstallationMutation?
+    func setInstallationMutation(_ operation: @escaping AVPlayerInstallationMutation) {
+        precondition(request == nil, "Installation authority must be bound before item installation")
+        installationMutation = operation
+    }
+
     init(driver: any AVPlayerDriving,
          evidenceSource: any AVPlayerPreparationEvidenceProviding,
          allocator: PlaybackIdentityAllocator = .shared,
@@ -1307,7 +1338,11 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         state.phase = .installed
         state.itemGeneration = request.item.itemGeneration
         state.selectionRevision = 0
-        try driver.install(url: request.itemURL, identity: request.item)
+        if let installationMutation {
+            try driver.install(url: request.itemURL, identity: request.item, admission: installationMutation)
+        } else {
+            try driver.install(url: request.itemURL, identity: request.item)
+        }
         driver.retainInstallationResourceContext(resourceContextReservation)
         let itemURL = request.itemURL
         let itemIdentity = request.item

@@ -177,3 +177,20 @@ struct AACWriterAdmissionSnapshot: Sendable, Equatable {
     let nextBoundaryPacketBytes: Int
     let reservedPacketBytes: Int
 }
+
+/// Matches the store's authenticated long-GOP metadata domain. Checked before
+/// native/source input claim, never by silently trimming an emitted fragment.
+enum WriterDecodeCoveragePolicy {
+    static func accepts(trackKind: SegmentedFMP4TrackKind, samplesPerSecond: Int,
+                        samplesPerAccessUnit: Int, segmentInputCount: Int) -> Bool {
+        guard samplesPerSecond > 0, samplesPerAccessUnit > 0, segmentInputCount > 0 else { return false }
+        if segmentInputCount <= 256 { return true }
+        switch trackKind {
+        case .video:
+            return segmentInputCount <= 384 && Int128(samplesPerSecond) <= 60 * Int128(samplesPerAccessUnit)
+        case .aac:
+            return segmentInputCount <= 320 && samplesPerSecond <= 48_000 && samplesPerAccessUnit == 1_024
+        case .ac3, .eac3: return false
+        }
+    }
+}

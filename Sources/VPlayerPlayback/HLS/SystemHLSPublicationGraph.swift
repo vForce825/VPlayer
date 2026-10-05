@@ -369,7 +369,7 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
 
     init(itemGeneration: UInt64,
          publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
-         initialWindowMinimumSeconds: Int = 3,
+         initialWindowMinimumSeconds: Int = 6,
          clock: (any PlaybackMonotonicClock)? = nil) throws {
         guard publicationDeadlineNanoseconds > 0,
               [3, 4, 6].contains(initialWindowMinimumSeconds) else {

@@ -193,7 +193,7 @@ final class AudioServiceInputUnitOwnership: @unchecked Sendable {
     private let lock = NSLock()
     private var released = false
     private var releases = 0
-    private let onRelease: (@Sendable () -> Void)?
+    private var onRelease: (@Sendable () -> Void)?
 
     init(onRelease: (@Sendable () -> Void)? = nil) {
         self.onRelease = onRelease
@@ -206,7 +206,9 @@ final class AudioServiceInputUnitOwnership: @unchecked Sendable {
             guard !released else { return nil }
             released = true
             releases += 1
-            return onRelease
+            let callback = onRelease
+            onRelease = nil
+            return callback
         }
         callback?()
     }
@@ -477,6 +479,29 @@ final class AudioServiceSemanticCoordinator: @unchecked Sendable {
     var failure: AudioServiceSemanticFailure? { withAudioServiceCAS { storedFailure } }
     var failurePublicationCount: Int { withAudioServiceCAS { publishedFailureCount } }
     var receiptCommitIsValid: Bool { withAudioServiceCAS { receipt != nil && storedFailure == nil } }
+
+    /// Retirement revokes new service work and drops graph authorization cycles.
+    /// Transferred/claimed records and their physical-native tails remain until
+    /// the exact last-use callback; no live input counter is reset here.
+    func invalidateCompressedSourceAuthority() {
+        let ownerships = withAudioServiceCAS { () -> [AudioServiceInputUnitOwnership] in
+            guard compressedOutputAdmissionAuthority != nil else { return [] }
+            let ownerships = revokeAudioServiceGenerationForUnsupportedSemantic()
+            expectedValidation = nil
+            receipt = nil
+            storedFailure = storedFailure ?? .staleProof
+            audioServiceLeaseState.compressedOutputPlanBinding = nil
+            audioServiceLeaseState.branchGates.forEach { $0.compressedAuthorization = nil }
+            audioServiceLeaseState.forEachAdmittedProof { proof in
+                proof.branchState.participations.forEach { participation in
+                    participation.compressedAuthorization = nil
+                    participation.lease?.compressedAuthorization = nil
+                }
+            }
+            return ownerships
+        }
+        ownerships.forEach { $0.release() }
+    }
 
     func establishReceipt(
         selectedProgramID: Int32?,

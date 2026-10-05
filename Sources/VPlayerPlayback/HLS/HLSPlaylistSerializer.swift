@@ -128,19 +128,24 @@ enum HLSPlaylistSerializer {
         return try representation(raw: Data(text.utf8), kind: .master)
     }
 
-    static func media(segments: [HLSValidatedSegment], declaration: HLSItemDeclaration,
-                      discontinuitySequence: UInt64, anchor: HLSProgramDateAnchor, endList: Bool) throws -> HLSPlaylistRepresentation {
-        guard (1...7).contains(segments.count), let first = segments.first else { throw HLSPublicationFailure.invalidPlaylist }
-        var targetDuration = 2
-        for segment in segments {
-            let dur = segment.receipt.presentationRange.duration
-            if dur.timescale > 0 {
-                let ceiling = Int((dur.value + Int64(dur.timescale) - 1) / Int64(dur.timescale))
-                if ceiling > targetDuration {
-                    targetDuration = ceiling
-                }
-            }
+    static func requiredTargetDuration(segments: [HLSValidatedSegment]) throws -> Int64 {
+        guard !segments.isEmpty, segments.count <= 7 else { throw HLSPublicationFailure.invalidPlaylist }
+        return try segments.reduce(Int64(2)) { target, segment in
+            let duration = segment.receipt.presentationRange.duration
+            guard duration.value > 0, duration.timescale > 0 else { throw HLSPublicationFailure.invalidDuration }
+            let scale = Int64(duration.timescale)
+            let ceiling = try HLSChecked.add(duration.value / scale, duration.value % scale == 0 ? 0 : 1)
+            return max(target, ceiling)
         }
+    }
+
+    static func media(segments: [HLSValidatedSegment], declaration: HLSItemDeclaration,
+                      discontinuitySequence: UInt64, anchor: HLSProgramDateAnchor, endList: Bool,
+                      advertisedTargetDuration: Int64? = nil) throws -> HLSPlaylistRepresentation {
+        guard (1...7).contains(segments.count), let first = segments.first else { throw HLSPublicationFailure.invalidPlaylist }
+        let minimumTarget = try requiredTargetDuration(segments: segments)
+        let targetDuration = advertisedTargetDuration ?? minimumTarget
+        guard targetDuration >= minimumTarget else { throw HLSPublicationFailure.invalidDuration }
         var text = header + "#EXT-X-TARGETDURATION:\(targetDuration)\n#EXT-X-MEDIA-SEQUENCE:\(first.receipt.logicalSequence)\n#EXT-X-DISCONTINUITY-SEQUENCE:\(discontinuitySequence)\n"
         var previousMap: HLSResourceKey?
         for segment in segments {

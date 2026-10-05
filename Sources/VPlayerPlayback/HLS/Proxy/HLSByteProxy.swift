@@ -9,6 +9,7 @@ enum HLSByteProxy {
     static func start(source: ResolvedPlaybackSource, lifecycle: OutputLifecycleEpoch,
                       resolver: any PlaybackSourceResolving, sourceRetention: HLSApplicationLifetimeCharge? = nil,
                       manifestAuthority: HLSOwnedProxyManifestAuthority? = nil,
+                      useGeneratedSelectedService: Bool = false,
                       manifestTransport: any HLSResourceTransport = URLSessionHLSResourceTransport(),
                       validateManifest: (@Sendable (URL, HLSManifestGraph.Document) async throws -> Void)? = nil,
                       failure: @escaping @Sendable (HLSSourceError) -> Void = { _ in }) async throws -> HLSProxySession {
@@ -18,12 +19,19 @@ enum HLSByteProxy {
         let registry = try HLSProxyResourceRegistry(source: source, budget: budget, sourceRetention: sourceRetention)
         let kind: HLSManifestGraph.ReferenceKind
         let url: URL
+        var role = manifestAuthority?.rootRole
         switch source.topology {
-        case .hls: kind = .variant; url = source.context.entryURL
+        case .hls:
+            kind = .variant
+            if useGeneratedSelectedService {
+                guard let manifestAuthority else { throw HLSSourceError.incompleteEvidence }
+                let endpoint = try manifestAuthority.generatedServiceEndpoint()
+                url = endpoint.url; role = endpoint.role
+            } else { url = source.context.entryURL }
         case .media: kind = .segment; url = source.responseURL
         }
         let root = try registry.register(url: url, kind: kind, pin: true,
-            mediaType: .reference(kind, url: url, provenMedia: manifestAuthority?.rawMediaType), manifestRole: manifestAuthority?.rootRole)
+            mediaType: .reference(kind, url: url, provenMedia: manifestAuthority?.rawMediaType), manifestRole: role)
         let session = try HLSProxySession(source: source, root: root, resolver: resolver, registry: registry, budget: budget,
             manifestAuthority: manifestAuthority, manifestTransport: manifestTransport, validator: validateManifest, failure: failure)
         do { try await session.start(); return session }

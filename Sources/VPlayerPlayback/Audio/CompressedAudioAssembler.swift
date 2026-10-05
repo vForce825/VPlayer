@@ -19,9 +19,7 @@ final class CompressedAudioSourceStream: @unchecked Sendable {
     private var hasClaimedInput = false
 
     fileprivate static func make(_ copies: HLSAudioCopyOwnership) throws -> CompressedAudioSourceStream {
-        guard let lease = copies.compressedInput.acquire(bytes: 2_048) else {
-            throw CompressedAudioAssembler.validationError()
-        }
+        let lease = try copies.admitSourceProofWithoutWaiting(bytes: 2_048)
         return CompressedAudioSourceStream(ownership: HLSAudioCopyTail(lease))
     }
     private init(ownership: HLSAudioCopyTail) { self.ownership = ownership }
@@ -136,6 +134,8 @@ final class CompressedAudioAssembler {
     private let hlsCopyOwnership: HLSAudioCopyOwnership?
     let sourceStream: CompressedAudioSourceStream?
     private var sourceAACProofEnabled = true
+    private var dolbyProducer: DolbyAudioSourceProducer?
+    private var didDrainSource = false
     private var framer: (any CompressedAudioFramingStrategy)?
     private var nextID: UInt64?
     private var systemFormat: SystemCompressedAudioFormat?
@@ -155,7 +155,8 @@ final class CompressedAudioAssembler {
         formatState: AssemblyFormatState,
         binding: AssemblyEpochBinding = .standalone(),
         startingID: UInt64 = 1,
-        hlsCopyOwnership: HLSAudioCopyOwnership? = nil
+        hlsCopyOwnership: HLSAudioCopyOwnership? = nil,
+        dolbyProducer: DolbyAudioSourceProducer? = nil
     ) throws {
         guard let descriptor = trackSet.audio else { throw Self.validationError() }
         self.descriptor = descriptor
@@ -166,6 +167,7 @@ final class CompressedAudioAssembler {
         self.formatState = formatState
         self.binding = binding
         self.hlsCopyOwnership = hlsCopyOwnership
+        self.dolbyProducer = dolbyProducer
         sourceStream = descriptor.codec == .aac
             ? try hlsCopyOwnership.map(CompressedAudioSourceStream.make) : nil
         nextID = startingID
@@ -174,6 +176,7 @@ final class CompressedAudioAssembler {
 
     deinit {
         sourceStream?.abandonUnlessDrained()
+        if !didDrainSource { dolbyProducer?.invalidateSourceInput() }
         framer?.destroy()
     }
 
@@ -181,10 +184,20 @@ final class CompressedAudioAssembler {
     /// partial AU carry. Existing queued frame aliases keep their paid backing.
     func useCompatibleAudioBeforeSourceAppend() throws {
         guard sourceStream?.abandonBeforeClaim() ?? true else { throw SourceAACFailure.sourceAlreadyConsumed }
+        guard dolbyProducer?.canAbandonBeforeOutput ?? true else {
+            throw DolbyAudioSourceFailure.sourceAlreadyConsumed
+        }
+        dolbyProducer?.invalidateSourceInput()
+        dolbyProducer = nil
         sourceAACProofEnabled = false
     }
 
     func push(_ packet: DemuxPacket) throws {
+        do { try pushCurrent(packet) }
+        catch { dolbyProducer?.invalidateSourceInput(); throw error }
+    }
+
+    private func pushCurrent(_ packet: DemuxPacket) throws {
         try ensureFramerIsCurrent()
         let continuingWithoutPTS = !packet.presentationTimeStamp.isValid &&
             framer?.canContinueWithoutTimestamp == true
@@ -212,6 +225,15 @@ final class CompressedAudioAssembler {
         )
         do {
             try framer?.push(framedPacket)
+        } catch let error as DolbyAudioSourceFailure {
+            dolbyProducer?.invalidateSourceInput()
+            throw error
+        } catch let error as HLSAudioCopyAdmissionFailure {
+            sourceStream?.invalidate()
+            throw error
+        } catch is CancellationError {
+            sourceStream?.invalidate()
+            throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
             throw error
@@ -223,10 +245,26 @@ final class CompressedAudioAssembler {
     }
 
     func drain() throws {
+        do { try drainCurrent() }
+        catch { dolbyProducer?.invalidateSourceInput(); throw error }
+    }
+
+    private func drainCurrent() throws {
         try ensureFramerIsCurrent()
         do {
             try framer?.drain()
             sourceStream?.finish()
+            try dolbyProducer?.finishSourceInput()
+            didDrainSource = true
+        } catch let error as DolbyAudioSourceFailure {
+            dolbyProducer?.invalidateSourceInput()
+            throw error
+        } catch let error as HLSAudioCopyAdmissionFailure {
+            sourceStream?.invalidate()
+            throw error
+        } catch is CancellationError {
+            sourceStream?.invalidate()
+            throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
             throw error
@@ -286,6 +324,7 @@ final class CompressedAudioAssembler {
         let operationID = try currentOperationID()
         guard framerOperationID != operationID else { return }
         sourceStream?.invalidate()
+        dolbyProducer?.invalidateSourceInput()
         framer?.destroy()
         framer = nil
         framerOperationID = operationID
@@ -295,10 +334,7 @@ final class CompressedAudioAssembler {
     private func receive(_ framed: FramedCompressedAudioFrame) throws {
         // ADTS removal allocates a distinct payload backing; reserve before inspection.
         let payloadLease = profile.framing == .adts
-            ? hlsCopyOwnership?.compressedInput.acquire(bytes: framed.payload.count) : nil
-        guard profile.framing != .adts || hlsCopyOwnership == nil || payloadLease != nil else {
-            throw AudioUnitRejection(reason: .invalidFrame)
-        }
+            ? try hlsCopyOwnership?.admitSourceProofWithoutWaiting(bytes: framed.payload.count) : nil
         let payloadTail = payloadLease.map(HLSAudioCopyTail.init)
         let inspected: InspectedCompressedAudioFrame
         do {
@@ -331,12 +367,17 @@ final class CompressedAudioAssembler {
             guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
                 throw Self.validationError()
             }
-            if sourceAACProofEnabled, inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
+            if let dolbyProducer {
+                let proof = try dolbyProducer.makeProof(id: id, generation: generation,
+                    framed: framed, inspected: inspected)
+                eventSink(.frame(CompressedAudioFrame(id: id, payload: inspected.payload,
+                    codec: descriptor.codec, generation: generation,
+                    presentationTimeStamp: framed.presentationTimeStamp, duration: duration,
+                    frameSampleCount: inspected.sampleCount, dolbyProof: proof)))
+            } else if sourceAACProofEnabled, inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
                let hlsCopyOwnership, let sourceStream {
-                guard let ownedPayload = payloadTail ?? framed.hlsCopyTail,
-                      let proofLease = hlsCopyOwnership.compressedInput.acquire(bytes: 2_048) else {
-                    throw Self.validationError()
-                }
+                guard let ownedPayload = payloadTail ?? framed.hlsCopyTail else { throw Self.validationError() }
+                let proofLease = try hlsCopyOwnership.admitSourceProofWithoutWaiting(bytes: 2_048)
                 let metadataTail = HLSAudioCopyTail(proofLease)
                 try sourceStream.issued(id)
                 let proof = CompressedAudioSourceProof(id: id, stream: sourceStream, descriptor: descriptor,
@@ -354,6 +395,15 @@ final class CompressedAudioAssembler {
                     frameSampleCount: inspected.sampleCount,
                     payloadOwnership: payloadTail ?? framed.hlsCopyTail)))
             }
+        } catch let error as DolbyAudioSourceFailure {
+            dolbyProducer?.invalidateSourceInput()
+            throw error
+        } catch let error as HLSAudioCopyAdmissionFailure {
+            sourceStream?.invalidate()
+            throw error
+        } catch is CancellationError {
+            sourceStream?.invalidate()
+            throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
             throw error
@@ -373,6 +423,12 @@ final class CompressedAudioAssembler {
 
     private func rejectCurrentUnit(reason: AudioDecodeBreakReason) throws {
         sourceStream?.invalidate()
+        if let dolbyProducer {
+            // A rejected final AU cannot disappear into decodeBreak and leave a
+            // seemingly successful prefix that can later receive natural EOF.
+            dolbyProducer.invalidateSourceInput()
+            throw DolbyAudioSourceFailure.invalidSourceProof
+        }
         framer?.destroy()
         framer = nil
         let operationID = try currentOperationID()
