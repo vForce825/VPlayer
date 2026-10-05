@@ -183,7 +183,8 @@ private final class NativeSmokeTracingInspector: NativeHLSAssetInspecting {
         record("inspect-start", item: item)
         do {
             let result = try await base.snapshot(item: item, source: source)
-            record("inspect-success video=\(result.video != nil) audio=\(result.audio != nil)", item: item)
+            let duration = result.duration.map { "\($0.value)/\($0.timescale)" } ?? "none"
+            record("inspect-success video=\(result.video != nil) audio=\(result.audio != nil) selected-duration=\(duration)", item: item)
             return result
         } catch {
             record("inspect-failure \(error)", item: item)
@@ -195,7 +196,7 @@ private final class NativeSmokeTracingInspector: NativeHLSAssetInspecting {
         let enabled = physical.tracks.filter(\.isEnabled)
         let error = physical.error.map { ($0 as NSError).domain + ":" + String(($0 as NSError).code) } ?? "none"
         func time(_ value: CMTime) -> String { "\(value.value)/\(value.timescale) epoch=\(value.epoch) flags=\(value.flags.rawValue)" }
-        trace.record("\(stage) status=\(physical.status.rawValue) error=\(error) " +
+        trace.record("\(stage) output=\(item.outputLifecycleEpoch.outputNonce) item=\(item.itemGeneration) status=\(physical.status.rawValue) error=\(error) " +
             "tracks=\(enabled.count) missing-assets=\(enabled.filter { $0.assetTrack == nil }.count) " +
             "size=\(physical.presentationSize) current=\(time(physical.currentTime())) " +
             "duration=\(time(physical.duration)) end=\(time(physical.forwardPlaybackEndTime))")

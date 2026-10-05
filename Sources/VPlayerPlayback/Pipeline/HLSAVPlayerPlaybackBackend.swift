@@ -463,6 +463,9 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
 
     func requestWatchdogRecovery(activation: ActivationEpoch) async -> Bool {
         if let native = lock.withLock({ nativeAdapter }) {
+            #if DEBUG
+            print("NATIVE_HLS_RECOVERY entry=watchdog output=\(native.itemGeneration) activation=\(activation.activationNonce)")
+            #endif
             guard await native.coordinator.currentActivation == activation else { return false }
             return backendPublicationReplacementAuthoritySlot.requestWatchdogRecovery(activation: activation)
         }
@@ -785,6 +788,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             return (sourceActivation, metadata)
         }
         guard let admitted else { return }
+        #if DEBUG
+        print("NATIVE_HLS_RECOVERY entry=source-failure output=\(invocation.outputLifecycleEpoch.outputNonce) " +
+            "activation=\(admitted.0?.activationNonce ?? 0) reason=\(error) " +
+            "native=\(lock.withLock { nativeAdapter != nil }) source-current=\(source.sourceIsCurrent)")
+        #endif
         if let activation = admitted.0, invocation.replacementAuthority.requestWatchdogRecovery(activation: activation) { return }
         lock.withLock {
             // Creation and publication share the ownership lock. Retirement can

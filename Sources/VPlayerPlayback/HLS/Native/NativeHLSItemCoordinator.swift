@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import CoreMedia
 import Foundation
 
 /// Native readiness is distinct from locally generated publication proof. Every
@@ -78,6 +79,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         try validatePrepare()
         guard driver.currentItemIdentity == item, driver.rate == 0 else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         selected = snapshot; prepared = true
+        diagnose("prepare.selected")
         metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
     }
     func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
@@ -90,6 +92,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         // A same-size SPS or audio-format change cannot hide behind cached facts.
         let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
         try validateActive(invocation)
+        if let selected { diagnoseTransition(snapshot, from: selected, stage: "activate.selected") }
         if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
         selected = snapshot
         if alreadyArmed {
@@ -123,15 +126,18 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         try validateActive(invocation)
         let afterPreroll = try await selectionSnapshot { try self.validateActive(invocation) }
         try validateActive(invocation)
+        diagnoseTransition(afterPreroll, from: snapshot, stage: "activate.prerolled")
         guard afterPreroll.permitsTransition(from: snapshot) else { throw HLSSourceError.unsupportedMedia }
         selected = afterPreroll
         if let endpoint = afterPreroll.duration {
             try driver.installNaturalEndTerminalHandler(item: item) { [weak self] capability, item in self?.naturalEnd(capability, item: item) }
             try driver.constrainPlaybackEnd(to: endpoint, item: item)
         }
+        diagnose("activate.endpoint", authorityValidated: true)
         try await driver.play(invocation: invocation, item: item)
         try validateActive(invocation)
         armed = true
+        diagnose("activate.played", authorityValidated: true)
         if let system = driver as? SystemAVPlayerDriver, let physical = system.nativeCurrentItem(item) {
             monitor = try NativeHLSObservation(item: physical, driver: system) { [weak self] failed in await self?.refresh(failed: failed) }
         }
@@ -162,32 +168,74 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     func observeSelectedFormatChangeForTesting() async { await refresh(failed: false) }
     #endif
     private func refresh(failed: Bool) async {
+        diagnose("refresh.event", detail: "event-failed=\(failed)")
         guard !retired, !failureDelivered, armed, let invocation = authorization, invocation.revalidateCurrentAuthority() else { return }
-        if failed || owned.source.refreshReason() != nil { fail(.network); return }
+        if failed { fail(.network, stage: "observation.failed"); return }
+        if owned.source.refreshReason() != nil { fail(.network, stage: "source.expired"); return }
         do {
             let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
             try validateActive(invocation)
+            if let selected { diagnoseTransition(snapshot, from: selected, stage: "refresh.selected") }
             if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
             selected = snapshot
             metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
             await metadataChanged(invocation.activation)
-        } catch is CancellationError {} catch { if authorization == invocation && invocation.revalidateCurrentAuthority() { fail(.unsupportedMedia) } }
+        } catch is CancellationError {} catch {
+            if authorization == invocation && invocation.revalidateCurrentAuthority() {
+                fail(.unsupportedMedia, stage: "selection.refresh",
+                    detail: "error-type=\(String(reflecting: type(of: error))) error-code=\((error as NSError).code)")
+            }
+        }
     }
-    private func fail(_ reason: HLSSourceError) {
+    private func diagnoseTransition(_ snapshot: NativeHLSSelectionSnapshot, from prior: NativeHLSSelectionSnapshot, stage: StaticString) {
+        #if DEBUG
+        diagnose(stage, authorityValidated: true, detail: "transition=\(snapshot.permitsTransition(from: prior)) item-equal=\(snapshot.item == prior.item) " +
+            "physical-equal=\(snapshot.physicalItem == prior.physicalItem) audio-selection-equal=\(snapshot.audioSelection == prior.audioSelection) " +
+            "video-equal=\(snapshot.video == prior.video) audio-equal=\(snapshot.audio == prior.audio) digest-equal=\(snapshot.audioConfigurationDigest == prior.audioConfigurationDigest)")
+        #endif
+    }
+    /// Synchronous bounded scalar diagnostics only. No SDK loads, media payloads,
+    /// source addresses, retained event history, or changes to admission/recovery.
+    private func diagnose(_ stage: StaticString, authorityValidated: Bool? = nil, detail: @autoclosure () -> String = "") {
+        #if DEBUG
+        func time(_ value: CMTime) -> String { "\(value.value)/\(value.timescale):\(value.epoch):\(value.flags.rawValue)" }
+        let physical = (driver as? SystemAVPlayerDriver)?.nativeCurrentItem(item)
+        let error = physical?.error as NSError?
+        let selectedDuration = selected?.duration.map { time($0.cmTime) } ?? "none"
+        // Report the immediately preceding required guard, never revalidate just
+        // for logging: Registry validation itself can fold queued safety ingress.
+        let authority = authorityValidated.map { String($0) } ?? "unchecked-event"
+        print("NATIVE_HLS_LIFECYCLE stage=\(stage) output=\(item.outputLifecycleEpoch.outputNonce) " +
+            "item=\(item.itemGeneration) activation=\(authorization?.activation.activationNonce ?? 0) " +
+            "authority-validated=\(authority) item-match=\(driver.currentItemIdentity == item) " +
+            "physical-match=\(physical.map { selected?.physicalItem == ObjectIdentifier($0) } ?? false) " +
+            "source-current=\(owned.sourceIsCurrent) prepared=\(prepared) armed=\(armed) retired=\(retired) stopping=\(stopInFlight) " +
+            "progress=\(progress.hasObservedProgress) rate=\(driver.rate) control=\(driver.timeControlStatus.rawValue) " +
+            "status=\(physical?.status.rawValue ?? -1) error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0) " +
+            "current=\(physical.map { time($0.currentTime()) } ?? "none") duration=\(physical.map { time($0.duration) } ?? "none") " +
+            "end=\(physical.map { time($0.forwardPlaybackEndTime) } ?? "none") selected-duration=\(selectedDuration) " + String(detail().prefix(512)))
+        #endif
+    }
+    private func fail(_ reason: HLSSourceError, stage: StaticString, detail: @autoclosure () -> String = "") {
         guard !retired, !failureDelivered else { return }
+        diagnose(stage, authorityValidated: true, detail: "reason=\(reason) \(detail())")
         failureDelivered = true; cancelProgress()
         metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: nil))
         failure(reason, authorization?.activation)
     }
     private func observe(_ status: AVPlayer.TimeControlStatus, item: AVPlayerItemInstanceIdentity, activation: ActivationEpoch) {
+        diagnose("observe.control", detail: "event-control=\(status.rawValue) event-item-match=\(self.item == item) event-activation-match=\(authorization?.activation == activation)")
         guard self.item == item, authorization?.activation == activation, authorization?.revalidateCurrentAuthority() == true,
               !retired, !stopInFlight, armed else { return }
-        if status == .paused, progress.hasObservedProgress, !naturalEndVerified, !driver.hasPendingNaturalEndVerification(item: item, activation: activation) { fail(.network) }
+        if status == .paused, progress.hasObservedProgress, !naturalEndVerified, !driver.hasPendingNaturalEndVerification(item: item, activation: activation) {
+            fail(.network, stage: "playback.paused", detail: "event-control=\(status.rawValue)")
+        }
     }
     private func naturalEnd(_ capability: AVPlayerNaturalEndTerminalCapability, item: AVPlayerItemInstanceIdentity) {
         guard self.item == item, authorization?.revalidateCurrentAuthority() == true,
               let result = driver.consumeNaturalEndTerminal(capability, item: item) else { return }
-        if case .success = result { naturalEndVerified = true; cancelProgress() } else { fail(.network) }
+        if case .success = result { naturalEndVerified = true; cancelProgress() }
+        else if case let .failure(reason) = result { fail(.network, stage: "naturalEnd.rejected", detail: "endpoint-reason=\(reason)") }
     }
     private func startProgress(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) {
         cancelProgress()
@@ -209,7 +257,8 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
               let now = invocation.observationInstant else { if progressIdentity == identity { cancelProgress() }; return }
         invocation.retireHLSProgress(identity: identity)
         guard case .currentItem(let time) = driver.playbackClockObservation(item: item) else { cancelProgress(); return }
-        if owned.source.refreshReason() != nil || progress.observe(mediaTime: time.map { Double($0.value) / Double($0.timescale) }, at: now) { fail(.network); return }
+        if owned.source.refreshReason() != nil { fail(.network, stage: "progress.expired"); return }
+        if progress.observe(mediaTime: time.map { Double($0.value) / Double($0.timescale) }, at: now) { fail(.network, stage: "progress.stalled"); return }
         if progress.hasObservedProgress && !progressReported { progressReported = invocation.completeObservedMediaProgress() }
         let next = UUID()
         if invocation.scheduleHLSProgress(item: item, identity: next, receiver: self, delayNanoseconds: progress.nextPollDelay(at: now)) {

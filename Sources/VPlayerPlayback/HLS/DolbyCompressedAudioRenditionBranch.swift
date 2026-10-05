@@ -89,6 +89,9 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
         try beginOperation()
         defer { endOperation() }
         var completed: CompressedAudioAccessUnit?
+#if DEBUG
+        var failureStage: StaticString = "collect"
+#endif
         do {
             let members = try producer.sharedControlExecutor.sync { try collect(timed) }
             guard !members.isEmpty else { return }
@@ -98,7 +101,13 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
             }
             // canAdd and candidate rejection are reversible only here. No service
             // record, transfer, boundary, or native append has been created yet.
+#if DEBUG
+            failureStage = "install-first-writer"
+#endif
             try await installFirstWriterIfNeeded(first: first, proof: firstProof)
+#if DEBUG
+            failureStage = "assemble"
+#endif
             let unit = try producer.sharedControlExecutor.sync { try assemble(members) }
             completed = unit
             let lifetime: DolbyAudioPayloadLifetime
@@ -111,8 +120,17 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
             } else {
                 lifetime = firstProof.payloadLifetime
             }
+#if DEBUG
+            failureStage = "begin-output"
+#endif
             try producer.beginOutput()
+#if DEBUG
+            failureStage = "append"
+#endif
             try await appendComplete(unit, timed: first, nativeTail: lifetime)
+#if DEBUG
+            failureStage = "retire-members"
+#endif
             try producer.sharedControlExecutor.sync {
                 try requireCurrent()
                 guard members.allSatisfy({ $0.validatesSourceMapping() }),
@@ -131,6 +149,14 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
                 pending.removeAll(keepingCapacity: true); pendingBlocks = 0; aggregateReservation = nil
             }
         } catch {
+#if DEBUG
+            let usage = writer?.usage
+            print("DOLBY_BRANCH_FAILURE stage=\(failureStage) codec=\(producer.source.codec.rawValue) " +
+                "sourceMask=\(producer.source.channelLayout.nativeMask ?? 0) " +
+                "rawSystemFailure=\((error as? SegmentedFMP4WriterFailure) == .systemFailure) writerPresent=\(usage != nil) " +
+                "initialization=\(usage?.initializationCount ?? 0) media=\(usage?.mediaCallbackCount ?? 0) " +
+                "pending=\(usage?.pendingCallbackCount ?? 0)")
+#endif
             let isInitialRejection: Bool
             if case DolbyCompressedAudioRenditionFailure.initialWriterUnsupported = error { isInitialRejection = true }
             else { isInitialRejection = false }

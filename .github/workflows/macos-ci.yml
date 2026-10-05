@@ -173,7 +173,9 @@ jobs:
             xcrun simctl boot "$TVOS_SIMULATOR_UDID"
           fi
           xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
-          VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseColdStarts" \
+          # Reuse only this job's build data. The script still runs its exact
+          # build command so Xcode validates current inputs and build settings.
+          VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseStartup" \
             ./Scripts/test-release-startup.sh
 
   sanitizer-validation:

@@ -26,13 +26,29 @@ final class NativeHLSObservation: @unchecked Sendable {
         observations = [
             item.observe(\.presentationSize, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false) },
             item.observe(\.tracks, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false) },
-            item.observe(\.status, options: [.new]) { [weak self] item, _ in callback.assertRegistered(); self?.offer(failed: item.status == .failed) }
+            item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                callback.assertRegistered()
+                #if DEBUG
+                if item.status == .failed {
+                    let error = item.error as NSError?
+                    print("NATIVE_HLS_SDK_FAILURE signal=status error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0)")
+                }
+                #endif
+                self?.offer(failed: item.status == .failed)
+            }
         ]
         for name in [AVPlayerItem.mediaSelectionDidChangeNotification, AVPlayerItem.newAccessLogEntryNotification,
                      AVPlayerItem.newErrorLogEntryNotification, AVPlayerItem.failedToPlayToEndTimeNotification] {
             let failure = name == AVPlayerItem.failedToPlayToEndTimeNotification
-            notifications.append(NotificationCenter.default.addObserver(forName: name, object: item, queue: nil) { [weak self] _ in
-                callback.assertRegistered(); self?.offer(failed: failure)
+            notifications.append(NotificationCenter.default.addObserver(forName: name, object: item, queue: nil) { [weak self] notification in
+                callback.assertRegistered()
+                #if DEBUG
+                if failure {
+                    let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+                    print("NATIVE_HLS_SDK_FAILURE signal=failed-to-end error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0)")
+                }
+                #endif
+                self?.offer(failed: failure)
             })
         }
         notifications.append(NotificationCenter.default.addObserver(forName: AVPlayer.eligibleForHDRPlaybackDidChangeNotification,

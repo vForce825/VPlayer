@@ -83,6 +83,28 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('./Scripts/test.sh -configuration Debug',normal)
         self.assertNotRegex(normal,r'--?(?:only|skip)-testing(?=[:=\s]|$)')
 
+    def test_cold_starts_share_only_same_job_production_release_build_data(self):
+        text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
+        release=text.split('  release-contracts:',1)[1].split('  sanitizer-validation:',1)[0]
+        startup=release.split('      - name: Run production-configuration Release startup UI tests\n',1)[1]
+        startup=startup.split('      - name: Report Release startup failures\n',1)[0]
+        cold=release.split('      - name: Check six Release cold starts including allocator accounting\n',1)[1]
+        startup_paths=re.findall(r'-derivedDataPath "([^"]+)"',startup)
+        cold_paths=re.findall(r'VPLAYER_STARTUP_DERIVED_DATA="([^"]+)"',cold)
+        self.assertEqual(startup_paths,['$RUNNER_TEMP/ReleaseStartup'])
+        self.assertEqual(cold_paths,startup_paths)
+        # The testable boundary build remains separate; result evidence is a
+        # sibling, not a product overwritten by the later incremental build.
+        self.assertIn('-derivedDataPath "$RUNNER_TEMP/ReleaseBoundary"',release)
+        self.assertIn('-resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult"',startup)
+        self.assertIn('        timeout-minutes: 15\n',cold)
+        self.assertIn('./Scripts/test-release-startup.sh',cold)
+        self.assertNotIn('actions/cache',text)
+        script=(ROOT/'Scripts/test-release-startup.sh').read_text()
+        self.assertIn('for mode in normal step1; do',script)
+        self.assertIn('for attempt in 1 2 3; do',script)
+        self.assertLess(script.index('xcodebuild build '),script.index('simctl install'))
+
     def test_strict_http_keeps_fixture_gates_and_adds_bounded_native_smoke_coverage(self):
         text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
         fixture=text.split('  fixture-validation:',1)[1].split('  compiler-controls:',1)[0]

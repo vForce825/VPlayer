@@ -77,9 +77,12 @@ final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
                 print("OWNED_DOLBY_TRIAL codec=\(codec.rawValue) nativeTrials=\(trials) outcome=\(outcome) progressed=true")
             } catch {
                 let native = probe.snapshot
+                // Failed preparation can release this weak backend before the
+                // observer runs. Absence is not evidence of zero bundle attempts.
+                let bundles = factory.backend.map { String($0.generatedBundleCallsForTesting) } ?? "unavailable"
                 XCTFail("Owned Dolby smoke codec=\(codec.rawValue) failed: \(error); " +
-                    "inspections=\(observation.inspections) AC3-trials=\(native.nativeAC3WriterCount) " +
-                    "EAC3-trials=\(native.nativeEAC3WriterCount) bundles=\(factory.backend?.generatedBundleCallsForTesting ?? 0)")
+                    "inspections=\(observation.inspections) nativeTotal=\(native.nativeWriterCount) " +
+                    "AC3-trials=\(native.nativeAC3WriterCount) EAC3-trials=\(native.nativeEAC3WriterCount) bundles=\(bundles)")
                 failure = error
             }
             await controller.stop(); await registry.joinOwnedTerminalCleanup(); await origin.close()

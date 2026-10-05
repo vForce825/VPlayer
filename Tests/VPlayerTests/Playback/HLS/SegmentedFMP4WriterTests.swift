@@ -13,6 +13,13 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testDiagnosedSystemFailureNeverClaimsCodecUnsupported() {
+        let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("ordinary-fixture", status: -1)
+        XCTAssertEqual(failure, .systemFailure)
+        XCTAssertNotEqual(failure, .unsupportedCompressedAudioFormat)
+        XCTAssertNotEqual(failure, .compressedAudioCompatibilityRequired)
+    }
+
     func testNativeCallSerializationRetriesTheSameNotReadyAdmission() async throws {
         let harness = Task17NativeCallHarness()
         XCTAssertTrue(harness.calls.start { true })
@@ -689,10 +696,25 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             sourceFormatHint: CMSampleBufferGetFormatDescription(source), factory: factory)
         let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
         try writer.start(at: CMTime(value: 10, timescale: 1))
+        defer { writer.requestCancellation() }
+        let native = try XCTUnwrap(factory.lastWriter)
         try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
-        XCTAssertEqual(factory.lastWriter?.appendCount, 1)
-        let terminal = try await writer.finish()
+        XCTAssertEqual(native.appendCount, 1)
+        XCTAssertNil(writer.terminalReceipt)
+        XCTAssertEqual(writer.usage.inputAllocationCount, 1)
+        XCTAssertEqual(writer.usage.inputReleaseCount, 0)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 1)
+
+        // This adapter proves exact input admission, but cannot authenticate AAC
+        // publication callbacks. Retire the accepted input without synthetic finish.
+        let terminal = await writer.cancelAwaitingCompletion()
+        XCTAssertEqual(terminal.terminalReason, .cancelled)
         XCTAssertEqual(terminal.inputCount, 1)
+        XCTAssertEqual(terminal.mediaCallbackCount, 0)
+        XCTAssertEqual(native.calls, [.start, .append, .cancel])
+        XCTAssertEqual(native.retainedInputSampleCount, 0)
+        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+        XCTAssertEqual(writer.usage.inputReleaseCount, 1)
     }
 
     func testAsyncVideoAcceptsRemovedBufferAttachmentsInBothModes() async throws {

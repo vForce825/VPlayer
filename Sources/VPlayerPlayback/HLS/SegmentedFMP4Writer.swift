@@ -280,7 +280,7 @@ extension SegmentedFMP4SynchronousSystemWriting {
         _ sampleBuffer: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>
     ) async throws {
         try sampleBuffer.withUnsafeSampleBuffer { buffer in
-            guard append(buffer) else { throw SegmentedFMP4WriterFailure.systemFailure }
+            guard append(buffer) else { throw SegmentedFMP4WriterFailure.diagnosedSystemFailure() }
         }
     }
 }
@@ -592,7 +592,7 @@ func nativeSamplePayloadDigest(_ block: CMBlockBuffer) throws -> Data {
                 dataPointerOut: &pointer)
             guard status == noErr, let pointer, totalLength == length,
                   contiguousLength > 0, contiguousLength <= length - offset else {
-                throw SegmentedFMP4WriterFailure.systemFailure
+                throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("native.payloadDigest", status: status)
             }
             hasher.update(bufferPointer: UnsafeRawBufferPointer(
                 start: pointer, count: contiguousLength))
@@ -815,6 +815,16 @@ enum SegmentedFMP4WriterFailure: Error, Sendable, Equatable {
     case compressedAudioCompatibilityRequired
     case relayCapacityExceeded
     case arithmeticOverflow
+
+    /// Debug localization only: an unexplained failure never becomes capability
+    /// rejection. Static sites, line numbers and OSStatus expose no media or URLs.
+    static func diagnosedSystemFailure(_ stage: StaticString = #function,
+                                       line: UInt = #line, status: OSStatus? = nil) -> Self {
+#if DEBUG
+        print("HLS_WRITER_SYSTEM_FAILURE stage=\(stage) line=\(line) status=\(status.map { String($0) } ?? "none")")
+#endif
+        return .systemFailure
+    }
 }
 
 /// writer 只接收连续逐帧 cadence。源视频的正向缺帧必须在转码分支内
@@ -2009,7 +2019,7 @@ final class AACWriterTerminalBinding: @unchecked Sendable {
         let terminal: Terminal
         switch reason {
         case .failed:
-            terminal = .failure(.systemFailure)
+            terminal = .failure(.diagnosedSystemFailure("aac.terminal.failed"))
         case .cancelled:
             terminal = .writerCancelled
         case .finished:
@@ -3144,7 +3154,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 defer { discardUnusedFlushAdmissionIsolated(&admission) }
                 try flushIfRequiredIsolated(ticket, admission: &admission)
                 guard state == .started else {
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
                 }
                 guard ticket.prepare(
                         binding: binding,
@@ -3701,7 +3711,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let terminal = try await finish()
         guard let drain = await drainTask.value,
               relay.accepts(drain, source: callbackContext) else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
         return try withLane {
             guard terminal == storedTerminalReceipt,
@@ -3778,7 +3788,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let terminal = try await finish()
         guard let drain = await drainTask.value,
               relay.accepts(drain, source: callbackContext) else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
         return try withLane {
             guard terminal == storedTerminalReceipt,
@@ -3914,9 +3924,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         withLane {
             guard state != .terminal, state != .retiring else { return }
             guard writerObjectIdentity == systemWriter.objectIdentity else {
+                let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.writerIdentity")
                 cancelSystemWriter = true
                 continuation = beginFailureRetirementIsolated()
-                continuationResult = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                continuationResult = .failure(failure)
                 return
             }
             let kind: SealedMediaObjectKind
@@ -3924,15 +3935,17 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             case .initialization: kind = .initialization
             case .separable: kind = .media
             @unknown default:
+                let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.type")
                 cancelSystemWriter = true
                 continuation = beginFailureRetirementIsolated()
-                continuationResult = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                continuationResult = .failure(failure)
                 return
             }
             guard let index = pendingCallbacks.firstIndex(where: { $0.kind == kind }) else {
+                let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.pending")
                 cancelSystemWriter = true
                 continuation = beginFailureRetirementIsolated()
-                continuationResult = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                continuationResult = .failure(failure)
                 return
             }
             let pending = pendingCallbacks[index]
@@ -3943,9 +3956,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                       let trusted = capsule.consume(context: callbackContext, adapter: systemWriter,
                         writer: writerObjectIdentity, bytes: bytes, type: type, report: report),
                       cadenceIsValid else {
+                    let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.provenance")
                     cancelSystemWriter = true
                     continuation = beginFailureRetirementIsolated()
-                    continuationResult = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                    continuationResult = .failure(failure)
                     return
                 }
                 trustedBytes = trusted.0; trustedFormat = trusted.1
@@ -3974,12 +3988,17 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     let expected = initialMovieFragmentSequenceNumber.addingReportingOverflow(mediaCallbackCount)
                     guard !expected.overflow, actual.sequence == expected.partialValue,
                           lastNativeFragment.map({ actual.decodeTime > $0.decodeTime }) ?? true else {
-                        throw SegmentedFMP4WriterFailure.systemFailure
+                        throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.fragmentSequence")
                     }
                     lastNativeFragment = actual
                     acceptanceObservation?.observed(logicalSequence: pending.logicalSequence,
                         nativeSequence: actual.sequence)
                 } catch {
+#if DEBUG
+                    print("HLS_WRITER_CALLBACK_FAILURE stage=fragmentFacts track=\(trackKind.rawValue) " +
+                        "inputs=\(inputCount) initialization=\(initializationCallbackCount) media=\(mediaCallbackCount) " +
+                        "typedCallback=\(firstTypedCallbackFailure != nil)")
+#endif
                     cancelSystemWriter = true
                     continuation = beginFailureRetirementIsolated()
                     continuationResult = .failure(error)
@@ -4002,18 +4021,35 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     if kind == .media { try segmentEvidence.retireVerified(sequence: pending.logicalSequence) }
                     inputAdmission.signalCapacityChange()
                     guard schedulePublicationIsolated(acceptance) else {
-                        throw SegmentedFMP4WriterFailure.systemFailure
+                        throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.publication")
                     }
                 } catch {
+#if DEBUG
+                    print("HLS_WRITER_CALLBACK_FAILURE stage=record track=\(trackKind.rawValue) " +
+                        "inputs=\(inputCount) initialization=\(initializationCallbackCount) media=\(mediaCallbackCount) " +
+                        "typedCallback=\(firstTypedCallbackFailure != nil)")
+#endif
                     cancelSystemWriter = true
                     continuation = beginFailureRetirementIsolated()
                     continuationResult = .failure(error)
                     return
                 }
-            case .discarded, .fatal:
+            case .discarded:
+                let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.discarded")
                 cancelSystemWriter = true
                 continuation = beginFailureRetirementIsolated()
-                continuationResult = .failure(SegmentedFMP4WriterFailure.systemFailure)
+                continuationResult = .failure(failure)
+                return
+            case .fatal:
+#if DEBUG
+                if case let .fatal(reason) = result {
+                    print("HLS_WRITER_CALLBACK_FAILURE stage=relay reason=\(reason) track=\(trackKind.rawValue)")
+                }
+#endif
+                let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.relay")
+                cancelSystemWriter = true
+                continuation = beginFailureRetirementIsolated()
+                continuationResult = .failure(failure)
                 return
             }
             if state == .finishing,
@@ -4026,7 +4062,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         if cancelSystemWriter {
             scheduleFailureCleanup(continuation, result: continuationResult
-                ?? .failure(SegmentedFMP4WriterFailure.systemFailure))
+                ?? .failure(SegmentedFMP4WriterFailure.diagnosedSystemFailure()))
             return
         }
         if let continuation, let continuationResult {
@@ -4256,7 +4292,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     ) throws {
         try flushIfRequiredIsolated(ticket, admission: &admission)
         guard state == .started else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
         guard ticket.prepare(
             binding: binding,
@@ -4819,7 +4855,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         currentSegmentInputCount = 0
         currentPublicationBoundary = nil
         currentFrameDuration = nil
-        guard state == .started else { throw SegmentedFMP4WriterFailure.systemFailure }
+        guard state == .started else { throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("flush.state") }
         if !usesExplicitOwnershipLimits {
             let live = inputAdmission.usage
             let precedingCount = live.count - (admission.inputLifetime == nil ? 0 : 1)
@@ -4939,18 +4975,29 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.arithmeticOverflow
         }
         guard recordAppendFailureOrdinal != nextOrdinal.partialValue else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
     }
 
     /// 必须在 cancel/retire 前读取系统首错；这些操作可能覆盖 AVAssetWriter.error。
-    private func systemFailureIsolated() -> SegmentedFMP4WriterFailure {
+    private func systemFailureIsolated(_ stage: StaticString = #function,
+                                       line: UInt = #line) -> SegmentedFMP4WriterFailure {
+#if DEBUG
+        print("HLS_WRITER_FAILURE_SELECTION stage=\(stage) line=\(line) track=\(trackKind.rawValue) " +
+            "state=\(state) inputs=\(inputCount) initialization=\(initializationCallbackCount) media=\(mediaCallbackCount) " +
+            "pending=\(pendingCallbacks.count) typedCallback=\(firstTypedCallbackFailure != nil) retainedSystem=\(firstSystemFailureDiagnostic != nil)")
+#endif
         if let firstTypedCallbackFailure { return firstTypedCallbackFailure }
         if firstSystemFailureDiagnostic == nil {
             firstSystemFailureDiagnostic = systemWriter.failureDiagnostic
         }
-        if let diagnostic = firstSystemFailureDiagnostic { return .systemError(diagnostic) }
-        return .systemFailure
+        if let diagnostic = firstSystemFailureDiagnostic {
+#if DEBUG
+            print("HLS_WRITER_FAILURE_SELECTED stage=\(stage) line=\(line) category=systemError")
+#endif
+            return .systemError(diagnostic)
+        }
+        return .diagnosedSystemFailure(stage, line: line)
     }
 
     private func finishSystemDidComplete(_ succeeded: Bool) {
@@ -4975,7 +5022,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         if requiresCleanup {
             scheduleFailureCleanup(continuation, result: result
-                ?? .failure(SegmentedFMP4WriterFailure.systemFailure))
+                ?? .failure(SegmentedFMP4WriterFailure.diagnosedSystemFailure()))
             return
         }
         if let continuation, let result {
@@ -4996,7 +5043,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         guard acceptance.reportIdentity == report.identity,
               acceptance.byteRange == byteRange,
               acceptance.digest == digest else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("callback.seal")
         }
         let nextEvidence = callbackEvidenceCount.addingReportingOverflow(1)
         guard !nextEvidence.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
@@ -5031,6 +5078,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 publicationEvidence.dolbyInitialization = try DolbyWriterInitializationEvidence.validate(bytes,
                     configuration: compressedFormatConfiguration, sourceLayout: compressedSourceLayout)
             } catch is CompressedAudioInitializationRejection {
+#if DEBUG
+                print("HLS_DOLBY_INITIALIZATION_REJECT track=\(trackKind.rawValue) " +
+                    "sourceMask=\(compressedSourceLayout.nativeMask ?? 0) bytes=\(bytes.count)")
+#endif
                 firstTypedCallbackFailure = .compressedAudioCompatibilityRequired
                 throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
             }
@@ -5055,7 +5106,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     reportIdentity: report.identity)
                 guard aacRenditionTerminalBinding?.acceptInitialization(
                     object, binding: binding) == true else {
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
                 }
                 aacWriterWindowAdmission?.recordInitialization(object)
             }
@@ -5065,7 +5116,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             mediaCallbackCount = next.partialValue
             if trackKind == .aac, sourceAACConfiguration == nil {
                 guard let leaf = acceptance.aacMediaMembershipLeaf else {
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
                 }
                 let object = AACEndpointSealedObjectEvidence(
                     key: HLSResourceKey(
@@ -5083,7 +5134,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 guard windowCallbackMembership.accept(leaf) == .accepted,
                       aacRenditionTerminalBinding?.acceptCallback(
                     leaf, evidence: object) == true else {
-                    throw SegmentedFMP4WriterFailure.systemFailure
+                    throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
                 }
                 if firstAACMediaEvidence == nil { firstAACMediaEvidence = object }
                 terminalAACMediaEvidence = object
@@ -5486,7 +5537,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             formatDescription: sourceFormatHint, sampleCount: 1, sampleTimingEntryCount: 1,
             sampleTimingArray: &timing, sampleSizeEntryCount: 1, sampleSizeArray: &size,
             sampleBufferOut: &sample) == noErr, let sample else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
         return (sample, lifetime)
     }
@@ -5519,7 +5570,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         )
         var size = payload.count
         var sample: CMSampleBuffer?
-        guard CMSampleBufferCreateReady(
+        let status = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault,
             dataBuffer: block,
             formatDescription: sourceFormatHint,
@@ -5529,7 +5580,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             sampleSizeEntryCount: 1,
             sampleSizeArray: &size,
             sampleBufferOut: &sample
-        ) == noErr, let sample else { throw SegmentedFMP4WriterFailure.systemFailure }
+        )
+        guard status == noErr, let sample else {
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure("compressed.sampleBuffer", status: status)
+        }
         return sample
     }
 
@@ -5588,7 +5642,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     private static func projectedCharge(_ sampleBuffer: CMSampleBuffer) throws -> Int {
         guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else {
-            throw SegmentedFMP4WriterFailure.systemFailure
+            throw SegmentedFMP4WriterFailure.diagnosedSystemFailure()
         }
         let result = CMBlockBufferGetDataLength(block).addingReportingOverflow(Self.sampleChargeOverhead)
         guard !result.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
