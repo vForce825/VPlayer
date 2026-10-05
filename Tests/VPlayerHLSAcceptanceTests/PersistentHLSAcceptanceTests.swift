@@ -467,12 +467,16 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let provider = reader.outputProvider(for: output)
         let originalProvider = originalReader.outputProvider(for: originalOutput)
         var timing = AcceptanceVideoTiming()
+        var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
+        var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
         defer {
             decodeDiagnostics["reader_status"] = reader.status.rawValue
             decodeDiagnostics["original_reader_status"] = originalReader.status.rawValue
             decodeDiagnostics["original_reader_error"] = originalReader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
             decodeDiagnostics["decoded_frames"] = timing.frames
             decodeDiagnostics["sample_timing"] = timing.diagnostics
+            decodeDiagnostics["decoded_cursor"] = decodedCursor.diagnostics
+            decodeDiagnostics["original_cursor"] = originalCursor.diagnostics
             decodeDiagnostics["reader_error"] = reader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
             if reader.status == .reading { reader.cancelReading() }
             if originalReader.status == .reading { originalReader.cancelReading() }
@@ -482,14 +486,23 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         try reader.start()
         decodeDiagnostics["stage"] = "paired_video_timing"
         while let ready = try await provider.next() {
-            guard let original = try await originalProvider.next() else {
+            guard try decodedCursor.consumesMedia(ready) else { continue }
+            var paired = false
+            while let original = try await originalProvider.next() {
+                guard try originalCursor.consumesMedia(original) else { continue }
+                try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
+                    original: makeOwnedReaderFixtureSample(copying: original))
+                paired = true
+                break
+            }
+            guard paired else {
                 throw AcceptanceError.invalid("decoded video has no original sample timing")
             }
-            try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
-                original: makeOwnedReaderFixtureSample(copying: original))
         }
-        if let _ = try await originalProvider.next() {
-            throw AcceptanceError.invalid("original video sample has no decoded image")
+        while let original = try await originalProvider.next() {
+            if try originalCursor.consumesMedia(original) {
+                throw AcceptanceError.invalid("original video sample has no decoded image")
+            }
         }
         guard reader.status == .completed, originalReader.status == .completed,
               let seconds = timing.decodedSeconds else {
@@ -500,6 +513,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             "init_count":track.inits,"fragments":track.fragments,"decoded_frames":timing.frames,
             "decoded_seconds":seconds,"maximum_gap_seconds":timing.maximumGapSeconds,
             "missing_decoded_durations":timing.missingDecodedDurations,
+            "decoded_cursor":decodedCursor.diagnostics,"original_cursor":originalCursor.diagnostics,
             "timing_evidence":"original compressed duration matched to every decoded PTS and raw fragment endpoint"]
         result.merge(AcceptanceReport.fragment(track.continuity)) { _, new in new }
         return result

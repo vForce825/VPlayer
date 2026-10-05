@@ -215,6 +215,42 @@ class AcceptanceControls(unittest.TestCase):
             '--duration-seconds','301','--head','a'*40],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0);self.assertIn('300',result.stderr)
 
+class AcceptanceReaderSourceContract(unittest.TestCase):
+    """Read-loop/ownership guards only; native controls exercise buffer semantics."""
+    def test_short_and_full_readers_filter_both_streams_and_exhaust_trailing_markers(self):
+        for name, start, end in [
+            ('AcceptanceNativeControlTests.swift', 'private func decodeRemuxControl(',
+             'private func checkVideoReaderMarkerEvidence('),
+            ('PersistentHLSAcceptanceTests.swift', 'private func decodeVideo(',
+             '/// Bounded completion state')]:
+            source=(ROOT/'Tests/VPlayerHLSAcceptanceTests'/name).read_text().split(start,1)[1].split(end,1)[0]
+            self.assertIn('AcceptanceVideoReaderCursor(kind: .decoded)',source)
+            self.assertIn('AcceptanceVideoReaderCursor(kind: .original)',source)
+            self.assertIn('guard try decodedCursor.consumesMedia(ready) else { continue }',source)
+            self.assertEqual(source.count('while let original = try await originalProvider.next()'),2)
+            self.assertIn('guard try originalCursor.consumesMedia(original) else { continue }',source)
+            self.assertIn('if try originalCursor.consumesMedia(original)',source)
+            self.assertIn('guard paired else',source)
+            self.assertIn('reader.status == .completed, originalReader.status == .completed',source)
+            self.assertIn('continuity.requireVideoCoverage(timing',source)
+            self.assertIn('makeOwnedReaderFixtureSample(copying: ready)',source)
+            self.assertIn('makeOwnedReaderFixtureSample(copying: original)',source)
+
+    def test_reader_cursor_uses_only_synchronous_scalar_state(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        self.assertIn('struct AcceptanceVideoReaderCursor',source)
+        cursor=source.split('struct AcceptanceVideoReaderCursor',1)[1].split('struct AcceptanceVideoTiming',1)[0]
+        self.assertIn('maximumConsecutiveMarkers = 8',cursor)
+        self.assertIn('contentType == .markerOnly',cursor)
+        self.assertIn('sample.blockSize == nil',cursor)
+        self.assertIn('!sample.hasImage',cursor)
+        self.assertIn('CMTimeCompare(sample.duration, .zero) == 0',cursor)
+        self.assertIn('let blockSize = sample.blockSize, blockSize >= sample.totalSize',cursor)
+        self.assertIn('ready.withUnsafeSampleBuffer',cursor)
+        self.assertNotIn('async',cursor)
+        self.assertNotIn('CMSampleBuffer?',cursor)
+        self.assertNotIn('[CMSampleBuffer]',cursor)
+
 class AcceptanceSamplerSourceContract(unittest.TestCase):
     """Portable capture/order guard; Apple compilation and ARC remain native checks."""
     def setUp(self):

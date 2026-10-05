@@ -135,11 +135,15 @@ final class AcceptanceNativeControlTests: XCTestCase {
         let provider = reader.outputProvider(for: output)
         let originalProvider = originalReader.outputProvider(for: originalOutput)
         var timing = AcceptanceVideoTiming()
+        var decodedCursor = AcceptanceVideoReaderCursor(kind: .decoded)
+        var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
         defer {
             var observation = timing.diagnostics
             observation["entry"] = String(describing: entry)
             observation["reader_status"] = reader.status.rawValue
             observation["original_reader_status"] = originalReader.status.rawValue
+            observation["decoded_cursor"] = decodedCursor.diagnostics
+            observation["original_cursor"] = originalCursor.diagnostics
             if let evidence = try? JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys]) {
                 print("HLS_ACCEPTANCE_REMUX_TIMING=" + String(decoding: evidence, as: UTF8.self))
             }
@@ -149,14 +153,23 @@ final class AcceptanceNativeControlTests: XCTestCase {
         try originalReader.start()
         try reader.start()
         while let ready = try await provider.next() {
-            guard let original = try await originalProvider.next() else {
+            guard try decodedCursor.consumesMedia(ready) else { continue }
+            var paired = false
+            while let original = try await originalProvider.next() {
+                guard try originalCursor.consumesMedia(original) else { continue }
+                try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
+                    original: makeOwnedReaderFixtureSample(copying: original))
+                paired = true
+                break
+            }
+            guard paired else {
                 throw AcceptanceError.invalid("short decoded video has no original timing")
             }
-            try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
-                original: makeOwnedReaderFixtureSample(copying: original))
         }
-        if let _ = try await originalProvider.next() {
-            throw AcceptanceError.invalid("short original video has no decoded image")
+        while let original = try await originalProvider.next() {
+            if try originalCursor.consumesMedia(original) {
+                throw AcceptanceError.invalid("short original video has no decoded image")
+            }
         }
         guard reader.status == .completed, originalReader.status == .completed,
               timing.frames > 0, timing.frames == timed.count else {
@@ -164,6 +177,99 @@ final class AcceptanceNativeControlTests: XCTestCase {
         }
         try captured.continuity.requireVideoCoverage(timing, timescale: captured.latestMediaTimescale)
         return timing.frames
+    }
+
+    private func checkVideoReaderMarkerEvidence() throws {
+        typealias Snapshot = AcceptanceVideoReaderCursor.Snapshot
+        let marker = Snapshot(count: 0, contentType: .markerOnly, duration: .zero)
+        let compressed = Snapshot(count: 1, contentType: .dataBuffer,
+            duration: CMTime(value: 1, timescale: 25), totalSize: 4, blockSize: 4, hasFormat: true)
+        let decoded = Snapshot(count: 1, contentType: .pixelBuffer, duration: .invalid,
+            hasImage: true, hasFormat: true)
+        for kind in [AcceptanceVideoReaderCursor.Kind.decoded, .original] {
+            var cursor = AcceptanceVideoReaderCursor(kind: kind)
+            // Use a real typed marker too: no unsafe header escapes its borrow.
+            let zero = CMReadySampleBuffer<Never>(markerAt: .zero, duration: .zero)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(zero)))
+            let untimed = CMReadySampleBuffer<Never>(markerAt: .invalid)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(untimed)))
+            let mediaGap = CMReadySampleBuffer<Never>(markerAt: .zero, duration: CMTime(value: 1, timescale: 25))
+            XCTAssertThrowsError(try cursor.consumesMedia(CMReadySampleBuffer(mediaGap)),
+                "A real typed marker with positive duration must not hide a media gap")
+            XCTAssertTrue(try cursor.consumesMedia(kind == .decoded ? decoded : compressed))
+            XCTAssertEqual(cursor.consecutiveMarkers, 0)
+            // Trailing markers are consumed to EOF, never counted as extra media.
+            XCTAssertFalse(try cursor.consumesMedia(marker))
+            XCTAssertEqual(cursor.skippedMarkers, 3)
+            XCTAssertEqual(cursor.maximumMarkerRun, 2)
+            XCTAssertTrue(try cursor.consumesMedia(kind == .decoded ? decoded : compressed),
+                "An extra real sample after a trailing marker must not disappear")
+        }
+
+        var markerFaults: [Snapshot] = []
+        for duration in [CMTime(value: 1, timescale: 25), CMTime(value: -1, timescale: 25),
+                         .indefinite, .positiveInfinity,
+                         CMTime(value: 0, timescale: 1, flags: .valid, epoch: 1)] {
+            var bad = marker; bad.duration = duration; markerFaults.append(bad)
+        }
+        for type in [CMSampleBuffer.ContentType.dataBuffer, .pixelBuffer, .taggedBuffers, .sampleReference] {
+            var bad = marker; bad.contentType = type; markerFaults.append(bad)
+        }
+        var bad = marker; bad.blockSize = 0; markerFaults.append(bad)
+        bad = marker; bad.blockSize = 4; markerFaults.append(bad)
+        bad = marker; bad.hasImage = true; markerFaults.append(bad)
+        bad = marker; bad.hasFormat = true; markerFaults.append(bad)
+        bad = marker; bad.totalSize = 4; markerFaults.append(bad)
+        bad = marker; bad.valid = false; markerFaults.append(bad)
+        bad = marker; bad.ready = false; markerFaults.append(bad)
+        for kind in [AcceptanceVideoReaderCursor.Kind.decoded, .original] {
+            for fault in markerFaults {
+                var cursor = AcceptanceVideoReaderCursor(kind: kind)
+                XCTAssertThrowsError(try cursor.consumesMedia(fault))
+                XCTAssertEqual(cursor.skippedMarkers, 0, "Malformed empty buffers cannot be discarded")
+            }
+            var cursor = AcceptanceVideoReaderCursor(kind: kind)
+            for _ in 0..<AcceptanceVideoReaderCursor.maximumConsecutiveMarkers {
+                XCTAssertFalse(try cursor.consumesMedia(marker))
+            }
+            XCTAssertThrowsError(try cursor.consumesMedia(marker), "An unbounded marker stream must fail")
+            XCTAssertEqual(cursor.skippedMarkers, AcceptanceVideoReaderCursor.maximumConsecutiveMarkers)
+            XCTAssertTrue(try cursor.consumesMedia(kind == .decoded ? decoded : compressed))
+            XCTAssertFalse(try cursor.consumesMedia(marker), "A real sample resets only the consecutive limit")
+            XCTAssertEqual(cursor.maximumMarkerRun, AcceptanceVideoReaderCursor.maximumConsecutiveMarkers)
+        }
+
+        var mediaFaults: [Snapshot] = []
+        for count in [-1, 2] { var bad = compressed; bad.count = count; mediaFaults.append(bad) }
+        bad = compressed; bad.blockSize = nil; mediaFaults.append(bad)
+        bad = compressed; bad.blockSize = 0; mediaFaults.append(bad)
+        bad = compressed; bad.blockSize = 3; mediaFaults.append(bad)
+        bad = compressed; bad.totalSize = 0; mediaFaults.append(bad)
+        bad = compressed; bad.hasImage = true; mediaFaults.append(bad)
+        bad = compressed; bad.hasFormat = false; mediaFaults.append(bad)
+        bad = compressed; bad.contentType = .sampleReference; mediaFaults.append(bad)
+        for fault in mediaFaults {
+            var cursor = AcceptanceVideoReaderCursor(kind: .original)
+            XCTAssertThrowsError(try cursor.consumesMedia(fault), "Nonempty malformed data must fail")
+        }
+        var imageCursor = AcceptanceVideoReaderCursor(kind: .decoded)
+        bad = decoded; bad.hasImage = false
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        bad = decoded; bad.blockSize = 4
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        XCTAssertThrowsError(try imageCursor.consumesMedia(compressed))
+        var originalCursor = AcceptanceVideoReaderCursor(kind: .original)
+        XCTAssertThrowsError(try originalCursor.consumesMedia(decoded))
+        bad = compressed; bad.blockSize = 5
+        XCTAssertTrue(try originalCursor.consumesMedia(bad),
+            "Sufficient extra logical backing remains a real sample, never a skipped marker")
+        XCTAssertEqual(originalCursor.skippedMarkers, 0)
+        bad = compressed; bad.duration = .invalid
+        XCTAssertTrue(try originalCursor.consumesMedia(bad),
+            "A real sample with missing timing reaches the exact timing verifier; it is never a marker")
+        var timing = AcceptanceVideoTiming()
+        XCTAssertThrowsError(try timing.observe(decodedPTS: .zero, decodedDuration: .invalid,
+            originalPTS: .zero, originalDuration: bad.duration, decodedCount: 1, originalCount: 1))
     }
 
     private func checkVideoTimingEvidence() throws {
@@ -205,6 +311,19 @@ final class AcceptanceNativeControlTests: XCTestCase {
         try complete.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
             originalDuration: CMTime(value: 1, timescale: 1), decodedCount: 1, originalCount: 1)
         XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000))
+        var extraFrame = AcceptanceVideoTiming()
+        for pts in [start, CMTimeAdd(start, CMTime(value: 1, timescale: 2))] {
+            try extraFrame.observe(decodedPTS: pts, decodedDuration: .invalid,
+                originalPTS: pts, originalDuration: CMTime(value: 1, timescale: 2),
+                decodedCount: 1, originalCount: 1)
+        }
+        XCTAssertThrowsError(try original.requireVideoCoverage(extraFrame, timescale: 48_000),
+            "Matching first/end timestamps cannot hide an extra decoded sample")
+        var twoRawSamples = AcceptanceFragmentContinuity()
+        try twoRawSamples.observe(fragment(sequence: 1, time: 480_000), defaultDuration: 24_000)
+        try twoRawSamples.observe(fragment(sequence: 2, time: 504_000), defaultDuration: 24_000)
+        XCTAssertThrowsError(try twoRawSamples.requireVideoCoverage(complete, timescale: 48_000),
+            "Matching first/end timestamps cannot hide a missing decoded sample")
         XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000),
             "Equal decoded and raw frame counts plus exact raw endpoints are mandatory")
         var shortEnd = AcceptanceVideoTiming()
@@ -347,6 +466,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
     }
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
+        try checkVideoReaderMarkerEvidence()
         try checkVideoTimingEvidence()
         try await checkCanonicalVideoDecode()
         try checkFailureDiagnosticSerialization()

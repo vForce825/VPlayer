@@ -593,6 +593,104 @@ struct AcceptanceFragmentContinuity {
     }
 }
 
+/// AVAssetReader emits timed, payload-free markers as well as media, including
+/// decoded output: https://developer.apple.com/videos/play/wwdc2020/10090/ (8:57).
+/// The typed content discriminator rules out tagged and sample-reference payloads:
+/// https://developer.apple.com/documentation/coremedia/cmsamplebuffer/contenttype-swift.enum/markeronly
+/// This acceptance cursor skips only zero-duration/untimed markers, not media gaps.
+/// It retains scalar evidence only; reader calls and owned copies stay at the caller.
+struct AcceptanceVideoReaderCursor {
+    enum Kind: Equatable { case decoded, original }
+    struct Snapshot: Sendable {
+        var count: Int
+        var contentType: CMSampleBuffer.ContentType
+        var duration: CMTime
+        var valid = true
+        var ready = true
+        var totalSize = 0
+        var blockSize: Int?
+        var hasImage = false
+        var hasFormat = false
+    }
+    // A finite run permits ordinary start/end state markers without allowing a
+    // broken provider to spin forever before a media sample or terminal nil.
+    static let maximumConsecutiveMarkers = 8
+    let kind: Kind
+    private(set) var skippedMarkers = 0
+    private(set) var consecutiveMarkers = 0
+    private(set) var maximumMarkerRun = 0
+    private var latest: Snapshot?
+
+    init(kind: Kind) { self.kind = kind }
+
+    var diagnostics: [String: Any] {
+        var value: [String: Any] = ["skipped_markers":skippedMarkers,
+            "consecutive_markers":consecutiveMarkers,"maximum_marker_run":maximumMarkerRun,
+            "marker_run_limit":Self.maximumConsecutiveMarkers]
+        if let latest {
+            value["latest"] = ["count":latest.count,"content_type":String(describing: latest.contentType),
+                "duration":AcceptanceReport.time(latest.duration),"valid":latest.valid,"ready":latest.ready,
+                "total_size":latest.totalSize,"block_size":latest.blockSize.map { $0 as Any } ?? NSNull(),
+                "has_image":latest.hasImage,"has_format":latest.hasFormat]
+        }
+        return value
+    }
+
+    mutating func consumesMedia(_ ready: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>) throws -> Bool {
+        let contentType = ready.contentType
+        let snapshot = ready.withUnsafeSampleBuffer { sample in
+            Snapshot(count: CMSampleBufferGetNumSamples(sample), contentType: contentType,
+                duration: CMSampleBufferGetDuration(sample), valid: CMSampleBufferIsValid(sample),
+                ready: CMSampleBufferDataIsReady(sample), totalSize: CMSampleBufferGetTotalSampleSize(sample),
+                blockSize: CMSampleBufferGetDataBuffer(sample).map { CMBlockBufferGetDataLength($0) },
+                hasImage: CMSampleBufferGetImageBuffer(sample) != nil,
+                hasFormat: CMSampleBufferGetFormatDescription(sample) != nil)
+        }
+        return try consumesMedia(snapshot)
+    }
+
+    mutating func consumesMedia(_ sample: Snapshot) throws -> Bool {
+        latest = sample
+        guard sample.valid, sample.ready, sample.count >= 0 else {
+            throw AcceptanceError.invalid("\(kind) video reader returned an invalid buffer")
+        }
+        if sample.count == 0 {
+            guard sample.contentType == .markerOnly, sample.totalSize == 0,
+                  sample.blockSize == nil, !sample.hasImage, !sample.hasFormat,
+                  !sample.duration.isValid || (sample.duration.isNumeric && sample.duration.epoch == 0 &&
+                      CMTimeCompare(sample.duration, .zero) == 0) else {
+                throw AcceptanceError.invalid("\(kind) video reader empty buffer carries media or duration")
+            }
+            guard consecutiveMarkers < Self.maximumConsecutiveMarkers else {
+                throw AcceptanceError.invalid("\(kind) video reader marker run exceeded its bound")
+            }
+            consecutiveMarkers += 1
+            skippedMarkers += 1
+            maximumMarkerRun = max(maximumMarkerRun, consecutiveMarkers)
+            return false
+        }
+        guard sample.count == 1, sample.hasFormat else {
+            throw AcceptanceError.invalid("\(kind) video reader must return one formatted media sample")
+        }
+        switch kind {
+        case .decoded:
+            guard sample.contentType == .pixelBuffer, sample.hasImage,
+                  sample.blockSize == nil, sample.totalSize == 0 else {
+                throw AcceptanceError.invalid("decoded video reader sample has no sole image payload")
+            }
+        case .original:
+            // A reader may expose more logical backing than the declared sample
+            // uses. Require enough bytes, without imposing an undocumented equality.
+            guard sample.contentType == .dataBuffer, !sample.hasImage, sample.totalSize > 0,
+                  let blockSize = sample.blockSize, blockSize >= sample.totalSize else {
+                throw AcceptanceError.invalid("original video reader sample has inconsistent compressed backing")
+            }
+        }
+        consecutiveMarkers = 0
+        return true
+    }
+}
+
 /// One decoded image must match one original compressed sample. The original
 /// container duration is authoritative when AVAssetReader omits image duration.
 /// Only timing scalars survive each pair; no media owner or nominal FPS is used.
