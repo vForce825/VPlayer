@@ -96,15 +96,20 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let cpuStart = try processCPUSeconds()
         // The one299.5-second source/player deadline starts BEFORE prebuffer.
         let watchdog = AcceptancePlaybackDeadline(player: player, server: server, start: start)
-        let sampler = Task { @MainActor in
+        // Capture weak values, never the caller's mutable optional boxes. Parent
+        // roots stay alive until cancel + join; the task handle owns no graph.
+        let sampler = Task { @MainActor [weak graph, weak authority] in
             do {
                 var nextSample = 0.0
                 while !watchdog.hasStopped && !Task.isCancelled {
                     let wall = AcceptanceClock.now - start
                     if wall >= nextSample && nextSample < 300 {
+                        guard let graph, authority != nil else {
+                            throw AcceptanceError.invalid("active sampler lost graph ownership")
+                        }
                         var sample = AcceptanceReport.sample(wall: wall, footprint: try nativeFootprint(),
-                            packets: graph!.packetCount, eof: graph!.hasEOF,
-                            packetAge: max(0, AcceptanceClock.now - graph!.lastPacketTime))
+                            packets: graph.packetCount, eof: graph.hasEOF,
+                            packetAge: max(0, AcceptanceClock.now - graph.lastPacketTime))
                         #if !HLS_ACCEPTANCE_BASELINE
                         let value = probe.snapshot
                         guard value.isComplete else { throw AcceptanceError.invalid("native diagnostic capacity exceeded") }

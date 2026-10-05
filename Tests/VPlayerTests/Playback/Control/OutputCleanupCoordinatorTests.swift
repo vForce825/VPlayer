@@ -4144,7 +4144,7 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let beforeClaim = try XCTUnwrap(registry.outputResourceContextSnapshot())
             let reservation = try XCTUnwrap(registry.cleanupReservationSnapshot())
             let occupancy = registry.occupancy
-            registry.executor.sync {
+            try registry.executor.sync {
                 // Hold the executor across the claim and its local projection so
                 // the already-registered asynchronous drain cannot win this check.
                 XCTAssertThrowsError(try registry.claimOutputSuccessor(claim)) {

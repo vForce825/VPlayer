@@ -215,4 +215,28 @@ class AcceptanceControls(unittest.TestCase):
             '--duration-seconds','301','--head','a'*40],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0);self.assertIn('300',result.stderr)
 
+class AcceptanceSamplerSourceContract(unittest.TestCase):
+    """Portable capture/order guard; Apple compilation and ARC remain native checks."""
+    def setUp(self):
+        self.source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/PersistentHLSAcceptanceTests.swift').read_text()
+
+    def test_sampler_captures_weak_values_instead_of_mutable_optional_boxes(self):
+        declaration=next(line.strip() for line in self.source.splitlines()
+                         if line.strip().startswith('let sampler = Task'))
+        self.assertEqual(declaration,'let sampler = Task { @MainActor [weak graph, weak authority] in')
+        self.assertTrue('guard let graph, authority != nil else {' in self.source,
+                        'Active sampling must reject unexpectedly missing graph owners')
+
+    def test_sampler_is_physically_joined_before_both_root_release_paths(self):
+        cleanups=self.source.split('let cleanupStart = AcceptanceClock.now')[1:]
+        self.assertEqual(len(cleanups),2)
+        for cleanup in cleanups:
+            cancelled=cleanup.index('sampler.cancel()')
+            joined=cleanup.index('await sampler.value')
+            self.assertLess(cancelled,joined)
+            for root in ['assembler','graph','authority']:
+                self.assertLess(joined,cleanup.index(f'{root} = nil'))
+        self.assertIn('let ownersReleased = retiredOwners.allReleased',self.source)
+        self.assertIn('guard ownersReleased, ledgers() == ledgerBefore else {',self.source)
+
 if __name__=='__main__':unittest.main()
