@@ -12,3 +12,5 @@
 #import <VPlayerPlayback/VPFFmpegParser.h>
 #import <VPlayerPlayback/VPFFmpegSourceInspector.h>
 #import <VPlayerPlayback/VPFFmpegVideoDecoder.h>
+#import <VPlayerPlayback/VPSourceContainerAdmission.h>
+#import <VPlayerPlayback/VPSourceDolbyFramer.h>

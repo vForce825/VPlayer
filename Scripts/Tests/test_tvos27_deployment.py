@@ -51,5 +51,35 @@ class TVOS27DeploymentTests(unittest.TestCase):
     def test_public_deployment_contract(self):
         self.assertIn('"tvOS 27.0"', (ROOT / 'Sources/VPlayerCore/VPlayerCore.swift').read_text())
 
+    def test_playback_umbrella_covers_generated_public_headers(self):
+        project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()
+        target = re.search(
+            r'/\* VPlayerPlayback \*/ = \{\n\s*isa = PBXNativeTarget;(.*?)\n\t\t\};',
+            project, re.S)
+        self.assertIsNotNone(target)
+        phase = re.search(r'([A-F0-9]{24}) /\* Headers \*/', target.group(1))
+        self.assertIsNotNone(phase)
+        headers = re.search(
+            re.escape(phase.group(1)) + r' /\* Headers \*/ = \{(.*?)\n\t\t\};',
+            project, re.S)
+        self.assertIsNotNone(headers)
+        entries = re.findall(r'([A-F0-9]{24}) /\* (\S+\.h) in Headers \*/',
+                             headers.group(1))
+        self.assertTrue(entries)
+        public = set()
+        for entry_id, name in entries:
+            entry = re.search(r'^\s*' + re.escape(entry_id) + r' /\*[^\n]+',
+                              project, re.M)
+            self.assertIsNotNone(entry)
+            if re.search(r'ATTRIBUTES = \([^)]*\bPublic\b', entry.group(0)):
+                public.add(name)
+        self.assertIn('VPlayerPlayback.h', public)
+        self.assertIn('VPFFmpegSourceInspector.h', public)
+        umbrella = (ROOT / 'Sources/VPlayerPlayback/include/VPlayerPlayback.h').read_text()
+        imports = set(re.findall(
+            r'^\s*#(?:import|include)\s+<VPlayerPlayback/([^>]+)>', umbrella, re.M))
+        self.assertEqual(public - {'VPlayerPlayback.h'}, imports,
+                         'The playback umbrella must cover every generated public header')
+
 if __name__ == '__main__':
     unittest.main()
