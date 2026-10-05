@@ -32,6 +32,8 @@ CASES = {
             "testMissingMarkerIsUnavailableRatherThanZeroWidth",
             "testAnotherCardsMarkerCannotStandInForTheRequestedCard",
             "testInvalidRasterStorageAndNonfiniteBoundsAreUnavailable",
+            "testMarkerSearchIsBoundedByRowsAndIntersectingRuns",
+            "testCenteredMarkerSearchPreservesGeometryRejectionsAndLongestRun",
         ],
     },
 }

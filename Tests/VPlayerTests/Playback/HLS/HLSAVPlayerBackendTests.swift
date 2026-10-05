@@ -167,6 +167,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             publicationDeadlineNanoseconds: 10_000_000_000)
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
             graph: SystemHLSDeliveryGraph(authority: authority))
         let currentRelay = try Self.makeRuntimeFailureRelay(in: .shared, sink: sharedSink)
         let second = HLSOutputItemBundle(
@@ -207,6 +208,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let assembler = HLSMediaGraphAssembler(
             sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
             graph: SystemHLSDeliveryGraph(authority: authority))
 
         do {
@@ -263,6 +265,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         publication.installBeforeReceiveForTesting { object in gate.receive(object) }
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
             graph: SystemHLSDeliveryGraph(authority: authority))
         let before = SystemHLSLoopbackClock.nowNanoseconds()
         do {
@@ -285,8 +288,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     func testLiveLongGOPPendingSegmentPublishesWithoutAnotherCallback() async throws {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        // A bounded 60s source prefix supplies the six-segment startup plus
+        // the pending segment. Holding a publication callback must not enqueue
+        // the entire 80s burst behind it and exhaust the native relay.
         let server = try Task22LatePublicationFixtureServer(
-            fileURL: file, sendEntireBodyWithoutEOF: true)
+            fileURL: file)
         let authority = try SystemHLSMediaGraphAuthority(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_202))
         let publication = authority.publicationForTesting
@@ -303,17 +309,17 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let publisher = try XCTUnwrap(publication.publisher)
             let initial = try XCTUnwrap(publisher.visible)
             let video = try XCTUnwrap(publication.declaration?.video?.participantID)
-            XCTAssertEqual(initial.media[video]?.logicalSequences.last, 2)
-            gate.releaseThrough(3)
-            let nextBlocked = await Task.detached { gate.waitUntilBlocked(atLeast: 4) }.value
+            XCTAssertEqual(initial.media[video]?.logicalSequences.last, 5)
+            gate.releaseThrough(6)
+            let nextBlocked = await Task.detached { gate.waitUntilBlocked(atLeast: 7) }.value
             XCTAssertTrue(nextBlocked, "The next callback must be held outside the real publication graph")
             let deadline = ContinuousClock.now + .seconds(7)
-            while publisher.visible?.media[video]?.logicalSequences.last == 2,
+            while publisher.visible?.media[video]?.logicalSequences.last == 5,
                   authority.failureDiagnostic == nil, ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(20))
             }
             XCTAssertNil(authority.failureDiagnostic)
-            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 3,
+            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 6,
                 "A sealed pending 5s segment must publish when its real-time gate opens, with no callback or EOF to drive it")
             XCTAssertFalse(publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
             XCTAssertFalse(server.hasSentSourceEOF)
@@ -335,8 +341,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let authority = try SystemHLSMediaGraphAuthority(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_203))
         let publication = authority.publicationForTesting
-        let gate = Task22LatePublicationReceiveGate()
-        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
         // Keep the deliberately incomplete live HTTP body inside its read budget
         // for the whole publication observation; network timeout is a different test.
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
@@ -346,20 +350,37 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         do {
             _ = try await assembler.startUntilPlayablePrefix()
             let publisher = try XCTUnwrap(publication.publisher)
+            let store = try XCTUnwrap(publication.store)
             let video = try XCTUnwrap(publication.declaration?.video?.participantID)
-            XCTAssertEqual(publisher.visible?.media[video]?.logicalSequences.last, 2)
-            gate.release()
+            let (initial, initialCommit) = try store.domain.sync {
+                (try XCTUnwrap(publisher.visible),
+                 try XCTUnwrap(publisher.ticket.previousPublishInstant))
+            }
+            let initialSequence = try XCTUnwrap(initial.media[video]?.logicalSequences.last)
+            XCTAssertEqual(initialSequence, 5)
             // The body arrives as a burst, but the production graph must bound its
             // producer and keep publishing on real five-second gates. No test calls
             // publisher.publish, finishes a writer, or manufactures a receipt.
             let deadline = ContinuousClock.now + .seconds(75)
-            var lastSequence: UInt64 = 2
+            var lastCommit = initialCommit
+            var lastSequence = initialSequence
             var maximumPending = 0
             while lastSequence < 13, authority.failureDiagnostic == nil,
                   ContinuousClock.now < deadline {
-                let snapshot = try XCTUnwrap(publisher.visible)
+                // Snapshot and commit instant must describe the same transaction.
+                // A delayed polling task may miss a valid five-second publication.
+                let (snapshot, committed) = try store.domain.sync {
+                    (try XCTUnwrap(publisher.visible),
+                     try XCTUnwrap(publisher.ticket.previousPublishInstant))
+                }
                 let current = try XCTUnwrap(snapshot.media[video]?.logicalSequences.last)
                 XCTAssertGreaterThanOrEqual(current, lastSequence)
+                if current > lastSequence {
+                    let elapsedGates = Int64(current - lastSequence) * 5_000_000_000
+                    XCTAssertGreaterThanOrEqual(committed - lastCommit, elapsedGates,
+                        "Burst input cannot bypass any production five-second monotonic gate")
+                    lastCommit = committed
+                }
                 lastSequence = current
                 maximumPending = max(maximumPending, publisher.pendingLogicalSequenceCount)
                 XCTAssertFalse(snapshot.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
@@ -371,11 +392,13 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 "A live playlist must cover at least 70 seconds of real media without natural-end drain")
             XCTAssertLessThanOrEqual(maximumPending, 8,
                 "Fixing the clock must preserve the bounded publication backlog")
+            XCTAssertGreaterThanOrEqual(lastCommit - initialCommit, 40_000_000_000,
+                "Eight live five-second commits must occur after the genuine six-segment prefix")
             let coverage = try XCTUnwrap(publisher.visible?.coverage.participants.first {
                 $0.participantID == video
             })
             let horizon = try XCTUnwrap(coverage.ranges.last?.end)
-            XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(horizon.cmTime), 70)
+            XCTAssertGreaterThanOrEqual(CMTimeGetSeconds(horizon.cmTime) - 10, 70)
             for range in coverage.ranges {
                 XCTAssertEqual(CMTimeGetSeconds(range.duration.cmTime), 5, accuracy: 0.001,
                     "This fixture must exercise genuine 5s GOP segments, not one-second callbacks")
@@ -384,7 +407,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         } catch {
             XCTFail("The production continuous-live path failed before its progress assertion: \(error)")
         }
-        gate.release()
         server.stop()
         let retired = await assembler.retireAndAwaitReceipt()
         XCTAssertTrue(retired, "The continuous source must retire without relying on source EOF")
@@ -400,8 +422,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 22_204),
             publicationClock: clock)
         let publication = authority.publicationForTesting
-        let gate = Task22LatePublicationReceiveGate()
-        publication.installBeforeReceiveForTesting { object in gate.receive(object) }
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
             demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
@@ -415,7 +435,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertEqual(publisher.ticket.previousPublishInstant, 90_000_000_000)
             XCTAssertEqual(publication.store?.monotonicNowNanoseconds, 90_000_000_000,
                 "HTTP residency and publication must sample the same injected domain")
-            gate.release()
             let deadline = ContinuousClock.now + .seconds(10)
             while !publisher.shouldBackpressureProducer, authority.failureDiagnostic == nil,
                   ContinuousClock.now < deadline {
@@ -429,7 +448,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         } catch {
             XCTFail("The actual producer did not reach its capacity wait: \(error)")
         }
-        gate.release()
         // Retirement must interrupt the producer wait before joining that worker.
         let retired = await assembler.retireAndAwaitReceipt()
         server.stop()
@@ -457,6 +475,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         publication.installBeforeReceiveForTesting { object in gate.receive(object) }
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
             graph: SystemHLSDeliveryGraph(authority: authority))
         do {
             _ = try await assembler.startUntilPlayablePrefix()
@@ -550,6 +569,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let publication = authority.publicationForTesting
         let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
             applicationLedger: HLSDeliveryApplicationChargeLedger(),
+            demuxer: FFmpegDemuxer(timeoutUS: 120_000_000),
             graph: SystemHLSDeliveryGraph(authority: authority))
         let wake = Task22SelectedLiveWakeGate()
         do {
@@ -558,10 +578,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             print("EOF_WAKE_INITIAL sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
             let video = try XCTUnwrap(publication.declaration?.video?.participantID)
             try assertLateFixtureCoverage(try XCTUnwrap(publisher.visible), video: video,
-                logicalSequences: Array(0...2))
+                logicalSequences: Array(0...5))
             // The real timeline-origin contract above proves 15 eligible seconds:
-            // initial three segments, eleven live commits, then one EOF commit.
-            for expected in UInt64(1)..<12 {
+            // initial six segments, eight live commits, then one EOF commit.
+            for expected in UInt64(1)..<9 {
                 let pending = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
                 XCTAssertTrue(pending, "expected=\(expected) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) failure=\(String(describing: authority.failureDiagnostic))")
                 clock.advance(nanoseconds: 1_000_000_000)
@@ -570,9 +590,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 }
                 XCTAssertTrue(published)
             }
-            XCTAssertEqual(publisher.visible?.publicationSequence, 12)
+            XCTAssertEqual(publisher.visible?.publicationSequence, 9)
             try assertLateFixtureCoverage(try XCTUnwrap(publisher.visible), video: video,
-                logicalSequences: Array(8...13))
+                logicalSequences: Array(8...13), publishedSequences: Array(7...13))
             XCTAssertEqual(publisher.pendingLogicalSequenceCount, 0,
                 "The genuine source has 15 eligible seconds and leaves only its unsealed final segment")
             publication.installLiveWakeObserverForTesting(
@@ -588,7 +608,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let final = try XCTUnwrap(publisher.visible)
             print("EOF_WAKE_FINAL sequence=\(final.publicationSequence) media=\(final.media.mapValues { $0.logicalSequences }) coverage=\(final.coverage)")
             XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
-            XCTAssertEqual(final.publicationSequence, 13, "Exactly one final commit follows the twelve live publications")
+            XCTAssertEqual(final.publicationSequence, 10, "Exactly one final commit follows the nine live publications")
             try assertLateFixtureCoverage(final, video: video, logicalSequences: Array(9...14))
             XCTAssertNil(authority.failureDiagnostic)
             wake.release()
@@ -650,9 +670,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             print("CAPACITY_WAKE_INITIAL outcome=\(outcome) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
             let store = try XCTUnwrap(publication.store)
             // Logical13 is the last sealed live segment; logical14 seals only at
-            // genuine EOF. Block the former at publication11, not an absent logical15.
-            let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 11 : 4
-            callbacks.releaseThrough(lastBeforeCapacity + 2)
+            // genuine EOF. Six initial segments make logical12 publication8.
+            let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 8 : 4
+            callbacks.releaseThrough(lastBeforeCapacity + 5)
             for expected in UInt64(1)...lastBeforeCapacity {
                 let reached = try await waitForLiveTestCondition {
                     publisher.visible?.publicationSequence == expected || authority.failureDiagnostic != nil
@@ -777,17 +797,52 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     }
 
     private func assertLateFixtureCoverage(_ snapshot: HLSPublishedSnapshot, video: UInt64,
-        logicalSequences: [UInt64], file: StaticString = #filePath, line: UInt = #line) throws {
+        logicalSequences: [UInt64], publishedSequences: [UInt64]? = nil,
+        file: StaticString = #filePath, line: UInt = #line) throws {
         XCTAssertEqual(snapshot.media.count, 2, file: file, line: line)
+        XCTAssertEqual(logicalSequences.count, 6, file: file, line: line)
         XCTAssertEqual(snapshot.coverage.logicalSequences, logicalSequences, file: file, line: line)
-        for media in snapshot.media.values {
-            XCTAssertEqual(media.logicalSequences, logicalSequences, file: file, line: line)
-        }
         XCTAssertEqual(Set(snapshot.coverage.participants.map { $0.participantID }),
             Set(snapshot.media.keys), file: file, line: line)
+        // The readiness view always has exactly six common entries. AAC access
+        // units can make their physical duration slightly less than three immutable
+        // target durations; only that real deficit permits one published overlap.
+        var needsOverlap = false
+        for participant in snapshot.coverage.participants {
+            let media = try XCTUnwrap(snapshot.media[participant.participantID], file: file, line: line)
+            let targetLine = try XCTUnwrap(media.text.split(separator: "\n").first {
+                $0.hasPrefix("#EXT-X-TARGETDURATION:")
+            }, file: file, line: line)
+            let target = try XCTUnwrap(Int64(targetLine.split(separator: ":")[1]), file: file, line: line)
+            let sixDuration = try participant.ranges.reduce(ExactMediaTime(value: 0, timescale: 1)) {
+                try $0.adding($1.duration)
+            }
+            XCTAssertEqual(participant.ranges.count, 6, file: file, line: line)
+            let belowTargetFloor = try HLSChecked.compare(sixDuration,
+                .init(value: 3 * target, timescale: 1)) < 0
+            needsOverlap = needsOverlap || belowTargetFloor
+            let durations = try media.text.split(separator: "\n").filter { $0.hasPrefix("#EXTINF:") }.map {
+                try XCTUnwrap(Double($0.dropFirst(8).split(separator: ",")[0]), file: file, line: line)
+            }
+            XCTAssertEqual(durations.count, media.logicalSequences.count, file: file, line: line)
+            XCTAssertGreaterThanOrEqual(durations.reduce(0, +), Double(3 * target) - 0.000_01,
+                "The actual published bytes must satisfy the immutable target-duration floor", file: file, line: line)
+        }
+        let first = try XCTUnwrap(logicalSequences.first, file: file, line: line)
+        var expectedWindow = logicalSequences
+        if needsOverlap {
+            let predecessor = try XCTUnwrap(first > 0 ? first - 1 : nil, file: file, line: line)
+            expectedWindow.insert(predecessor, at: 0)
+        }
+        if let publishedSequences {
+            XCTAssertEqual(expectedWindow, publishedSequences, file: file, line: line)
+        }
+        XCTAssertEqual(snapshot.coverage.publishedWindow, expectedWindow, file: file, line: line)
+        for media in snapshot.media.values {
+            XCTAssertEqual(media.logicalSequences, expectedWindow, file: file, line: line)
+        }
         let videoCoverage = try XCTUnwrap(snapshot.coverage.participants.first { $0.participantID == video },
             file: file, line: line)
-        XCTAssertEqual(videoCoverage.ranges.count, logicalSequences.count, file: file, line: line)
         for (sequence, range) in zip(logicalSequences, videoCoverage.ranges) {
             XCTAssertEqual(range.start, .init(value: 10 + Int64(sequence), timescale: 1), file: file, line: line)
             XCTAssertEqual(range.duration, .init(value: 1, timescale: 1), file: file, line: line)
@@ -1776,8 +1831,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let media = records.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
             let initial = try XCTUnwrap(records.first { $0.kind == .initialization })
             XCTAssertGreaterThanOrEqual(media.count, 60)
-            XCTAssertGreaterThan(Set(media.map(\.writer)).count, 5,
-                "The regression must cross actual physical AAC writer windows")
+            XCTAssertEqual(Set(media.map(\.writer)).count, 1,
+                "Stable AAC input must retain one persistent native writer across all fragment windows")
+            XCTAssertEqual(records.filter { $0.kind == .initialization }.count, 1)
             for (previous, current) in zip(media, media.dropFirst()) {
                 XCTAssertEqual(current.sequence, previous.sequence + 1)
                 let previousEnd = CMTimeAdd(try XCTUnwrap(previous.start), try XCTUnwrap(previous.duration))
@@ -1794,10 +1850,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             try bytes.write(to: output)
             let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0) }
             XCTAssertTrue(zip(fragments, fragments.dropFirst()).allSatisfy { pair in pair.1.sequence > pair.0.sequence },
-                "Native mfhd values must increase across physical writers: \(fragments.map(\.sequence))")
+                "Native mfhd values must increase across persistent-writer fragments: \(fragments.map(\.sequence))")
             for (previous, current) in zip(fragments, fragments.dropFirst()) {
                 XCTAssertEqual(current.decodeTime, previous.decodeTime + previous.sampleCount * 1_024,
-                    "Original tfdt/trun must preserve every AAC access unit across writer windows")
+                    "Original tfdt/trun must preserve every AAC access unit across fragment windows")
             }
             // Decode the actual canonical init and all original media bytes. No
             // sequence-number rewrite, box removal, or timing normalization is allowed.
@@ -2086,19 +2142,19 @@ private final class EmptyHLSFailureDemuxHandle: FFmpegDemuxHandle, @unchecked Se
     func destroy() {}
 }
 
-/// 只挡住真实已 sealed 的第四段及后继 callback；不触碰媒体、report 或 receipt。
+/// Hold only callbacks beyond the genuine six-segment startup; media and receipts stay untouched.
 private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
     private let condition = NSCondition()
     private var released = false
     private var blocked = 0
     private var highestBlockedSequence: UInt64 = 0
-    private var permittedThrough: UInt64 = 2
+    private var permittedThrough: UInt64 = 5
     private var timedOut = false
 
     var didTimeout: Bool { condition.withLock { timedOut } }
 
     func receive(_ object: SealedMediaObject) {
-        guard object.kind == .media, object.logicalSequence >= 3 else { return }
+        guard object.kind == .media, object.logicalSequence >= 6 else { return }
         condition.lock()
         defer { condition.unlock() }
         guard !released, object.logicalSequence > permittedThrough else { return }
@@ -2114,7 +2170,7 @@ private final class Task22LatePublicationReceiveGate: @unchecked Sendable {
         }
     }
 
-    func waitUntilBlocked(atLeast sequence: UInt64 = 3) -> Bool {
+    func waitUntilBlocked(atLeast sequence: UInt64 = 6) -> Bool {
         condition.lock()
         defer { condition.unlock() }
         let deadline = Date().addingTimeInterval(10)
@@ -2178,8 +2234,8 @@ private final class Task22SelectedLiveWakeGate: @unchecked Sendable {
     func release() { condition.withLock { released = true; condition.broadcast() } }
 }
 
-/// 只发送固定 TS 的前 3/8（188-byte packet 对齐），声明完整长度但保持响应未结束。
-/// 本 fixture 静态 PTS 覆盖约 5.8 秒，足够真实 3 秒 prefix 与已 sealed 第四段。
+/// Send a packet-aligned 3/4 prefix (or all but one packet) and withhold real EOF.
+/// The default 16s fixture then supplies the six-segment startup and sealed successors.
 private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
     private final class Connections: @unchecked Sendable {
         private let lock = NSLock()
@@ -2241,7 +2297,7 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
         // This tests live publication; no EOF can activate the separate drain.
         let prefixBytes = sendEntireBodyWithoutEOF
             ? (payload.count / 188 - 1) * 188
-            : (payload.count * 3 / 8) / 188 * 188
+            : (payload.count * 3 / 4) / 188 * 188
         guard prefixBytes > 0, prefixBytes < payload.count else {
             throw NSError(domain: "Task22LatePublicationFixtureServer", code: 1)
         }

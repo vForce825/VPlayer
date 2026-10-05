@@ -675,7 +675,7 @@ struct AcceptanceVideoReaderCursor {
         switch kind {
         case .decoded:
             guard sample.contentType == .pixelBuffer, sample.hasImage,
-                  sample.blockSize == nil, sample.totalSize == 0 else {
+                  sample.blockSize == nil else {
                 throw AcceptanceError.invalid("decoded video reader sample has no sole image payload")
             }
         case .original:

@@ -4643,6 +4643,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 authority.commands[index]?.phase = .terminal(.canceled)
             }
         }
+        if case .failed(let error) = result {
+            startFailedBackendPublicationReprepareCleanup(handoff, error: error)
+            return
+        }
         guard case .succeeded = result, handoff.shouldReactivate,
               let context = outputResourceContextSnapshot(), context.prepared,
               let activation = try? beginOutputActivation(
@@ -4653,6 +4657,35 @@ final class ControlTaskRegistry: @unchecked Sendable {
         // 用户播放意图。Registry 在新 lifecycle 上重新签发正式 activation；backend
         // 不能绕过该权威直接调用 AVPlayer.play()。
         _ = await joinOutputBackendOperation(activation)
+    }
+
+    /// The replacement runner has no controller awaiting its prepare result.
+    /// Transfer a real failure to terminal cleanup on this exact installed
+    /// lifecycle, then return so that cleanup can join the runner's physical tail.
+    private func startFailedBackendPublicationReprepareCleanup(
+        _ handoff: BackendPublicationReprepareHandoff, error: PlaybackCoreError
+    ) {
+        let failure = PlaybackController.failure(for: error)
+        executor.sync {
+            guard let receiver = terminalReceiver else { return }
+            let owner: OutputTransitionOwnerTicket? = try? transaction(operationDescriptor: .resourceOwnership) { output in
+                guard case .installed(let context, let backend) = authority.resourceState,
+                      context.owner == nil, context.sourceTask == handoff.ticket,
+                      context.prepareTicket == handoff.invocation.ticket,
+                      backend.object === handoff.backend,
+                      backend.lifecycle == handoff.invocation.outputLifecycleEpoch,
+                      let record = authority.commands.first(where: {
+                        $0?.controlTaskTicket == handoff.ticket
+                      }) ?? nil,
+                      record.backendOperation === handoff.runner else { return nil }
+                return try beginOutputTransitionLocked(contextNonce: context.contextNonce,
+                    reason: .terminal, anchorInstant: monotonicClock.nowNanoseconds,
+                    teardown: true, sourceActivation: nil, output: &output)
+            }
+            guard let owner else { return }
+            _ = startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+                terminalState: .failed(failure))
+        }
     }
 
     private func finishFailedBackendPublicationReplacement(
@@ -8716,6 +8749,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
             context.desiredBackendKind = kind
             context.sourceTask = prepared.ticket
             context.prepareTicket = prepare
+            // The retained lease carries the predecessor's context, not its
+            // readiness. Only this new backend's prepare may reopen activation.
+            context.prepared = false
             context.retainedRebase = nil
             authority.resourceState = .pendingCreation(context, lease)
             return installPreparedCommand(prepared)

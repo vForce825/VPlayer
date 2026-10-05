@@ -151,7 +151,10 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
     }
 
     func testRecoveryReadyFailureHasNoSuccessorActivationAndTeardownJoins() async throws {
-        try await NativeAdapterFixture.withFixture { fixture in
+        // Keep the startup budget frozen: only the actual reprepare failure may
+        // own terminal cleanup, not the original sixty-second deadline.
+        let clock = ManualPlaybackClock(100)
+        try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
             fixture.play(); try await fixture.until { fixture.isPlaying }
             let backend = try XCTUnwrap(fixture.factory.backend)
             let activation = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.activation)
@@ -160,9 +163,22 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
             let recoveryAccepted = await backend.requestWatchdogRecovery(activation: activation)
             XCTAssertTrue(recoveryAccepted)
             try await fixture.until { gate.entered }
+            let successor = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
+            XCTAssertFalse(successor.prepared)
+            XCTAssertNil(successor.activation)
+            XCTAssertNotEqual(fixture.driver.currentItemIdentity?.outputLifecycleEpoch, activation.outputLifecycleEpoch)
             gate.release()
             try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+            await fixture.registry.joinOwnedTerminalCleanup()
+            guard case .failed(let failure) = fixture.registry.playbackStateSnapshot() else {
+                return XCTFail("The failed successor must publish its preparation failure")
+            }
+            XCTAssertEqual(failure.code, "playback.backend.reprepare")
+            XCTAssertEqual(fixture.driver.installs, 2)
             XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertNil(fixture.driver.currentItemIdentity)
+            XCTAssertEqual(fixture.driver.rate, 0)
+            XCTAssertEqual(fixture.registry.occupancy.groups, 0)
         }
     }
 

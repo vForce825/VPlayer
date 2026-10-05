@@ -740,6 +740,42 @@ final class ChannelCardFocusRasterTests: XCTestCase {
         ))
     }
 
+    func testMarkerSearchIsBoundedByRowsAndIntersectingRuns() throws {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        var inspectedPixelCount = 0
+        XCTAssertEqual(try XCTUnwrap(raster(marker: 60..<220).markerWidth(
+            near: frame, inspectedPixelCount: &inspectedPixelCount
+        )), 160, accuracy: 0.001)
+        // 100 candidate rows plus six 160-pixel marker runs and their edges.
+        // Scanning all 260 columns per row would exceed this by over 20 times.
+        XCTAssertLessThanOrEqual(inspectedPixelCount, 1_100,
+            "Empty rows must use one center-column read, not a full-width scan")
+    }
+
+    func testCenteredMarkerSearchPreservesGeometryRejectionsAndLongestRun() throws {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        for marker in [60..<220, 61..<221, 90..<190] {
+            XCTAssertEqual(try XCTUnwrap(raster(marker: marker).markerWidth(near: frame)),
+                CGFloat(marker.count), accuracy: 0.001)
+        }
+        for marker in [84..<244, 34..<194, 91..<189] {
+            XCTAssertNil(raster(marker: marker).markerWidth(near: frame),
+                "Center tolerance and minimum run length must still reject \(marker)")
+        }
+        let fractionalCenter = CGRect(x: 139.0625, y: 40, width: 1, height: 100)
+        XCTAssertEqual(try XCTUnwrap(raster(marker: 139..<140).markerWidth(
+            near: fractionalCenter
+        )), 1, accuracy: 0.001,
+            "The center column must be floored; rounding would miss this accepted run")
+        XCTAssertNil(raster(marker: 60..<300).markerWidth(near: frame),
+            "A run crossing the right search edge must remain unavailable")
+        let split = raster(markers: [(40..<46, 60..<130), (40..<46, 150..<220)])
+        XCTAssertNil(split.markerWidth(near: frame), "Separated runs must not be joined")
+        let varied = raster(markers: [(40..<42, 60..<220), (42..<46, 50..<230)])
+        XCTAssertEqual(try XCTUnwrap(varied.markerWidth(near: frame)), 180, accuracy: 0.001,
+            "All marker rows must be measured, including a later, wider run")
+    }
+
     func testInvalidRasterStorageAndNonfiniteBoundsAreUnavailable() {
         let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
         let short = CardFocusRaster(width: 600, height: 200,
@@ -753,13 +789,19 @@ final class ChannelCardFocusRasterTests: XCTestCase {
     }
 
     private func raster(marker: Range<Int>) -> CardFocusRaster {
+        raster(markers: [(40..<46, marker)])
+    }
+
+    private func raster(markers: [(rows: Range<Int>, columns: Range<Int>)]) -> CardFocusRaster {
         var pixels = [UInt8](repeating: 0, count: 600 * 200 * 4)
-        for y in 40..<46 {
-            for x in marker {
-                let offset = (y * 600 + x) * 4
-                pixels[offset] = 255
-                pixels[offset + 2] = 255
-                pixels[offset + 3] = 255
+        for marker in markers {
+            for y in marker.rows {
+                for x in marker.columns {
+                    let offset = (y * 600 + x) * 4
+                    pixels[offset] = 255
+                    pixels[offset + 2] = 255
+                    pixels[offset + 3] = 255
+                }
             }
         }
         return CardFocusRaster(width: 600, height: 200,
@@ -804,6 +846,11 @@ private struct CardFocusRaster {
     }
 
     func markerWidth(near frame: CGRect) -> CGFloat? {
+        var inspectedPixelCount = 0
+        return markerWidth(near: frame, inspectedPixelCount: &inspectedPixelCount)
+    }
+
+    func markerWidth(near frame: CGRect, inspectedPixelCount: inout Int) -> CGFloat? {
         // Validate one contiguous read before scanning the screenshot. Repeated
         // Array subscripts make this diagnostic unnecessarily slow in Debug;
         // the pointer stays inside this synchronous, owner-retaining closure.
@@ -830,32 +877,37 @@ private struct CardFocusRaster {
         let y0 = Int(min(CGFloat(height), max(0, bounds[2])))
         let y1 = Int(min(CGFloat(height), max(0, bounds[3])))
         guard x0 < x1, y0 < y1 else { return nil }
+        // Every accepted run spans the center column: its half-length is at
+        // least 25% of the card width while its center offset is below 12%.
+        // Empty rows therefore need only one pixel read. This preserves the
+        // longest complete run, clipping rejection and all geometry thresholds.
+        guard centreX >= CGFloat(x0), centreX < CGFloat(x1) else { return nil }
+        let centerColumn = Int(centreX.rounded(.down))
         return rgba.withUnsafeBufferPointer { storage in
             guard let base = storage.baseAddress else { return nil }
+            func isMarker(_ x: Int, row: UnsafePointer<UInt8>) -> Bool {
+                inspectedPixelCount += 1
+                let pixel = row.advanced(by: x * 4)
+                return pixel[0] >= 180 && pixel[1] <= 100 && pixel[2] >= 180
+            }
             var longest = 0
             for y in y0..<y1 {
                 let row = base.advanced(by: y * width * 4)
-                var start: Int?
-                for x in x0...x1 {
-                    let isMarker: Bool
-                    if x < x1 {
-                        let pixel = row.advanced(by: x * 4)
-                        isMarker = pixel[0] >= 180 && pixel[1] <= 100 && pixel[2] >= 180
-                    } else {
-                        isMarker = false
-                    }
-                    if isMarker {
-                        if start == nil { start = x }
-                    } else if let runStart = start {
-                        let length = x - runStart
-                        let centre = CGFloat(runStart + x) / 2
-                        if runStart > x0, x < x1,
-                           abs(centre - centreX) < frame.width * scaleX * 0.12,
-                           CGFloat(length) >= frame.width * scaleX * 0.5 {
-                            longest = max(longest, length)
-                        }
-                        start = nil
-                    }
+                guard isMarker(centerColumn, row: row) else { continue }
+                var runStart = centerColumn
+                while runStart > x0, isMarker(runStart - 1, row: row) {
+                    runStart -= 1
+                }
+                var runEnd = centerColumn + 1
+                while runEnd < x1, isMarker(runEnd, row: row) {
+                    runEnd += 1
+                }
+                let length = runEnd - runStart
+                let centre = CGFloat(runStart + runEnd) / 2
+                if runStart > x0, runEnd < x1,
+                   abs(centre - centreX) < frame.width * scaleX * 0.12,
+                   CGFloat(length) >= frame.width * scaleX * 0.5 {
+                    longest = max(longest, length)
                 }
             }
             guard longest > 0 else { return nil }

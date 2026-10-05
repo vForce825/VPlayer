@@ -53,8 +53,12 @@ final class PlaybackControllerTests: XCTestCase {
             let commit = try XCTUnwrap(harness.registry.stableRouteCommitSnapshot())
             let backend = try XCTUnwrap(harness.factory.createdBackends.last)
             XCTAssertEqual(preparing.phase, .installed)
-            XCTAssertFalse(preparing.prepared)
+            XCTAssertFalse(preparing.prepared,
+                "A new backend cannot inherit the predecessor's completed preparation")
             XCTAssertNil(preparing.owner)
+            XCTAssertNil(preparing.activation)
+            XCTAssertNil(preparing.interval)
+            XCTAssertEqual(preparing.sourceTask.flatMap { harness.registry.phase(of: $0) }, .running)
             XCTAssertEqual(prepare.stableRouteCommitEpoch, commit.epoch)
             XCTAssertEqual(prepare.backendIdentity, backend.identity)
             XCTAssertNotEqual(predecessorCommit, commit)
@@ -76,7 +80,19 @@ final class PlaybackControllerTests: XCTestCase {
             prepareGate.signal()
             await delivery.value
             await handoff.value
+            // The route service can own the handoff before the explicit request
+            // enters the controller. Join the exact successor's terminal activation.
+            try await eventually {
+                guard let current = harness.registry.outputResourceContextSnapshot(),
+                      current.prepareTicket == prepare, let activation = current.sourceTask else { return false }
+                return current.prepared && current.owner == nil
+                    && harness.registry.phase(of: activation) == .terminal(.completed)
+            }
+            XCTAssertEqual(harness.registry.stableRouteCommitSnapshot(), commit)
             XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, prepare)
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.desiredBackendKind, .hlsAVPlayer)
+            XCTAssertEqual(backend.positiveWorkSnapshot.prepared, 1)
+            XCTAssertEqual(backend.positiveWorkSnapshot.activated, 1)
             XCTAssertEqual(backend.retirementSnapshot.count, 0)
             XCTAssertEqual(harness.backendCreationCount, 2)
             XCTAssertEqual(harness.currentAudibleOutputs, 1)

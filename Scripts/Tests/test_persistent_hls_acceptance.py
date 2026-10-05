@@ -251,6 +251,15 @@ class AcceptanceReaderSourceContract(unittest.TestCase):
         self.assertNotIn('CMSampleBuffer?',cursor)
         self.assertNotIn('[CMSampleBuffer]',cursor)
 
+    def test_decoded_reader_accepts_raster_size_without_weakening_payload_checks(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
+        cursor=source.split('struct AcceptanceVideoReaderCursor',1)[1].split('struct AcceptanceVideoTiming',1)[0]
+        decoded=cursor.split('case .decoded:',1)[1].split('case .original:',1)[0]
+        self.assertIn('sample.contentType == .pixelBuffer',decoded)
+        self.assertIn('sample.hasImage',decoded)
+        self.assertIn('sample.blockSize == nil',decoded)
+        self.assertNotIn('sample.totalSize',decoded)
+
 class AcceptanceSamplerSourceContract(unittest.TestCase):
     """Portable capture/order guard; Apple compilation and ARC remain native checks."""
     def setUp(self):

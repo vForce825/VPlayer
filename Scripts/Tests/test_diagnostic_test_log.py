@@ -21,10 +21,10 @@ class DiagnosticLogTests(unittest.TestCase):
             for cls, cases in MODULE.CASES[group].items() for case in cases
         )
 
-    def test_focus_requires_all_eight_visual_and_raster_cases(self):
+    def test_focus_requires_all_ten_visual_and_raster_cases(self):
         self.assertIn("testInvalidRasterStorageAndNonfiniteBoundsAreUnavailable",
                       MODULE.CASES["focus"]["ChannelCardFocusRasterTests"])
-        self.assertEqual(MODULE.verify(self.transcript("focus"), "focus"), 8)
+        self.assertEqual(MODULE.verify(self.transcript("focus"), "focus"), 10)
 
     def test_audio_requires_all_six_original_cases(self):
         self.assertEqual(MODULE.verify(self.transcript("audio"), "audio"), 6)

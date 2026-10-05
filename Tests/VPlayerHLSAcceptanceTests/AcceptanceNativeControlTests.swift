@@ -253,9 +253,13 @@ final class AcceptanceNativeControlTests: XCTestCase {
             XCTAssertThrowsError(try cursor.consumesMedia(fault), "Nonempty malformed data must fail")
         }
         var imageCursor = AcceptanceVideoReaderCursor(kind: .decoded)
-        bad = decoded; bad.hasImage = false
+        var raster = decoded; raster.totalSize = 1_414_080
+        XCTAssertTrue(try imageCursor.consumesMedia(raster),
+            "The native reader reports positive raster bytes for a valid decoded image")
+        XCTAssertEqual(imageCursor.skippedMarkers, 0)
+        bad = raster; bad.hasImage = false
         XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
-        bad = decoded; bad.blockSize = 4
+        bad = raster; bad.blockSize = 4
         XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
         XCTAssertThrowsError(try imageCursor.consumesMedia(compressed))
         var originalCursor = AcceptanceVideoReaderCursor(kind: .original)

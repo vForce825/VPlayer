@@ -1492,9 +1492,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
     }
 
     func testWriterMetadataAndEvidenceExhaustionPrecedeRemuxMaterializationAndBoundaryEffects() throws {
-        for available in [4_095, 4_096 + 1_023] {
+        // New reservations are rejected at the soft threshold even below the hard
+        // cap. Leave exactly enough headroom for metadata only in the second case.
+        for metadataHeadroom in [0, WriterInputAdmission.metadataBytes] {
             let ledger = HLSDeliveryApplicationChargeLedger()
-            let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: UInt64(80_000 + available))
+            let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: UInt64(80_000 + metadataHeadroom))
             let factory = Task17FakeSystemWriterFactory()
             let writer = try Task17Fixtures.makeWriter(seed: 80_000, kind: .video,
                 writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
@@ -1506,11 +1508,11 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
             let before = fixture.boundary.usage
             let blocker = try ledger.reserve(allocationIdentity: UUID(),
-                bytes: HLSDeliveryApplicationChargeLedger.documentedApplicationHardBytes - ledger.chargedBytes - available)
+                bytes: HLSDeliveryApplicationChargeLedger.documentedApplicationSoftBytes - ledger.chargedBytes - metadataHeadroom)
             let pressure = ledger.chargedBytes
             XCTAssertThrowsError(try writer.appendRemuxVideo(attempt, ticket: ticket)) {
                 XCTAssertEqual($0 as? SegmentedFMP4WriterFailure,
-                    available < WriterInputAdmission.metadataBytes
+                    metadataHeadroom == 0
                         ? .terminalOwnershipCapacityExceeded : .inputEvidenceCapacityExceeded)
             }
             XCTAssertEqual(factory.lastWriter?.appendCount, 0)
