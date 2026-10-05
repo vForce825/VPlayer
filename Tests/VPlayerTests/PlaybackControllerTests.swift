@@ -29,6 +29,72 @@ final class PlaybackControllerTests: XCTestCase {
         await harness.registry.joinOwnedTerminalCleanup()
     }
 
+    func testRouteCommitAlreadyOwnedByPreparingSuccessorDoesNotStartAnotherHandoff() async throws {
+        let harness = BackendOwnershipTestHarness()
+        await harness.playLocal()
+        let predecessorCommit = try XCTUnwrap(harness.registry.stableRouteCommitSnapshot())
+        let prepareEntered = expectation(description: "The successor owns the new route and is preparing")
+        let prepareGate = DispatchSemaphore(value: 0)
+        defer { prepareGate.signal() }
+        harness.factory.configureBackend = { [weak factory = harness.factory] backend in
+            guard backend.kind == .hlsAVPlayer else { return }
+            factory?.configureBackend = nil
+            backend.observePreparation { _ in
+                prepareEntered.fulfill()
+                prepareGate.wait()
+            }
+        }
+        harness.setRoute(.hlsAVPlayer)
+        let handoff = Task { await harness.controller.requestRouteHandoff(to: .hlsAVPlayer) }
+        await fulfillment(of: [prepareEntered], timeout: 2)
+        do {
+            let preparing = try XCTUnwrap(harness.registry.outputResourceContextSnapshot())
+            let prepare = try XCTUnwrap(preparing.prepareTicket)
+            let commit = try XCTUnwrap(harness.registry.stableRouteCommitSnapshot())
+            let backend = try XCTUnwrap(harness.factory.createdBackends.last)
+            XCTAssertEqual(preparing.phase, .installed)
+            XCTAssertFalse(preparing.prepared)
+            XCTAssertNil(preparing.owner)
+            XCTAssertEqual(prepare.stableRouteCommitEpoch, commit.epoch)
+            XCTAssertEqual(prepare.backendIdentity, backend.identity)
+            XCTAssertNotEqual(predecessorCommit, commit)
+
+            // Deliver both a late predecessor notification and the exact commit
+            // consumed by this prepare while its actual Task is still held.
+            // Neither notification may take ownership or wait for that Task.
+            let delivered = expectation(description: "Route notifications leave the original prepare in charge")
+            let delivery = Task {
+                await harness.controller.handleRouteCommit(predecessorCommit)
+                await harness.controller.handleRouteCommit(commit)
+                delivered.fulfill()
+            }
+            await fulfillment(of: [delivered], timeout: 2)
+            XCTAssertNil(harness.registry.outputResourceContextSnapshot()?.owner)
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, prepare)
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.sourceTask, preparing.sourceTask)
+            XCTAssertEqual(backend.retirementSnapshot.count, 0)
+            prepareGate.signal()
+            await delivery.value
+            await handoff.value
+            XCTAssertEqual(harness.registry.outputResourceContextSnapshot()?.prepareTicket, prepare)
+            XCTAssertEqual(backend.retirementSnapshot.count, 0)
+            XCTAssertEqual(harness.backendCreationCount, 2)
+            XCTAssertEqual(harness.currentAudibleOutputs, 1)
+            XCTAssertEqual(harness.registry.occupancy.ordinarySlots, 4,
+                "A fresh successor retains exactly factory, relay, prepare, and activation")
+        } catch {
+            prepareGate.signal()
+            await handoff.value
+            await harness.controller.stop()
+            await harness.registry.joinOwnedTerminalCleanup()
+            throw error
+        }
+        await harness.controller.stop()
+        await harness.registry.joinOwnedTerminalCleanup()
+        XCTAssertNil(harness.registry.ownedResourceSnapshot())
+        XCTAssertEqual(harness.registry.occupancy.groups, 0)
+    }
+
     func testRepeatedHLSRouteReplacementReclaimsDestroyedRelayChildren() async throws {
         let baseline = PlaybackResourceContextLedger.shared.chargedBytes
         try await exerciseRepeatedHLSRouteReplacement()
@@ -41,27 +107,32 @@ final class PlaybackControllerTests: XCTestCase {
         harness.setRoute(.hlsAVPlayer)
         await harness.playLocal()
         do {
-            // Cold start retains a factory command that a retained-session route
-            // cycle legitimately reclaims. Compare the same lifecycle phase;
-            // keep exact slot/group equality for every subsequent cycle.
+            // Compare complete route cycles. Every newly created backend keeps
+            // its factory record; a delayed notification for the route already
+            // owned by prepare must not cause an extra same-backend reprepare.
             for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
                 harness.setRoute(kind)
                 await harness.controller.requestRouteHandoff(to: kind)
                 try await eventually {
-                    guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                    guard let context = harness.registry.outputResourceContextSnapshot(),
+                          let activation = context.sourceTask else { return false }
                     return context.owner == nil && context.prepared && context.desiredBackendKind == kind
+                        && harness.registry.phase(of: activation) == .terminal(.completed)
                         && harness.currentAudibleOutputs == 1
                 }
             }
             let initial = harness.registry.occupancy
             let initialCommands = ordinaryCommandDiagnostics(harness.registry)
+            XCTAssertEqual(initial.ordinarySlots, 4, "The baseline must be a complete fresh-backend cycle")
             for _ in 0..<36 {
                 for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
                     harness.setRoute(kind)
                     await harness.controller.requestRouteHandoff(to: kind)
                     try await eventually {
-                        guard let context = harness.registry.outputResourceContextSnapshot() else { return false }
+                        guard let context = harness.registry.outputResourceContextSnapshot(),
+                              let activation = context.sourceTask else { return false }
                         return context.owner == nil && context.prepared && context.desiredBackendKind == kind
+                            && harness.registry.phase(of: activation) == .terminal(.completed)
                             && harness.currentAudibleOutputs == 1
                     }
                     if kind == .hlsAVPlayer {

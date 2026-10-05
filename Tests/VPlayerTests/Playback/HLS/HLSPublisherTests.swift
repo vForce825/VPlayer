@@ -230,6 +230,16 @@ final class HLSPublisherTests: XCTestCase {
             XCTAssertEqual(endpoint.receipt.terminalLogicalSequence, UInt64(5 + backlog))
             XCTAssertEqual(endpoint.media.count, 6 + backlog,
                 "The terminal authority must cover every real callback, including the pending prefix")
+            if backlog == 8 {
+                XCTAssertGreaterThan(endpoint.receipt.inputEvidenceCount,
+                    SegmentedFMP4WriterOwnershipLimits.audio.hardCapacity,
+                    "The full endpoint proof covers historical inputs beyond the live-input cap")
+                let usage = try XCTUnwrap(h.tracks[2]).sink.formalWriterProbe.snapshot
+                XCTAssertEqual(usage.nativeWriterCount, 1)
+                XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+                XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+                XCTAssertTrue(usage.isComplete)
+            }
             for index in 1...backlog {
                 let ticket = h.publisher.ticket
                 XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: Int64(index) * Task19.second,

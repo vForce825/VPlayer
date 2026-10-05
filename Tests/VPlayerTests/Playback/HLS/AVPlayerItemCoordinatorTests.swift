@@ -6482,50 +6482,86 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testReview3CapacityChargesRetainedGraphAndFifthDeadlineFailsClosed() async throws {
-        let player = AVPlayer()
-        let driver = try SystemAVPlayerDriver.make(player: player)
+        try await withInstalledReview3Driver(outputNonce: 23_300) { driver, item in
+            let player = driver.player
+            player.play()
+            try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
+            for _ in 0..<4 {
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                                object: player.currentItem)
+            }
+            for _ in 0..<8 { await Task.yield() }
+            let fifth = Task { try await driver.waitUntilPaused(item: item) }
+            for _ in 0..<8 { await Task.yield() }
+
+            XCTAssertEqual(driver.fixedTimerCount, 0)
+            XCTAssertEqual(driver.activeWaiterCount, 0,
+                           "deadline 第五项必须在返回伪 UUID 前显式 capacityExceeded")
+            let failedClosed = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    do { try await fifth.value; return false }
+                    catch { return error as? AVPlayerItemCoordinatorFailure == .directPauseNotConfirmed }
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    return false
+                }
+                let first = await group.next() ?? false
+                fifth.cancel()
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(failedClosed, "容量耗尽必须同步返回准确错误，不能留下永久 waiter")
+            _ = try? await fifth.value
+
+            let authorityHarness = try await Task21Harness()
+            let coordinator = try AVPlayerItemCoordinator(
+                driver: Task21FakeDriver(), evidenceSource: authorityHarness.evidence)
+            let graphBytes = malloc_size(Unmanaged.passUnretained(coordinator).toOpaque())
+            XCTAssertLessThanOrEqual(graphBytes, 2_048,
+                                     "完整 retained graph 与所有 backing 必须统一计费")
+            try await authorityHarness.shutdown()
+        }
+    }
+
+    func testReview3DriverFixtureJoinsObserverTailBeforeRethrowingBodyFailure() async throws {
+        enum Expected: Error { case bodyFailure }
+        let original = WeakSystemAVPlayerDriverProbe(nil)
+        do {
+            try await withInstalledReview3Driver(outputNonce: 23_301) { driver, item in
+                original.value = driver
+                try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
+                throw Expected.bodyFailure
+            }
+            XCTFail("The fixture must preserve its body failure")
+        } catch Expected.bodyFailure {}
+        XCTAssertNil(original.value)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0,
+            "A throwing fixture must remove its original endpoint observer and join the callback tail")
+        let successor = try SystemAVPlayerDriver.make()
+        withExtendedLifetime(successor) {}
+    }
+
+    private func withInstalledReview3Driver(outputNonce: UInt64,
+        _ body: @MainActor (SystemAVPlayerDriver, AVPlayerItemInstanceIdentity) async throws -> Void) async throws {
+        let driver = try SystemAVPlayerDriver.make()
         let item = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 23_300),
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce),
             itemGeneration: 1)
-        try driver.install(url: URL(string: "http://127.0.0.1:1/review3-capacity.m3u8")!,
-                           identity: item)
-        player.play()
-        try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
-        for _ in 0..<4 {
-            NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
-                                            object: player.currentItem)
-        }
-        for _ in 0..<8 { await Task.yield() }
-        let fifth = Task { try await driver.waitUntilPaused(item: item) }
-        for _ in 0..<8 { await Task.yield() }
-
-        XCTAssertEqual(driver.fixedTimerCount, 0)
-        XCTAssertEqual(driver.activeWaiterCount, 0,
-                       "deadline 第五项必须在返回伪 UUID 前显式 capacityExceeded")
-        let failedClosed = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                do { try await fifth.value; return false }
-                catch { return error as? AVPlayerItemCoordinatorFailure == .directPauseNotConfirmed }
-            }
-            group.addTask {
-                try? await Task.sleep(for: .milliseconds(200))
-                return false
-            }
-            let first = await group.next() ?? false
-            fifth.cancel()
-            group.cancelAll()
-            return first
-        }
-        XCTAssertTrue(failedClosed, "容量耗尽必须同步返回准确错误，不能留下永久 waiter")
-        _ = try? await fifth.value
-
-        let authorityHarness = try await Task21Harness()
-        let coordinator = try AVPlayerItemCoordinator(
-            driver: Task21FakeDriver(), evidenceSource: authorityHarness.evidence)
-        let graphBytes = malloc_size(Unmanaged.passUnretained(coordinator).toOpaque())
-        XCTAssertLessThanOrEqual(graphBytes, 2_048,
-                                 "完整 retained graph 与所有 backing 必须统一计费")
+        var failure: (any Error)?
+        do {
+            try driver.install(url: URL(string: "http://127.0.0.1:1/review3-capacity.m3u8")!, identity: item)
+            try await body(driver, item)
+        } catch { failure = error }
+        // NotificationCenter owns the endpoint callback independently of the
+        // driver. A later throwing harness must not leave that original SDK
+        // credit alive and block every subsequent single-driver admission.
+        driver.pause(item: item)
+        driver.removeObservers(item: item)
         driver.replaceCurrentItemWithNil(item: item)
+        await driver.joinNativeCallbackTails()
+        XCTAssertNil(driver.currentItemIdentity)
+        if let failure { throw failure }
     }
 
     func testRelaySourceReplacementKeepsPhysicalWakeAndRejectsOldUUID() {

@@ -14,6 +14,19 @@ SCRIPT = ROOT / 'Scripts/test-release-startup.sh'
 
 
 class ReleaseStartupDiagnosticsTests(unittest.TestCase):
+    def test_live_startup_establishes_add_focus_before_selecting(self):
+        source = (ROOT / 'Tests/VPlayerUITests/LiveStartupUITests.swift').read_text()
+        activation = source.split('let add = app.buttons["source.add"]', 1)[1]
+        before_select, after_select = activation.split('XCUIRemote.shared.press(.select)', 1)
+        self.assertIn('for _ in 0..<4 where !add.hasFocus', before_select)
+        self.assertIn('XCUIRemote.shared.press(.down)', before_select)
+        self.assertIn(r'guard add.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {',
+                      before_select)
+        self.assertIn('XCTFail(', before_select)
+        self.assertIn('return', before_select)
+        for identifier in ('name', 'm3u', 'epg', 'save'):
+            self.assertIn(f'source.editor.{identifier}', after_select)
+
     def run_exit(self, command, *, selected=True, broken_copy=False):
         # Load the actual initialization, functions and traps, stopping immediately
         # before the first SDK operation. No production test mode is required.

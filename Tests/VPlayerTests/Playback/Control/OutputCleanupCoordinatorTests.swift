@@ -4141,13 +4141,52 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let rebase = try XCTUnwrap(registry.rebaseRetainedOutput(contextNonce: retained.contextNonce,
                 stableCommit: fixture.stable, owner: nil))
             let claim = try XCTUnwrap(rebase.successorClaim)
-            XCTAssertThrowsError(try registry.claimOutputSuccessor(claim),
-                "outputLifecycle身份耗尽必须在claim-time失败关闭")
-            XCTAssertTrue(allocator.isExhausted)
-            XCTAssertNil(registry.executor.safetyIngress.snapshot.failure,
-                "claim-time局部失败关闭不伪造全局Cell失败")
-            XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
-            XCTAssertTrue(registry.cleanupReservationSnapshot()?.terminal == true)
+            let beforeClaim = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let reservation = try XCTUnwrap(registry.cleanupReservationSnapshot())
+            let occupancy = registry.occupancy
+            registry.executor.sync {
+                // Hold the executor across the claim and its local projection so
+                // the already-registered asynchronous drain cannot win this check.
+                XCTAssertThrowsError(try registry.claimOutputSuccessor(claim)) {
+                    XCTAssertEqual($0 as? PlaybackIdentityAllocationError, .identitySpaceExhausted)
+                }
+                XCTAssertTrue(allocator.isExhausted)
+                XCTAssertNil(registry.executor.safetyIngress.snapshot.failure)
+                let unchanged = registry.outputResourceContextSnapshot()
+                XCTAssertEqual(unchanged?.phase, .pendingSuccessorLease)
+                XCTAssertEqual(unchanged?.contextNonce, beforeClaim.contextNonce)
+                XCTAssertEqual(unchanged?.retainedRebase?.successorClaim, claim)
+                XCTAssertNil(unchanged?.candidateBackendIdentity)
+                XCTAssertNil(unchanged?.prepareTicket)
+                XCTAssertEqual(unchanged?.sourceTask, beforeClaim.sourceTask)
+                XCTAssertEqual(registry.occupancy.ordinarySlots, occupancy.ordinarySlots,
+                    "The failed claim cannot publish a partial factory command")
+
+                // Exhaustion is sticky across all allocator domains. The next
+                // real barrier must revoke globally while preserving the exact
+                // original cleanup reservation; a read-only getter must not do it.
+                while true {
+                    switch registry.executor.withSafetyIngressBarrier(
+                        operationDescriptor: .cleanupOwnership, operation: { _ in () }) {
+                    case .retry: continue
+                    case .rejected: XCTFail("Terminal cleanup must remain admitted")
+                    case .performed: break
+                    }
+                    break
+                }
+                let safety = registry.executor.safetyIngress.snapshot
+                XCTAssertEqual(safety.failure, .identitySpaceExhausted)
+                XCTAssertFalse(safety.outputPermitPresent)
+                XCTAssertFalse(safety.readinessOpen)
+                XCTAssertFalse(safety.routeObservationGateOpen)
+                XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.disposition, .releaseAfterTeardown)
+                let terminalReservation = registry.cleanupReservationSnapshot()
+                XCTAssertTrue(terminalReservation?.terminal == true)
+                XCTAssertEqual(terminalReservation?.ticket, reservation.ticket)
+                XCTAssertEqual(terminalReservation?.terminalOwner, reservation.terminalOwner)
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.reservation, reservation.ticket)
+            }
         }
 
         let allocator = PlaybackIdentityAllocator(initialIssuedValue: .max - 512,

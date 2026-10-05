@@ -9,6 +9,24 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class SourceAACNativeWindowTests: XCTestCase {
+    func testInputCollectorPreservesDemuxFailureInsteadOfReportingCodecRejection() throws {
+        let collector = SourceAACNativeInputCollector(done: {})
+        collector.receive(AdmittedDemuxEvent(event: .failure(.demuxRead(-123)), admissionTail: nil))
+        let admission = HLSDataPlaneAdmission(capacity: 8, maximumBytes: 8 * 1_024 * 1_024)
+        XCTAssertThrowsError(try collector.input(admission: admission)) {
+            XCTAssertEqual($0 as? PlaybackCoreError, .demuxRead(-123))
+        }
+    }
+
+    func testInputCollectorPreservesCancellationInsteadOfReportingCodecRejection() throws {
+        let collector = SourceAACNativeInputCollector(done: {})
+        collector.receive(AdmittedDemuxEvent(event: .cancelled, admissionTail: nil))
+        let admission = HLSDataPlaneAdmission(capacity: 8, maximumBytes: 8 * 1_024 * 1_024)
+        XCTAssertThrowsError(try collector.input(admission: admission)) {
+            XCTAssertTrue($0 is CancellationError)
+        }
+    }
+
     func testRealFiveAndSixSecondSourceFragmentsPreserveBothNativeRates() async throws {
         for rate: Int32 in [44_100, 48_000] {
             let input = try await input(rate: rate)
@@ -213,6 +231,7 @@ private final class SourceAACNativeInputCollector: @unchecked Sendable {
     private var first: Data?
     private var owners: [AdmittedDemuxEvent] = []
     private var terminal = false
+    private var terminalFailure: (any Error)?
     init(done: @escaping @Sendable () -> Void) { self.done = done }
     func receive(_ owner: AdmittedDemuxEvent) {
         let finish = lock.withLock { () -> Bool in
@@ -223,7 +242,13 @@ private final class SourceAACNativeInputCollector: @unchecked Sendable {
                     if track == nil { track = tracks.audio; owners.append(owner) }
                 case let .packet(packet):
                     if first == nil, packet.streamIndex == track?.streamIndex { first = packet.data; owners.append(owner) }
-                case .endOfStream, .failure, .cancelled:
+                case let .failure(error):
+                    if !terminal { terminalFailure = error }
+                    finish = !terminal; terminal = true
+                case .cancelled:
+                    if !terminal { terminalFailure = CancellationError() }
+                    finish = !terminal; terminal = true
+                case .endOfStream:
                     finish = !terminal; terminal = true
                 default: break
                 }
@@ -234,6 +259,7 @@ private final class SourceAACNativeInputCollector: @unchecked Sendable {
     }
     func input(admission: HLSDataPlaneAdmission) throws -> SourceAACNativeInput {
         try lock.withLock {
+            if let terminalFailure { throw terminalFailure }
             guard terminal, let track, track.codec == .aac, let first, !first.isEmpty,
                   first.count <= 65_536, owners.count == 2 else { throw SourceAACFailure.unsupportedSource }
             return .init(track: track, payload: first, owners: owners, admission: admission)

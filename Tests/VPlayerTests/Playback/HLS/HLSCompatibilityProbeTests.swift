@@ -30,17 +30,85 @@ final class HLSCompatibilityProbeTests: XCTestCase {
         XCTAssertEqual(facts.audio.first?.formatValidated, true)
     }
     func testLargeOrdinaryAccessUnitAdmissionAndExplicitLocalLimit() async throws {
+        let capability = HLSVideoCapability(codec: .h264, profiles: [66], maximumLevel: 51,
+            maximumWidth: 3840, maximumHeight: 2160, maximumFrameRate: MediaRational(num: 25, den: 1)!,
+            bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])
         for name in ["large-au.ts", "large-au.mp4", "large-au-limit.mp4"] {
             let bytes = try sourceFixture(name)
             XCTAssertLessThan(bytes.count, HLSCompatibilityProbe.maximumBytes)
             let facts = try await FFmpegHLSContainerInspector().inspect(data: bytes, url: URL(string: "https://example.test/media")!, deadline: HLSMonotonicClock.deadline(seconds: 10))
             XCTAssertEqual(facts.video?.width, 3840); XCTAssertEqual(facts.video?.height, 2160)
             XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+            let video = try XCTUnwrap(facts.video)
+            XCTAssertEqual(video.scan, .progressive)
+            XCTAssertNil(video.colorPrimaries); XCTAssertNil(video.colorTransfer); XCTAssertNil(video.videoRange)
+            XCTAssertEqual(video.colorMatrix, .bt709)
+            XCTAssertFalse(capability.matches(video), "unspecified source color cannot establish native playback eligibility")
         }
         do {
             _ = try await FFmpegHLSContainerInspector().inspect(data: sourceFixture("large-au-over-limit.mp4"), url: URL(string: "https://example.test/media")!, deadline: HLSMonotonicClock.deadline(seconds: 10))
             XCTFail("sample larger than the explicit local AU bound was admitted")
         } catch { XCTAssertEqual(error as? HLSSourceError, .unsupportedMedia) }
+    }
+    func testOrdinaryLargeSourceSPSPreservesUnspecifiedColorWithoutRelaxingGeneratedInspection() throws {
+        // Exact SPS shared by the committed large-au.ts and MP4 fixtures. The
+        // generator requests BT.709, but these authored bytes signal 2/2/1.
+        let sps = largeSourceH264SPS(primaries: 2, transfer: 2, matrix: 1)
+        let proof = try VideoSequenceParameterSetInspector.sourceProof(sps, codec: .h264)
+        XCTAssertEqual(proof.width, 3840); XCTAssertEqual(proof.height, 2160)
+        let format = try VideoSequenceParameterSetInspector.sourceFormat(sps, codec: .h264)
+        XCTAssertNil(format.primaries); XCTAssertNil(format.transfer)
+        XCTAssertEqual(format.matrix, .bt709)
+        let scan = try VideoSequenceParameterSetInspector.sourceScanFlags(sps, codec: .h264)
+        XCTAssertTrue(scan.progressiveOnly); XCTAssertFalse(scan.interlacedOnly)
+        XCTAssertThrowsError(try VideoSequenceParameterSetInspector.inspectH264(sps)) { error in
+            XCTAssertEqual(error as? VideoAccessUnitInspectionError, .unsupportedColorPrimaries(2))
+        }
+    }
+    func testSourceSPSColorSeparatesKnownUnspecifiedAndExplicitUnsupportedCodes() throws {
+        let known = try VideoSequenceParameterSetInspector.sourceFormat(
+            largeSourceH264SPS(primaries: 1, transfer: 1, matrix: 1), codec: .h264)
+        XCTAssertEqual(known.primaries, .bt709); XCTAssertEqual(known.transfer, .bt709)
+        XCTAssertEqual(known.matrix, .bt709)
+        let unspecified = try VideoSequenceParameterSetInspector.sourceFormat(
+            largeSourceH264SPS(primaries: 2, transfer: 2, matrix: 2), codec: .h264)
+        XCTAssertNil(unspecified.primaries); XCTAssertNil(unspecified.transfer); XCTAssertNil(unspecified.matrix)
+        let unsupported: [([UInt8], VideoAccessUnitInspectionError)] = [
+            (largeSourceH264SPS(primaries: 0, transfer: 1, matrix: 1), .unsupportedColorPrimaries(0)),
+            (largeSourceH264SPS(primaries: 1, transfer: 0, matrix: 1), .unsupportedColorTransfer(0)),
+            (largeSourceH264SPS(primaries: 1, transfer: 1, matrix: 0), .unsupportedColorMatrix(0))
+        ]
+        for (sps, expected) in unsupported {
+            XCTAssertThrowsError(try VideoSequenceParameterSetInspector.sourceFormat(sps, codec: .h264)) { error in
+                XCTAssertEqual(error as? VideoAccessUnitInspectionError, expected)
+            }
+        }
+    }
+    func testSourceHEVCScanWithoutExclusiveFlagsStaysUnknown() throws {
+        // Committed hevc-sdr.mp4 SPS with only the progressive_source_flag
+        // cleared. Neither scan flag establishes progressive-only evidence.
+        let sps: [UInt8] = [0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03,
+            0x00, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3f,
+            0xa0, 0x05, 0x02, 0x01, 0x71, 0xf2, 0xe5, 0x95, 0x95, 0x29,
+            0x30, 0xbc, 0x05, 0xa8, 0x08, 0x08, 0x08, 0x20, 0x00, 0x00,
+            0x03, 0x00, 0x20, 0x00, 0x00, 0x03, 0x03, 0x21]
+        let proof = try VideoSequenceParameterSetInspector.sourceProof(sps, codec: .hevc)
+        XCTAssertEqual(proof.width, 640); XCTAssertEqual(proof.height, 360)
+        let format = try VideoSequenceParameterSetInspector.sourceFormat(sps, codec: .hevc)
+        XCTAssertEqual(format.progressiveSourceFlag, false); XCTAssertEqual(format.interlacedSourceFlag, false)
+        let scan = try VideoSequenceParameterSetInspector.sourceScanFlags(sps, codec: .hevc)
+        XCTAssertFalse(scan.progressiveOnly); XCTAssertFalse(scan.interlacedOnly)
+    }
+    private func largeSourceH264SPS(primaries: UInt8, transfer: UInt8, matrix: UInt8) -> [UInt8] {
+        var bytes: [UInt8] = [0x67, 0x42, 0xc0, 0x33, 0xda, 0x00, 0xf0, 0x01,
+            0x0f, 0xb0, 0x16, 0xa0, 0x40, 0x40, 0x28, 0x00, 0x00, 0x03,
+            0x00, 0x08, 0x00, 0x00, 0x03, 0x01, 0x90, 0x78, 0xc1, 0x95]
+        // Three ordinary VUI fields begin at RBSP bits 91, 99 and 107.
+        bytes[11] = 0xa0 | (primaries >> 3)
+        bytes[12] = (primaries << 5) | (transfer >> 3)
+        bytes[13] = (transfer << 5) | (matrix >> 3)
+        bytes[14] = (matrix << 5) | 0x08
+        return bytes
     }
     func testExplicitPrefixIsNotACompleteFiniteTSFile() async throws {
         let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "task22-progressive-h264-aac-16s", withExtension: "ts"))

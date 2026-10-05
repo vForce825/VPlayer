@@ -132,7 +132,7 @@ private final class SourceInspectionState: @unchecked Sendable {
             let spsUnits = units.filter { codec == .h264 ? $0[0] & 31 == 7 : ($0[0] >> 1) & 63 == 33 }
             guard let sps = spsUnits.first, spsUnits.allSatisfy({ $0 == sps }) else { throw HLSSourceError.incompleteEvidence }
             let bytes = Array(sps)
-            let proof = try codec == .h264 ? VideoSequenceParameterSetInspector.inspectH264(bytes) : VideoSequenceParameterSetInspector.inspectHEVC(bytes)
+            let proof = try VideoSequenceParameterSetInspector.sourceProof(bytes, codec: codec)
             let flags = try VideoSequenceParameterSetInspector.sourceScanFlags(bytes, codec: codec)
             let format = try VideoSequenceParameterSetInspector.sourceFormat(bytes, codec: codec)
             if extra.first == 1 {

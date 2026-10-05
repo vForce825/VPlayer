@@ -149,21 +149,31 @@ struct SourceVideoSequenceFormat {
     let interlacedSourceFlag: Bool?
 }
 
+private enum VideoSPSColorInspectionMode {
+    case generatedMedia
+    case sourceFacts
+}
+
 enum VideoSequenceParameterSetInspector {
+    static func sourceProof(_ bytes: [UInt8], codec: VideoCodec) throws -> VideoSequenceParameterSetProof {
+        try codec == .h264
+            ? inspectH264(bytes, colorMode: .sourceFacts)
+            : inspectHEVC(bytes, colorMode: .sourceFacts)
+    }
     /// Factual preflight accessors reuse the bounded SPS grammar. They do not
     /// create generated-media eligibility or reinterpret unknown scan as progressive.
     static func sourceFormat(_ bytes: [UInt8], codec: VideoCodec) throws -> SourceVideoSequenceFormat {
         try bytes.withUnsafeBytes { buffer in
             if codec == .h264 {
-                _ = try inspectH264(bytes)
-                let parsed = try parseH264SPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer))
+                _ = try inspectH264(bytes, colorMode: .sourceFacts)
+                let parsed = try parseH264SPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer), colorMode: .sourceFacts)
                 return SourceVideoSequenceFormat(tier: .main, frameRate: parsed.vui.frameRate,
                     primaries: parsed.vui.primaries, transfer: parsed.vui.transfer, matrix: parsed.vui.matrix,
                     progressiveSourceFlag: parsed.frameMBSOnly, interlacedSourceFlag: nil)
             }
             guard bytes.count > 3, bytes[3] & 0xC0 == 0 else { throw VideoAccessUnitInspectionError.unsupportedSyntax }
-            _ = try inspectHEVC(bytes)
-            let parsed = try parseHEVCSPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer))
+            _ = try inspectHEVC(bytes, colorMode: .sourceFacts)
+            let parsed = try parseHEVCSPS(buffer, digest: VideoAccessUnitSHA256(bytes: buffer), colorMode: .sourceFacts)
             return SourceVideoSequenceFormat(tier: parsed.tier,
                 frameRate: parsed.vui.pocProportionalToTiming == true ? parsed.vui.frameRate : nil,
                 primaries: parsed.vui.primaries, transfer: parsed.vui.transfer, matrix: parsed.vui.matrix,
@@ -177,6 +187,9 @@ enum VideoSequenceParameterSetInspector {
                 format.interlacedSourceFlag == true && format.progressiveSourceFlag == false)
     }
     static func inspectH264(_ bytes: [UInt8]) throws -> VideoSequenceParameterSetProof {
+        try inspectH264(bytes, colorMode: .generatedMedia)
+    }
+    private static func inspectH264(_ bytes: [UInt8], colorMode: VideoSPSColorInspectionMode) throws -> VideoSequenceParameterSetProof {
         try bytes.withUnsafeBytes { buffer in
             guard buffer.count > 1,
                   buffer[0] & 0x80 == 0,
@@ -185,7 +198,8 @@ enum VideoSequenceParameterSetInspector {
             }
             let parsed = try parseH264SPS(
                 buffer,
-                digest: VideoAccessUnitSHA256(bytes: buffer)
+                digest: VideoAccessUnitSHA256(bytes: buffer),
+                colorMode: colorMode
             )
             return VideoSequenceParameterSetProof(
                 codec: .h264,
@@ -211,6 +225,9 @@ enum VideoSequenceParameterSetInspector {
     }
 
     static func inspectHEVC(_ bytes: [UInt8]) throws -> VideoSequenceParameterSetProof {
+        try inspectHEVC(bytes, colorMode: .generatedMedia)
+    }
+    private static func inspectHEVC(_ bytes: [UInt8], colorMode: VideoSPSColorInspectionMode) throws -> VideoSequenceParameterSetProof {
         try bytes.withUnsafeBytes { buffer in
             guard buffer.count > 2,
                   buffer[0] & 0x80 == 0,
@@ -220,7 +237,8 @@ enum VideoSequenceParameterSetInspector {
             }
             let parsed = try parseHEVCSPS(
                 buffer,
-                digest: VideoAccessUnitSHA256(bytes: buffer)
+                digest: VideoAccessUnitSHA256(bytes: buffer),
+                colorMode: colorMode
             )
             return VideoSequenceParameterSetProof(
                 codec: .hevc,
@@ -1238,7 +1256,8 @@ private struct RBSPBitReader {
 
 private func parseH264SPS(
     _ bytes: UnsafeRawBufferPointer,
-    digest: VideoAccessUnitSHA256
+    digest: VideoAccessUnitSHA256,
+    colorMode: VideoSPSColorInspectionMode = .generatedMedia
 ) throws -> H264SPSRecord {
     var reader = try RBSPBitReader(ebsp: bytes, headerBytes: 1)
     let profileIDC = UInt8(try reader.readBits(8))
@@ -1325,7 +1344,7 @@ private func parseH264SPS(
         cropBottom: cropBottom
     )
     var vui = ParsedVUI()
-    if try reader.readFlag() { vui = try parseH264VUI(&reader) }
+    if try reader.readFlag() { vui = try parseH264VUI(&reader, colorMode: colorMode) }
     try reader.consumeRBSPTrailingBits()
     return H264SPSRecord(
         id: id,
@@ -1466,7 +1485,7 @@ private func h264Dimensions(
     return (width, height, codedPictureMacroblockCount)
 }
 
-private func parseH264VUI(_ reader: inout RBSPBitReader) throws -> ParsedVUI {
+private func parseH264VUI(_ reader: inout RBSPBitReader, colorMode: VideoSPSColorInspectionMode) throws -> ParsedVUI {
     var result = ParsedVUI()
     if try reader.readFlag() { result.sampleAspectRatio = try parseAspectRatio(&reader) }
     if try reader.readFlag() { _ = try reader.readFlag() }
@@ -1474,7 +1493,7 @@ private func parseH264VUI(_ reader: inout RBSPBitReader) throws -> ParsedVUI {
         _ = try reader.readBits(3)
         result.range = try reader.readFlag() ? .full : .limited
         if try reader.readFlag() {
-            let description = try parseColorDescription(&reader)
+            let description = try parseColorDescription(&reader, colorMode: colorMode)
             result.primaries = description.primaries
             result.transfer = description.transfer
             result.matrix = description.matrix
@@ -1614,7 +1633,8 @@ private func parseHEVCVPS(
 
 private func parseHEVCSPS(
     _ bytes: UnsafeRawBufferPointer,
-    digest: VideoAccessUnitSHA256
+    digest: VideoAccessUnitSHA256,
+    colorMode: VideoSPSColorInspectionMode = .generatedMedia
 ) throws -> HEVCSPSRecord {
     var reader = try RBSPBitReader(ebsp: bytes, headerBytes: 2)
     let vpsID = UInt32(try reader.readBits(4))
@@ -1735,7 +1755,8 @@ private func parseHEVCSPS(
     if try reader.readFlag() {
         let parsed = try parseHEVCVUI(
             &reader,
-            maximumSubLayersMinusOne: maximumSubLayersMinusOne
+            maximumSubLayersMinusOne: maximumSubLayersMinusOne,
+            colorMode: colorMode
         )
         vui.sampleAspectRatio = parsed.sampleAspectRatio
         vui.frameRate = parsed.frameRate
@@ -1980,7 +2001,8 @@ private func skipHEVCShortTermReferencePictureSet(
 
 private func parseHEVCVUI(
     _ reader: inout RBSPBitReader,
-    maximumSubLayersMinusOne: Int
+    maximumSubLayersMinusOne: Int,
+    colorMode: VideoSPSColorInspectionMode
 ) throws -> ParsedVUI {
     var result = ParsedVUI()
     if try reader.readFlag() { result.sampleAspectRatio = try parseAspectRatio(&reader) }
@@ -1989,7 +2011,7 @@ private func parseHEVCVUI(
         _ = try reader.readBits(3)
         result.range = try reader.readFlag() ? .full : .limited
         if try reader.readFlag() {
-            let description = try parseColorDescription(&reader)
+            let description = try parseColorDescription(&reader, colorMode: colorMode)
             result.primaries = description.primaries
             result.transfer = description.transfer
             result.matrix = description.matrix
@@ -2170,22 +2192,28 @@ private func parseChromaLocation(_ value: UInt32) throws -> DemuxChromaLocation?
 }
 
 private func parseColorDescription(
-    _ reader: inout RBSPBitReader
+    _ reader: inout RBSPBitReader,
+    colorMode: VideoSPSColorInspectionMode
 ) throws -> (
-    primaries: DemuxColorPrimaries,
-    transfer: DemuxColorTransfer,
-    matrix: DemuxColorMatrix
+    primaries: DemuxColorPrimaries?,
+    transfer: DemuxColorTransfer?,
+    matrix: DemuxColorMatrix?
 ) {
+    // Source facts preserve ISO unspecified (2) as absence. Generated-media
+    // inspection remains strict so this cannot unlock frozen color fallback.
     let primariesValue = UInt16(try reader.readBits(8))
-    guard let primaries = DemuxColorPrimaries(rawValue: primariesValue) else {
+    let primaries = DemuxColorPrimaries(rawValue: primariesValue)
+    guard primaries != nil || (colorMode == .sourceFacts && primariesValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorPrimaries(primariesValue)
     }
     let transferValue = UInt16(try reader.readBits(8))
-    guard let transfer = DemuxColorTransfer(rawValue: transferValue) else {
+    let transfer = DemuxColorTransfer(rawValue: transferValue)
+    guard transfer != nil || (colorMode == .sourceFacts && transferValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorTransfer(transferValue)
     }
     let matrixValue = UInt16(try reader.readBits(8))
-    guard let matrix = DemuxColorMatrix(rawValue: matrixValue) else {
+    let matrix = DemuxColorMatrix(rawValue: matrixValue)
+    guard matrix != nil || (colorMode == .sourceFacts && matrixValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorMatrix(matrixValue)
     }
     return (primaries, transfer, matrix)

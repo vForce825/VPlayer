@@ -293,11 +293,22 @@ fileprivate final class SealedDecodeMapPrepayment: @unchecked Sendable {
     static func reserve(bytes: Int) throws -> SealedDecodeMapPrepayment {
         let reservation: PlaybackApplicationChargeReservation
         do { reservation = try HLSDeliveryApplicationChargeLedger.shared.reserve(allocationIdentity: UUID(), bytes: bytes) }
-        catch is LoopbackHTTPReservationError { throw HLSPublicationFailure.capacityExceeded }
+        catch is LoopbackHTTPReservationError {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=prepayment-ledger requestedBytes=\(bytes) chargedBytes=\(HLSDeliveryApplicationChargeLedger.shared.chargedBytes)")
+            #endif
+            throw HLSPublicationFailure.capacityExceeded
+        }
         let value = SealedDecodeMapPrepayment(bytes: bytes, reservation: reservation)
-        let actual = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value).toOpaque()))
-            + malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value.lock).toOpaque()))
-        guard actual <= allocationBytes else { throw CompletedMediaEvidenceError.capacityExceeded }
+        let ownerBytes = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value).toOpaque()))
+        let lockBytes = malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(value.lock).toOpaque()))
+        let actual = ownerBytes + lockBytes
+        guard actual <= allocationBytes else {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=prepayment-owner ownerActualBytes=\(ownerBytes) lockActualBytes=\(lockBytes) ownerReservedBytes=\(malloc_good_size(class_getInstanceSize(Self.self))) lockReservedBytes=\(malloc_good_size(class_getInstanceSize(NSLock.self))) actualBytes=\(actual) reservedBytes=\(allocationBytes)")
+            #endif
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
         return value
     }
     func claim() throws -> PlaybackApplicationChargeReservation {
@@ -689,7 +700,12 @@ struct SealedDecodeCoverageMap: Sendable {
             sampleCount: samples.count, commonSpanCount: commonByteSpans.count, maximumSampleCount: maximumSampleCount)
         let actualCapacityCharge = try LoopbackStorageLayout.current.decodeMapStorageAllocation(
             sampleCapacity: samples.capacity, commonSpanCapacity: commonByteSpans.capacity)
-        guard actualCapacityCharge <= charge else { throw CompletedMediaEvidenceError.capacityExceeded }
+        guard actualCapacityCharge <= charge else {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=array-prepayment sampleCount=\(samples.count) sampleCapacity=\(samples.capacity) spanCapacity=\(commonByteSpans.capacity) maximumSampleCount=\(maximumSampleCount) actualBytes=\(actualCapacityCharge) reservedBytes=\(charge)")
+            #endif
+            throw CompletedMediaEvidenceError.capacityExceeded
+        }
         func validSpan(_ span: Range<Int>) -> Bool {
             span.lowerBound >= 0 && !span.isEmpty && span.upperBound <= sealedBodyLength
         }
@@ -720,6 +736,9 @@ struct SealedDecodeCoverageMap: Sendable {
         self.samples = .init(samples, storagePrepayment: storagePrepayment)
         self.maximumSampleCount = maximumSampleCount
         guard storagePrepayment == nil || storagePrepayment?.bytes == charge else {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=prepayment-charge actualBytes=\(charge) reservedBytes=\(storagePrepayment?.bytes ?? 0)")
+            #endif
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         self.storagePrepayment = storagePrepayment

@@ -9,6 +9,18 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testNativeFixturePublishesPresentationBeforePositiveRateAdmission() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play()
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.prepared == true }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            XCTAssertNotNil(backend.presentation,
+                "A prepared native fixture must satisfy the real presentation commit before activation")
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.plays, 1)
+        }
+    }
+
     func testExactNativeFirstClockAdvanceSettlesDeadlineAndOldActivationCannotSettleSuccessor() async throws {
         let clock = ManualPlaybackClock(100)
         try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
@@ -370,7 +382,7 @@ private final class NativeAdapterFixture {
             try await Task.sleep(for: .milliseconds(5))
         }
         guard predicate() else {
-            XCTFail("Native fixture timed out: \(String(describing: registry.outputResourceContextSnapshot()))")
+            XCTFail("Native fixture timed out at \(PlaybackDiagnosticTracker.shared.current): \(String(describing: registry.outputResourceContextSnapshot()))")
             throw HLSSourceError.deadline
         }
     }
@@ -441,6 +453,10 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
         let slot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
         let backend = HLSAVPlayerPlaybackBackend(identity: identity,
             bundleBuilder: try SystemHLSOutputItemBundleBuilder(validating: url),
+            // The controller commits a mountable presentation before activation.
+            // This inert shell is never played; the injected driver still owns
+            // all lifecycle, authority and media-clock observations under test.
+            presentationContext: AVPlayerPresentationContext(player: AVPlayer()),
             coordinatorFactory: { _ in throw HLSSourceError.unsupportedMedia }, replacementSlot: slot)
         backend.configureSourceRouting(dependencies: dependencies, sessionLease: lease,
             builderFactory: { [retry] _, owned in

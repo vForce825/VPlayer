@@ -94,10 +94,13 @@ final class PersistentHLSWriterTests: XCTestCase {
         let profile = try AACWriterBoundaryProfile(maximumBoundarySeconds: 6,
             maximumNativePacketBytes: 1_708)
         let workspace = AACCalibrationWorkspace()
-        let pool = try workspace.reserveReusablePackets(
-            bytes: AACCalibrationWorkspace.aacPacketCapacity - 131_072)
         let charge = try AACIncrementalEmission.allocationCharge(payloadBytes: 1, packetCount: 1)
-        XCTAssertLessThan(pool.capacity - profile.packetReservationBytes, charge)
+        // Keep exactly one byte less than the headroom needed for this accepted
+        // prefix, independently of platform packet-description metadata sizes.
+        let poolBytes = profile.packetReservationBytes + charge - 1
+        XCTAssertLessThanOrEqual(poolBytes, AACCalibrationWorkspace.aacPacketCapacity - 131_072)
+        let pool = try workspace.reserveReusablePackets(bytes: poolBytes)
+        XCTAssertEqual(pool.capacity - profile.packetReservationBytes, charge - 1)
         let reservation = try pool.reserveAvailable(preferredBytes: charge, minimumBytes: charge)
         var frozen: AACCalibrationWorkspace.Lease? = try reservation.claim(bytes: charge)
         frozen?.markWriterAccepted()
@@ -106,13 +109,14 @@ final class PersistentHLSWriterTests: XCTestCase {
             length: 1, lifetime: WriterInputLifetime { [lease = try XCTUnwrap(frozen)] in
                 withExtendedLifetime(lease) {}
             })
-        XCTAssertLessThan(pool.nextBoundaryCapacity, profile.packetReservationBytes)
+        XCTAssertEqual(pool.nextBoundaryCapacity, profile.packetReservationBytes - 1)
         frozen = nil // Exactly what consuming a PendingBatch prefix now does.
         XCTAssertNotNil(native)
-        XCTAssertLessThan(pool.nextBoundaryCapacity, profile.packetReservationBytes,
+        XCTAssertEqual(pool.nextBoundaryCapacity, profile.packetReservationBytes - 1,
             "consuming a batch entry must never free a surviving native alias")
         native = nil
-        XCTAssertGreaterThanOrEqual(pool.nextBoundaryCapacity, profile.packetReservationBytes)
+        XCTAssertEqual(pool.nextBoundaryCapacity, pool.capacity)
+        XCTAssertEqual(pool.availableBytes, pool.capacity)
         let next = try pool.reserveAvailable(preferredBytes: profile.packetReservationBytes,
             minimumBytes: profile.packetReservationBytes)
         next.releaseUnclaimed()

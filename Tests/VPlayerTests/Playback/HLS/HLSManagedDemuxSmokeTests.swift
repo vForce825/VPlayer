@@ -8,6 +8,37 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class HLSManagedDemuxSmokeTests: XCTestCase {
+    func testFixturePublishesReadyOriginBeforeAuthenticatedRangeAndHEADRequests() async throws {
+        let bytes = Data("ordinary fixture body".utf8)
+        let origin = try NativeHLSHTTPFixture(resources: [
+            "/media.ts": .init(data: bytes, contentType: "video/mp2t")], credential: "fixture credential")
+        let client = URLSession(configuration: .ephemeral)
+        var failure: (any Error)?
+        do {
+            let url = origin.url("media.ts")
+            XCTAssertGreaterThan(try XCTUnwrap(url.port), 0)
+            _ = try PlaybackSourceOrigin(url)
+            var request = URLRequest(url: url)
+            request.setValue("fixture credential", forHTTPHeaderField: "Authorization")
+            request.setValue("bytes=1-4", forHTTPHeaderField: "Range")
+            let ranged = try await client.data(for: request)
+            let response = try XCTUnwrap(ranged.1 as? HTTPURLResponse)
+            XCTAssertEqual(response.statusCode, 206)
+            XCTAssertEqual(response.value(forHTTPHeaderField: "Content-Range"), "bytes 1-4/\(bytes.count)")
+            XCTAssertEqual(ranged.0, bytes.subdata(in: 1..<5))
+            request.httpMethod = "HEAD"
+            let headed = try await client.data(for: request)
+            XCTAssertEqual((headed.1 as? HTTPURLResponse)?.statusCode, 206)
+            XCTAssertEqual((headed.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length"), "4")
+            XCTAssertTrue(headed.0.isEmpty)
+            XCTAssertEqual(origin.authenticatedCount, 2)
+            XCTAssertEqual(origin.deniedCount, 0)
+        } catch { failure = error }
+        client.invalidateAndCancel()
+        await origin.close()
+        if let failure { throw failure }
+    }
+
     func testManagedTSMediaPlaylistReachesRealPinnedFFmpegWithTypedSegmentSuffix() async throws {
         let bytes = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(forResource: "progressive-h264-aac", withExtension: "ts")))
         try await runManagedMedia(header: nil, media: bytes, duration: 4, expectedSuffix: "ts")

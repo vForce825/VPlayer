@@ -44,6 +44,9 @@ struct LoopbackStorageLayout: Sendable {
 
     func decodeMapStorageAllocation(sampleCapacity: Int, commonSpanCapacity: Int) throws -> Int {
         guard (1...512).contains(sampleCapacity), (0...64).contains(commonSpanCapacity) else {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=array-capacity sampleCapacity=\(sampleCapacity) spanCapacity=\(commonSpanCapacity)")
+            #endif
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         // Actual Array.capacity is checked against this same allocator arithmetic
@@ -54,6 +57,9 @@ struct LoopbackStorageLayout: Sendable {
             HLSChecked.add(Int(malloc_good_size(samples)), Int(malloc_good_size(spans))))
         let rounded = (try HLSChecked.add(raw, 15)) & ~15
         guard try HLSChecked.add(rounded, 4_096) <= mediaMapReservationBytes else {
+            #if DEBUG
+            print("DECODE_MAP_ADMISSION stage=array-envelope sampleCapacity=\(sampleCapacity) spanCapacity=\(commonSpanCapacity) sampleStride=\(decodeSampleStride) actualBytes=\(rounded) evidenceBytes=4096 reservedBytes=\(mediaMapReservationBytes)")
+            #endif
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         return rounded

@@ -242,15 +242,15 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         defer { writer.requestCancellation() }
         let append = Task { try await writer.appendAACEncodedEpochAwaitingReadiness(epoch,
             coordinator: boundary) }
-        // Admission is observable without wrapping the native adapter or replacing its
-        // private provenance. Native appends may complete before finish is scheduled;
-        // the separate gated inspection test proves the exact suspended interleaving.
+        // Observe cumulative admission, since native aliases may be released before
+        // this task resumes. The separate gated inspection test proves the exact
+        // suspended interleaving without wrapping the real adapter's provenance.
         let admissionDeadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while writer.usage.retainedTerminalOwnershipCount == 0,
+        while writer.usage.inputAllocationCount == 0,
               writer.terminalReceipt == nil, ContinuousClock.now < admissionDeadline {
             try await Task.sleep(for: .milliseconds(1))
         }
-        XCTAssertGreaterThan(writer.usage.retainedTerminalOwnershipCount, 0)
+        XCTAssertGreaterThan(writer.usage.inputAllocationCount, 0)
         let finish = Task { try await writer.finish() }
         try await append.value
         let terminal = try await finish.value
@@ -259,6 +259,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(terminal.initializationCallbackCount, 1)
         XCTAssertGreaterThan(terminal.mediaCallbackCount, 0)
         XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0)
+        XCTAssertEqual(writer.usage.inputAllocationCount, UInt64(epoch.buffers.count))
+        XCTAssertEqual(writer.usage.inputReleaseCount, writer.usage.inputAllocationCount)
         let media = collector.objects.filter { $0.kind == .media }
         XCTAssertEqual(media.count, terminal.mediaCallbackCount)
         for object in media {
@@ -1500,13 +1502,17 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             defer { _ = writer.cancel() }
             try writer.start(at: .zero)
             let pending = try fixture.builder.makeSubmission(for: fixture.timed[0], admission: fixture.admissions[0])
-            let attempt = try pending.currentWriterAttempt(binding: writer.binding)
+            let attempt = try pending.claimWriterAttempt(binding: writer.binding)
             let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
             let before = fixture.boundary.usage
             let blocker = try ledger.reserve(allocationIdentity: UUID(),
                 bytes: HLSDeliveryApplicationChargeLedger.documentedApplicationHardBytes - ledger.chargedBytes - available)
             let pressure = ledger.chargedBytes
-            XCTAssertThrowsError(try writer.appendRemuxVideo(attempt, ticket: ticket))
+            XCTAssertThrowsError(try writer.appendRemuxVideo(attempt, ticket: ticket)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure,
+                    available < WriterInputAdmission.metadataBytes
+                        ? .terminalOwnershipCapacityExceeded : .inputEvidenceCapacityExceeded)
+            }
             XCTAssertEqual(factory.lastWriter?.appendCount, 0)
             XCTAssertEqual(factory.lastWriter?.calls.filter { $0 == .flush }.count, 0)
             XCTAssertEqual(factory.lastWriter?.cancelCount, 0)
@@ -1949,6 +1955,78 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(receipt.writerReceiptIdentity, accepted.writer.terminalReceipt?.identity)
         XCTAssertEqual(accepted.writer.aacTerminalBinding?.endpointAuthority?.receipt,
                        receipt)
+    }
+
+    func testAACBatchLifetimeCountDoesNotConsumeLiveInputCapacity() async throws {
+        for awaitsReadiness in [false, true] {
+            let complete = try Task17Fixtures.aacEpoch(bufferCount: 3)
+            let factory = Task17FakeSystemWriterFactory()
+            let writer = try Task17Fixtures.makeWriter(
+                seed: awaitsReadiness ? 1_612 : 1_611, kind: .aac,
+                sourceFormatHint: try XCTUnwrap(CMSampleBufferGetFormatDescription(complete.buffers[0])),
+                factory: factory, ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 2),
+                releaseTransfersImmediately: true)
+            defer { _ = writer.cancel() }
+            let boundary = try Task17Fixtures.aacCoordinator(epoch: complete, writer: writer)
+            try writer.start(at: CMTime(value: 10, timescale: 1))
+            let native = try XCTUnwrap(factory.lastWriter)
+            func append(_ epoch: AACEncodedEpoch) async throws {
+                if awaitsReadiness {
+                    try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
+                } else {
+                    try writer.appendAACEncodedEpoch(epoch, coordinator: boundary)
+                }
+            }
+
+            // Each submitted batch is still bounded before any preview or native append.
+            let beforeOversizedBatch = writer.usage
+            await assertWriterThrowsError(try await append(complete)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .inputEvidenceCapacityExceeded)
+            }
+            XCTAssertEqual(writer.usage, beforeOversizedBatch)
+            XCTAssertEqual(native.appendCount, 0)
+
+            try await append(Task17TerminalAACChunk.make(complete, range: 0..<1))
+            var alias: CMBlockBuffer? = try native.makeInputBlockAlias(at: 0)
+            native.releaseInputSamples()
+            XCTAssertEqual(writer.usage.liveInputCount, 1, "The last native alias keeps its real charge")
+            try await append(Task17TerminalAACChunk.make(complete, range: 1..<2))
+            XCTAssertEqual(writer.usage.liveInputCount, 2)
+
+            let last = Task17TerminalAACChunk.make(complete, range: 2..<3)
+            let beforeFullAdmission = writer.usage
+            let boundaryBeforeRejection = boundary.usage
+            await assertWriterThrowsError(try await append(last)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+            }
+            XCTAssertEqual(writer.usage, beforeFullAdmission)
+            XCTAssertEqual(boundary.usage, boundaryBeforeRejection)
+            XCTAssertEqual(native.appendCount, 2)
+            XCTAssertNil(writer.terminalReceipt)
+
+            // Only the second sample loses its last owner. The first alias stays paid.
+            native.releaseInputSamples()
+            XCTAssertEqual(writer.usage.liveInputCount, 1)
+            try await append(last)
+            XCTAssertEqual(writer.usage.liveInputCount, 2)
+            XCTAssertEqual(writer.usage.inputAllocationCount, 3)
+            XCTAssertEqual(writer.usage.inputReleaseCount, 1)
+            XCTAssertEqual(writer.usage.segmentEvidenceCount, 3)
+            XCTAssertEqual(factory.configurations.count, 1)
+            await assertWriterThrowsError(try await writer.finish()) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .systemFailure,
+                    "Synthetic AAC callbacks cannot acquire native publication authority")
+            }
+            let terminal = try XCTUnwrap(writer.terminalReceipt)
+            XCTAssertEqual(terminal.terminalReason, .failed)
+            XCTAssertEqual(terminal.inputCount, 3, "Cumulative accounting may exceed live capacity")
+            XCTAssertEqual(writer.usage.segmentEvidenceCount, 0)
+            XCTAssertEqual(writer.usage.liveInputCount, 1)
+            XCTAssertNotNil(alias)
+            alias = nil
+            XCTAssertEqual(writer.usage.liveInputCount, 0)
+            XCTAssertEqual(writer.usage.inputReleaseCount, 3)
+        }
     }
 
     func testAACEncoderIdentityCannotChangeWithinWriterAndSameIdentityChunksSealEndpoint()
@@ -3344,6 +3422,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         )
         let disorderWriter = disorderFixture.writer
         try disorderFixture.append()
+        let disorderNative = try XCTUnwrap(disorderFactory.lastWriter)
+        var disorderAlias: CMBlockBuffer? = try disorderNative.makeInputBlockAlias(at: 0)
         let disorderFinish = Task { try await disorderWriter.finish() }
         XCTAssertEqual(disorderFactory.lastWriter?.waitUntilFinishRequested(timeout: .now() + 2), .success)
         disorderFactory.lastWriter?.completeFinish(success: true)
@@ -3351,6 +3431,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         await Task.yield()
         XCTAssertNil(disorderWriter.terminalReceipt)
         XCTAssertEqual(disorderWriter.usage.pendingCallbackCount, 1)
+        XCTAssertEqual(disorderNative.retainedInputSampleCount, 0,
+            "The final media callback releases native sample headers before deferred initialization")
         XCTAssertEqual(disorderWriter.usage.retainedTerminalOwnershipCount, 1)
         disorderFactory.lastWriter?.emitDeferredInitializationCallback()
         let disorderReceipt = try await disorderFinish.value
@@ -3359,6 +3441,10 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(disorderReceipt.initializationCallbackCount, 1)
         XCTAssertEqual(disorderReceipt.mediaCallbackCount, 1)
         XCTAssertEqual(disorderCollector.objects.filter { $0.kind == .media }.count, 1)
+        XCTAssertEqual(disorderWriter.usage.retainedTerminalOwnershipCount, 1,
+            "Successful finish cannot release the surviving block alias")
+        XCTAssertNotNil(disorderAlias)
+        disorderAlias = nil
         XCTAssertEqual(disorderWriter.usage.retainedTerminalOwnershipCount, 0)
         disorderFactory.lastWriter?.emitMedia()
         disorderFactory.lastWriter?.emitDeferredInitializationCallback()
@@ -4951,6 +5037,18 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             "Unmodified native mfhd must continue across physical AAC writers")
         XCTAssertEqual(factory.configurations.map(\.initialMovieFragmentSequenceNumber), [1, 2])
         XCTAssertTrue(factory.configurations.allSatisfy(\.producesCombinableFragments))
+        let rendition = try XCTUnwrap(next.aacRenditionTerminalBinding)
+        let originalMapping = try XCTUnwrap(predecessor.terminalBinding.timelineMappingReceipt)
+        let successorTerminal = try XCTUnwrap(next.aacTerminalBinding)
+        let successorMapping = try XCTUnwrap(successorTerminal.timelineMappingReceipt)
+        XCTAssertFalse(successorTerminal === predecessor.terminalBinding)
+        XCTAssertTrue(predecessor.terminalBinding.acceptsRenditionAnchor(rendition,
+            mapping: originalMapping))
+        XCTAssertTrue(successorTerminal.acceptsRenditionAnchor(rendition,
+            mapping: successorMapping))
+        XCTAssertFalse(successorTerminal.acceptsRenditionAnchor(rendition,
+            mapping: originalMapping),
+            "A genuine later physical writer slot cannot replace the original prefix anchor")
     }
 
     func testWriterWindowFragmentSequenceAdvancesByMediaCountNotWriterIdentity() async throws {
@@ -5500,11 +5598,21 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         }
         XCTAssertEqual(harness.store.usage.resourceCount, usageBeforePreflight.resourceCount)
         XCTAssertEqual(harness.store.usage.snapshotCount, usageBeforePreflight.snapshotCount)
+        XCTAssertTrue(authority.terminalBinding === originalTerminalBinding,
+            "A persistent one-writer epoch keeps its original prefix anchor through finalization")
+        let unanchoredWriter = try Task17Fixtures.makeWriter(seed: 32_099, kind: .aac,
+            writerBinding: originalMapping.binding, factory: Task17FakeSystemWriterFactory())
+        defer { _ = unanchoredWriter.cancel() }
+        let unanchoredTerminal = try XCTUnwrap(unanchoredWriter.aacTerminalBinding)
+        XCTAssertEqual(unanchoredTerminal.binding, originalTerminalBinding.binding)
+        XCTAssertFalse(unanchoredTerminal === originalTerminalBinding)
         XCTAssertThrowsError(try AVPlayerAACEndpointValidator.preflight(
             authority: authority, currentFinalPublication: currentFinal,
             store: harness.store, originalPrefix: originalPrefix,
-            originalTerminalBinding: authority.terminalBinding),
-            "A later physical writer slot cannot replace the original prefix anchor")
+            originalTerminalBinding: unanchoredTerminal),
+            "Matching binding values cannot substitute an unanchored terminal slot") {
+            XCTAssertEqual($0 as? AVPlayerAACEndpointValidationFailure, .identityMismatch)
+        }
         XCTAssertEqual(originalPrefix.mapping, originalMapping)
         let finalPreparation = try await task22PrepareFinalThroughCoordinator(
             request: preparation.request,
@@ -9255,6 +9363,7 @@ private enum Task17Fixtures {
     struct WindowPredecessor {
         let encoder: AACRenditionEncoder
         let binding: FMP4WriterBinding
+        let terminalBinding: AACWriterTerminalBinding
         let format: CMFormatDescription
         let boundary: SegmentBoundaryCoordinator
         let continuation: AACWriterWindowContinuation
@@ -9803,7 +9912,8 @@ private enum Task17Fixtures {
         }
         XCTAssertEqual(pending[1].ordinal, pending[0].ordinal + 1,
                        "rollover 后 N+1 必须紧随原 pending N 排队")
-        return .init(encoder: encoder, binding: binding, format: format, boundary: boundary,
+        return .init(encoder: encoder, binding: binding,
+                     terminalBinding: try XCTUnwrap(writer.aacTerminalBinding), format: format, boundary: boundary,
                      continuation: continuation, pending: pending)
     }
 

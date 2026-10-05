@@ -1160,11 +1160,15 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     func handleRouteCommit(_ commit: StableRouteCommitIdentity) async {
+        // A queued notification cannot control a newer route or cancel its timer.
+        guard registry.stableRouteCommitSnapshot() == commit else { return }
         recoveryCoordinator.cancelRouteUnavailableTimeout()
         guard let request = controllerState.request, let runIdentity = admittedRun, isCurrent(runIdentity) else {
             return
         }
-        guard let context = registry.outputResourceContextSnapshot(), context.sessionIdentity.requestID == request.id else {
+        guard let context = registry.outputResourceContextSnapshot(),
+              context.sessionIdentity.requestID == request.id,
+              commit.authority.sessionIdentity == context.sessionIdentity else {
             return
         }
         let ports = commit.authority.semanticIdentity?.ports ?? []
@@ -1184,6 +1188,19 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         if targetKind != currentKind {
             await requestRouteHandoff(to: targetKind)
         } else {
+            // The stable-route wake and its notification run independently. A
+            // successor may already own this exact commit while its prepare or
+            // activation is awaiting the SDK and activeRoutePorts still names
+            // the predecessor. Keep that original lifecycle in charge. Derive
+            // ownership from the live prepare, so no separate marker can survive
+            // cancellation, replacement, or teardown; newer commits still act.
+            if context.phase == .installed, let prepare = context.prepareTicket,
+               prepare.backendIdentity == context.candidateBackendIdentity,
+               prepare.backendIdentity.sessionIdentity == context.sessionIdentity,
+               prepare.stableRouteCommitEpoch == commit.epoch,
+               prepare.audioAdmissionFenceRevision == commit.authority.audioAdmissionFenceRevision {
+                return
+            }
             let activePorts = controllerState.activeRoutePorts
             if activePorts == nil {
                 controllerState.activeRoutePorts = ports

@@ -519,13 +519,16 @@ final class HLSTimelineCoordinator {
         } else { try useCompatibleAudioBeforeSourceAppendIsolated() }
     }
     private func useCompatibleAudioBeforeSourceAppendIsolated() throws {
+        // The assembler and timeline share this producer. Check its one-shot
+        // output precondition before the assembler invalidates source authority;
+        // rechecking afterward would reject our own successful fallback.
+        guard dolbyProducer?.canAbandonBeforeOutput ?? true else {
+            throw DolbyAudioSourceFailure.sourceAlreadyConsumed
+        }
         if let assembler = state?.audioAssembler {
             try assembler.useCompatibleAudioBeforeSourceAppend()
         } else if sourceAudioStream?.abandonBeforeClaim() == false {
             throw SourceAACFailure.sourceAlreadyConsumed
-        }
-        guard dolbyProducer?.canAbandonBeforeOutput ?? true else {
-            throw DolbyAudioSourceFailure.sourceAlreadyConsumed
         }
         dolbyProducer?.invalidateSourceInput()
         dolbyProducer = nil

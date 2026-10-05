@@ -3091,6 +3091,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
               coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
+        // Bound this live batch before allocating identities and boundary previews.
+        // The fixed-size snapshot also accounts for already released earlier batches.
+        guard epoch.buffers.count <= ownershipLimits.hardCapacity else {
+            throw SegmentedFMP4WriterFailure.inputEvidenceCapacityExceeded
+        }
         let snapshotBaseline = withLane { (aacSnapshotRevision, aacSnapshot) }
         let snapshot = try makeAACSnapshot(
             epoch,
@@ -3182,6 +3187,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         guard trackKind == .aac, sourceAACConfiguration == nil, !epoch.buffers.isEmpty,
               coordinator.session === boundarySession else {
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        guard epoch.buffers.count <= ownershipLimits.hardCapacity else {
+            throw SegmentedFMP4WriterFailure.inputEvidenceCapacityExceeded
         }
         let baseline = withLane { (aacSnapshotRevision, aacSnapshot) }
         let snapshot = try makeAACSnapshot(epoch, extending: baseline.1)
@@ -3945,11 +3953,18 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         initializationObject: SealedMediaObject,
         mediaObjects: [SealedMediaObject]
     ) throws -> AACEffectiveEndpointReceipt {
-        let snapshot = try makeAACSnapshot(epoch)
         guard let terminal = storedTerminalReceipt,
               terminal.terminalReason == .finished,
               let frozen = aacSnapshot,
-              frozen.epochIdentity == snapshot.epochIdentity,
+              frozen.epochIdentity == epoch.identity,
+              frozen.inputCount == epoch.buffers.count,
+              terminal.inputCount == frozen.inputCount else {
+            throw SegmentedFMP4WriterFailure.aacEndpointMismatch
+        }
+        // Verify the supplied historical inputs against committed accounting. This
+        // folds them into a fixed-size digest; it does not admit or retain inputs.
+        let snapshot = try makeAACSnapshot(epoch)
+        guard frozen.epochIdentity == snapshot.epochIdentity,
               frozen.inputCount == snapshot.inputCount,
               frozen.inputDigest == snapshot.inputDigest,
               frozen.sampleRate == snapshot.sampleRate,
@@ -5135,10 +5150,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ epoch: AACEncodedEpoch,
         extending previous: AACSnapshot? = nil
     ) throws -> AACSnapshot {
-        guard !epoch.buffers.isEmpty,
-              // 一个完整 encoder epoch 可以跨多个 segment；128 是单 segment
-              // 的证据上限，epoch 总输入仍由本 writer 的 ownership hard cap 封顶。
-              epoch.buffers.count <= ownershipLimits.hardCapacity else {
+        guard !epoch.buffers.isEmpty else {
             throw SegmentedFMP4WriterFailure.inputEvidenceCapacityExceeded
         }
         var digest = Data(SHA256.hash(data: Data()))
@@ -5265,11 +5277,13 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             current.realSampleCount)
         let combinedTotal = previous.totalDecodedFrames.addingReportingOverflow(
             current.totalDecodedFrames)
+        // These cumulative scalars and digest do not own native inputs or retain
+        // per-sample evidence. Live capacity is enforced by inputAdmission and
+        // segmentEvidence, independently of the persistent writer's lifetime count.
         guard !combinedInputCount.overflow,
               !combinedReal.overflow,
-              !combinedTotal.overflow,
-              combinedInputCount.partialValue <= ownershipLimits.hardCapacity else {
-            throw SegmentedFMP4WriterFailure.inputEvidenceCapacityExceeded
+              !combinedTotal.overflow else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
         }
         var combinedDigest = previous.inputDigest
         for buffer in epoch.buffers {

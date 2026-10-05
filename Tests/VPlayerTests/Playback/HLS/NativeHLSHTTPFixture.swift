@@ -43,8 +43,17 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         listener.stateUpdateHandler = { state in
             switch state { case .ready, .failed, .cancelled: gate.signal(); default: break }
         }
+        // Network.framework fails startup when no connection handler exists.
+        // No URL has escaped yet; reject early connections until all fixture
+        // state is initialized and the ordinary serving handler is installed.
+        listener.newConnectionHandler = { $0.cancel() }
         listener.start(queue: queue)
-        guard gate.wait(timeout: .now() + 5) == .success, let port = listener.port else { listener.cancel(); throw HLSSourceError.network }
+        guard gate.wait(timeout: .now() + 5) == .success,
+              case .ready = listener.state,
+              let port = listener.port, port.rawValue > 0 else {
+            listener.cancel()
+            throw HLSSourceError.network
+        }
         baseURL = URL(string: "http://127.0.0.1:\(port.rawValue)/")!
         listener.stateUpdateHandler = { [weak self] state in
             if case .cancelled = state { self?.listenerStopped() }

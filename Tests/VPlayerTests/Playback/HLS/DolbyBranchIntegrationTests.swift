@@ -145,31 +145,39 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         XCTAssertEqual(ledger.chargedBytes, baseline)
     }
 
-    func testNativeEAC3BranchPublishesActualSixBlockConfigurationAndSideLayout() async throws {
+    func testNativeEAC3BranchPublishesValidatedSideLayoutOrRejectsMissingLayout() async throws {
         let fixture = try DolbyBranchFixture.eac3()
         let graph = try DolbyBranchTestGraph(fixture: fixture, accessUnits: 4,
             retainsAliases: false, usesNativeWriter: true)
         defer { graph.timeline.retireCompressedGeneration() }
-        for frame in graph.frames { try await graph.branch.append(frame) }
-        let terminal = try await graph.branch.finish()
-        XCTAssertEqual(terminal.terminalReason, .finished)
-        XCTAssertEqual(graph.branch.physicalWriterCount, 1)
-        for _ in 0..<200 where graph.factory.initializations.count != 1 || graph.factory.mediaCount == 0 {
-            try await Task.sleep(for: .milliseconds(5))
+        do {
+            for frame in graph.frames { try await graph.branch.append(frame) }
+            let terminal = try await graph.branch.finish()
+            XCTAssertEqual(terminal.terminalReason, .finished)
+            XCTAssertEqual(graph.branch.physicalWriterCount, 1)
+            for _ in 0..<200 where graph.factory.initializations.count != 1 || graph.factory.mediaCount == 0 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            try graph.factory.checkCallbackFailures()
+            XCTAssertEqual(graph.factory.initializations.count, 1)
+            XCTAssertEqual(graph.factory.mediaCount, 1)
+            let bytes = try XCTUnwrap(graph.factory.initializations.first)
+            let configuration = try XCTUnwrap(graph.branch.configuration)
+            let evidence = try DolbyWriterInitializationEvidence.validate(bytes,
+                configuration: configuration, sourceLayout: fixture.source.channelLayout)
+            XCTAssertEqual(evidence.channelPositions, 0x60F)
+            XCTAssertFalse(configuration.declaresDolbyAtmos)
+            await graph.branch.cancelAndAwait()
+        } catch CompressedAudioInitializationRejection.invalidConfiguration {
+            await graph.branch.cancelAndAwait()
+            try assertMissingNativeLayoutWasRejected(graph, fixture: fixture)
+        } catch {
+            await graph.branch.cancelAndAwait()
+            throw error
         }
-        try graph.factory.checkCallbackFailures()
-        XCTAssertEqual(graph.factory.initializations.count, 1)
-        XCTAssertEqual(graph.factory.mediaCount, 1)
-        let bytes = try XCTUnwrap(graph.factory.initializations.first)
-        let configuration = try XCTUnwrap(graph.branch.configuration)
-        let evidence = try DolbyWriterInitializationEvidence.validate(bytes,
-            configuration: configuration, sourceLayout: fixture.source.channelLayout)
-        XCTAssertEqual(evidence.channelPositions, 0x60F)
-        XCTAssertFalse(configuration.declaresDolbyAtmos)
-        await graph.branch.cancelAndAwait()
     }
 
-    func testRealNativePredecessorRolloverKeepsOriginalPendingAUAndLiveAliasDomain() async throws {
+    func testRealNativePredecessorRolloverPreservesAliasesOrRejectsMissingLayout() async throws {
         // A real AVAssetWriter predecessor is mandatory: no fake callback binding,
         // fabricated drain certificate, or directly constructed continuation.
         let fixture = try await DolbyBranchFixture.ac3()
@@ -177,45 +185,85 @@ final class DolbyBranchIntegrationTests: XCTestCase {
             retainsAliases: true, usesNativeWriter: true,
             ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 384))
         defer { graph.factory.aliases.releaseAll(); graph.timeline.retireCompressedGeneration() }
-        for frame in graph.frames.prefix(32) { try await graph.branch.append(frame) }
-        XCTAssertEqual(graph.branch.physicalWriterCount, 1)
-        XCTAssertEqual(graph.factory.aliases.count, 32)
-        let predecessor = TestWeakReference(graph.branch.writer)
-        let finalPendingProof = try XCTUnwrap(graph.frames[32].source.dolbyProof)
-        let proofIdentity = finalPendingProof.identity
-        try await graph.branch.append(graph.frames[32])
-        XCTAssertEqual(graph.branch.physicalWriterCount, 2)
-        XCTAssertEqual(graph.factory.continuationCount, 1)
-        XCTAssertNil(predecessor.value)
-        XCTAssertEqual(finalPendingProof.identity, proofIdentity)
-        XCTAssertNil(finalPendingProof.admittedProof)
-        XCTAssertEqual(graph.producer.coordinator.claimedCompressedWriterSubmissionCount, 33,
-            "The pre-claim capacity retry consumes its original complete AU exactly once")
-        XCTAssertGreaterThanOrEqual(graph.branch.writer!.usage.liveInputCount, 32,
-            "The successor retains the predecessor's actual input admission domain")
-        try await graph.branch.append(graph.frames[33])
-        let terminal = try await graph.branch.finish()
-        XCTAssertEqual(terminal.terminalReason, .finished)
-        XCTAssertEqual(graph.factory.writerBindings.count, 2)
-        XCTAssertNotEqual(graph.factory.writerBindings[0].writerIdentity, graph.factory.writerBindings[1].writerIdentity)
-        XCTAssertEqual(graph.factory.writerBindings[0].renditionIdentity, graph.factory.writerBindings[1].renditionIdentity)
-        XCTAssertEqual(graph.factory.continuationCount, 1)
-        for _ in 0..<200 where graph.factory.initializations.count != 2 || graph.factory.mediaCount < 2 {
-            try await Task.sleep(for: .milliseconds(5))
+        do {
+            for frame in graph.frames.prefix(32) { try await graph.branch.append(frame) }
+            XCTAssertEqual(graph.branch.physicalWriterCount, 1)
+            XCTAssertEqual(graph.factory.aliases.count, 32)
+            let predecessor = TestWeakReference(graph.branch.writer)
+            let finalPendingProof = try XCTUnwrap(graph.frames[32].source.dolbyProof)
+            let proofIdentity = finalPendingProof.identity
+            try await graph.branch.append(graph.frames[32])
+            XCTAssertEqual(graph.branch.physicalWriterCount, 2)
+            XCTAssertEqual(graph.factory.continuationCount, 1)
+            XCTAssertNil(predecessor.value)
+            XCTAssertEqual(finalPendingProof.identity, proofIdentity)
+            XCTAssertNil(finalPendingProof.admittedProof)
+            XCTAssertEqual(graph.producer.coordinator.claimedCompressedWriterSubmissionCount, 33,
+                "The pre-claim capacity retry consumes its original complete AU exactly once")
+            XCTAssertGreaterThanOrEqual(graph.branch.writer!.usage.liveInputCount, 32,
+                "The successor retains the predecessor's actual input admission domain")
+            try await graph.branch.append(graph.frames[33])
+            let terminal = try await graph.branch.finish()
+            XCTAssertEqual(terminal.terminalReason, .finished)
+            XCTAssertEqual(graph.factory.writerBindings.count, 2)
+            XCTAssertNotEqual(graph.factory.writerBindings[0].writerIdentity, graph.factory.writerBindings[1].writerIdentity)
+            XCTAssertEqual(graph.factory.writerBindings[0].renditionIdentity, graph.factory.writerBindings[1].renditionIdentity)
+            XCTAssertEqual(graph.factory.continuationCount, 1)
+            for _ in 0..<200 where graph.factory.initializations.count != 2 || graph.factory.mediaCount < 2 {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            try graph.factory.checkCallbackFailures()
+            let initializations = graph.factory.initializations
+            XCTAssertEqual(initializations.count, 2)
+            let configuration = try XCTUnwrap(graph.branch.configuration)
+            for bytes in initializations {
+                let evidence = try DolbyWriterInitializationEvidence.validate(bytes,
+                    configuration: configuration, sourceLayout: fixture.source.channelLayout)
+                XCTAssertEqual(evidence.channelPositions, UInt32(fixture.channelMask))
+            }
+            XCTAssertGreaterThanOrEqual(graph.factory.mediaCount, 2)
+            await graph.branch.cancelAndAwait()
+            XCTAssertGreaterThanOrEqual(graph.producer.coordinator.liveCompressedWriterSubmissionCount, 32)
+            graph.factory.aliases.releaseAll()
+        } catch CompressedAudioInitializationRejection.invalidConfiguration {
+            await graph.branch.cancelAndAwait()
+            try assertMissingNativeLayoutWasRejected(graph, fixture: fixture)
+        } catch {
+            await graph.branch.cancelAndAwait()
+            throw error
         }
+    }
+
+    private func assertMissingNativeLayoutWasRejected(
+        _ graph: DolbyBranchTestGraph, fixture: DolbyBranchFixture
+    ) throws {
+        // This is a supported native capability outcome only when the real
+        // callback proves that the requested multichannel layout was omitted.
+        // Bad cookies/rates, fabricated evidence and arbitrary errors still fail.
         try graph.factory.checkCallbackFailures()
-        let initializations = graph.factory.initializations
-        XCTAssertEqual(initializations.count, 2)
+        let facts = try XCTUnwrap(graph.factory.nativeInitializations.first)
         let configuration = try XCTUnwrap(graph.branch.configuration)
-        for bytes in initializations {
-            let evidence = try DolbyWriterInitializationEvidence.validate(bytes,
-                configuration: configuration, sourceLayout: fixture.source.channelLayout)
-            XCTAssertEqual(evidence.channelPositions, UInt32(fixture.channelMask))
+        XCTAssertNil(facts.channelLayout)
+        XCTAssertEqual(facts.sampleEntry, fixture.codec == .ac3 ? 0x61632d33 : 0x65632d33)
+        XCTAssertEqual(facts.sampleEntrySampleRate, UInt32(configuration.sampleRate))
+        XCTAssertEqual(facts.decoderConfiguration, configuration.serializedBox)
+        XCTAssertEqual(fixture.source.channelLayout.channelCount, 6)
+        XCTAssertEqual(graph.factory.nativeInitializations.count, 1)
+        XCTAssertEqual(graph.branch.physicalWriterCount, 1,
+            "A rejected initialization cannot authorize a successor")
+        XCTAssertEqual(graph.factory.continuationCount, 0)
+        XCTAssertTrue(graph.factory.initializations.isEmpty,
+            "A rejected native layout must never mint publication evidence")
+        XCTAssertEqual(graph.factory.mediaCount, 0)
+        XCTAssertFalse(graph.producer.isCurrent)
+        if graph.factory.aliases.count > 0 {
+            XCTAssertGreaterThan(graph.branch.writer?.usage.liveInputCount ?? 0, 0,
+                "Joined cancellation cannot discharge retained native aliases")
         }
-        XCTAssertGreaterThanOrEqual(graph.factory.mediaCount, 2)
-        await graph.branch.cancelAndAwait()
-        XCTAssertGreaterThanOrEqual(graph.producer.coordinator.liveCompressedWriterSubmissionCount, 32)
         graph.factory.aliases.releaseAll()
+        XCTAssertEqual(graph.branch.writer?.usage.liveInputCount, 0)
+        XCTAssertEqual(graph.producer.coordinator.liveCompressedWriterSubmissionCount, 0)
+        XCTAssertEqual(graph.producer.coordinator.audioServiceRegistryUsage.admittedProofs, 0)
     }
 #endif
 }
@@ -367,12 +415,15 @@ private final class DolbyBranchWriterFactory: @unchecked Sendable {
     private var bindings: [FMP4WriterBinding] = []
     private var submitted: [DolbyObservedSample] = []
     private var initializationBytes: [Data] = []
+    private var nativeInitializationFacts: [FMP4CompressedAudioInitialization] = []
+    private var nativeSinks: [DolbyNativeObservationSink] = []
     private var mediaObjects = 0
     private var continuations = 0
     private var callbackFailure: String?
     var writerBindings: [FMP4WriterBinding] { lock.withLock { bindings } }
     var samples: [DolbyObservedSample] { lock.withLock { submitted } }
     var initializations: [Data] { lock.withLock { initializationBytes } }
+    var nativeInitializations: [FMP4CompressedAudioInitialization] { lock.withLock { nativeInitializationFacts } }
     var mediaCount: Int { lock.withLock { mediaObjects } }
     var continuationCount: Int { lock.withLock { continuations } }
 
@@ -411,7 +462,7 @@ private final class DolbyBranchWriterFactory: @unchecked Sendable {
         })
         holder.relay = relay
         let system: any SegmentedFMP4SystemWriterFactory = usesNativeWriter
-            ? AVAssetSegmentedFMP4SystemWriterFactory() : DolbyPromptSystemFactory(recorder: self)
+            ? DolbyObservedNativeSystemFactory(recorder: self) : DolbyPromptSystemFactory(recorder: self)
         let writer = try SegmentedFMP4Writer(binding: binding,
             trackKind: configuration.codec == .ac3 ? .ac3 : .eac3, sourceFormatHint: description,
             boundarySession: boundary.session, compressedFormatConfiguration: configuration,
@@ -425,6 +476,25 @@ private final class DolbyBranchWriterFactory: @unchecked Sendable {
 #endif
         lock.withLock { bindings.append(binding); if continuation != nil { continuations += 1 } }
         return writer
+    }
+    func observeNativeSink(_ sink: any SegmentedFMP4SystemCallbackSink) throws -> DolbyNativeObservationSink {
+        try lock.withLock {
+            guard nativeSinks.count < 2 else { throw SegmentedFMP4WriterFailure.invalidSystemConfiguration }
+            let observer = DolbyNativeObservationSink(target: sink, recorder: self)
+            nativeSinks.append(observer)
+            return observer
+        }
+    }
+    func observeNativeInitialization(_ bytes: Data) {
+        do {
+            let facts = try FMP4CompressedAudioInspection.initialization(bytes)
+            lock.withLock {
+                if nativeInitializationFacts.count < 2 { nativeInitializationFacts.append(facts) }
+                else { callbackFailure = "Unexpected extra actual native initialization" }
+            }
+        } catch {
+            lock.withLock { callbackFailure = "Actual native initialization could not be inspected: \(error)" }
+        }
     }
     func record(_ sample: CMSampleBuffer) -> Bool {
         guard let block = CMSampleBufferGetDataBuffer(sample), let format = CMSampleBufferGetFormatDescription(sample) else { return false }
@@ -449,6 +519,32 @@ private final class DolbyBranchWriterFactory: @unchecked Sendable {
 }
 
 private final class DolbyWeakRelay: @unchecked Sendable { weak var relay: SegmentReportRelay? }
+
+/// Observes bounded parsed facts before strict production validation. The real
+/// adapter, callback capsule, bytes and report are forwarded without substitution.
+private struct DolbyObservedNativeSystemFactory: SegmentedFMP4SystemWriterFactory {
+    let recorder: DolbyBranchWriterFactory
+    func makeWriter(configuration: SegmentedFMP4SystemConfiguration, sourceFormatHint: CMFormatDescription,
+                    callbackSink: any SegmentedFMP4SystemCallbackSink) throws -> any SegmentedFMP4SystemWriting {
+        let observer = try recorder.observeNativeSink(callbackSink)
+        return try AVAssetSegmentedFMP4SystemWriterFactory().makeWriter(configuration: configuration,
+            sourceFormatHint: sourceFormatHint, callbackSink: observer)
+    }
+}
+
+private final class DolbyNativeObservationSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendable {
+    private weak var target: (any SegmentedFMP4SystemCallbackSink)?
+    private weak var recorder: DolbyBranchWriterFactory?
+    init(target: any SegmentedFMP4SystemCallbackSink, recorder: DolbyBranchWriterFactory) {
+        self.target = target; self.recorder = recorder
+    }
+    func receiveSystemSegment(writerObjectIdentity: ObjectIdentifier, bytes: Data,
+                              type: AVAssetSegmentType, report: SegmentedFMP4SystemReportEvidence) {
+        if type == .initialization { recorder?.observeNativeInitialization(bytes) }
+        target?.receiveSystemSegment(writerObjectIdentity: writerObjectIdentity,
+            bytes: bytes, type: type, report: report)
+    }
+}
 
 private struct DolbyPromptSystemFactory: SegmentedFMP4SystemWriterFactory {
     let recorder: DolbyBranchWriterFactory

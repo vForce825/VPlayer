@@ -65,12 +65,40 @@ final class DolbyTimelineProofTests: XCTestCase {
             timing: first.timing, boundaryDecision: first.boundaryDecision)
         XCTAssertFalse(copied.validatesSourceMapping())
         XCTAssertNil(timeline.makeCompressedAudioCandidatePlan(for: copied))
+        XCTAssertTrue(harness.producer.canAbandonBeforeOutput)
+        XCTAssertEqual(harness.producer.coordinator.claimedCompressedWriterSubmissionCount, 0)
         try timeline.useCompatibleAudioBeforeSourceAppend()
+        XCTAssertFalse(harness.producer.isCurrent)
+        XCTAssertEqual(harness.producer.coordinator.claimedCompressedWriterSubmissionCount, 0)
         let second = try XCTUnwrap(try timeline.consume(.packet(packet(1))).compactMap {
             if case let .audioSample(frame) = $0 { return frame }; return nil
         }.first)
         XCTAssertNil(second.source.dolbyProof)
         XCTAssertFalse(first.validatesSourceMapping())
+        XCTAssertEqual(second.source.id, 2)
+        XCTAssertEqual(second.source.presentationTimeStamp, packet(1).presentationTimeStamp)
+    }
+
+    func testCompatibleFallbackAfterOutputBeginsRejectsWithoutRevokingCurrentMapping() throws {
+        let harness = try DolbyProducerTestHarness()
+        let timeline = makeTimeline(harness)
+        defer { timeline.retireCompressedGeneration() }
+        _ = try timeline.consume(.tracks(tracks(harness)))
+        let first = try XCTUnwrap(try timeline.consume(.packet(packet(0))).compactMap {
+            if case let .audioSample(frame) = $0 { return frame }; return nil
+        }.first)
+        try harness.producer.beginOutput()
+        XCTAssertFalse(harness.producer.canAbandonBeforeOutput)
+        XCTAssertThrowsError(try timeline.useCompatibleAudioBeforeSourceAppend()) {
+            XCTAssertEqual($0 as? DolbyAudioSourceFailure, .sourceAlreadyConsumed)
+        }
+        XCTAssertTrue(harness.producer.isCurrent)
+        XCTAssertTrue(first.validatesSourceMapping())
+        let second = try XCTUnwrap(try timeline.consume(.packet(packet(1))).compactMap {
+            if case let .audioSample(frame) = $0 { return frame }; return nil
+        }.first)
+        XCTAssertNotNil(second.source.dolbyProof)
+        XCTAssertTrue(second.validatesSourceMapping())
         XCTAssertEqual(second.source.id, 2)
         XCTAssertEqual(second.source.presentationTimeStamp, packet(1).presentationTimeStamp)
     }
