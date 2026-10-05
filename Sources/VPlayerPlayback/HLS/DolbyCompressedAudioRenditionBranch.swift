@@ -38,6 +38,7 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
     private let initialFormatAdmission: InitialFormatAdmission
     private let writerFactory: WriterFactory
     private let fixedCharge: HLSCompressedAudioApplicationReservation
+    private let capacityWakeup: WriterCapacityWakeup
     private let directBuilder: AC3DirectAccessUnitBuilder?
     private let aggregateBuilder: EAC3AccessUnitAssembler?
     // All mutable state is accessed through the producer's single control lane.
@@ -68,6 +69,7 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
             throw DolbyCompressedAudioRenditionFailure.sourceMismatch
         }
         fixedCharge = try producer.reserveBranchStorage()
+        capacityWakeup = try producer.makeCapacityWakeup()
         self.producer = producer; self.authorization = authorization; self.boundary = boundary
         self.initialFormatAdmission = initialFormatAdmission; self.writerFactory = writerFactory
         directBuilder = authorization.codec == .ac3
@@ -214,6 +216,7 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
                 storedFormatDescription = description; storedSourceLayout = proof.sourceLayout
                 storedPhysicalWriterCount = 1
             }
+            try trial.installCompressedCapacityWakeup(capacityWakeup)
             try trial.start(at: first.timing.presentationTimeStamp.cmTime)
         } catch {
             _ = await trial.cancelAwaitingCompletion()
@@ -249,14 +252,15 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
 
     private func appendComplete(_ unit: CompressedAudioAccessUnit, timed: HLSTimedAudioAccessUnit,
                                 nativeTail: DolbyAudioPayloadLifetime) async throws {
-        guard let current = writer else { throw DolbyCompressedAudioRenditionFailure.noWriter }
+        var current = writer
+        guard current != nil else { throw DolbyCompressedAudioRenditionFailure.noWriter }
         do {
-            try await current.appendMappedCompressedAwaitingReadiness(unit.writerSubmission,
-                timed: timed, coordinator: producer.coordinator, boundary: boundary, nativeTail: nativeTail)
+            try await appendWhenCapacityReturns(unit, timed: timed, writer: current!, nativeTail: nativeTail)
         } catch SegmentedFMP4WriterFailure.rolloverRequired {
             // An actual pre-claim capacity boundary is the only continuation path.
             // Keep this very same complete AU and native tail throughout the retry.
-            let continuation = try await current.finishWriterWindow()
+            let continuation = try await current!.finishWriterWindow()
+            let previous = current!.binding
             try producer.sharedControlExecutor.sync { try requireCurrent() }
             guard timed.validatesSourceMapping(), let configuration, let formatDescription else {
                 throw DolbyCompressedAudioRenditionFailure.sourceMismatch
@@ -265,7 +269,7 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
             do {
                 try producer.sharedControlExecutor.sync {
                     try requireCurrent()
-                    let previous = current.binding; let next = successor.binding
+                    let next = successor.binding
                     guard continuation.predecessorTerminal.binding == previous,
                           previous.outputLifecycleEpoch == next.outputLifecycleEpoch,
                           previous.itemGeneration == next.itemGeneration, previous.mediaEpoch == next.mediaEpoch,
@@ -276,12 +280,34 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
                     }
                     storedWriter = successor; storedPhysicalWriterCount += 1
                 }
+                current = nil
+                try successor.installCompressedCapacityWakeup(capacityWakeup)
                 try successor.start(at: timed.timing.presentationTimeStamp.cmTime)
-                try await successor.appendMappedCompressedAwaitingReadiness(unit.writerSubmission,
-                    timed: timed, coordinator: producer.coordinator, boundary: boundary, nativeTail: nativeTail)
+                try await appendWhenCapacityReturns(unit, timed: timed, writer: successor, nativeTail: nativeTail)
             } catch {
                 _ = await successor.cancelAwaitingCompletion()
                 throw error
+            }
+        }
+    }
+
+    private func appendWhenCapacityReturns(_ unit: CompressedAudioAccessUnit,
+                                           timed: HLSTimedAudioAccessUnit,
+                                           writer: SegmentedFMP4Writer,
+                                           nativeTail: DolbyAudioPayloadLifetime) async throws {
+        let deadline = try capacityWakeup.makeDeadline()
+        while true {
+            try Task.checkCancellation()
+            try producer.sharedControlExecutor.sync { try requireCurrent() }
+            guard timed.validatesSourceMapping() else { throw DolbyCompressedAudioRenditionFailure.sourceMismatch }
+            let revision = capacityWakeup.currentRevision
+            do {
+                try await writer.appendMappedCompressedAwaitingReadiness(unit.writerSubmission,
+                    timed: timed, coordinator: producer.coordinator, boundary: boundary, nativeTail: nativeTail)
+                return
+            } catch let error as SegmentedFMP4WriterFailure
+                where error == .terminalOwnershipCapacityExceeded || error == .relayCapacityExceeded {
+                guard try await capacityWakeup.wait(after: revision, until: deadline) else { throw error }
             }
         }
     }
@@ -319,6 +345,7 @@ final class DolbyCompressedAudioRenditionBranch: @unchecked Sendable {
     }
 
     func cancel() {
+        capacityWakeup.cancel()
         let current: SegmentedFMP4Writer? = producer.sharedControlExecutor.sync {
             stopped = true; producer.cancel()
             if !operationActive { aggregateBuilder?.terminate(.cancelled); retirePending() }

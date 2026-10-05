@@ -74,7 +74,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         // AVPlayer retains its original default/alternate media selections.
         try await driver.primeMediaData(item: item)
         try validatePrepare()
-        let snapshot = try await inspector.snapshot(item: item, source: owned)
+        let snapshot = try await selectionSnapshot { try self.validatePrepare() }
         try validatePrepare()
         guard driver.currentItemIdentity == item, driver.rate == 0 else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         selected = snapshot; prepared = true
@@ -88,7 +88,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         authorization = invocation
         // Reload before EVERY rate admission, including ordinary pause/resume.
         // A same-size SPS or audio-format change cannot hide behind cached facts.
-        let snapshot = try await inspector.snapshot(item: item, source: owned)
+        let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
         try validateActive(invocation)
         if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
         selected = snapshot
@@ -121,7 +121,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         }
         try await driver.primeMediaData(item: item)
         try validateActive(invocation)
-        let afterPreroll = try await inspector.snapshot(item: item, source: owned)
+        let afterPreroll = try await selectionSnapshot { try self.validateActive(invocation) }
         try validateActive(invocation)
         guard afterPreroll.permitsTransition(from: snapshot) else { throw HLSSourceError.unsupportedMedia }
         selected = afterPreroll
@@ -140,6 +140,24 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         try validateActive(invocation)
         startProgress(invocation)
     }
+    /// ABR and media selection can move while the SDK loads a track. Retry only
+    /// that transient condition on this same joined stack and original authority.
+    /// Unsupported stable formats, missing audio and stale owners are never retried.
+    private func selectionSnapshot(validate: () throws -> Void) async throws -> NativeHLSSelectionSnapshot {
+        for attempt in 0..<3 {
+            try validate()
+            do {
+                let value = try await inspector.snapshot(item: item, source: owned)
+                try validate()
+                return value
+            } catch let error as AVPlayerItemCoordinatorFailure where error == .selectionChanged {
+                try validate()
+                guard attempt < 2 else { throw error }
+            }
+        }
+        throw AVPlayerItemCoordinatorFailure.selectionChanged
+    }
+
     #if DEBUG
     func observeSelectedFormatChangeForTesting() async { await refresh(failed: false) }
     #endif
@@ -147,7 +165,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         guard !retired, !failureDelivered, armed, let invocation = authorization, invocation.revalidateCurrentAuthority() else { return }
         if failed || owned.source.refreshReason() != nil { fail(.network); return }
         do {
-            let snapshot = try await inspector.snapshot(item: item, source: owned)
+            let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
             try validateActive(invocation)
             if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
             selected = snapshot

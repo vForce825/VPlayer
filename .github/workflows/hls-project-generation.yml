@@ -4,7 +4,9 @@ name: HLS preparation only, pinned Apple project readback
 # It never substitutes for acceptance or the six complete gates.
 "on":
   push:
-    branches: [feat/homepod-hls-evolution]
+    branches: [work/homepod-hls-rebuild]
+    paths:
+      - .github/workflows/hls-project-generation.yml
   workflow_dispatch:
 
 permissions:

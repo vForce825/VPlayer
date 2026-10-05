@@ -138,6 +138,10 @@ final class DolbyBranchIntegrationTests: XCTestCase {
         aliases.releaseFirst(19)
         XCTAssertGreaterThan(ledger.chargedBytes, baseline)
         aliases.releaseAll()
+        // The prepaid capacity deadline handler may still be leaving Dispatch;
+        // retain its charge until that real tail, rather than forcing zero early.
+        let deadline = Date().addingTimeInterval(2)
+        while ledger.chargedBytes != baseline && Date() < deadline { await Task.yield() }
         XCTAssertEqual(ledger.chargedBytes, baseline)
     }
 

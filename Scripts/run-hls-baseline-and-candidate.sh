@@ -16,6 +16,12 @@ echo "HLS_COMPARISON_DIRECTORY=$root"
 VPLAYER_HLS_ACCEPTANCE_DERIVED_DATA="$root/CandidateDerivedData" \
   ./Scripts/run-persistent-hls-acceptance.sh --controls-only --duration-seconds 300 \
   --head "$head" --output "$root/native-controls.json"
+# The obsolete PR branch may already be deleted. Fetch only its approved exact
+# source commit when checkout's reachable objects do not include that baseline.
+if ! git cat-file -e "$old^{commit}" 2>/dev/null; then
+  git fetch --no-write-fetch-head origin "$old"
+fi
+[[ "$(git rev-parse --verify "$old^{commit}")" == "$old" ]]
 git worktree add --detach "$root/old-writer" "$old"
 # Only test harness, build manifest and synthetic resources may overlay old code.
 python3 - "$candidate" "$root/old-writer" "$root/overlay.sha256" <<'PY'

@@ -319,7 +319,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
     }
 
-    private func withWatchdogController(_ body: @MainActor (
+    private func withWatchdogController(factory: WatchdogPlaybackFactory = WatchdogPlaybackFactory(), _ body: @MainActor (
         PlaybackController, ControlTaskRegistry, ManualPlaybackClock, WatchdogPlaybackFactory,
         FakeAudioSessionSDK
     ) async throws -> Void) async throws {
@@ -327,7 +327,6 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator(), clock: clock)
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let audio = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
-        let factory = WatchdogPlaybackFactory()
         let controller = makeRoutedPlaybackController(backendFactory: factory, audioSessionOwner: audio)
         let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "watchdog-e2e",
             streamURL: URL(string: "http://localhost/watchdog-fixture")!, title: "Watchdog fixture")
@@ -3146,6 +3145,51 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                            "The installed callback must classify the adopted publication and its selection")
             _ = try await harness.activate()
             XCTAssertEqual(harness.driver.playCallCount, 1)
+        }
+    }
+
+    func testGenuineSourceAACCoordinatorNearEOFPauseUsesCurrentHTTPRootAndRejectsRetirement() async throws {
+        for retireBeforeResume in [false, true] {
+            let factory = WatchdogPlaybackFactory(sourceAAC: true)
+            try await withWatchdogController(factory: factory) { controller, registry, _, factory, _ in
+                let driver = try XCTUnwrap(factory.driver)
+                let source = try XCTUnwrap(factory.sourceAACBuilder?.fixture)
+                let timeline = try XCTUnwrap(driver.observedPlayheads.last?.timelineMappingAuthority)
+                XCTAssertTrue(timeline.sourceAACBinding === source.root)
+                XCTAssertNil(timeline.aacEndpointReceipt)
+                XCTAssertNil(timeline.aacPrefixReceipt)
+                let final = try XCTUnwrap(source.root.finalSeal)
+                XCTAssertEqual(timeline.sourceAACFinalEndpoint, final.writtenEnd)
+                let endpoint = try timeline.playerItemTime(for: final.writtenEnd)
+                XCTAssertEqual(driver.constrainedPlaybackEnd, endpoint)
+                let remaining = ExactMediaTime(value: 1, timescale: 4)
+                let cursor = try endpoint.subtracting(remaining)
+                driver.observedPausedTime = cursor.cmTime
+                await controller.setPaused(true)
+                try await waitForWatchdogCondition { driver.systemAudioDisconnected && registry.outputResourceContextSnapshot()?.interval == nil }
+                XCTAssertEqual(driver.playCallCount, 1)
+                if retireBeforeResume {
+                    source.timeline.retireCompressedGeneration()
+                    XCTAssertNil(timeline.sourceAACFinalEndpoint)
+                }
+                let range = try FMP4PresentationRange(start: cursor, duration: remaining)
+                driver.loadedRangesOverride = [range]
+                driver.applySeekToObservedPausedTime = true
+                driver.reconnectedPausedTime = try cursor.adding(ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
+                await controller.setPaused(false)
+                if retireBeforeResume {
+                    XCTAssertFalse(source.root.isCurrent)
+                    XCTAssertEqual(driver.playCallCount, 1, "Retired source callback authority cannot resume near EOF")
+                } else {
+                    try await waitForWatchdogCondition { driver.playCallCount == 2 }
+                    XCTAssertEqual(driver.requestedSeekTime, cursor)
+                    XCTAssertEqual(driver.lastPlayedPausedTime, cursor)
+                    XCTAssertEqual(driver.lastRequestedLoadedRange, ExactMediaInterval(range))
+                    XCTAssertEqual(driver.lastRequestedLoadedRange?.end, endpoint)
+                    XCTAssertTrue(driver.observedPlayheads.allSatisfy { $0.timelineMappingAuthority === timeline })
+                    XCTAssertEqual(driver.installCount, 1)
+                }
+            }
         }
     }
 
@@ -8737,6 +8781,9 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
     private(set) var drivers: [Task21FakeDriver] = []
     private(set) weak var coordinator: AVPlayerItemCoordinator?
     private(set) var builder: WatchdogPlaybackBundleBuilder?
+    private(set) var sourceAACBuilder: SourceAACCoordinatorBundleBuilder?
+    private let usesSourceAAC: Bool
+    init(sourceAAC: Bool = false) { usesSourceAAC = sourceAAC }
     private(set) var maximumAudibleOutputs = 0
     var driver: Task21FakeDriver? { drivers.last }
 
@@ -8759,12 +8806,18 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
             self.maximumAudibleOutputs = max(self.maximumAudibleOutputs, others + 1)
         }
         drivers.append(driver)
-        let builder = WatchdogPlaybackBundleBuilder(eventSink: eventSink, resetClock: {
-            await MainActor.run { driver.observedPlaybackTime = Task21Fixtures.time(0) }
-        }, releaseHistory: {
-            await MainActor.run { driver.observedPlayheads.removeAll() }
-        })
-        self.builder = builder
+        let builder: any HLSOutputItemBundleBuilding
+        if usesSourceAAC {
+            let source = SourceAACCoordinatorBundleBuilder()
+            sourceAACBuilder = source; builder = source
+        } else {
+            let ordinary = WatchdogPlaybackBundleBuilder(eventSink: eventSink, resetClock: {
+                await MainActor.run { driver.observedPlaybackTime = Task21Fixtures.time(0) }
+            }, releaseHistory: {
+                await MainActor.run { driver.observedPlayheads.removeAll() }
+            })
+            self.builder = ordinary; builder = ordinary
+        }
         let slot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
         return HLSAVPlayerPlaybackBackend(identity: identity, bundleBuilder: builder,
             presentationContext: AVPlayerPresentationContext(player: AVPlayer()),
@@ -8782,7 +8835,76 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
     func releaseObservations() {
         drivers.forEach { $0.observedPlayheads.removeAll() }
         drivers.removeAll()
-        builder = nil
+        builder = nil; sourceAACBuilder = nil
+    }
+}
+
+private final class SourceAACCoordinatorBundleBuilder: HLSOutputItemBundleBuilding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: SourceAACCoordinatorBundleOwner?
+    var fixture: SourceAACPublicationFixture? { lock.withLock { current?.fixture } }
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
+        let owner = SourceAACCoordinatorBundleOwner(lifecycle: invocation.outputLifecycleEpoch)
+        lock.withLock { current = owner }
+        return HLSOutputItemBundle(startProducer: { try await owner.start() }, retireProducer: { await owner.retire() })
+    }
+}
+private final class SourceAACCoordinatorBundleOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let lifecycle: OutputLifecycleEpoch
+    private var fixtureValue: SourceAACPublicationFixture?
+    private var serverValue: LoopbackHTTPServer?
+    private var evidenceValue: LoopbackAVPlayerPreparationEvidenceSource?
+    var fixture: SourceAACPublicationFixture? { lock.withLock { fixtureValue } }
+    init(lifecycle: OutputLifecycleEpoch) { self.lifecycle = lifecycle }
+    func start() async throws -> AVPlayerItemReplacementBundle {
+        let original = Task19.binding(id: 2, writer: 989_123)
+        let binding = FMP4WriterBinding(outputLifecycleEpoch: lifecycle, itemGeneration: original.itemGeneration,
+            mediaEpoch: original.mediaEpoch, publicationParticipantID: original.publicationParticipantID,
+            renditionIdentity: original.renditionIdentity, writerIdentity: original.writerIdentity)
+        let source = try await SourceAACPublicationFixture.make(binding: binding)
+        lock.withLock { fixtureValue = source }
+        let snapshot = try XCTUnwrap(source.publisher.visible)
+        let server = try await LoopbackHTTPServer.start(store: source.store, declaration: source.declaration,
+            publishedSnapshot: snapshot, sessionCapability: source.session, now: { 1_000_000_000 }, logger: { _ in })
+        lock.withLock { serverValue = server }
+        let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+        lock.withLock { evidenceValue = evidence }
+        let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+        let request = try server.makeAVPlayerPreparationRequest(item: item, publicationSequence: snapshot.publicationSequence)
+        let playlist = try XCTUnwrap(snapshot.media[2])
+        let resources = playlist.initializationResources + playlist.resources
+        let urls = [request.itemURL] + (try resources.map {
+            try XCTUnwrap(URL(string: server.path(for: $0), relativeTo: server.baseURL)?.absoluteURL)
+        })
+        let client = URLSession(configuration: .ephemeral)
+        defer { client.invalidateAndCancel() }
+        for url in urls {
+            var get = URLRequest(url: url); get.setValue("close", forHTTPHeaderField: "Connection")
+            let response = try await client.data(for: get)
+            guard (response.1 as? HTTPURLResponse)?.statusCode == 200, !response.0.isEmpty else { throw HLSSourceError.network }
+        }
+        let completionDeadline = ContinuousClock.now + .seconds(2)
+        while !resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }),
+              ContinuousClock.now < completionDeadline { try await Task.sleep(for: .milliseconds(5)) }
+        guard resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }) else { throw HLSSourceError.incompleteEvidence }
+        return .init(request: request, evidenceSource: evidence)
+    }
+    func retire() async -> Bool {
+        let held = lock.withLock { (fixtureValue, serverValue, evidenceValue) }
+        held.2?.retirePreparation()
+        if let server = held.1 {
+            let ticket = server.closeAdmission()
+            let deadline = ContinuousClock.now + .seconds(2)
+            while (server.usage.connections != 0 || server.usage.activeResponses != 0 || FrozenPreparationOwner.activeHistoryServer === server),
+                  ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+            do { try server.drain(cleanupTicket: ticket); try server.retire(cleanupTicket: ticket) }
+            catch { return false }
+        }
+        held.0?.close()
+        if let writer = held.0?.writer { _ = await writer.cancelAwaitingCompletion() }
+        lock.withLock { fixtureValue = nil; serverValue = nil; evidenceValue = nil }
+        return true
     }
 }
 

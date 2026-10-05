@@ -176,21 +176,46 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
-    func testChangedSelectionDuringSnapshotAndMissingExpectedAudioFailBeforePlay() async throws {
-        for mutateSelection in [false, true] {
-            try await NativeAdapterFixture.withFixture { fixture in
-                if mutateSelection {
-                    let gate = fixture.hold(.format)
-                    fixture.play(); try await fixture.until { gate.entered }
-                    fixture.driver.selectionRevision += 1
-                    gate.release()
-                } else {
-                    fixture.inspector.missingExpectedAudio = true
-                    fixture.play()
-                }
-                try await fixture.until { fixture.factory.backend != nil && fixture.registry.outputResourceContextSnapshot() == nil }
-                XCTAssertEqual(fixture.driver.plays, 0)
+    func testKnownVariantAndAlternateSelectionDuringHeldLoadGetOneFreshStableSnapshot() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            let preparing = fixture.hold(.format)
+            fixture.play(); try await fixture.until { preparing.entered }
+            fixture.driver.selectionRevision += 1
+            fixture.inspector.useAlternate = true
+            preparing.release()
+            try await fixture.until { fixture.isPlaying }
+            let original = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            XCTAssertGreaterThanOrEqual(fixture.inspector.reads, 2)
+            XCTAssertEqual(fixture.driver.installs, 1)
+            let runtime = NativeFixtureGate(); fixture.gates.append(runtime); fixture.inspector.gate = runtime
+            let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+            let oldReads = fixture.inspector.reads
+            fixture.spawn { await coordinator.observeSelectedFormatChangeForTesting() }
+            try await fixture.until { runtime.entered }
+            fixture.driver.selectionRevision += 1
+            fixture.driver.selectedAudio = NSObject()
+            fixture.inspector.useAlternate = false
+            runtime.release()
+            try await fixture.until {
+                fixture.inspector.reads >= oldReads + 2 &&
+                    backend.preparedMediaInformation(for: coordinator.item.outputLifecycleEpoch)?.information?.width == 1_920
             }
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.prepareTicket, original.prepareTicket)
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.activation, original.activation)
+            XCTAssertEqual(fixture.driver.installs, 1)
+            XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertEqual(backend.preparedMediaInformation(for: coordinator.item.outputLifecycleEpoch)?.information?.width, 1_920)
+        }
+    }
+
+    func testMissingExpectedAudioStillFailsBeforePlayWithoutSelectionRetry() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.inspector.missingExpectedAudio = true
+            fixture.play()
+            try await fixture.until { fixture.factory.backend != nil && fixture.registry.outputResourceContextSnapshot() == nil }
+            XCTAssertEqual(fixture.driver.plays, 0)
+            XCTAssertEqual(fixture.inspector.reads, 1)
         }
     }
 
@@ -473,7 +498,7 @@ private final class NativeFixtureInspector: NativeHLSAssetInspecting {
         guard source.isCurrent, driver.currentItemIdentity == item, driver.physical === physical,
               driver.selectionRevision == selection else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
         guard !rejectFormat, !missingExpectedAudio else { throw HLSSourceError.incompleteEvidence }
-        return try .init(item: item, physicalItem: ObjectIdentifier(physical), audioSelection: nil,
+        return try .init(item: item, physicalItem: ObjectIdentifier(physical), audioSelection: ObjectIdentifier(driver.selectedAudio),
             video: NativeFixtureProbe.video(width: useAlternate ? 1_280 : 1_920), audio: NativeFixtureProbe.audio,
             audioConfigurationDigest: Data([1]), observedFrameRate: 25, sourceOwner: source,
             retention: HLSApplicationLifetimeCharge(bytes: 8 * 1_024))
@@ -487,6 +512,7 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     var currentItemIdentity: AVPlayerItemInstanceIdentity?
     var physical: NSObject?
+    var selectedAudio = NSObject()
     var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
     var failReady = false

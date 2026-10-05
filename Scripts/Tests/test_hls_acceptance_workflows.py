@@ -24,14 +24,25 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('./Scripts/test.sh -configuration Debug',normal)
         self.assertNotIn('-only-testing:',normal)
 
-    def test_durability_branch_push_never_triggers_ci(self):
+    def test_checkpoints_do_not_run_tests_and_preparation_requires_explicit_workflow_edit(self):
         for path in (ROOT/'.github/workflows').glob('*.yml'):
             text=path.read_text()
-            self.assertNotIn('work/homepod-hls-rebuild',text,path.name)
             if '  push:' in text:
                 block=text.split('  push:',1)[1].split('\n\n',1)[0]
-                self.assertIn('branches: [feat/homepod-hls-evolution]',block,path.name)
+                self.assertEqual(path.name,'hls-project-generation.yml')
+                self.assertIn('branches: [work/homepod-hls-rebuild]',block,path.name)
+                self.assertIn('    paths:\n      - .github/workflows/hls-project-generation.yml',block,path.name)
                 self.assertNotIn('branches-ignore',block,path.name)
+                self.assertNotIn('test.sh',text,path.name)
+            else:
+                self.assertNotIn('work/homepod-hls-rebuild',text,path.name)
+
+    def test_exact_old_writer_is_fetched_independently_of_deleted_branches(self):
+        text=(ROOT/'Scripts/run-hls-baseline-and-candidate.sh').read_text()
+        self.assertIn('old=36f9f00044db05b707e25ea470b0da3cec62682c',text)
+        self.assertIn('git fetch --no-write-fetch-head origin "$old"',text)
+        self.assertLess(text.index('git fetch --no-write-fetch-head origin "$old"'),text.index('git worktree add'))
+        self.assertIn('git rev-parse --verify "$old^{commit}"',text)
 
     def test_acceptance_path_filters_and_manual_final_dispatch(self):
         text=(ROOT/'.github/workflows/hls-acceptance.yml').read_text()
@@ -64,6 +75,8 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_verified_host_tools_precede_app_build(self):
         for name in ['macos-ci.yml','hls-acceptance.yml','hls-project-generation.yml']:
+            if name=='hls-project-generation.yml' and not (ROOT/'.github/workflows'/name).exists():
+                continue # Temporary preparation workflow is removed after genuine readback.
             text=(ROOT/'.github/workflows'/name).read_text()
             blocks=text.split('          brew install mint jq ripgrep pkgconf x264 x265 nasm\n')[1:]
             self.assertTrue(blocks,name)
@@ -77,7 +90,9 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(full.count('./Scripts/prepare-hls-ci-fixtures.sh --verify-committed\n          ./Scripts/bootstrap.sh --check'),5)
         self.assertNotIn('--project-readback',full)
         self.assertIn('./Scripts/prepare-hls-ci-fixtures.sh --acceptance',(ROOT/'.github/workflows/hls-acceptance.yml').read_text())
-        self.assertIn('./Scripts/prepare-hls-ci-fixtures.sh --project-readback',(ROOT/'.github/workflows/hls-project-generation.yml').read_text())
+        generation=ROOT/'.github/workflows/hls-project-generation.yml'
+        if generation.exists():
+            self.assertIn('./Scripts/prepare-hls-ci-fixtures.sh --project-readback',generation.read_text())
         prep=(ROOT/'Scripts/prepare-hls-ci-fixtures.sh').read_text()
         self.assertIn('git diff --exit-code HEAD -- Tests/Fixtures/SourcePlanning',prep)
         self.assertIn('if [[ "$mode" == --acceptance ]]',prep)

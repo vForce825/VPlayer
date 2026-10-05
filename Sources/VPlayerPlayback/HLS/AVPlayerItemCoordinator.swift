@@ -1085,6 +1085,7 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     private var progressReported = false
     private(set) var progressObservationIdentity: UUID?
     private var naturalEndVerified = false
+    private var installedSourceAACEndpoint: ExactMediaTime?
     private var preparationTicket: UInt64?
     private var preparingInvocation: ControlTaskRegistry.BackendPrepareInvocation?
     /// 完整身份在bind时对应不可变request验真，保留业务证据而不再次复制request身份。
@@ -1338,6 +1339,7 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         runtimeFailureRelay = nil
         automaticStopRequested = false
         naturalEndVerified = false
+        installedSourceAACEndpoint = nil
         renditionSelectionSlot = initialSelection.map(RenditionSelectionSlot.bound)
             ?? .unbound
         state.phase = .installed
@@ -1793,8 +1795,27 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         } else if timeline.aacEndpointReceipt != nil {
             throw AVPlayerItemCoordinatorFailure.invalidTimeline
         }
+        try refreshSourceAACEndpoint(timeline: timeline, item: request.item)
         return .init(playhead: playhead, requested: requested,
                      playerItemRequested: playerItemRequested, selection: selection)
+    }
+
+    private func refreshSourceAACEndpoint(timeline: PlayerItemTimelineMappingAuthority,
+                                          item: AVPlayerItemInstanceIdentity) throws {
+        guard let source = timeline.sourceAACBinding else { return }
+        guard source.isCurrent else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        guard let endpoint = timeline.sourceAACFinalEndpoint else {
+            guard installedSourceAACEndpoint == nil else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+            return
+        }
+        let itemEnd = try timeline.playerItemTime(for: endpoint)
+        guard itemEnd.value > 0 else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        if let installedSourceAACEndpoint {
+            guard installedSourceAACEndpoint == itemEnd else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        } else {
+            try driver.constrainPlaybackEnd(to: itemEnd, item: item)
+            installedSourceAACEndpoint = itemEnd
+        }
     }
 
     private func validatePreparationSeek(_ seek: AVPlayerSeekReceipt,
@@ -2000,6 +2021,8 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
                 try evidenceSource.revalidatePausedResumeCoverage(coverage)
             }
             try validateActivation(invocation, request: request, resumeScope: resumeScope)
+            if let timeline = preparedTimelineMapping { try refreshSourceAACEndpoint(timeline: timeline, item: item) }
+            try validateActivation(invocation, request: request, resumeScope: resumeScope)
             try await driver.play(invocation: invocation, item: item)
             try validateActivation(invocation, request: request, resumeScope: resumeScope)
             if let resumeCoverage { try evidenceSource.revalidatePausedResumeCoverage(resumeCoverage) }
@@ -2068,6 +2091,12 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             return
         }
         invocation.retireHLSProgress(identity: identity)
+        do {
+            if let timeline = preparedTimelineMapping { try refreshSourceAACEndpoint(timeline: timeline, item: item) }
+        } catch {
+            invalidateCurrentPublication(failure: .invalidTimeline, watchdogActivation: invocation.activation)
+            return
+        }
         guard driver.timeControlStatus != .paused,
               !driver.hasPendingNaturalEndVerification(item: item, activation: invocation.activation) else {
             cancelProgressObservation()

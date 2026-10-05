@@ -69,8 +69,8 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         var audioGroup: AVMediaSelectionGroup?, subtitleGroup: AVMediaSelectionGroup?
         func validate() throws {
             try Task.checkCancellation()
-            guard source.sourceIsCurrent, driver.nativeCurrentItem(identity) === item,
-                  item.presentationSize == presentationSize else { throw HLSSourceError.staleResolution }
+            guard source.sourceIsCurrent, driver.nativeCurrentItem(identity) === item else { throw HLSSourceError.staleResolution }
+            guard item.presentationSize == presentationSize else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
             let current = item.tracks.filter(\.isEnabled)
             guard current.map(ObjectIdentifier.init) == trackIDs,
                   current.map({ $0.assetTrack.map(ObjectIdentifier.init) }) == assetIDs else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
@@ -119,7 +119,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
             let currentFormats = try await asset.load(.formatDescriptions)
             try validate()
             guard currentFormats.count == 1, let currentFormat = currentFormats.first,
-                  CMFormatDescriptionEqual(format, otherFormatDescription: currentFormat) else { throw HLSSourceError.unsupportedMedia }
+                  CMFormatDescriptionEqual(format, otherFormatDescription: currentFormat) else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
         }
         guard !expectsAudio || audio != nil, !expectsVideo || video != nil else { throw HLSSourceError.incompleteEvidence }
         try validate()

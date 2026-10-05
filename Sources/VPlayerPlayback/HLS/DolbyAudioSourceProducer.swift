@@ -277,6 +277,8 @@ final class DolbyAudioSourceProducer: @unchecked Sendable {
         }
     }
 
+    func makeCapacityWakeup() throws -> WriterCapacityWakeup { try .make(ledger: applicationLedger) }
+
     func reserveBranchStorage() throws -> HLSCompressedAudioApplicationReservation {
         try HLSCompressedAudioApplicationReservation.reserve(bytes: 16_384, ledger: applicationLedger)
     }

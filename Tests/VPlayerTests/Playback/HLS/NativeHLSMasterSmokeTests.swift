@@ -50,7 +50,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     XCTAssertEqual(selected.audio?.codec, .aac)
                     try await until(registry: registry) { player.currentItem === physical && player.currentTime().seconds > started + 0.25 }
                     guard player.currentItem === physical, player.currentTime().seconds > started + 0.25,
-                          backend.generatedBundleCallsForTesting == 0 else { throw HLSSourceError.incompleteEvidence }
+                          backend.generatedBundleCallsForTesting == 0,
+                          backend.routedTransportForTesting == (managed ? .proxy : .native),
+                          selected.video != nil, selected.audio?.codec == .aac, selected.audio?.channelCount == 2,
+                          source.facts.complete, source.facts.media.first?.video?.frameRate == MediaRational(num: 25, den: 1),
+                          source.facts.media.first?.video?.colorTransfer == .bt709, origin.deniedCount == 0 else { throw HLSSourceError.incompleteEvidence }
                     XCTAssertEqual(origin.deniedCount, 0)
                     print("NATIVE_HLS_REAL_SELECTED_FORMAT managed=\(managed) video=\(selected.video?.width ?? 0)x\(selected.video?.height ?? 0) audio=AAC progressed=true")
                 }

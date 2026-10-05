@@ -79,9 +79,13 @@ final class HLSManagedDemuxSmokeTests: XCTestCase {
                 XCTFail("Real FFmpeg HLS demux rejected managed \(expectedSuffix): \(String(describing: result.failure))")
                 throw HLSSourceError.incompleteEvidence
             }
-            if header == nil { XCTAssertGreaterThan(result.audioPackets, 0) }
+            if header == nil {
+                XCTAssertGreaterThan(result.audioPackets, 0)
+                guard result.audioPackets > 0 else { throw HLSSourceError.incompleteEvidence }
+            }
             XCTAssertEqual(origin.deniedCount, 0)
             XCTAssertGreaterThan(origin.authenticatedCount, 2)
+            guard origin.deniedCount == 0, origin.authenticatedCount > 2 else { throw HLSSourceError.incompleteEvidence }
             print("MANAGED_HLS_PINNED_DEMUX container=\(expectedSuffix) video=\(result.videoPackets) audio=\(result.audioPackets) eof=true")
         } catch { failure = error }
         demux.cancel()

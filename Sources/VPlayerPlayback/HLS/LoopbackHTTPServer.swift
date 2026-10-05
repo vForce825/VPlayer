@@ -878,6 +878,21 @@ final class PlayerItemTimelineMappingAuthority: @unchecked Sendable, Hashable {
         return false
     }
 
+    /// A source EOF alone grants no endpoint. The same server must have
+    /// completed the genuine final init/media body and still own its final seal.
+    var sourceAACFinalEndpoint: ExactMediaTime? {
+        guard owner.completionIsFrozen, let root = sourceAACBinding, root.isCurrent,
+              let seal = root.finalSeal,
+              seal.terminal.binding.outputLifecycleEpoch == outputLifecycleEpoch,
+              seal.terminal.binding.itemGeneration.rawValue == itemGeneration,
+              seal.terminal.binding.renditionIdentity == renditionIdentity,
+              let store = owner.metadataStore,
+              let final = store.currentFinalPublication(matching: seal.terminal.binding),
+              final.publicationSequence >= publicationSequence,
+              store.validatesSourceAACFinal(final, binding: root), root.isCurrent else { return nil }
+        return seal.writtenEnd
+    }
+
     func playerItemTime(for sourceTime: ExactMediaTime) throws -> ExactMediaTime {
         try mapping.playerItemTime(for: sourceTime)
     }

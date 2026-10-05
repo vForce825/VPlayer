@@ -35,15 +35,19 @@ final class SourceAACRenditionAuthority: @unchecked Sendable {
     let identity = UUID()
     let initialBinding: FMP4WriterBinding
     let stream: CompressedAudioSourceStream
+    private let applicationLedger: HLSDeliveryApplicationChargeLedger
     private let applicationCharge: HLSCompressedAudioApplicationReservation
     private let lock = NSLock()
     private var currentBinding: FMP4WriterBinding?
 
     fileprivate init(binding: FMP4WriterBinding, stream: CompressedAudioSourceStream,
-                     charge: HLSCompressedAudioApplicationReservation) throws {
+                     charge: HLSCompressedAudioApplicationReservation,
+                     applicationLedger: HLSDeliveryApplicationChargeLedger) throws {
         initialBinding = binding; self.stream = stream; applicationCharge = charge
+        self.applicationLedger = applicationLedger
         guard stream.bindRendition(identity) else { throw SourceAACFailure.renditionAlreadyBound }
     }
+    func makeCapacityWakeup() throws -> WriterCapacityWakeup { try .make(ledger: applicationLedger) }
     func acceptsInitialWriter(_ binding: FMP4WriterBinding) -> Bool {
         binding == initialBinding && stream.acceptsRendition(identity)
     }
@@ -97,7 +101,7 @@ struct SourceAACWriterConfiguration: @unchecked Sendable {
         }
         // Fixed authority/continuation bookkeeping is paid before its class/locks.
         let charge = try HLSCompressedAudioApplicationReservation.reserve(bytes: 16_384, ledger: applicationLedger)
-        authority = try SourceAACRenditionAuthority(binding: binding, stream: proof.stream, charge: charge)
+        authority = try SourceAACRenditionAuthority(binding: binding, stream: proof.stream, charge: charge, applicationLedger: applicationLedger)
         sampleRate = source.sampleRate; channelCount = source.channelCount; channelMask = source.channelMask
         audioSpecificConfig = source.decoderConfiguration; priming = source.priming
         sourceFormatHint = proof.formatDescription; format = proof.format

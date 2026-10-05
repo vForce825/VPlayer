@@ -11,15 +11,24 @@ import Foundation
 final class WriterInputLifetime: @unchecked Sendable {
     private let lock = NSLock()
     private var releaseBody: (@Sendable () -> Void)?
+    private var capacityWakeup: WriterCapacityWakeup?
+    private var nativeAdopted = false
 
-    init(release: @escaping @Sendable () -> Void = {}) { releaseBody = release }
+    init(capacityWakeup: WriterCapacityWakeup? = nil,
+         release: @escaping @Sendable () -> Void = {}) {
+        self.capacityWakeup = capacityWakeup; releaseBody = release
+    }
+    func markNativeAdopted() { lock.withLock { nativeAdopted = true } }
 
     func releaseBacking() {
-        let body = lock.withLock { () -> (@Sendable () -> Void)? in
-            defer { releaseBody = nil }
-            return releaseBody
+        let released = lock.withLock { () -> ((@Sendable () -> Void)?, WriterCapacityWakeup?) in
+            defer { releaseBody = nil; capacityWakeup = nil }
+            return (releaseBody, nativeAdopted ? capacityWakeup : nil)
         }
-        body?()
+        released.0?()
+        // Failed preflight copies are not native release edges and cannot cause
+        // a self-waking retry loop. Signal only after real backing credit returns.
+        released.1?.signal()
     }
 
     deinit { releaseBacking() }
@@ -33,6 +42,7 @@ final class WriterInputAdmission: @unchecked Sendable {
     private let observation: HLSWriterAcceptanceProbe.Rendition?
     private let metadataAdmission: HLSDataPlaneAdmission
     private let lock = NSLock()
+    private weak var capacityWakeup: WriterCapacityWakeup?
     let capacity: Int
     let maximumBytes: Int
     private var liveCount = 0
@@ -54,6 +64,14 @@ final class WriterInputAdmission: @unchecked Sendable {
             maximumBytes: capacity * (Self.metadataBytes + 63 * 256),
             applicationLedger: applicationLedger)
     }
+
+    func installCapacityWakeup(_ value: WriterCapacityWakeup) throws {
+        try lock.withLock {
+            guard capacityWakeup == nil || capacityWakeup === value else { throw SegmentedFMP4WriterFailure.illegalState }
+            capacityWakeup = value
+        }
+    }
+    func signalCapacityChange() { lock.withLock { capacityWakeup }?.signal() }
 
     var usage: HLSDataPlaneAdmissionUsage {
         lock.withLock { .init(count: liveCount, bytes: liveBytes, cancelled: cancelled) }
@@ -78,7 +96,7 @@ final class WriterInputAdmission: @unchecked Sendable {
             observation?.admitted(bytes: bytes)
             return lease
         }
-        return WriterInputLifetime { [self, lease] in
+        return WriterInputLifetime(capacityWakeup: lock.withLock { capacityWakeup }) { [self, lease] in
             release()
             lease.release()
             lock.withLock {
@@ -94,6 +112,7 @@ final class WriterInputAdmission: @unchecked Sendable {
     func cancel() {
         lock.withLock { cancelled = true }
         metadataAdmission.cancel()
+        signalCapacityChange()
     }
 }
 

@@ -2299,6 +2299,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var storedTerminalReceipt: SegmentedFMP4WriterTerminalReceipt?
     private var firstSystemFailureDiagnostic: ErrorDiagnosticSnapshot?
     private var firstTypedCallbackFailure: SegmentedFMP4WriterFailure?
+    private weak var compressedCapacityWakeup: WriterCapacityWakeup?
     /// endpoint receipt/authority 与 terminal binding 必须在 writer lane 内作为
     /// 一个不可分割的终态推进。成功后的并发 loser 只能被拒绝，不能再把
     /// 已封存的 binding 覆盖成 failure。
@@ -2750,6 +2751,17 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     /// Service proofs retain raw source PTS; only the private timeline mapping
     /// translates native samples and boundary identity into the same output time.
+    func installCompressedCapacityWakeup(_ wakeup: WriterCapacityWakeup) throws {
+        try withLane {
+            guard compressedCapacityWakeup == nil || compressedCapacityWakeup === wakeup else {
+                throw SegmentedFMP4WriterFailure.illegalState
+            }
+            try inputAdmission.installCapacityWakeup(wakeup)
+            try relay.installCapacityWakeup(wakeup)
+            compressedCapacityWakeup = wakeup
+        }
+    }
+
     func appendSourceAACAwaitingReadiness(_ unit: SourceAACAccessUnit,
                                          boundary: SegmentBoundaryCoordinator) async throws {
         try Task.checkCancellation()
@@ -2761,18 +2773,25 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         let ticket = try boundary.issueSourceAACAppend(for: unit, writerBinding: binding)
         do {
-            let sample = try makeSourceAACSampleBuffer(unit)
             let identity = SegmentBoundaryCoordinator.sourceAACIdentity(unit)
+            let projected = unit.payload.count.addingReportingOverflow(Self.sampleChargeOverhead)
+            guard !projected.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
             let operation = try withLane {
-                var admission = try preflightTypedIsolated(sample, ticket: ticket,
+                var admission = try preflightAppendCoreIsolated(facts: .init(
+                    formatDescription: sourceFormatHint, duration: unit.duration,
+                    presentationTimeStamp: unit.presentationStart, decodeTimeStamp: unit.presentationStart,
+                    projectedCharge: projected.partialValue, sampleCount: 1), ticket: ticket,
                     sampleIdentity: identity, readinessFailurePolicy: .awaiting)
                 defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                let prepared = try makeSourceAACSampleBuffer(unit)
+                let sample = prepared.sample
                 return try beginAwaitingAppendIsolated(sample, ticket: ticket, sampleIdentity: identity,
                     ownership: FMP4InputOwnership(), validatesSource: { _ in unit.validates() },
                     admission: &admission, claimOwnership: {
                         guard terminalBinding.acceptsInput(unit, origin: origin), unit.claimForAppend() else {
                             throw SourceAACFailure.sourceAlreadyConsumed
                         }
+                        prepared.lifetime.markNativeAdopted()
                     })
             }
             try await completeAwaitingAppend(operation) {
@@ -2808,9 +2827,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
               timed.validatesCompressedSubmission(submission),
               let frozen = compressedFormatConfiguration,
               frozen == submission.formatConfiguration,
-              let lastUse = submission.accessUnit.writerLastUseReceipt,
-              coordinator.hasCompressedWriterSubmissionCapacity else {
+              let lastUse = submission.accessUnit.writerLastUseReceipt else {
             throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
+        }
+        guard coordinator.hasCompressedWriterSubmissionCapacity else {
+            throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
         }
         let ownerBindingMatches: Bool
         switch submission.admissionIdentity {
@@ -2834,12 +2855,21 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let ticket = try boundary.issueMappedCompressedAudioAppend(submission, timed: timed, writerBinding: binding)
         do {
             let identity = try SegmentBoundaryCoordinator.mappedCompressedIdentity(submission, timed: timed)
-            let sample = try makeCompressedSampleBuffer(submission.accessUnit,
-                presentationStart: timed.timing.presentationTimeStamp.cmTime, nativeTail: nativeTail)
+            let projected = submission.accessUnit.payloadRange.length.addingReportingOverflow(Self.sampleChargeOverhead)
+            guard !projected.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
             let operation = try withLane {
-                var admission = try preflightTypedIsolated(sample, ticket: ticket,
+                var admission = try preflightAppendCoreIsolated(facts: .init(
+                    formatDescription: sourceFormatHint,
+                    duration: ExactMediaTime(value: Int64(submission.accessUnit.sampleCount), timescale: submission.accessUnit.sampleRate),
+                    presentationTimeStamp: timed.timing.presentationTimeStamp, decodeTimeStamp: timed.timing.presentationTimeStamp,
+                    projectedCharge: projected.partialValue, sampleCount: 1), ticket: ticket,
                     sampleIdentity: identity, readinessFailurePolicy: .awaiting)
                 defer { discardUnusedFlushAdmissionIsolated(&admission) }
+                var backingLifetime: WriterInputLifetime?
+                let sample = try makeCompressedSampleBuffer(submission.accessUnit,
+                    presentationStart: timed.timing.presentationTimeStamp.cmTime, nativeTail: nativeTail,
+                    retainedLifetime: { backingLifetime = $0 })
+                guard let backingLifetime else { throw SegmentedFMP4WriterFailure.illegalState }
                 return try beginAwaitingAppendIsolated(sample, ticket: ticket, sampleIdentity: identity,
                     ownership: FMP4InputOwnership {
                         _ = coordinator.finishCompressedAudioWriterLastUse(lastUse)
@@ -2850,6 +2880,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                               coordinator.claimCompressedAudioWriterSubmission(submission, expectedIdentity: expected) else {
                             throw SegmentedFMP4WriterFailure.compressedIdentityMismatch
                         }
+                        backingLifetime.markNativeAdopted()
                     })
             }
             try await completeAwaitingAppend(operation)
@@ -3824,6 +3855,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                         publicationEvidence: publicationEvidence
                     )
                     if kind == .media { try segmentEvidence.retireVerified(sequence: pending.logicalSequence) }
+                    inputAdmission.signalCapacityChange()
                     guard schedulePublicationIsolated(acceptance) else {
                         throw SegmentedFMP4WriterFailure.systemFailure
                     }
@@ -4018,6 +4050,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.illegalState
         }
         admission.inputLifetime = nil
+        prepaid.markNativeAdopted()
         // Both the local occupancy and wrapper metadata were reserved before any
         // flush, single-use materialization or producer claim. Only native FreeBlock
         // (or failed-construction rollback) may now return the admitted resources.
@@ -5265,7 +5298,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         return scaled.value
     }
 
-    private func makeSourceAACSampleBuffer(_ unit: SourceAACAccessUnit) throws -> CMSampleBuffer {
+    private func makeSourceAACSampleBuffer(_ unit: SourceAACAccessUnit) throws
+        -> (sample: CMSampleBuffer, lifetime: WriterInputLifetime) {
         let charge = unit.payload.count.addingReportingOverflow(HLSOwnedBlockAdmission.fixedOwnerMetadataBytes)
         guard !charge.overflow, let lease = compressedBackingAdmission.acquire(units: 1,
             bytes: unit.payload.count, applicationBytes: charge.partialValue) else {
@@ -5273,7 +5307,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         // The producer proof/paid source backing follows the actual block alias,
         // never physical writer completion or a copied NSData no-copy wrapper.
-        let lifetime = WriterInputLifetime { [admission = compressedBackingAdmission, lease, unit] in
+        let lifetime = WriterInputLifetime(capacityWakeup: withLane { compressedCapacityWakeup }) { [admission = compressedBackingAdmission, lease, unit] in
             lease.release(); withExtendedLifetime((admission, unit)) {}
         }
         let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(copying: unit.payload, lifetime: lifetime)
@@ -5287,13 +5321,14 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             sampleBufferOut: &sample) == noErr, let sample else {
             throw SegmentedFMP4WriterFailure.systemFailure
         }
-        return sample
+        return (sample, lifetime)
     }
 
     private func makeCompressedSampleBuffer(
         _ accessUnit: CompressedAudioAccessUnit,
         presentationStart: CMTime? = nil,
-        nativeTail: DolbyAudioPayloadLifetime? = nil
+        nativeTail: DolbyAudioPayloadLifetime? = nil,
+        retainedLifetime: ((WriterInputLifetime) -> Void)? = nil
     ) throws -> CMSampleBuffer {
         let payload = accessUnit.payload
         let charge = payload.count.addingReportingOverflow(HLSOwnedBlockAdmission.fixedOwnerMetadataBytes)
@@ -5301,10 +5336,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             bytes: payload.count, applicationBytes: charge.partialValue) else {
             throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
         }
-        let lifetime = WriterInputLifetime { [admission = compressedBackingAdmission, lease, nativeTail] in
+        let lifetime = WriterInputLifetime(capacityWakeup: nativeTail == nil ? nil : withLane { compressedCapacityWakeup }) { [admission = compressedBackingAdmission, lease, nativeTail] in
             lease.release()
             withExtendedLifetime((admission, nativeTail)) {}
         }
+        retainedLifetime?(lifetime)
         let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(copying: payload, lifetime: lifetime)
         var timing = CMSampleTimingInfo(
             duration: CMTime(

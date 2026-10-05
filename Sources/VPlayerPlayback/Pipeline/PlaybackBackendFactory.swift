@@ -50,15 +50,18 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
     /// 应用启动时注入唯一的 writer/publisher/store/server 装配 authority。没有 authority
     /// 时 AirPlay 仍创建 HLS backend，但 prepare 必须 fail-closed，绝不退回 SampleBuffer。
     private let hlsGraphFactory: SystemHLSOutputItemBundleBuilder.GraphFactory?
+    private let hlsAcceptanceProbe: HLSWriterAcceptanceProbe?
     private let sourceDependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies
 
     init(
         pipelineFactory: any PlaybackPipelineFactory = SystemPlaybackPipelineFactory(),
         hlsGraphFactory: SystemHLSOutputItemBundleBuilder.GraphFactory? = nil,
+        hlsAcceptanceProbe: HLSWriterAcceptanceProbe? = nil,
         sourceDependencies: @escaping @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies = { .init(context: $0) }
     ) {
         self.pipelineFactory = pipelineFactory
         self.hlsGraphFactory = hlsGraphFactory
+        self.hlsAcceptanceProbe = hlsAcceptanceProbe
         self.sourceDependencies = sourceDependencies
     }
 
@@ -132,10 +135,10 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
             )
             if let sourceContext, hlsGraphFactory == nil {
                 backend.configureSourceRouting(dependencies: sourceDependencies(sourceContext), sessionLease: lease,
-                    builderFactory: { input, owned in
+                    builderFactory: { [probe = hlsAcceptanceProbe] input, owned in
                         try SystemHLSOutputItemBundleBuilder(sourceURL: input,
                             startupBufferSeconds: tuning.videoBufferSeconds, runtimeEventSink: eventSink,
-                            generatedSource: owned)
+                            acceptanceProbe: probe, generatedSource: owned)
                     }, eventSink: eventSink)
             }
             return backend

@@ -93,6 +93,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     var generatedBundleCallsForTesting: Int { lock.withLock { sourceBundleCalls } }
     #if DEBUG
     var nativeCoordinatorForTesting: NativeHLSItemCoordinator? { lock.withLock { nativeAdapter?.coordinator } }
+    var ownedSourceForTesting: HLSOwnedSourcePlan? { lock.withLock { ownedSource } }
+    var generatedItemURLForTesting: URL? { lock.withLock { bundle?.replacement.request.itemURL } }
     @MainActor var nativeSystemDriverForTesting: SystemAVPlayerDriver? {
         let lease = lock.withLock { sessionLease }
         return lease?.driver as? SystemAVPlayerDriver
