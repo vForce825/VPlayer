@@ -10,11 +10,13 @@ import XCTest
 @MainActor
 final class NativeHLSMasterSmokeTests: XCTestCase {
     func testRealAVPlayerNativeAndManagedHLSPrepareSelectedTracksAndProgressWithoutGeneratedGraph() async throws {
-        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "task22-progressive-h264-aac-16s", withExtension: "ts"))
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
+        // Native admission requires explicit source color. The task22 fixture
+        // intentionally omits it; this committed lavfi fixture signals BT.709.
         let bytes = try Data(contentsOf: file)
         for managed in [false, true] {
             let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
-            let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:16\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:16,\npart.ts\n#EXT-X-ENDLIST\n"
+            let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
             let origin = try NativeHLSHTTPFixture(resources: [
                 "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
                 "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
@@ -43,7 +45,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     XCTAssertTrue(coordinator.isPrepared)
                     let source = coordinator.owned
                     XCTAssertTrue(source.facts.complete)
-                    XCTAssertEqual(source.facts.media.first?.video?.frameRate, MediaRational(num: 25, den: 1))
+                    XCTAssertEqual(source.facts.media.first?.video?.frameRate, MediaRational(num: 30, den: 1))
                     XCTAssertEqual(source.facts.media.first?.video?.colorTransfer, .bt709)
                     let selected = try await SystemNativeHLSAssetInspector(driver: XCTUnwrap(playerDriver(backend))).snapshot(item: coordinator.item, source: source)
                     XCTAssertNotNil(selected.video)
@@ -53,7 +55,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                           backend.generatedBundleCallsForTesting == 0,
                           backend.routedTransportForTesting == (managed ? .proxy : .native),
                           selected.video != nil, selected.audio?.codec == .aac, selected.audio?.channelCount == 2,
-                          source.facts.complete, source.facts.media.first?.video?.frameRate == MediaRational(num: 25, den: 1),
+                          source.facts.complete, source.facts.media.first?.video?.frameRate == MediaRational(num: 30, den: 1),
                           source.facts.media.first?.video?.colorTransfer == .bt709, origin.deniedCount == 0 else { throw HLSSourceError.incompleteEvidence }
                     XCTAssertEqual(origin.deniedCount, 0)
                     print("NATIVE_HLS_REAL_SELECTED_FORMAT managed=\(managed) video=\(selected.video?.width ?? 0)x\(selected.video?.height ?? 0) audio=AAC progressed=true")
@@ -67,7 +69,13 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
     private func until(registry: ControlTaskRegistry, _ predicate: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(20)
-        while !predicate(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        while !predicate(), ContinuousClock.now < deadline {
+            if case let .failed(failure) = registry.playbackStateSnapshot() {
+                XCTFail("Real native HLS terminated before prepare/progress: \(failure)")
+                throw failure
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         guard predicate() else {
             XCTFail("Real native HLS failed to prepare/progress: \(String(describing: registry.outputResourceContextSnapshot()))")
             throw HLSSourceError.deadline
@@ -100,7 +108,7 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
     private let lock = NSLock()
     private weak var result: HLSAVPlayerPlaybackBackend?
     var backend: HLSAVPlayerPlaybackBackend? { lock.withLock { result } }
-    // Explicit test envelope permits the public committed 720p/25 fixture on a
+    // Explicit test envelope permits the public committed 320×180/30 fixture on a
     // simulator. It supplies no source facts and changes no production policy.
     private let factory = SystemPlaybackBackendFactory(sourceDependencies: { context in
         var dependencies = HLSNativeSourceDependencies(context: context)

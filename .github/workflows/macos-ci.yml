@@ -383,6 +383,11 @@ jobs:
           ./Scripts/run-playback-integration-tests.sh \
             --timeline-fixture "$fixture_dir/timeline.ts" \
             --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/SampleBufferBuilderTests \
+            --only-testing VPlayerTests/HLSManagedDemuxSmokeTests \
+            --only-testing VPlayerTests/HLSProxyBackpressureTests \
+            --only-testing VPlayerTests/NativeHLSMasterSmokeTests \
+            --only-testing VPlayerTests/NativeOwnedDolbyFallbackSmokeTests \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \

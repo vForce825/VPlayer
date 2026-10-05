@@ -636,10 +636,12 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         for labels in layouts {
             let input = try await Task21RealAACSeed.makeEncodedInput(layoutLabels: labels)
             XCTAssertGreaterThan(input.buffers.count, 1)
+            XCTAssertEqual(input.outputTimings.count, input.buffers.count)
             for (index, source) in input.buffers.enumerated() {
                 let context = "channels=\(labels.count) bucket=\(index)"
                 let wrapped = try SampleBufferBuilder.makeWriterInputSample(
-                    source, lifetime: WriterInputLifetime())
+                    source, lifetime: WriterInputLifetime(),
+                    outputTiming: input.outputTimings[index])
                 XCTAssertFalse(ObjectIdentifier(wrapped) == ObjectIdentifier(source), "\(context) independent header")
                 XCTAssertTrue(CMSampleBufferGetFormatDescription(wrapped).map(ObjectIdentifier.init)
                     == CMSampleBufferGetFormatDescription(source).map(ObjectIdentifier.init), "\(context) format identity")
@@ -11868,7 +11870,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
         let buffers = try template.buffers.map {
             try makeEncodedBuffer(from: $0, format: template.format)
         }
-        return Task21AACEncodedInput(buffers: buffers, summary: template.streamSummary)
+        return Task21AACEncodedInput(buffers: buffers.map { $0.buffer },
+            outputTimings: buffers.map { $0.outputTiming }, summary: template.streamSummary)
     }
 
     fileprivate static func makePending(
@@ -11894,7 +11897,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
             actualTrailingPrimeFrames: summary.actualTrailingPrimeFrames,
             bandwidth: summary.bandwidth,
             packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192))
+            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192),
+            outputTimings: input.outputTimings)
         guard epoch.buffers.count <= 8,
               let first = epoch.buffers.first,
               let format = CMSampleBufferGetFormatDescription(first) else {
@@ -12102,7 +12106,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
     private static func makeEncodedBuffer(
         from template: Task21AACEncodedBufferTemplate,
         format: CMAudioFormatDescription
-    ) throws -> CMSampleBuffer {
+    ) throws -> (buffer: CMSampleBuffer, outputTiming: WriterInputOutputTiming) {
         var block: CMBlockBuffer?
         try AACRenditionEncoder.check(CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -12137,9 +12141,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
             sampleBufferOut: &result
         ))
         let buffer = try XCTUnwrap(result)
-        try AACRenditionEncoder.check(CMSampleBufferSetOutputPresentationTimeStamp(
-            buffer, newValue: template.outputPresentationTimeStamp
-        ))
+        let outputTiming = try WriterInputOutputTiming.settingExplicit(
+            template.outputPresentationTimeStamp, on: buffer)
         if let leadingTrim = template.leadingTrim {
             CMSetAttachment(buffer,
                 key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
@@ -12154,7 +12157,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
                     allocator: kCFAllocatorDefault)!,
                 attachmentMode: kCMAttachmentMode_ShouldPropagate)
         }
-        return buffer
+        return (buffer, outputTiming)
     }
 
     fileprivate static func trimTime(_ buffer: CMSampleBuffer,
@@ -12173,6 +12176,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
 /// Fresh buffers rebuilt from the immutable encoding template for one fixture owner.
 private struct Task21AACEncodedInput: @unchecked Sendable {
     let buffers: [CMSampleBuffer]
+    let outputTimings: [WriterInputOutputTiming]
     let summary: AACStreamSummary
 }
 
@@ -12785,8 +12789,9 @@ final class Task21RealAVSeed: @unchecked Sendable {
         // 编码块：系统 writer 的最终 flush 段因此仍落在 HLS 最多 7 段的
         // 可见窗口内，两个 terminal media key 都能由同一 snapshot 广告。
         let inputBufferCount = additionalAudioSeed == nil ? 7 : 6
-        let retimedAudio = try retimedAudioAccessUnits(
+        let retimedInput = try retimedAudioInput(
             Array(audio.encodedBuffers.prefix(inputBufferCount)))
+        let retimedAudio = retimedInput.buffers
         guard retimedAudio.count >= 6,
               let firstAudio = retimedAudio.first,
               let audioFormat = CMSampleBufferGetFormatDescription(firstAudio) else {
@@ -12797,11 +12802,12 @@ final class Task21RealAVSeed: @unchecked Sendable {
         guard (additionalAudioSeed == nil) == (additionalAudioParticipantID == nil) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
-        let additionalRetimedAudio = try additionalAudioSeed.map { seed in
-            try retimedAudioAccessUnits(
+        let additionalRetimedInput = try additionalAudioSeed.map { seed in
+            try retimedAudioInput(
                 Array(seed.encodedBuffers.prefix(inputBufferCount)),
                 startingAt: sourceStart)
         }
+        let additionalRetimedAudio = additionalRetimedInput?.buffers
         let additionalAudioFormat = additionalRetimedAudio?.first.flatMap {
             CMSampleBufferGetFormatDescription($0)
         }
@@ -12935,9 +12941,10 @@ final class Task21RealAVSeed: @unchecked Sendable {
         var accumulatedAudioEpoch: AACEncodedEpoch?
         var accumulatedAdditionalAudioEpoch: AACEncodedEpoch?
         if let additionalAudioWriter, let additionalAudioSeed,
-           let additionalRetimedAudio {
+           let additionalRetimedInput {
             func makeCompleteEpoch(
                 _ buffers: [CMSampleBuffer],
+                outputTimings: [WriterInputOutputTiming],
                 seed: Task21RealAACSeed
             ) throws -> AACEncodedEpoch {
                 let counts = try aacEpochCounts(buffers)
@@ -12956,13 +12963,15 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualTrailingPrimeFrames: UInt32(counts.trailing),
                     bandwidth: seed.streamSummary.bandwidth,
                     packetLease: try workspace.acquire(.aacPackets, bytes: bytes),
-                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+                    outputTimings: outputTimings)
             }
             func appendAccessUnit(
-                _ buffer: CMSampleBuffer,
+                at index: Int,
                 from completeEpoch: AACEncodedEpoch,
                 to writer: SegmentedFMP4Writer
             ) async throws {
+                let buffer = completeEpoch.buffers[index]
                 let counts = try aacEpochCounts([buffer])
                 let chunk = AACEncodedEpoch(
                     identity: completeEpoch.identity,
@@ -12974,12 +12983,16 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualTrailingPrimeFrames: UInt32(counts.trailing),
                     bandwidth: completeEpoch.bandwidth,
                     packetLease: completeEpoch.packetLease,
-                    formatLease: completeEpoch.formatLease)
+                    formatLease: completeEpoch.formatLease,
+                    outputTimings: completeEpoch.outputTimings.isEmpty
+                        ? [] : [completeEpoch.outputTimings[index]])
                 try await writer.appendAACEncodedEpochAwaitingReadiness(chunk, coordinator: boundary)
             }
-            let audioEpoch = try makeCompleteEpoch(retimedAudio, seed: audio)
+            let audioEpoch = try makeCompleteEpoch(retimedAudio,
+                outputTimings: retimedInput.outputTimings, seed: audio)
             let additionalEpoch = try makeCompleteEpoch(
-                additionalRetimedAudio,
+                additionalRetimedInput.buffers,
+                outputTimings: additionalRetimedInput.outputTimings,
                 seed: additionalAudioSeed)
             accumulatedAudioEpoch = audioEpoch
             accumulatedAdditionalAudioEpoch = additionalEpoch
@@ -13018,19 +13031,18 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     videoIndex += 1
                 } else if audioIndex < audioEpoch.buffers.count,
                           CMTimeCompare(audioEnd, additionalEnd) <= 0 {
-                    try await appendAccessUnit(audioEpoch.buffers[audioIndex],
+                    try await appendAccessUnit(at: audioIndex,
                         from: audioEpoch, to: audioWriter)
                     audioIndex += 1
                 } else {
-                    let buffer = additionalEpoch.buffers[additionalAudioIndex]
-                    try await appendAccessUnit(buffer, from: additionalEpoch,
-                                         to: additionalAudioWriter)
+                    try await appendAccessUnit(at: additionalAudioIndex,
+                        from: additionalEpoch, to: additionalAudioWriter)
                     additionalAudioIndex += 1
                 }
             }
         } else {
             let workspace = AACCalibrationWorkspace()
-            for buffer in retimedAudio {
+            for (index, buffer) in retimedAudio.enumerated() {
                 let bufferEnd = CMTimeAdd(
                     CMSampleBufferGetOutputPresentationTimeStamp(buffer),
                     CMSampleBufferGetDuration(buffer)
@@ -13057,7 +13069,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualLeadingPrimeFrames: 0, actualTrailingPrimeFrames: 0,
                     bandwidth: audio.streamSummary.bandwidth,
                     packetLease: try workspace.acquire(.aacPackets, bytes: bytes),
-                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+                    outputTimings: [retimedInput.outputTimings[index]])
                 try await audioWriter.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
             }
             while videoIndex < videoOutputs.count {
@@ -13171,7 +13184,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                 bandwidth: audio.streamSummary.bandwidth,
                 packetLease: try endpointWorkspace.acquire(.aacPackets,
                                                             bytes: endpointByteCount),
-                formatLease: try endpointWorkspace.acquire(.nonPayload, bytes: 1_024))
+                formatLease: try endpointWorkspace.acquire(.nonPayload, bytes: 1_024),
+                outputTimings: retimedInput.outputTimings)
         }
         let endpointAuthority = try audioWriter.makeAACEffectiveEndpointAuthority(
             epoch: endpointEpoch, initializationObject: audioInitialization,
@@ -13225,6 +13239,12 @@ final class Task21RealAVSeed: @unchecked Sendable {
     fileprivate static func retimedAudioAccessUnits(
         _ buffers: [CMSampleBuffer], startingAt requestedStart: CMTime? = nil
     ) throws -> [CMSampleBuffer] {
+        try retimedAudioInput(buffers, startingAt: requestedStart).buffers
+    }
+
+    private static func retimedAudioInput(
+        _ buffers: [CMSampleBuffer], startingAt requestedStart: CMTime? = nil
+    ) throws -> (buffers: [CMSampleBuffer], outputTimings: [WriterInputOutputTiming]) {
         // Removing the leading trim keeps its packets: the original first second
         // can become 49 * 1024 / 48000 = 1.045333 seconds. Submit individual AUs so
         // the next common cut is encountered within the strict 1024/48000 window.
@@ -13289,8 +13309,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
     /// 均来自系统编码结果，trim 只允许留在完整 epoch 的首尾。
     private static func splitAACAccessUnits(
         _ buffers: [CMSampleBuffer]
-    ) throws -> [CMSampleBuffer] {
-        guard let first = buffers.first, let last = buffers.last else { return [] }
+    ) throws -> (buffers: [CMSampleBuffer], outputTimings: [WriterInputOutputTiming]) {
+        guard let first = buffers.first, let last = buffers.last else { return ([], []) }
         let leadingTrim = Task21RealAACSeed.trimTime(first,
             key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
         let trailingTrim = Task21RealAACSeed.trimTime(last,
@@ -13300,6 +13320,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                 .map(CMBlockBufferGetDataLength) ?? 0)
         }
         var accessUnits: [CMSampleBuffer] = []
+        var outputTimings: [WriterInputOutputTiming] = []
         accessUnits.reserveCapacity(buffers.reduce(0) {
             $0 + CMSampleBufferGetNumSamples($1)
         })
@@ -13345,9 +13366,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     sampleBufferOut: &retimed
                 ))
                 let accessUnit = try XCTUnwrap(retimed)
-                try AACRenditionEncoder.check(
-                    CMSampleBufferSetOutputPresentationTimeStamp(
-                        accessUnit, newValue: outputStart))
+                let outputTiming = try WriterInputOutputTiming.settingExplicit(
+                    outputStart, on: accessUnit)
                 CMRemoveAttachment(accessUnit,
                     key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
                 CMRemoveAttachment(accessUnit,
@@ -13367,6 +13387,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     throw AACRenditionFailure.invalidInput
                 }
                 accessUnits.append(accessUnit)
+                outputTimings.append(outputTiming)
             }
         }
         if let leadingTrim, let firstAccessUnit = accessUnits.first {
@@ -13392,7 +13413,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
               actualPayloadBytes == expectedPayloadBytes else {
             throw AACRenditionFailure.capacityExceeded
         }
-        return accessUnits
+        return (accessUnits, outputTimings)
     }
 
     private static func aacEpochCounts(

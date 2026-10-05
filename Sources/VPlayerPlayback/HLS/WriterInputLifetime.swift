@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AudioToolbox
+import CoreMedia
 import Foundation
 
 /// One native backing allocation's tail. The release body may own admitted
@@ -38,7 +40,20 @@ final class WriterInputLifetime: @unchecked Sendable {
 /// lane. Admission never waits on a boundary that the same media worker must make.
 /// The native block retains this service, not the writer, until its last alias dies.
 final class WriterInputAdmission: @unchecked Sendable {
-    static let metadataBytes = 4_096
+    // Prepay two complete header envelopes: the packet-derived temporary and the
+    // exact-timing copy overlap. Each envelope includes bounded timing/sizing/
+    // packet arrays and attachment metadata. Retain this conservative charge until
+    // the final block alias releases; destroying the temporary returns no credit.
+    static let metadataBytes = 2 * 4_096
+    static let additionalSampleMetadataBytes = 2 * 256
+    private static var nativeHeaderArraysFitReservation: Bool {
+        let headerEntry = MemoryLayout<CMSampleTimingInfo>.stride
+            + MemoryLayout<AudioStreamPacketDescription>.stride + MemoryLayout<Int>.stride
+        // Two native arrays plus the complete source timing array coexist. The
+        // remaining 128 bytes per sample cover the bounded attachment graph.
+        return 2 * headerEntry + MemoryLayout<CMSampleTimingInfo>.stride + 128
+            <= additionalSampleMetadataBytes
+    }
     private let observation: HLSWriterAcceptanceProbe.Rendition?
     private let metadataAdmission: HLSDataPlaneAdmission
     private let lock = NSLock()
@@ -60,8 +75,11 @@ final class WriterInputAdmission: @unchecked Sendable {
         self.observation = observation
         self.capacity = capacity
         self.maximumBytes = maximumBytes
+        // Only this derived metadata ceiling changes: capacity * 20,224 becomes
+        // capacity * 40,448 for 64-sample inputs. Slot/payload/global caps do not
+        // grow; every lease still prepays its full applicationBytes below.
         metadataAdmission = HLSDataPlaneAdmission(capacity: capacity,
-            maximumBytes: capacity * (Self.metadataBytes + 63 * 256),
+            maximumBytes: capacity * (Self.metadataBytes + 63 * Self.additionalSampleMetadataBytes),
             applicationLedger: applicationLedger)
     }
 
@@ -80,11 +98,12 @@ final class WriterInputAdmission: @unchecked Sendable {
     func admit(bytes: Int, sampleCount: Int = 1,
                release: @escaping @Sendable () -> Void = {}) throws -> WriterInputLifetime {
         let lease = try lock.withLock { () throws -> HLSDataPlaneAdmission.Lease in
-            guard !cancelled, bytes > 0, bytes <= maximumBytes - liveBytes,
+            guard Self.nativeHeaderArraysFitReservation,
+                  !cancelled, bytes > 0, bytes <= maximumBytes - liveBytes,
                   liveCount < capacity, (1...64).contains(sampleCount), admitted < UInt64.max else {
                 throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
             }
-            let metadata = Self.metadataBytes + (sampleCount - 1) * 256
+            let metadata = Self.metadataBytes + (sampleCount - 1) * Self.additionalSampleMetadataBytes
             guard let lease = metadataAdmission.acquire(units: 1, bytes: metadata, applicationBytes: metadata) else {
                 throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
             }

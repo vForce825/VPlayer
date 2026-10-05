@@ -1729,6 +1729,11 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         let buffers = inputs.flatMap(\.buffers)
+        let outputTimings = inputs.flatMap { epoch in
+            epoch.outputTimings.isEmpty
+                ? Array(repeating: WriterInputOutputTiming.calculated, count: epoch.buffers.count)
+                : epoch.outputTimings
+        }
         let payloadBytes = buffers.reduce(0) {
             $0 + (CMSampleBufferGetDataBuffer($1).map(CMBlockBufferGetDataLength) ?? 0)
         }
@@ -1746,7 +1751,8 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
                 accessUnitCount: inputs.reduce(0) { $0 + $1.bandwidth.accessUnitCount },
                 requiresWriterBodyAccounting: true),
             packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+            outputTimings: outputTimings)
     }
     func releaseEndpointInputs() { lock.withLock { endpointInputs.removeAll() } }
     func collect(_ object: SealedMediaObject) {

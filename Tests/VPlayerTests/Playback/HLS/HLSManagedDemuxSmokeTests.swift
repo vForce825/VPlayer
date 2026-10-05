@@ -65,6 +65,19 @@ final class HLSManagedDemuxSmokeTests: XCTestCase {
         await origin.close()
         if let failure { throw failure }
         let sample = try XCTUnwrap(capture.snapshot)
+        // Exercise the same closed source-admission boundary on the actual native
+        // writer bytes. Do not weaken it or substitute a hand-written MP4.
+        let combined = sample.header + sample.media
+        var container: Int32 = 0, usable = 0
+        let admission = combined.withUnsafeBytes { bytes in
+            vp_source_admit_container(bytes.bindMemory(to: UInt8.self).baseAddress,
+                bytes.count, 0, &container, &usable)
+        }
+        XCTAssertEqual(admission, 0,
+            "Native FMP4 source admission status=\(admission) kind=\(container); " +
+            "ordinary-init-prefix=\(sample.header.prefix(4_096).base64EncodedString()) " +
+            "ordinary-media-prefix=\(sample.media.prefix(2_048).base64EncodedString())")
+        guard admission == 0 else { throw HLSSourceError.unsupportedMedia }
         try await runManagedMedia(header: sample.header, media: sample.media, duration: sample.duration, expectedSuffix: "mp4")
     }
 
@@ -81,27 +94,44 @@ final class HLSManagedDemuxSmokeTests: XCTestCase {
         let ioQueue = DispatchQueue(label: "org.vplayer.tests.managed-demux-io")
         let demux = FFmpegDemuxer(timeoutUS: 5_000_000, ioQueue: ioQueue)
         let count = ManagedDemuxCounts()
+        var stage = "resolve"
         var failure: (any Error)?
         do {
             let context = try sourceContext(url: origin.url("media"), attributes: ["Authorization": "demux fixture"])
             let sourceCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.sourceRetention)
             let source = try await resolver.resolve(context, reason: .initial)
             let factsCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.factsRetention)
+            stage = "source-facts"
             let facts = try await HLSCompatibilityProbe().inspect(source, retainingFacts: factsCharge)
             let owner = try XCTUnwrap(context.owner)
             let plan = HLSPlaybackPlan(owner: owner, resolutionGeneration: source.generation, transport: .generated,
                 video: .remux, audio: .source, selectedServiceURL: source.responseURL, formatFingerprint: facts.formatFingerprint)
             let owned = HLSOwnedSourcePlan(source: source, facts: facts, plan: plan, resolver: resolver,
                 sourceCharge: sourceCharge, factsCharge: factsCharge)
+            stage = "proxy-start"
             let live = try await HLSByteProxy.start(source: source,
                 lifecycle: .init(backendIdentity: owner.backendIdentity, outputNonce: owner.outputLifecycleNonce), resolver: resolver,
                 sourceRetention: sourceCharge, manifestAuthority: owned.makeProxyManifestAuthority(), useGeneratedSelectedService: true)
             proxy = live
+            stage = "rewritten-manifest"
             let response = try await URLSession.shared.data(from: live.itemURL)
             let rewritten = try XCTUnwrap(HLSManifestGraph.parse(data: response.0, responseURL: live.itemURL).document(for: live.itemURL))
             XCTAssertEqual(rewritten.kind, .media)
             XCTAssertEqual(rewritten.segments.first?.resource.url.pathExtension, expectedSuffix)
             if header != nil { XCTAssertEqual(rewritten.segments.first?.initialization?.url.pathExtension, "mp4") }
+            stage = "media-range-readback"
+            // The same open-ended Range request used by FFmpeg must preserve
+            // every byte before stream selection is allowed to count as coverage.
+            let resource = try XCTUnwrap(rewritten.segments.first?.resource.url)
+            var request = URLRequest(url: resource)
+            request.setValue("bytes=0-", forHTTPHeaderField: "Range")
+            let readback = try await URLSession.shared.data(for: request)
+            XCTAssertEqual((readback.1 as? HTTPURLResponse)?.statusCode, 206)
+            XCTAssertEqual(readback.0, media)
+            guard (readback.1 as? HTTPURLResponse)?.statusCode == 206, readback.0 == media else {
+                throw HLSSourceError.incompleteEvidence
+            }
+            stage = "pinned-demux"
             try demux.start(url: live.itemURL, sink: count.receive)
             let deadline = ContinuousClock.now + .seconds(10)
             while !count.snapshot.terminal, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
@@ -118,7 +148,11 @@ final class HLSManagedDemuxSmokeTests: XCTestCase {
             XCTAssertGreaterThan(origin.authenticatedCount, 2)
             guard origin.deniedCount == 0, origin.authenticatedCount > 2 else { throw HLSSourceError.incompleteEvidence }
             print("MANAGED_HLS_PINNED_DEMUX container=\(expectedSuffix) video=\(result.videoPackets) audio=\(result.audioPackets) eof=true")
-        } catch { failure = error }
+        } catch {
+            XCTFail("Managed \(expectedSuffix) failed at \(stage): \(error); " +
+                "proxy-io=\(String(describing: proxy?.observedIO)) origin-requests=\(origin.requestCount)")
+            failure = error
+        }
         demux.cancel()
         // The original injected serial I/O queue joins the native run/destroy tail.
         await withCheckedContinuation { continuation in ioQueue.async { continuation.resume() } }

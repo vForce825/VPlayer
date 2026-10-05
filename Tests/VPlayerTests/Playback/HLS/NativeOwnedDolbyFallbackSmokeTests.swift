@@ -28,7 +28,7 @@ final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
                 let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "owned-dolby-\(codec.rawValue)",
                     streamURL: origin.url("source.ts"), title: "Owned Dolby fixture", attributes: ["Authorization": "dolby fixture"])
                 await controller.play(request)
-                try await until {
+                try await until(registry: registry) {
                     guard let backend = factory.backend, registry.outputResourceContextSnapshot()?.prepared == true,
                           registry.outputResourceContextSnapshot()?.interval != nil,
                           case let .avPlayer(context)? = backend.presentation else { return false }
@@ -71,11 +71,17 @@ final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
                     // first graph's actual producer retirement returned confirmed.
                     outcome = "compressed-unavailable-owned-joined-AAC-retry"
                 }
-                try await until { context.player.currentItem === physical && context.player.currentTime().seconds > start + 0.25 }
+                try await until(registry: registry) { context.player.currentItem === physical && context.player.currentTime().seconds > start + 0.25 }
                 guard context.player.currentItem === physical, context.player.currentTime().seconds > start + 0.25,
                       audio.formatValidated else { throw HLSSourceError.incompleteEvidence }
                 print("OWNED_DOLBY_TRIAL codec=\(codec.rawValue) nativeTrials=\(trials) outcome=\(outcome) progressed=true")
-            } catch { failure = error }
+            } catch {
+                let native = probe.snapshot
+                XCTFail("Owned Dolby smoke codec=\(codec.rawValue) failed: \(error); " +
+                    "inspections=\(observation.inspections) AC3-trials=\(native.nativeAC3WriterCount) " +
+                    "EAC3-trials=\(native.nativeEAC3WriterCount) bundles=\(factory.backend?.generatedBundleCallsForTesting ?? 0)")
+                failure = error
+            }
             await controller.stop(); await registry.joinOwnedTerminalCleanup(); await origin.close()
             XCTAssertNil(registry.outputResourceContextSnapshot())
             XCTAssertEqual(probe.snapshot.liveInputCount, 0)
@@ -83,9 +89,14 @@ final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
             if let failure { throw failure }
         }
     }
-    private func until(_ condition: @MainActor () -> Bool) async throws {
+    private func until(registry: ControlTaskRegistry, _ condition: @MainActor () -> Bool) async throws {
         let deadline = ContinuousClock.now + .seconds(30)
-        while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        while !condition(), ContinuousClock.now < deadline {
+            if case let .failed(failure) = registry.playbackStateSnapshot() {
+                throw failure
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
         guard condition() else { throw HLSSourceError.deadline }
     }
     private func inspectPublishedAudio(_ itemURL: URL) async throws -> HLSSourceAudioFacts {

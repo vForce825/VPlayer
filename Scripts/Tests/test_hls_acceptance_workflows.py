@@ -73,15 +73,39 @@ class WorkflowContracts(unittest.TestCase):
     def test_six_full_gates_remain_independent_and_check_true_candidate(self):
         text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
         jobs=re.findall(r'^  ([a-z][a-z-]+):$',text.split('jobs:',1)[1],re.M)
-        self.assertEqual(set(jobs),{'complete-tests','release-contracts','sanitizer-validation',
-            'artifact-validation','fixture-validation','compiler-controls'})
+        self.assertCountEqual(jobs,['complete-tests','release-contracts','sanitizer-validation',
+            'artifact-validation','fixture-validation','compiler-controls'])
         self.assertEqual(text.count('ref: ${{ github.event.pull_request.head.sha || github.sha }}'),6)
         self.assertEqual(text.count('echo "ACCEPTANCE_TREE='),6)
         self.assertNotRegex(text,re.compile(r'^    (?:if|needs):',re.M))
         self.assertNotIn('migration/tvos27',text)
         normal=text.split('  complete-tests:',1)[1].split('  release-contracts:',1)[0]
         self.assertIn('./Scripts/test.sh -configuration Debug',normal)
-        self.assertNotIn('-only-testing:',normal)
+        self.assertNotRegex(normal,r'--?(?:only|skip)-testing(?=[:=\s]|$)')
+
+    def test_strict_http_keeps_fixture_gates_and_adds_bounded_native_smoke_coverage(self):
+        text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
+        fixture=text.split('  fixture-validation:',1)[1].split('  compiler-controls:',1)[0]
+        step=fixture.split('      - name: Run strict HTTP playback and full-length 4K remux assertions\n',1)[1]
+        command=step.split('          ./Scripts/run-playback-integration-tests.sh \\\n',1)[1]
+        selectors=re.findall(r'^\s+--only-testing (\S+) \\$',command,re.M)
+        self.assertCountEqual(selectors,[
+            'VPlayerTests/PlaybackFixtureIntegrationTests',
+            'VPlayerTests/SampleBufferBuilderTests',
+            'VPlayerTests/HLSManagedDemuxSmokeTests',
+            'VPlayerTests/HLSProxyBackpressureTests',
+            'VPlayerTests/NativeHLSMasterSmokeTests',
+            'VPlayerTests/NativeOwnedDolbyFallbackSmokeTests',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput',
+            'VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints',
+            'VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail',
+            'VPlayerTests/HLSTimelineTests',
+        ])
+        self.assertIn('        timeout-minutes: 30\n',step)
+        self.assertIn('--timeline-fixture "$fixture_dir/timeline.ts"',command)
+        self.assertIn('-maximum-test-execution-time-allowance 300\n',command)
+        self.assertNotRegex(command,r'--?skip-testing(?=[:=\s]|$)')
 
     def test_checkpoints_do_not_run_tests_and_preparation_requires_explicit_workflow_edit(self):
         for path in (ROOT/'.github/workflows').glob('*.yml'):

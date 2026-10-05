@@ -15,7 +15,8 @@ final class WriterInputLifetimeTests: XCTestCase {
         defer { lifetime.releaseBacking() }
         XCTAssertEqual(admission.usage.count, 1)
         XCTAssertEqual(admission.usage.bytes, 128)
-        XCTAssertEqual(ledger.chargedBytes, WriterInputAdmission.metadataBytes + 63 * 256)
+        XCTAssertEqual(ledger.chargedBytes, WriterInputAdmission.metadataBytes
+            + 63 * WriterInputAdmission.additionalSampleMetadataBytes)
         XCTAssertThrowsError(try admission.admit(bytes: 1))
         lifetime.releaseBacking()
         XCTAssertEqual(admission.usage.count, 0)

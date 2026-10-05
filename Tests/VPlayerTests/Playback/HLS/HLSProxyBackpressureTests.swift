@@ -27,7 +27,14 @@ final class HLSProxyBackpressureTests: XCTestCase {
             try await reader.start(proxy.itemURL)
             let deadline = ContinuousClock.now + .seconds(5)
             while proxy.observedIO.callbackBytes == 0, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
-            guard proxy.observedIO.callbackBytes > 0 else { throw HLSSourceError.deadline }
+            guard proxy.observedIO.callbackBytes > 0 else {
+                let observed = proxy.observedIO
+                XCTFail("No held proxy data callback: peak=\(observed.peakCallbackBytes) " +
+                    "largest=\(observed.largestCallback) rejected=\(observed.rejectedOversizedCallbacks) " +
+                    "pending-send=\(observed.pendingSendAliases) transfers=\(proxy.admissionUsage.transfers) " +
+                    "origin-requests=\(origin.requestCount)")
+                throw HLSSourceError.deadline
+            }
             // No reads are registered. Wait while the native send holds the one
             // original data callback; this verifies the real socket/delegate path.
             try await Task.sleep(for: .milliseconds(50))

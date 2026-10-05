@@ -13,6 +13,48 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testAACFixtureEpochCopiesAndSlicesPreserveRecordedOutputTiming() throws {
+        let explicit = try Task17Fixtures.aacEpoch(bufferCount: 3)
+        let calculated = try Task17Fixtures.aacEpoch(
+            buffers: (0..<3).map {
+                try Task17Fixtures.aacBuffer(pts: CMTime(value: Int64($0 * 1_024), timescale: 48_000))
+            }, workspace: AACCalibrationWorkspace())
+        XCTAssertEqual(explicit.outputTimings.count, explicit.buffers.count)
+        XCTAssertTrue(calculated.outputTimings.isEmpty)
+
+        for complete in [explicit, calculated] {
+            let variants: [(epoch: AACEncodedEpoch, range: Range<Int>)] = [
+                (try Task17AACEndpointFixtures.copyEpoch(complete), 0..<3),
+                (Task17AACEndpointFixtures.prefix(complete, bufferCount: 2), 0..<2),
+                (Task17TerminalAACChunk.make(complete, range: 1..<3), 1..<3),
+                (Task17Fixtures.replacingAACCounts(complete,
+                    totalDecodedFrames: complete.totalDecodedFrames), 0..<3),
+            ]
+            for (epoch, range) in variants {
+                XCTAssertEqual(epoch.buffers.count, range.count)
+                XCTAssertEqual(epoch.outputTimings.count,
+                    complete.outputTimings.isEmpty ? 0 : range.count)
+                for (index, sourceIndex) in range.enumerated() {
+                    let outputTiming: WriterInputOutputTiming
+                    if epoch.outputTimings.isEmpty {
+                        outputTiming = .calculated
+                    } else {
+                        outputTiming = try XCTUnwrap(epoch.outputTimings.dropFirst(index).first)
+                    }
+                    let wrapped = try SampleBufferBuilder.makeWriterInputSample(
+                        epoch.buffers[index], lifetime: WriterInputLifetime(),
+                        outputTiming: outputTiming)
+                    let expected = CMSampleBufferGetOutputPresentationTimeStamp(complete.buffers[sourceIndex])
+                    let actual = CMSampleBufferGetOutputPresentationTimeStamp(wrapped)
+                    XCTAssertEqual(actual.value, expected.value)
+                    XCTAssertEqual(actual.timescale, expected.timescale)
+                    XCTAssertEqual(actual.flags, expected.flags)
+                    XCTAssertEqual(actual.epoch, expected.epoch)
+                }
+            }
+        }
+    }
+
     func testSourceAACFrozenModePreservesPayloadAndDoesNotAcquireEncoderAuthority() async throws {
         let copies = HLSAudioCopyOwnership(maximumCompressedBytes: 1_048_576,
             maximumPCMBytes: 1_024, capacity: 64)
@@ -2050,7 +2092,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 actualTrailingPrimeFrames: UInt32(trailing),
                 bandwidth: complete.bandwidth,
                 packetLease: complete.packetLease,
-                formatLease: complete.formatLease)
+                formatLease: complete.formatLease,
+                outputTimings: complete.outputTimings.isEmpty ? [] : [complete.outputTimings[index]])
         }
         let boundary = try SegmentBoundaryCoordinator(
             mode: .audioOnly(epochStart: CMTime(value: 10, timescale: 1)))
@@ -4125,7 +4168,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 actualTrailingPrimeFrames: epoch.actualTrailingPrimeFrames,
                 bandwidth: epoch.bandwidth,
                 packetLease: epoch.packetLease,
-                formatLease: epoch.formatLease
+                formatLease: epoch.formatLease,
+                outputTimings: epoch.outputTimings
             )
         }
 
@@ -4628,7 +4672,8 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let retryWorkspace = AACCalibrationWorkspace()
         let retryEpoch = try Task17Fixtures.aacEpoch(
             buffers: [epoch.buffers[47]],
-            workspace: retryWorkspace
+            workspace: retryWorkspace,
+            outputTimings: epoch.outputTimings.isEmpty ? [] : [epoch.outputTimings[47]]
         )
         let retryFactory = Task17FakeSystemWriterFactory()
         let retryBinding = Task17Fixtures.rolloverBinding(
@@ -9255,7 +9300,8 @@ private enum Task17TerminalAACChunk {
             actualTrailingPrimeFrames: UInt32(trailing),
             bandwidth: complete.bandwidth,
             packetLease: complete.packetLease,
-            formatLease: complete.formatLease)
+            formatLease: complete.formatLease,
+            outputTimings: complete.outputTimings.isEmpty ? [] : Array(complete.outputTimings[range]))
     }
 }
 
@@ -9338,7 +9384,8 @@ private enum Task17AACEndpointFixtures {
             actualTrailingPrimeFrames: UInt32(trailing),
             bandwidth: epoch.bandwidth,
             packetLease: epoch.packetLease,
-            formatLease: epoch.formatLease)
+            formatLease: epoch.formatLease,
+            outputTimings: epoch.outputTimings.isEmpty ? [] : Array(epoch.outputTimings.prefix(bufferCount)))
     }
 
     static func replacingCounts(
@@ -9357,7 +9404,8 @@ private enum Task17AACEndpointFixtures {
             actualTrailingPrimeFrames: epoch.actualTrailingPrimeFrames,
             bandwidth: epoch.bandwidth,
             packetLease: epoch.packetLease,
-            formatLease: epoch.formatLease)
+            formatLease: epoch.formatLease,
+            outputTimings: epoch.outputTimings)
     }
 }
 
@@ -10143,6 +10191,7 @@ private enum Task17Fixtures {
         let total = bufferCount * 1_024
         let base = CMTimeConvertScale(outputBase, timescale: 48_000, method: .default)
         var buffers: [CMSampleBuffer] = []
+        var outputTimings: [WriterInputOutputTiming] = []
         for index in 0..<bufferCount {
             let buffer = try sampleBuffer(
                 format: format,
@@ -10152,14 +10201,13 @@ private enum Task17Fixtures {
             )
             if index == 0 { setTrim(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart, samples: leading) }
             if index == bufferCount - 1 { setTrim(buffer, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd, samples: trailing) }
-            try check(CMSampleBufferSetOutputPresentationTimeStamp(
-                buffer,
-                newValue: CMTime(
+            let outputTiming = try WriterInputOutputTiming.settingExplicit(
+                CMTime(
                     value: base.value + Int64(index * 1_024) - (index == 0 ? 0 : Int64(leading)),
                     timescale: 48_000
-                )
-            ))
+                ), on: buffer)
             buffers.append(buffer)
+            outputTimings.append(outputTiming)
         }
         return AACEncodedEpoch(
             identity: identity,
@@ -10179,13 +10227,15 @@ private enum Task17Fixtures {
                 requiresWriterBodyAccounting: true
             ),
             packetLease: try workspace.acquire(.aacPackets, bytes: bufferCount * 24),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024)
+            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+            outputTimings: outputTimings
         )
     }
 
     static func aacEpoch(
         buffers: [CMSampleBuffer],
-        workspace: AACCalibrationWorkspace
+        workspace: AACCalibrationWorkspace,
+        outputTimings: [WriterInputOutputTiming] = []
     ) throws -> AACEncodedEpoch {
         precondition(!buffers.isEmpty)
         let request = try AACRenditionRequest(
@@ -10218,7 +10268,8 @@ private enum Task17Fixtures {
                 requiresWriterBodyAccounting: true
             ),
             packetLease: try workspace.acquire(.aacPackets, bytes: buffers.count * 24),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024)
+            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+            outputTimings: outputTimings
         )
     }
 
@@ -10237,7 +10288,8 @@ private enum Task17Fixtures {
             actualTrailingPrimeFrames: epoch.actualTrailingPrimeFrames,
             bandwidth: epoch.bandwidth,
             packetLease: epoch.packetLease,
-            formatLease: epoch.formatLease
+            formatLease: epoch.formatLease,
+            outputTimings: epoch.outputTimings
         )
     }
 

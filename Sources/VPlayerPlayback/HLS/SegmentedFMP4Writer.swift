@@ -497,6 +497,11 @@ private struct NativeSampleFacts: Sendable, Equatable {
             let expectedTime = timingIndex.flatMap {
                 other.timing.indices.contains($0) ? other.timing[$0] : nil
             } ?? "none"
+            func dictionaryCount(_ value: NativeAttachmentFacts?) -> Int {
+                guard let value else { return -1 }
+                if case .dictionary(let entries) = value { return entries.count }
+                return -2
+            }
             print("HLS_NATIVE_SAMPLE_MISMATCH stage=\(stage) "
                 + "formatEqual=\(format == other.format) "
                 + "timingCount=\(timing.count)/\(other.timing.count) "
@@ -504,7 +509,9 @@ private struct NativeSampleFacts: Sendable, Equatable {
                 + "sampleCount=\(sizes.count)/\(other.sizes.count) sizesEqual=\(sizes == other.sizes) "
                 + "sampleAttachmentsEqual=\(attachments[0] == other.attachments[0]) "
                 + "propagatingAttachmentsEqual=\(attachments[1] == other.attachments[1]) "
+                + "propagatingAttachmentCount=\(dictionaryCount(attachments[1]))/\(dictionaryCount(other.attachments[1])) "
                 + "privateAttachmentsEqual=\(attachments[2] == other.attachments[2]) "
+                + "privateAttachmentCount=\(dictionaryCount(attachments[2]))/\(dictionaryCount(other.attachments[2])) "
                 + "payloadEqual=\(payloadDigest == other.payloadDigest)")
             #endif
             return false
@@ -3142,7 +3149,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                         throw SegmentedFMP4WriterFailure.boundaryMismatch
                     }
                     let nativeSample = try makeNativeInputIsolated(epoch.buffers[index],
-                        ownership: FMP4InputOwnership(), admission: &admission)
+                        ownership: FMP4InputOwnership(), admission: &admission,
+                        outputTiming: epoch.outputTiming(at: index))
                     // AVAssetWriter 的 delegate 可在 append 返回前同步交付首个 media
                     // report。批量 AAC 路径必须先以本批真实首帧冻结输入时间域，令该
                     // callback 能签发 prefix mapping；失败路径随后会终结当前 writer，
@@ -3231,7 +3239,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                             ticket: ticket, sampleIdentity: identities[index],
                             ownership: FMP4InputOwnership(),
                             validatesSource: { try NativeSampleFacts.freeze(epoch.buffers[index]) == $0 },
-                            admission: &admission, batchIdentity: batchIdentity)
+                            admission: &admission, outputTiming: epoch.outputTiming(at: index),
+                            batchIdentity: batchIdentity)
                     } catch {
                         ticket.abort(binding: binding, session: boundarySession)
                         throw error
@@ -3299,7 +3308,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     throw SegmentedFMP4WriterFailure.boundaryMismatch
                 }
                 emission.markWriterAccepted()
-                let nativeSample = try makeNativeInputIsolated(buffer, ownership: FMP4InputOwnership(), admission: &admission)
+                let nativeSample = try makeNativeInputIsolated(buffer, ownership: FMP4InputOwnership(),
+                    admission: &admission, outputTiming: emission.outputTiming)
                 guard appendAndCommitIsolated(nativeSample, ticket: ticket,
                                               sampleIdentity: identity) else {
                     let failure = systemFailureIsolated()
@@ -3495,7 +3505,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                         emission.identity == emission.liveContext.encoderIdentity
                             && emission.liveContext.matches(binding)
                     },
-                    admission: &admission, claimOwnership: { emission.markWriterAccepted() })
+                    admission: &admission, outputTiming: emission.outputTiming,
+                    claimOwnership: { emission.markWriterAccepted() })
                 return (operation, prepared)
             } catch {
                 ticket.abort(binding: binding, session: boundarySession)
@@ -4098,7 +4109,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
 
     private func makeNativeInputIsolated(_ sample: CMSampleBuffer,
                                          ownership: FMP4InputOwnership,
-                                         admission: inout AppendPreflightAdmission) throws -> CMSampleBuffer {
+                                         admission: inout AppendPreflightAdmission,
+                                         outputTiming: WriterInputOutputTiming = .calculated) throws -> CMSampleBuffer {
+        guard outputTiming.matchesSource(sample) else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
         guard let prepaid = admission.inputLifetime else {
             throw SegmentedFMP4WriterFailure.illegalState
         }
@@ -4111,7 +4124,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             ownership.release()
             prepaid.releaseBacking()
         }
-        let native = try SampleBufferBuilder.makeWriterInputSample(sample, lifetime: lifetime)
+        let native = try SampleBufferBuilder.makeWriterInputSample(sample, lifetime: lifetime, outputTiming: outputTiming)
         guard try NativeSampleFacts.freeze(native).matches(
             NativeSampleFacts.freeze(sample), stage: "input-wrapper") else {
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
@@ -4185,9 +4198,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         ownership: @autoclosure () -> FMP4InputOwnership,
         validatesSource: @escaping @Sendable (NativeSampleFacts) throws -> Bool,
         admission: inout AppendPreflightAdmission,
+        outputTiming: WriterInputOutputTiming = .calculated,
         batchIdentity: UUID? = nil,
         claimOwnership: () throws -> Void = {}
     ) throws -> AwaitingAppend {
+        guard outputTiming.matchesSource(sampleBuffer) else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
         let facts = try NativeSampleFacts.freeze(sampleBuffer)
         // 上游提交后只读使用同一冻结 sample。跨 executor 传递 CoreMedia 的 ready
         // 容器；账本也只在其同步借用中读取，所有 backing owner 保留到 native 归来。
@@ -4206,7 +4221,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.boundaryMismatch
         }
         try claimOwnership()
-        let nativeSample = try makeNativeInputIsolated(sampleBuffer, ownership: ownership(), admission: &admission)
+        let nativeSample = try makeNativeInputIsolated(sampleBuffer, ownership: ownership(),
+            admission: &admission, outputTiming: outputTiming)
         let sample = try nativeReadySample(copying: nativeSample)
         guard try sample.withUnsafeSampleBuffer({ try NativeSampleFacts.freeze($0) })
             .matches(facts, stage: "ready-header") else {

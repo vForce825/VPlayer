@@ -431,6 +431,36 @@ private func hlsOwnedFree(_ refCon: UnsafeMutableRawPointer?, _ block: UnsafeMut
     context.release()
 }
 
+/// Creation-time intent, never inferred from a sample's calculated output getter.
+/// Invalid represents the calculated mode; explicit values occupy one CMTime.
+struct WriterInputOutputTiming: Sendable {
+    private let value: CMTime
+    static let calculated = Self(value: .invalid)
+
+    static func settingExplicit(_ value: CMTime, on sample: CMSampleBuffer) throws -> Self {
+        guard value.isNumeric else { throw PlaybackCoreError.videoDecode(SampleBufferBuilder.invalidDataErrorCode) }
+        let intent = Self(value: value)
+        try intent.restore(on: sample)
+        guard intent.matchesSource(sample) else {
+            throw PlaybackCoreError.videoDecode(SampleBufferBuilder.invalidDataErrorCode)
+        }
+        return intent
+    }
+
+    func matchesSource(_ sample: CMSampleBuffer) -> Bool {
+        guard value.isValid else { return true }
+        let actual = CMSampleBufferGetOutputPresentationTimeStamp(sample)
+        return actual.value == value.value && actual.timescale == value.timescale
+            && actual.flags == value.flags && actual.epoch == value.epoch
+    }
+
+    func restore(on sample: CMSampleBuffer) throws {
+        guard value.isValid else { return }
+        let status = CMSampleBufferSetOutputPresentationTimeStamp(sample, newValue: value)
+        guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+    }
+}
+
 enum SampleBufferBuilder {
     static let invalidDataErrorCode: Int32 = -1_448_143_362
     private static let maximumVideoPayloadBytes = 64 * 1_024 * 1_024
@@ -888,9 +918,13 @@ enum SampleBufferBuilder {
 
     /// A paid header/custom block reference; payload stays in its original owner.
     /// No sample, encoded epoch/output or writer may be placed in the FreeBlock context.
-    static func makeWriterInputSample(_ sample: CMSampleBuffer, lifetime: WriterInputLifetime) throws -> CMSampleBuffer {
+    static func makeWriterInputSample(_ sample: CMSampleBuffer, lifetime: WriterInputLifetime,
+                                      outputTiming: WriterInputOutputTiming = .calculated) throws -> CMSampleBuffer {
         var transferred = false
         defer { if !transferred { lifetime.releaseBacking() } }
+        guard outputTiming.matchesSource(sample) else {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
         let count = CMSampleBufferGetNumSamples(sample)
         guard (1...64).contains(count), let original = CMSampleBufferGetDataBuffer(sample) else {
             throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
@@ -917,6 +951,7 @@ enum SampleBufferBuilder {
         if let values = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) {
             try validateWriterAttachment(values as NSArray, remaining: &attachmentBudget)
         }
+        let times = try writerInputTiming(sample, sampleCount: count)
         let block = try makePrepaidBlock(length: length, pointer: UnsafeMutableRawPointer(pointer),
             original: original, lifetime: lifetime)
         transferred = true
@@ -928,24 +963,14 @@ enum SampleBufferBuilder {
             packetDescriptionsPointerOut: &packets, sizeOut: &packetBytes)
         if packetStatus == noErr, let packets, let format,
            packetBytes == count * MemoryLayout<AudioStreamPacketDescription>.stride {
-            let status = CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
-                dataBuffer: block, formatDescription: format, sampleCount: count,
+            result = try makeWriterPacketSample(block: block, format: format, sampleCount: count,
                 presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
-                packetDescriptions: packets, sampleBufferOut: &result)
-            guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+                packets: packets, times: times)
         } else {
-            var times: [CMSampleTimingInfo] = []
-            var sizes: [Int] = []
-            for index in 0..<count {
-                var timing = CMSampleTimingInfo()
-                let status = CMSampleBufferGetSampleTimingInfo(sample, at: index, timingInfoOut: &timing)
-                guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
-                times.append(timing)
-                sizes.append(CMSampleBufferGetSampleSize(sample, at: index))
-            }
+            let sizes = (0..<count).map { CMSampleBufferGetSampleSize(sample, at: $0) }
             let status = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
-                formatDescription: format, sampleCount: count, sampleTimingEntryCount: count,
-                sampleTimingArray: &times, sampleSizeEntryCount: count, sampleSizeArray: &sizes,
+                formatDescription: format, sampleCount: count, sampleTimingEntryCount: times.count,
+                sampleTimingArray: times, sampleSizeEntryCount: count, sampleSizeArray: sizes,
                 sampleBufferOut: &result)
             guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
         }
@@ -964,10 +989,58 @@ enum SampleBufferBuilder {
                 target[index].addEntries(from: source[index] as! [AnyHashable: Any])
             }
         }
-        // The copied attachments preserve any explicit output-PTS override.
-        // Setting the getter's calculated value would create a new override
-        // attachment on an otherwise unchanged sample, breaking metadata identity
-        // and preventing future trim changes from recalculating its output PTS.
+        // Retiming drops an explicit output PTS. Restore only creation-time intent,
+        // after source trim/reverse attachments, matching the encoder's setter order.
+        // Never promote a calculated getter value into a new explicit override.
+        try outputTiming.restore(on: result)
+        return result
+    }
+
+    private static func writerInputTiming(_ sample: CMSampleBuffer,
+                                           sampleCount: Int) throws -> [CMSampleTimingInfo] {
+        var count = 0
+        var status = CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0,
+            arrayToFill: nil, entriesNeededOut: &count)
+        guard status == noErr, count == 1 || count == sampleCount else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        // Preserve the original array shape as well as every CMTime field; expanding
+        // a uniform entry through per-sample getters can perform timestamp arithmetic.
+        var times = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        var written = 0
+        status = CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count,
+            arrayToFill: &times, entriesNeededOut: &written)
+        guard status == noErr, written == count else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        return times
+    }
+
+    private static func makeWriterPacketSample(block: CMBlockBuffer, format: CMFormatDescription,
+                                               sampleCount: Int, presentationTimeStamp: CMTime,
+                                               packets: UnsafePointer<AudioStreamPacketDescription>,
+                                               times: [CMSampleTimingInfo]) throws -> CMSampleBuffer {
+        var packetSample: CMSampleBuffer?
+        let packetStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
+            dataBuffer: block, formatDescription: format, sampleCount: sampleCount,
+            presentationTimeStamp: presentationTimeStamp, packetDescriptions: packets,
+            sampleBufferOut: &packetSample)
+        guard packetStatus == noErr, let packetSample else {
+            throw PlaybackCoreError.videoDecode(packetStatus == noErr ? invalidDataErrorCode : packetStatus)
+        }
+        // The packet constructor derives timing from the format (e.g. 1024/48000),
+        // which need not match the source's exact representation (e.g. 8/375).
+        // Copy the packet-bearing header with the original, bounded timing array.
+        // Both headers share the prepaid block and are covered by input admission.
+        var result: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+            sampleBuffer: packetSample, sampleTimingEntryCount: times.count,
+            sampleTimingArray: times, sampleBufferOut: &result)
+        guard status == noErr, let result else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        // End the temporary header's scope before copying source attachments. The
+        // timing-copy API drops output-PTS overrides, so attachments must come last.
         return result
     }
 

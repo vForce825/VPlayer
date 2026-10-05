@@ -192,9 +192,10 @@ final class ReleaseAACSeed: @unchecked Sendable {
     ) async throws
         -> ReleasePendingAACSeed {
         let template = try await encodedTemplate(layoutLabels: layoutLabels)
-        let coalesced = try template.buffers.map {
+        let rebuilt = try template.buffers.map {
             try makeEncodedBuffer(from: $0, format: template.format)
         }
+        let coalesced = rebuilt.map { $0.buffer }
         let summary = template.streamSummary
         let workspace = AACCalibrationWorkspace()
         let payloadBytes = coalesced.reduce(0) {
@@ -209,7 +210,8 @@ final class ReleaseAACSeed: @unchecked Sendable {
             actualTrailingPrimeFrames: summary.actualTrailingPrimeFrames,
             bandwidth: summary.bandwidth,
             packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192))
+            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192),
+            outputTimings: rebuilt.map { $0.outputTiming })
         guard epoch.buffers.count <= 8,
               let first = epoch.buffers.first,
               let format = CMSampleBufferGetFormatDescription(first) else {
@@ -412,7 +414,7 @@ final class ReleaseAACSeed: @unchecked Sendable {
     private static func makeEncodedBuffer(
         from template: ReleaseAACEncodedBufferTemplate,
         format: CMAudioFormatDescription
-    ) throws -> CMSampleBuffer {
+    ) throws -> (buffer: CMSampleBuffer, outputTiming: WriterInputOutputTiming) {
         var block: CMBlockBuffer?
         try AACRenditionEncoder.check(CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -447,9 +449,8 @@ final class ReleaseAACSeed: @unchecked Sendable {
             sampleBufferOut: &result
         ))
         let buffer = try XCTUnwrap(result)
-        try AACRenditionEncoder.check(CMSampleBufferSetOutputPresentationTimeStamp(
-            buffer, newValue: template.outputPresentationTimeStamp
-        ))
+        let outputTiming = try WriterInputOutputTiming.settingExplicit(
+            template.outputPresentationTimeStamp, on: buffer)
         if let leadingTrim = template.leadingTrim {
             CMSetAttachment(buffer,
                 key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
@@ -464,7 +465,7 @@ final class ReleaseAACSeed: @unchecked Sendable {
                     allocator: kCFAllocatorDefault)!,
                 attachmentMode: kCMAttachmentMode_ShouldPropagate)
         }
-        return buffer
+        return (buffer, outputTiming)
     }
 
     fileprivate static func trimTime(_ buffer: CMSampleBuffer,
