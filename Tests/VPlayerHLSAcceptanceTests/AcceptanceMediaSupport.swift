@@ -398,7 +398,7 @@ final class AcceptanceCapture: @unchecked Sendable {
 /// Strict read-only MP4 facts, including tfhd/trex duration defaults.
 enum AcceptanceMP4 {
     struct Box { let type: String; let payload: Int; let end: Int }
-    struct Fragment { let sequence: UInt32; let time: UInt64; let duration: UInt64 }
+    struct Fragment { let sequence: UInt32; let time: UInt64; let duration: UInt64; let sampleCount: Int }
 
     static func u32(_ bytes: Data, _ offset: Int) -> UInt32 {
         bytes.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self).bigEndian }
@@ -507,6 +507,7 @@ enum AcceptanceMP4 {
             time = u64(bytes, tfdt.payload + 4)
         } else { time = UInt64(u32(bytes, tfdt.payload + 4)) }
         var duration: UInt64 = 0
+        var sampleCount = 0
         let runs = track.filter { $0.type == "trun" }
         guard !runs.isEmpty else { throw AcceptanceError.invalid("missing trun") }
         for run in runs {
@@ -514,6 +515,9 @@ enum AcceptanceMP4 {
             let flags = u32(bytes, run.payload) & 0x00ff_ffff
             let count = u32(bytes, run.payload + 4)
             guard count > 0 && count <= 65_536 else { throw AcceptanceError.invalid("trun sample count") }
+            let total = sampleCount.addingReportingOverflow(Int(count))
+            guard !total.overflow else { throw AcceptanceError.invalid("native sample count overflow") }
+            sampleCount = total.partialValue
             var position = run.payload + 8
             if flags & 1 != 0 { position += 4 }
             if flags & 4 != 0 { position += 4 }
@@ -531,7 +535,7 @@ enum AcceptanceMP4 {
         }
         let sequence = u32(bytes, mfhd.payload + 4)
         guard sequence > 0 else { throw AcceptanceError.invalid("zero mfhd") }
-        return Fragment(sequence: sequence, time: time, duration: duration)
+        return Fragment(sequence: sequence, time: time, duration: duration, sampleCount: sampleCount)
     }
 }
 
@@ -539,6 +543,7 @@ struct AcceptanceFragmentContinuity {
     private var lastSequence: UInt32?
     private var nextDecodeTime: UInt64?
     private var firstDecodeTime: UInt64?
+    private var totalSamples = 0
     private var lastDecodeTime: UInt64?
     private var lastDuration: UInt64?
     private(set) var rawSequenceContinuous = true
@@ -551,6 +556,9 @@ struct AcceptanceFragmentContinuity {
         if let expected = nextDecodeTime { rawTimeContinuous = rawTimeContinuous && facts.time == expected }
         let end = facts.time.addingReportingOverflow(facts.duration)
         guard !end.overflow else { throw AcceptanceError.invalid("native decode time overflow") }
+        let samples = totalSamples.addingReportingOverflow(facts.sampleCount)
+        guard !samples.overflow else { throw AcceptanceError.invalid("native total sample count overflow") }
+        totalSamples = samples.partialValue
         if firstDecodeTime == nil { firstDecodeTime = facts.time }
         lastSequence = facts.sequence
         lastDecodeTime = facts.time
@@ -558,10 +566,23 @@ struct AcceptanceFragmentContinuity {
         nextDecodeTime = end.partialValue
     }
 
+    func requireVideoCoverage(_ timing: AcceptanceVideoTiming, timescale: UInt32?) throws {
+        guard rawSequenceContinuous, rawTimeContinuous, totalSamples > 0,
+              timing.frames == totalSamples, let first = firstDecodeTime, let end = nextDecodeTime,
+              let startTicks = Int64(exactly: first), let endTicks = Int64(exactly: end),
+              let timescale, let scale = Int32(exactly: timescale), scale > 0,
+              let firstPTS = timing.firstPTS, let lastEnd = timing.lastEnd,
+              CMTimeCompare(firstPTS, CMTime(value: startTicks, timescale: scale)) == 0,
+              CMTimeCompare(lastEnd, CMTime(value: endTicks, timescale: scale)) == 0 else {
+            throw AcceptanceError.invalid("decoded video does not cover every raw fragment sample and endpoint")
+        }
+    }
+
     func failureDiagnostics(timescale: UInt32?) -> [String: Any] {
         let scale = timescale.flatMap { $0 > 0 ? Double($0) : nil }
         let endSeconds = scale.flatMap { scale in nextDecodeTime.map { Double($0) / scale } }
         return ["raw_mfhd_continuous":rawSequenceContinuous,"raw_tfdt_continuous":rawTimeContinuous,
+                "raw_sample_count":totalSamples,
                 "first_raw_tfdt":firstDecodeTime.map { $0 as Any } ?? NSNull(),
                 "last_raw_mfhd":lastSequence.map { $0 as Any } ?? NSNull(),
                 "last_raw_tfdt":lastDecodeTime.map { $0 as Any } ?? NSNull(),
@@ -569,6 +590,73 @@ struct AcceptanceFragmentContinuity {
                 "last_raw_end":nextDecodeTime.map { $0 as Any } ?? NSNull(),
                 "latest_init_timescale":timescale.map { $0 as Any } ?? NSNull(),
                 "last_raw_end_seconds":AcceptanceReport.finite(endSeconds)]
+    }
+}
+
+/// One decoded image must match one original compressed sample. The original
+/// container duration is authoritative when AVAssetReader omits image duration.
+/// Only timing scalars survive each pair; no media owner or nominal FPS is used.
+struct AcceptanceVideoTiming {
+    private(set) var frames = 0
+    private(set) var firstPTS: CMTime?
+    private(set) var lastEnd: CMTime?
+    private(set) var maximumGapSeconds = 0.0
+    private(set) var missingDecodedDurations = 0
+    private var firstPair: [String: Any]?
+    private var latestPair: [String: Any] = [:]
+    var decodedSeconds: Double? {
+        guard let firstPTS, let lastEnd else { return nil }
+        return CMTimeSubtract(lastEnd, firstPTS).seconds
+    }
+    var diagnostics: [String: Any] {
+        ["first_pair":firstPair ?? [:],"latest_pair":latestPair,"matched_frames":frames,
+         "missing_decoded_durations":missingDecodedDurations]
+    }
+    mutating func observe(decoded: CMSampleBuffer, original: CMSampleBuffer) throws {
+        guard CMSampleBufferGetImageBuffer(decoded) != nil else {
+            throw AcceptanceError.invalid("video was not really decoded")
+        }
+        try observe(decodedPTS: CMSampleBufferGetPresentationTimeStamp(decoded),
+            decodedDuration: CMSampleBufferGetDuration(decoded),
+            originalPTS: CMSampleBufferGetPresentationTimeStamp(original),
+            originalDuration: CMSampleBufferGetDuration(original),
+            decodedCount: CMSampleBufferGetNumSamples(decoded), originalCount: CMSampleBufferGetNumSamples(original))
+    }
+    mutating func observe(decodedPTS: CMTime, decodedDuration: CMTime,
+        originalPTS: CMTime, originalDuration: CMTime, decodedCount: Int, originalCount: Int) throws {
+        latestPair = ["decoded_pts":AcceptanceReport.time(decodedPTS),"decoded_duration":AcceptanceReport.time(decodedDuration),
+            "original_pts":AcceptanceReport.time(originalPTS),"original_duration":AcceptanceReport.time(originalDuration),
+            "decoded_count":decodedCount,"original_count":originalCount]
+        if firstPair == nil { firstPair = latestPair }
+        guard decodedCount == 1, originalCount == 1,
+              decodedPTS.isNumeric, originalPTS.isNumeric,
+              decodedPTS.epoch == 0, originalPTS.epoch == 0,
+              CMTimeCompare(decodedPTS, originalPTS) == 0 else {
+            throw AcceptanceError.invalid("decoded video PTS must match one original compressed sample")
+        }
+        guard originalDuration.isNumeric, originalDuration.epoch == 0, originalDuration.seconds > 0 else {
+            throw AcceptanceError.invalid("original compressed video sample duration unavailable")
+        }
+        if decodedDuration.isValid {
+            guard decodedDuration.isNumeric, decodedDuration.epoch == 0,
+                  CMTimeCompare(decodedDuration, originalDuration) == 0 else {
+                throw AcceptanceError.invalid("decoded video duration contradicts original sample")
+            }
+        } else { missingDecodedDurations += 1 }
+        if let lastEnd {
+            let gap = abs(CMTimeSubtract(decodedPTS, lastEnd).seconds)
+            guard gap.isFinite, gap <= 1.0 / 90_000 else {
+                throw AcceptanceError.invalid("decoded video gap or overlap against original duration")
+            }
+            maximumGapSeconds = max(maximumGapSeconds, gap)
+        }
+        let end = CMTimeAdd(originalPTS, originalDuration)
+        guard end.isNumeric, CMTimeCompare(end, originalPTS) > 0 else {
+            throw AcceptanceError.invalid("original video endpoint unavailable")
+        }
+        if firstPTS == nil { firstPTS = decodedPTS }
+        lastEnd = end
+        frames += 1
     }
 }
 

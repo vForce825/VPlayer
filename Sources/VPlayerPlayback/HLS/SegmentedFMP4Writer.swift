@@ -454,7 +454,12 @@ private indirect enum NativeAttachmentFacts: Sendable, Equatable {
         if let dictionary = value as? NSDictionary {
             var result: [String: NativeAttachmentFacts] = [:]
             for (key, value) in dictionary {
-                guard let key = key as? String else { throw SegmentedFMP4WriterFailure.sourceFormatMismatch }
+                guard let key = key as? String else {
+                    #if DEBUG
+                    print("HLS_NATIVE_SAMPLE_MISMATCH stage=freeze-attachment-key")
+                    #endif
+                    throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+                }
                 result[key] = try freeze(value)
             }
             return .dictionary(result)
@@ -465,6 +470,9 @@ private indirect enum NativeAttachmentFacts: Sendable, Equatable {
             return .number(String(cString: number.objCType), number.stringValue)
         }
         if let string = value as? String { return .string(string) }
+        #if DEBUG
+        print("HLS_NATIVE_SAMPLE_MISMATCH stage=freeze-attachment-value")
+        #endif
         throw SegmentedFMP4WriterFailure.sourceFormatMismatch
     }
 }
@@ -476,6 +484,33 @@ private struct NativeSampleFacts: Sendable, Equatable {
     let sizes: [Int]
     let attachments: [NativeAttachmentFacts?]
     let payloadDigest: Data?
+
+    /// Keep the exact guard while identifying which native header boundary failed.
+    /// Only bounded scalar facts are logged, never attachments, headers or payload.
+    func matches(_ other: Self, stage: StaticString) -> Bool {
+        guard self == other else {
+            #if DEBUG
+            let timingIndex = timing.indices.first {
+                !other.timing.indices.contains($0) || timing[$0] != other.timing[$0]
+            }
+            let actualTime = timingIndex.map { timing[$0] } ?? "none"
+            let expectedTime = timingIndex.flatMap {
+                other.timing.indices.contains($0) ? other.timing[$0] : nil
+            } ?? "none"
+            print("HLS_NATIVE_SAMPLE_MISMATCH stage=\(stage) "
+                + "formatEqual=\(format == other.format) "
+                + "timingCount=\(timing.count)/\(other.timing.count) "
+                + "timingIndex=\(timingIndex ?? -1) actualTime=\(actualTime) expectedTime=\(expectedTime) "
+                + "sampleCount=\(sizes.count)/\(other.sizes.count) sizesEqual=\(sizes == other.sizes) "
+                + "sampleAttachmentsEqual=\(attachments[0] == other.attachments[0]) "
+                + "propagatingAttachmentsEqual=\(attachments[1] == other.attachments[1]) "
+                + "privateAttachmentsEqual=\(attachments[2] == other.attachments[2]) "
+                + "payloadEqual=\(payloadDigest == other.payloadDigest)")
+            #endif
+            return false
+        }
+        return true
+    }
 
     static func freeze(_ sample: CMSampleBuffer) throws -> NativeSampleFacts {
         func exact(_ time: CMTime) -> String {
@@ -489,8 +524,11 @@ private struct NativeSampleFacts: Sendable, Equatable {
             exact(CMSampleBufferGetOutputDuration(sample))]
         for index in 0..<count {
             var info = CMSampleTimingInfo()
-            guard CMSampleBufferGetSampleTimingInfo(sample, at: index,
-                timingInfoOut: &info) == noErr else {
+            let status = CMSampleBufferGetSampleTimingInfo(sample, at: index, timingInfoOut: &info)
+            guard status == noErr else {
+                #if DEBUG
+                print("HLS_NATIVE_SAMPLE_MISMATCH stage=freeze-timing sampleCount=\(count) index=\(index) status=\(status)")
+                #endif
                 throw SegmentedFMP4WriterFailure.sourceFormatMismatch
             }
             timing.append(contentsOf: [exact(info.duration),
@@ -4059,7 +4097,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             prepaid.releaseBacking()
         }
         let native = try SampleBufferBuilder.makeWriterInputSample(sample, lifetime: lifetime)
-        guard try NativeSampleFacts.freeze(native) == NativeSampleFacts.freeze(sample) else {
+        guard try NativeSampleFacts.freeze(native).matches(
+            NativeSampleFacts.freeze(sample), stage: "input-wrapper") else {
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
         }
 #if DEBUG
@@ -4138,6 +4177,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         // 上游提交后只读使用同一冻结 sample。跨 executor 传递 CoreMedia 的 ready
         // 容器；账本也只在其同步借用中读取，所有 backing owner 保留到 native 归来。
         guard try validatesSource(facts) else {
+            #if DEBUG
+            print("HLS_NATIVE_SAMPLE_MISMATCH stage=source-before-append")
+            #endif
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
         }
         try flushIfRequiredIsolated(ticket, admission: &admission)
@@ -4151,7 +4193,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         try claimOwnership()
         let nativeSample = try makeNativeInputIsolated(sampleBuffer, ownership: ownership(), admission: &admission)
         let sample = try nativeReadySample(copying: nativeSample)
-        guard try sample.withUnsafeSampleBuffer({ try NativeSampleFacts.freeze($0) }) == facts else {
+        guard try sample.withUnsafeSampleBuffer({ try NativeSampleFacts.freeze($0) })
+            .matches(facts, stage: "ready-header") else {
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
         }
         let identity = UUID()
@@ -4183,8 +4226,14 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     throw CancellationError()
                 }
                 try operation.sample.withUnsafeSampleBuffer { sample in
-                    guard try NativeSampleFacts.freeze(sample) == operation.facts,
-                          try operation.validatesSource(operation.facts) else {
+                    guard try NativeSampleFacts.freeze(sample)
+                        .matches(operation.facts, stage: "native-return") else {
+                        throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+                    }
+                    guard try operation.validatesSource(operation.facts) else {
+                        #if DEBUG
+                        print("HLS_NATIVE_SAMPLE_MISMATCH stage=source-after-append")
+                        #endif
                         throw SegmentedFMP4WriterFailure.sourceFormatMismatch
                     }
                     guard commitAppendIsolated(sample, ticket: operation.ticket,

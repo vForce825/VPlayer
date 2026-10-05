@@ -32,11 +32,23 @@ class NativeSamplePayloadContractTests(unittest.TestCase):
     def test_validation_checkpoints_are_preserved(self):
         # Five original validation sites plus the two-sided zero-copy wrapper check.
         self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 7)
-        self.assertIn("NativeSampleFacts.freeze(native) == NativeSampleFacts.freeze(sample)", SOURCE)
+        self.assertIn('stage: "input-wrapper"', SOURCE)
         self.assertIn("try validatesSource(facts)", SOURCE)
         self.assertIn("try operation.validatesSource(operation.facts)", SOURCE)
         self.assertIn("try Task.checkCancellation()", SOURCE)
         self.assertIn("awaitingAppend?.identity == operation.identity", SOURCE)
+
+    def test_exact_metadata_failures_identify_the_copy_boundary(self):
+        facts = SOURCE.split("private struct NativeSampleFacts:", 1)[1].split(
+            "func nativeSamplePayloadDigest(", 1)[0]
+        self.assertIn("guard self == other else", facts,
+                      "diagnostics must retain full exact facts equality")
+        self.assertIn("HLS_NATIVE_SAMPLE_MISMATCH", facts)
+        self.assertIn("#if DEBUG", facts)
+        self.assertIn("timing.indices.first", facts,
+                      "print only the first timing difference, not a whole sample history")
+        for stage in ["input-wrapper", "ready-header", "native-return"]:
+            self.assertIn(f'stage: "{stage}"', SOURCE)
 
 
 if __name__ == "__main__":

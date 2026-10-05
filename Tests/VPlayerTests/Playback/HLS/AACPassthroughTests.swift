@@ -273,6 +273,46 @@ final class AACPassthroughTests: XCTestCase {
         XCTAssertEqual(copies.framing.usage.bytes, 0)
     }
 
+    func testRetirementReleasesUnclaimedSourceStreamWhileTimelineRemainsAlive() throws {
+        let copies = Self.copies()
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        XCTAssertEqual(copies.compressedInput.usage.bytes, 2_048)
+
+        timeline.retireCompressedGeneration()
+
+        withExtendedLifetime(timeline) {
+            XCTAssertEqual(copies.compressedInput.usage.bytes, 0,
+                "An assembler's generation callback must not retain its owning generation")
+            XCTAssertEqual(copies.framing.usage.bytes, 0)
+        }
+    }
+
+    func testRetirementKeepsSourceStreamChargeUntilLastAccessUnitAlias() throws {
+        let copies = Self.copies()
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        var unit: HLSTimedAudioAccessUnit? = try Self.unit(
+            timeline.consume(.packet(Self.packet(Data([0x21])))))
+        var alias = unit
+        let stream = TestWeakReference(unit?.source.sourceProof?.stream)
+        XCTAssertNotNil(stream.value)
+        let charged = copies.compressedInput.usage.bytes
+        XCTAssertGreaterThan(charged, 2_048)
+
+        timeline.retireCompressedGeneration()
+        XCTAssertFalse(try XCTUnwrap(unit).validatesSourceMapping())
+        withExtendedLifetime(unit) { XCTAssertEqual(copies.compressedInput.usage.bytes, charged) }
+        unit = nil
+        withExtendedLifetime(alias) { XCTAssertEqual(copies.compressedInput.usage.bytes, charged) }
+        alias = nil
+
+        XCTAssertNil(stream.value)
+        XCTAssertEqual(copies.compressedInput.usage.bytes, 0)
+        XCTAssertEqual(copies.framing.usage.bytes, 0)
+        withExtendedLifetime(timeline) {}
+    }
+
     private static func facts(priming: HLSSourceAudioPriming = .notSignaledPreserveTimestamps) -> HLSSourceAudioFacts {
         .init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2, channelMask: 3,
             decoderConfiguration: Data([0x11, 0x90]), priming: priming,

@@ -770,10 +770,13 @@ final class HLSTimelineCoordinator {
                 generation: MediaGeneration(rawValue: generation.rawValue)
             )
         }
+        // The generation owns both assemblers. Their escaping providers must
+        // capture its immutable value, not close a cycle back to that owner.
+        let installedGeneration = MediaGeneration(rawValue: installed.generation.rawValue)
         if tracks.audio != nil {
             installed.audioAssembler = try CompressedAudioAssembler(
                 trackSet: tracks,
-                generationProvider: { MediaGeneration(rawValue: installed.generation.rawValue) },
+                generationProvider: { installedGeneration },
                 eventSink: { [weak self, weak installed] event in
                     guard let self, callbackFailure == nil,
                           let installed, state === installed else { return }
@@ -791,7 +794,7 @@ final class HLSTimelineCoordinator {
         if tracks.video != nil {
             installed.videoAssembler = try CompressedVideoAssembler(
                 trackSet: tracks,
-                generationProvider: { MediaGeneration(rawValue: installed.generation.rawValue) },
+                generationProvider: { installedGeneration },
                 eventSink: { [weak self, weak installed] event in
                     guard let self, callbackFailure == nil,
                           let installed, state === installed else { return }

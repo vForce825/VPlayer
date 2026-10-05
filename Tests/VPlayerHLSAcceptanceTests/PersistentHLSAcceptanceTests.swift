@@ -13,6 +13,23 @@ import XCTest
 @testable import VPlayerCore
 @testable import VPlayerPlayback
 
+/// Weak observations distinguish dropping local references from real deallocation.
+/// This owner never retains the graph, a publication prefix or native media.
+private final class AcceptanceGraphRetirementObservation {
+    private weak var authority: SystemHLSMediaGraphAuthority?
+    private weak var graph: AcceptanceObservedGraph?
+    private weak var assembler: HLSMediaGraphAssembler?
+
+    init(authority: SystemHLSMediaGraphAuthority, graph: AcceptanceObservedGraph,
+         assembler: HLSMediaGraphAssembler) {
+        self.authority = authority
+        self.graph = graph
+        self.assembler = assembler
+    }
+
+    var allReleased: Bool { authority == nil && graph == nil && assembler == nil }
+}
+
 /// Dedicated target only. Portable checks never substitute for these observations.
 @MainActor
 final class PersistentHLSAcceptanceTests: XCTestCase {
@@ -58,17 +75,19 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         let lifecycle = OutputLifecycleEpoch(backendIdentity:
             .init(sessionIdentity: identity, backendGeneration: 30_001), outputNonce: 30_002)
         #if HLS_ACCEPTANCE_BASELINE
-        let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
+        var authority: SystemHLSMediaGraphAuthority? = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
             publicationDeadlineNanoseconds: 300_000_000_000, failureSink: { firstFailure.record($0, origin: "authority") })
         #else
-        let authority = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
+        var authority: SystemHLSMediaGraphAuthority? = try SystemHLSMediaGraphAuthority(lifecycle: lifecycle,
             publicationDeadlineNanoseconds: 300_000_000_000, acceptanceProbe: probe,
             failureSink: { firstFailure.record($0, origin: "authority") })
         #endif
-        authority.publicationForTesting.installBeforeReceiveForTesting { capture.receive($0) }
-        let graph = AcceptanceObservedGraph(authority: authority)
-        let assembler = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
-            applicationLedger: .shared, graph: graph)
+        authority!.publicationForTesting.installBeforeReceiveForTesting { capture.receive($0) }
+        var graph: AcceptanceObservedGraph? = AcceptanceObservedGraph(authority: authority!)
+        var assembler: HLSMediaGraphAssembler? = HLSMediaGraphAssembler(sourceURL: server.sourceURL,
+            applicationLedger: .shared, graph: graph!)
+        let retiredOwners = AcceptanceGraphRetirementObservation(
+            authority: authority!, graph: graph!, assembler: assembler!)
         let player = AVPlayer()
         player.automaticallyWaitsToMinimizeStalling = false
         let collector = AcceptanceSampleCollector()
@@ -84,13 +103,13 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                     let wall = AcceptanceClock.now - start
                     if wall >= nextSample && nextSample < 300 {
                         var sample = AcceptanceReport.sample(wall: wall, footprint: try nativeFootprint(),
-                            packets: graph.packetCount, eof: graph.hasEOF,
-                            packetAge: max(0, AcceptanceClock.now - graph.lastPacketTime))
+                            packets: graph!.packetCount, eof: graph!.hasEOF,
+                            packetAge: max(0, AcceptanceClock.now - graph!.lastPacketTime))
                         #if !HLS_ACCEPTANCE_BASELINE
                         let value = probe.snapshot
                         guard value.isComplete else { throw AcceptanceError.invalid("native diagnostic capacity exceeded") }
                         sample.merge(diagnosticFields(value)) { _, new in new }
-                        sample.merge(try ledgerSample(authority)) { _, new in new }
+                        sample.merge(try ledgerSample(authority!)) { _, new in new }
                         #endif
                         collector.append(sample)
                         nextSample += 5
@@ -104,22 +123,26 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         var report: [String: Any] = [:]
         var stopObservation: [String: Any] = [:]
         var renditions: [[String: Any]] = []
+        var retiredGraphDiagnostics: [String: Any] = [:]
         var stage = "await_playable_prefix"
         var playbackBeganAt: Double?
         var firstMediaTime: Double?
         var lastTime = 0.0
         var lastProgress = start
         do {
-            let prefix = try await assembler.startUntilPlayablePrefix()
+            var prefix: AVPlayerItemReplacementBundle? = try await assembler!.startUntilPlayablePrefix()
             stage = "await_native_item_ready"
-            let item = AVPlayerItem(url: prefix.request.itemURL)
+            var item: AVPlayerItem? = AVPlayerItem(url: prefix!.request.itemURL)
+            // The assembler owns the active prefix. This local URL consumer must
+            // not keep its preparation evidence/history alive past retirement.
+            prefix = nil
             player.replaceCurrentItem(with: item)
             let readyDeadline = min(start + 299.5, AcceptanceClock.now + 15)
-            while item.status == .unknown && AcceptanceClock.now < readyDeadline {
+            while item?.status == .unknown && AcceptanceClock.now < readyDeadline {
                 try await Task.sleep(for: .milliseconds(20))
             }
-            guard item.status == .readyToPlay else {
-                throw AcceptanceError.invalid("native item never ready: \(String(describing: item.error))")
+            guard item?.status == .readyToPlay else {
+                throw AcceptanceError.invalid("native item never ready: \(String(describing: item?.error))")
             }
             guard !watchdog.hasStopped else { throw AcceptanceError.invalid("preparation consumed the observation window") }
             let playbackStart = AcceptanceClock.now
@@ -160,7 +183,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             // SDK27: fetchAccessLog(completionHandler:) delivers a sending log;
             // reduce it inside the callback and retain only scalar observations.
             let access = AcceptanceAccessLogCapture(deadline: AcceptanceClock.now + 2)
-            item.fetchAccessLog(completionHandler: { log in
+            item?.fetchAccessLog(completionHandler: { log in
                 let events = log?.events
                 access.complete(droppedFrames: events?.reduce(0) { $0 + $1.numberOfDroppedVideoFrames },
                     stalls: events?.reduce(0) { $0 + $1.numberOfStalls }, at: AcceptanceClock.now)
@@ -168,10 +191,20 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             stage = "joined_retirement"
             let cleanupStart = AcceptanceClock.now
             player.replaceCurrentItem(with: nil)
-            let retired = await assembler.retireAndAwaitReceipt()
+            item = nil
+            sampler.cancel()
+            await sampler.value
+            let retired = await assembler!.retireAndAwaitReceipt()
             XCTAssertTrue(retired)
+            retiredGraphDiagnostics = graphDiagnostics(assembler: assembler, graph: graph)
+            // Retirement joins native work; final app charges follow actual last
+            // aliases. Drop all harness roots after the sampler has really exited.
+            assembler = nil
+            graph = nil
+            authority = nil
             let retireDeadline = AcceptanceClock.now + 10
-            while ledgers() != ledgerBefore && AcceptanceClock.now < retireDeadline {
+            while (ledgers() != ledgerBefore || !retiredOwners.allReleased)
+                && AcceptanceClock.now < retireDeadline {
                 try await Task.sleep(for: .milliseconds(20))
             }
             let tracks = try capture.finish()
@@ -179,9 +212,14 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             stopObservation["cleanup_joined"] = retired
             stopObservation["cleanup_seconds"] = cleanupSeconds
             stopObservation["ledger_after"] = ledgers()
+            let ownersReleased = retiredOwners.allReleased
+            stopObservation["harness_graph_owners_released"] = ownersReleased
             #if !HLS_ACCEPTANCE_BASELINE
             stopObservation.merge(AcceptanceReport.retirement(probe.snapshot)) { _, new in new }
             #endif
+            guard ownersReleased, ledgers() == ledgerBefore else {
+                throw AcceptanceError.invalid("retired graph charges did not return to the initialized ledger baseline")
+            }
             // Retirement is physically joined before any remaining telemetry wait
             // or timeout failure. This wait is outside playback and cleanup time.
             let accessWaitStart = AcceptanceClock.now
@@ -229,11 +267,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "error":ErrorDiagnosticSnapshot(error).summary,
                 "whole_test_seconds":AcceptanceClock.now - wholeTestStart,
                 "task_cancelled":Task.isCancelled,"watchdog_stopped":watchdog.hasStopped,
-                "assembler_phase":String(describing: assembler.currentPhase),
                 "first_runtime_failure":firstFailure.snapshot,
-                "authority_failure":graph.failureDiagnostic?.summary ?? "none",
-                "producer_packets":graph.packetCount,"producer_eof":graph.hasEOF,
-                "last_demux_control":graph.lastControlDiagnostic,
                 "transport":server.failureDiagnostics,"capture":capture.failureDiagnostics,
                 "player":failurePlayerState(player),
                 "prebuffer_seconds":AcceptanceReport.finite(playbackBeganAt.map { $0 - start }),
@@ -241,6 +275,8 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "last_advancing_media_seconds":AcceptanceReport.finite(playbackBeganAt == nil ? nil : lastTime),
                 "stop_observation":stopObservation,"completed_decode_results":renditions,"decode":decodeDiagnostics,
                 "history":acceptanceDiagnosticHistoryTail(PlaybackDiagnosticTracker.shared.recentHistory)]
+            failure.merge(retiredGraphDiagnostics.isEmpty
+                ? graphDiagnostics(assembler: assembler, graph: graph) : retiredGraphDiagnostics) { _, new in new }
             failure.merge(AcceptanceReport.failureTiming(elapsed: AcceptanceClock.now - start,
                 stopped: watchdog.measuredSeconds, playbackStart: playbackBeganAt.map { $0 - start },
                 lastProgress: playbackBeganAt == nil ? nil : lastProgress - start)) { _, new in new }
@@ -250,7 +286,13 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let cleanupStart = AcceptanceClock.now
             watchdog.stop()
             player.replaceCurrentItem(with: nil)
-            let retired = await assembler.retireAndAwaitReceipt()
+            sampler.cancel()
+            await sampler.value
+            let retired = if let assembler { await assembler.retireAndAwaitReceipt() }
+                else { stopObservation["cleanup_joined"] as? Bool ?? false }
+            assembler = nil
+            graph = nil
+            authority = nil
             print("HLS_ACCEPTANCE_FAILURE_CLEANUP=retired:\(retired),seconds:\(AcceptanceClock.now - cleanupStart)")
             throw error
         }
@@ -281,9 +323,20 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         return result
     }
 
+    private func graphDiagnostics(assembler: HLSMediaGraphAssembler?,
+                                  graph: AcceptanceObservedGraph?) -> [String: Any] {
+        ["assembler_phase":assembler.map { String(describing: $0.currentPhase) } ?? "released",
+         "authority_failure":graph?.failureDiagnostic?.summary ?? "none",
+         "producer_packets":graph?.packetCount ?? 0,"producer_eof":graph?.hasEOF ?? false,
+         "last_demux_control":graph?.lastControlDiagnostic ?? "none"]
+    }
+
     private func ledgers() -> [String: Int] {
-        ["application":HLSDeliveryApplicationChargeLedger.shared.chargedBytes,
-         "resource":PlaybackResourceContextLedger.shared.chargedBytes]
+        // Resource bootstrap also charges application. Initialize it before
+        // reading either total, including the very first cold-process sample.
+        let resource = PlaybackResourceContextLedger.shared
+        return ["application":HLSDeliveryApplicationChargeLedger.shared.chargedBytes,
+                "resource":resource.chargedBytes]
     }
     private func deviceIdentity() -> String {
         let environment = ProcessInfo.processInfo.environment
@@ -348,6 +401,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         if let bytes = try? JSONSerialization.data(withJSONObject: decodeDiagnostics, options: [.sortedKeys]) {
             print("HLS_ACCEPTANCE_DECODE_FORMAT=" + String(decoding: bytes, as: UTF8.self))
         }
+        if track.kind == "video" { return try await decodeVideo(track, asset: asset, source: source) }
         let reader = try AVAssetReader(asset: asset)
         let settings: [String: Any] = track.kind == "audio" ? [
             AVFormatIDKey:kAudioFormatLinearPCM,AVLinearPCMIsFloatKey:true,
@@ -396,6 +450,56 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         if track.kind == "audio" { result.merge(AcceptanceReport.audio(audio)) { _, new in new } }
         return result
     }
+    private func decodeVideo(_ track: AcceptanceCapture.Track, asset: AVAsset, source: AVAssetTrack) async throws -> [String: Any] {
+        let reader = try AVAssetReader(asset: asset)
+        let originalReader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: source, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+        let originalOutput = AVAssetReaderTrackOutput(track: source, outputSettings: nil)
+        guard reader.canAdd(output), originalReader.canAdd(originalOutput) else {
+            throw AcceptanceError.invalid("video timing reader cannot add output")
+        }
+        let provider = reader.outputProvider(for: output)
+        let originalProvider = originalReader.outputProvider(for: originalOutput)
+        var timing = AcceptanceVideoTiming()
+        defer {
+            decodeDiagnostics["reader_status"] = reader.status.rawValue
+            decodeDiagnostics["original_reader_status"] = originalReader.status.rawValue
+            decodeDiagnostics["original_reader_error"] = originalReader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
+            decodeDiagnostics["decoded_frames"] = timing.frames
+            decodeDiagnostics["sample_timing"] = timing.diagnostics
+            decodeDiagnostics["reader_error"] = reader.error.map { ErrorDiagnosticSnapshot($0).summary as Any } ?? NSNull()
+            if reader.status == .reading { reader.cancelReading() }
+            if originalReader.status == .reading { originalReader.cancelReading() }
+        }
+        decodeDiagnostics["stage"] = "paired_video_reader_start"
+        try originalReader.start()
+        try reader.start()
+        decodeDiagnostics["stage"] = "paired_video_timing"
+        while let ready = try await provider.next() {
+            guard let original = try await originalProvider.next() else {
+                throw AcceptanceError.invalid("decoded video has no original sample timing")
+            }
+            try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
+                original: makeOwnedReaderFixtureSample(copying: original))
+        }
+        if let _ = try await originalProvider.next() {
+            throw AcceptanceError.invalid("original video sample has no decoded image")
+        }
+        guard reader.status == .completed, originalReader.status == .completed,
+              let seconds = timing.decodedSeconds else {
+            throw AcceptanceError.invalid("paired video read incomplete")
+        }
+        try track.continuity.requireVideoCoverage(timing, timescale: track.latestMediaTimescale)
+        var result: [String: Any] = ["kind":"video","writer_count":track.writers.count,
+            "init_count":track.inits,"fragments":track.fragments,"decoded_frames":timing.frames,
+            "decoded_seconds":seconds,"maximum_gap_seconds":timing.maximumGapSeconds,
+            "missing_decoded_durations":timing.missingDecodedDurations,
+            "timing_evidence":"original compressed duration matched to every decoded PTS and raw fragment endpoint"]
+        result.merge(AcceptanceReport.fragment(track.continuity)) { _, new in new }
+        return result
+    }
+
 }
 
 /// Bounded completion state shared by the real SDK callback and short controls.

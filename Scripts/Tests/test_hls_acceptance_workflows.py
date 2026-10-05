@@ -28,7 +28,7 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('try await checkCanonicalVideoDecode()',selected)
         self.assertLess(selected.index('checkCanonicalVideoDecode()'),selected.index('positive:'))
         self.assertIn('if entry == canonical { throw error }',native)
-        self.assertIn('guard count > 0, count == timed.count',native)
+        self.assertIn('timing.frames > 0, timing.frames == timed.count',native)
         self.assertNotIn('XCTAssertEqual(count, timed.count',native)
         self.assertNotIn('XCTUnwrap(capture.finish().first)',native)
         self.assertNotIn('XCTUnwrap(tracks.first)',native)
@@ -36,6 +36,18 @@ class WorkflowContracts(unittest.TestCase):
         generator=(ROOT/'Scripts/generate-hls-acceptance-fixture.py').read_text()
         for fixture in ['control-avc.h264','control-hevc.h265']:
             self.assertIn(fixture,native);self.assertIn(fixture,generator)
+
+    def test_short_and_long_video_decode_share_original_sample_timing_and_end_proof(self):
+        short=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceNativeControlTests.swift').read_text()
+        long=(ROOT/'Tests/VPlayerHLSAcceptanceTests/PersistentHLSAcceptanceTests.swift').read_text()
+        for text in [short,long]:
+            self.assertIn('var timing = AcceptanceVideoTiming()',text)
+            self.assertIn('outputSettings: nil)',text)
+            self.assertIn('try timing.observe(decoded:',text)
+            self.assertIn('originalProvider.next()',text)
+            self.assertIn('continuity.requireVideoCoverage(timing',text)
+        selected=short.split('func testNativeObservationControlsRejectFiveFaults()',1)[1]
+        self.assertIn('try checkVideoTimingEvidence()',selected)
 
     def test_xcode_version_checks_drain_output_and_preserve_producer_failure(self):
         paths=list((ROOT/'.github/workflows').glob('*.yml'))

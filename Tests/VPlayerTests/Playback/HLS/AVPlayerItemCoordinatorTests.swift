@@ -627,6 +627,79 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testRealAACSeedWriterInputPreservesCoalescedPacketTimingAndTrimMetadata() async throws {
+        // Exercise the exact cached-and-rebuilt input used by coordinator fixtures,
+        // before AVAssetWriter can obscure a header-copy failure behind batch cleanup.
+        // A wrapper that reconstructs different timing, trims or packet metadata must
+        // fail here even when the encoded bytes and nominal audio format still match.
+        let layouts: [[RenditionChannelLabel]] = [[.l, .r], [.c, .l, .r, .ls, .rs, .lfe]]
+        for labels in layouts {
+            let input = try await Task21RealAACSeed.makeEncodedInput(layoutLabels: labels)
+            XCTAssertGreaterThan(input.buffers.count, 1)
+            for (index, source) in input.buffers.enumerated() {
+                let context = "channels=\(labels.count) bucket=\(index)"
+                let wrapped = try SampleBufferBuilder.makeWriterInputSample(
+                    source, lifetime: WriterInputLifetime())
+                XCTAssertFalse(ObjectIdentifier(wrapped) == ObjectIdentifier(source), "\(context) independent header")
+                XCTAssertTrue(CMSampleBufferGetFormatDescription(wrapped).map(ObjectIdentifier.init)
+                    == CMSampleBufferGetFormatDescription(source).map(ObjectIdentifier.init), "\(context) format identity")
+                let count = CMSampleBufferGetNumSamples(source)
+                XCTAssertGreaterThan(count, 1, context)
+                XCTAssertEqual(CMSampleBufferGetNumSamples(wrapped), count, context)
+
+                func assertTime(_ actual: CMTime, _ expected: CMTime, _ field: String) {
+                    XCTAssertEqual(actual.value, expected.value, "\(context) \(field) value")
+                    XCTAssertEqual(actual.timescale, expected.timescale, "\(context) \(field) timescale")
+                    XCTAssertEqual(actual.flags, expected.flags, "\(context) \(field) flags")
+                    XCTAssertEqual(actual.epoch, expected.epoch, "\(context) \(field) epoch")
+                }
+                assertTime(CMSampleBufferGetDuration(wrapped), CMSampleBufferGetDuration(source), "duration")
+                assertTime(CMSampleBufferGetPresentationTimeStamp(wrapped),
+                    CMSampleBufferGetPresentationTimeStamp(source), "pts")
+                assertTime(CMSampleBufferGetDecodeTimeStamp(wrapped),
+                    CMSampleBufferGetDecodeTimeStamp(source), "dts")
+                assertTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped),
+                    CMSampleBufferGetOutputPresentationTimeStamp(source), "output-pts")
+                assertTime(CMSampleBufferGetOutputDuration(wrapped),
+                    CMSampleBufferGetOutputDuration(source), "output-duration")
+                for packet in 0..<count {
+                    var expected = CMSampleTimingInfo()
+                    var actual = CMSampleTimingInfo()
+                    XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(source, at: packet,
+                        timingInfoOut: &expected), noErr, context)
+                    XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(wrapped, at: packet,
+                        timingInfoOut: &actual), noErr, context)
+                    assertTime(actual.duration, expected.duration, "packet[\(packet)].duration")
+                    assertTime(actual.presentationTimeStamp, expected.presentationTimeStamp, "packet[\(packet)].pts")
+                    assertTime(actual.decodeTimeStamp, expected.decodeTimeStamp, "packet[\(packet)].dts")
+                    XCTAssertEqual(CMSampleBufferGetSampleSize(wrapped, at: packet),
+                        CMSampleBufferGetSampleSize(source, at: packet), context)
+                }
+                for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+                    XCTAssertTrue(CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                        target: wrapped, attachmentMode: mode).map { $0 as NSDictionary }
+                        == CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                            target: source, attachmentMode: mode).map { $0 as NSDictionary },
+                        "\(context) attachmentMode=\(mode) attachments differ")
+                }
+                for key in [kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                            kCMSampleBufferAttachmentKey_TrimDurationAtEnd] {
+                    let expected = Task21RealAACSeed.trimTime(source, key: key)
+                    let actual = Task21RealAACSeed.trimTime(wrapped, key: key)
+                    XCTAssertEqual(actual == nil, expected == nil, context)
+                    if let actual, let expected { assertTime(actual, expected, key as String) }
+                }
+                XCTAssertTrue(CMSampleBufferGetSampleAttachmentsArray(wrapped,
+                    createIfNecessary: false).map { $0 as NSArray }
+                    == CMSampleBufferGetSampleAttachmentsArray(source,
+                        createIfNecessary: false).map { $0 as NSArray }, "\(context) sample attachments differ")
+                XCTAssertTrue(try nativeSamplePayloadDigest(XCTUnwrap(CMSampleBufferGetDataBuffer(wrapped)))
+                    == nativeSamplePayloadDigest(XCTUnwrap(CMSampleBufferGetDataBuffer(source))),
+                    "\(context) payload digests differ")
+            }
+        }
+    }
+
     func testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries() async throws {
         let encoded = try await Task21RealAACSeed.makeEncodedInput()
         XCTAssertGreaterThanOrEqual(encoded.buffers.count, 7)

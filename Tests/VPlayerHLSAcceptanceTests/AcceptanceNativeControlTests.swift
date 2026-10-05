@@ -125,23 +125,96 @@ final class AcceptanceNativeControlTests: XCTestCase {
         let tracks = try await asset.loadTracks(withMediaType: .video)
         guard let track = tracks.first else { throw AcceptanceError.invalid("short native output has no video track") }
         let reader = try AVAssetReader(asset: asset)
+        let originalReader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
             kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
-        guard reader.canAdd(output) else { throw AcceptanceError.invalid("short video reader cannot add output") }
+        let originalOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        guard reader.canAdd(output), originalReader.canAdd(originalOutput) else {
+            throw AcceptanceError.invalid("short video reader cannot add output")
+        }
         let provider = reader.outputProvider(for: output)
+        let originalProvider = originalReader.outputProvider(for: originalOutput)
+        var timing = AcceptanceVideoTiming()
+        defer {
+            var observation = timing.diagnostics
+            observation["entry"] = String(describing: entry)
+            observation["reader_status"] = reader.status.rawValue
+            observation["original_reader_status"] = originalReader.status.rawValue
+            if let evidence = try? JSONSerialization.data(withJSONObject: observation, options: [.sortedKeys]) {
+                print("HLS_ACCEPTANCE_REMUX_TIMING=" + String(decoding: evidence, as: UTF8.self))
+            }
+            if reader.status == .reading { reader.cancelReading() }
+            if originalReader.status == .reading { originalReader.cancelReading() }
+        }
+        try originalReader.start()
         try reader.start()
-        defer { if reader.status == .reading { reader.cancelReading() } }
-        var count = 0
         while let ready = try await provider.next() {
-            let sample = try makeOwnedReaderFixtureSample(copying: ready)
-            guard CMSampleBufferGetImageBuffer(sample) != nil else { throw AcceptanceError.invalid("video control was not decoded") }
-            count += CMSampleBufferGetNumSamples(sample)
+            guard let original = try await originalProvider.next() else {
+                throw AcceptanceError.invalid("short decoded video has no original timing")
+            }
+            try timing.observe(decoded: makeOwnedReaderFixtureSample(copying: ready),
+                original: makeOwnedReaderFixtureSample(copying: original))
         }
-        guard reader.status == .completed else { throw reader.error ?? AcceptanceError.invalid("short video decode incomplete") }
-        guard count > 0, count == timed.count else {
-            throw AcceptanceError.invalid("short video decode incomplete: \(count)/\(timed.count) frames")
+        if let _ = try await originalProvider.next() {
+            throw AcceptanceError.invalid("short original video has no decoded image")
         }
-        return count
+        guard reader.status == .completed, originalReader.status == .completed,
+              timing.frames > 0, timing.frames == timed.count else {
+            throw AcceptanceError.invalid("short paired video decode incomplete")
+        }
+        try captured.continuity.requireVideoCoverage(timing, timescale: captured.latestMediaTimescale)
+        return timing.frames
+    }
+
+    private func checkVideoTimingEvidence() throws {
+        let start = CMTime(value: 10, timescale: 1)
+        let duration = CMTime(value: 1, timescale: 25)
+        var timing = AcceptanceVideoTiming()
+        try timing.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
+            originalDuration: duration, decodedCount: 1, originalCount: 1)
+        let next = CMTimeAdd(start, duration)
+        let longer = CMTime(value: 3, timescale: 50)
+        try timing.observe(decodedPTS: next, decodedDuration: longer, originalPTS: next,
+            originalDuration: longer, decodedCount: 1, originalCount: 1)
+        XCTAssertEqual(timing.frames, 2)
+        XCTAssertEqual(timing.missingDecodedDurations, 1)
+        XCTAssertEqual(try XCTUnwrap(timing.decodedSeconds), 0.1, accuracy: 0.000001)
+        XCTAssertEqual(timing.maximumGapSeconds, 0)
+        for invalid in [CMTime.invalid, .zero, CMTime(value: -1, timescale: 25)] {
+            var value = AcceptanceVideoTiming()
+            XCTAssertThrowsError(try value.observe(decodedPTS: start, decodedDuration: .invalid,
+                originalPTS: start, originalDuration: invalid, decodedCount: 1, originalCount: 1))
+        }
+        for mismatch in [CMTime.invalid, CMTimeAdd(start, duration)] {
+            var value = AcceptanceVideoTiming()
+            XCTAssertThrowsError(try value.observe(decodedPTS: mismatch, decodedDuration: duration,
+                originalPTS: start, originalDuration: duration, decodedCount: 1, originalCount: 1))
+        }
+        var mismatchDuration = AcceptanceVideoTiming()
+        XCTAssertThrowsError(try mismatchDuration.observe(decodedPTS: start, decodedDuration: longer,
+            originalPTS: start, originalDuration: duration, decodedCount: 1, originalCount: 1))
+        var missing = AcceptanceVideoTiming()
+        try missing.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
+            originalDuration: duration, decodedCount: 1, originalCount: 1)
+        let gap = CMTimeAdd(next, duration)
+        XCTAssertThrowsError(try missing.observe(decodedPTS: gap, decodedDuration: .invalid,
+            originalPTS: gap, originalDuration: duration, decodedCount: 1, originalCount: 1))
+        var original = AcceptanceFragmentContinuity()
+        try original.observe(fragment(sequence: 1, time: 480_000), defaultDuration: 48_000)
+        var complete = AcceptanceVideoTiming()
+        try complete.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
+            originalDuration: CMTime(value: 1, timescale: 1), decodedCount: 1, originalCount: 1)
+        XCTAssertNoThrow(try original.requireVideoCoverage(complete, timescale: 48_000))
+        XCTAssertThrowsError(try original.requireVideoCoverage(timing, timescale: 48_000),
+            "Equal decoded and raw frame counts plus exact raw endpoints are mandatory")
+        var shortEnd = AcceptanceVideoTiming()
+        try shortEnd.observe(decodedPTS: start, decodedDuration: .invalid, originalPTS: start,
+            originalDuration: duration, decodedCount: 1, originalCount: 1)
+        XCTAssertThrowsError(try original.requireVideoCoverage(shortEnd, timescale: 48_000),
+            "The last frame endpoint cannot be inferred from nominal FPS")
+        var batched = AcceptanceVideoTiming()
+        XCTAssertThrowsError(try batched.observe(decodedPTS: start, decodedDuration: .invalid,
+            originalPTS: start, originalDuration: duration, decodedCount: 1, originalCount: 2))
     }
 
     private func checkFailureDiagnosticSerialization() throws {
@@ -274,6 +347,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
     }
 
     func testNativeObservationControlsRejectFiveFaults() async throws {
+        try checkVideoTimingEvidence()
         try await checkCanonicalVideoDecode()
         try checkFailureDiagnosticSerialization()
         checkFirstFailureCapture()
