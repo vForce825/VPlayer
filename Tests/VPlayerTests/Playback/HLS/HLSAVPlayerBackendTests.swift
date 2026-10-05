@@ -1480,6 +1480,87 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
+    func testProductionHLSPauseJoinsAlreadyStartedSuspendBeforeReplayingMediaInformation() async throws {
+        try await checkProductionHLSJoinsStartedSuspendBeforeMetadataReplay(routeLoss: false)
+    }
+
+    func testProductionHLSRouteLossJoinsAlreadyStartedSuspendBeforeMetadataRefresh() async throws {
+        try await checkProductionHLSJoinsStartedSuspendBeforeMetadataReplay(routeLoss: true)
+    }
+
+    private func checkProductionHLSJoinsStartedSuspendBeforeMetadataReplay(routeLoss: Bool) async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        try await withProductionMediaController { controller, registry, _, _ in
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "joined-pause-metadata",
+                streamURL: fixture.source, title: "Joined pause metadata")
+            await controller.play(request)
+            let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let lifecycle = try XCTUnwrap(context.interval?.outputLifecycle)
+            let information = await self.currentMediaInformation(controller)
+            let initial = try XCTUnwrap(information)
+            XCTAssertEqual(initial.width, 1_280)
+            XCTAssertEqual(initial.height, 720)
+            XCTAssertEqual(initial.scanMode, .progressive)
+            XCTAssertEqual(initial.sourceFrameRate, MediaRational(num: 25, den: 1))
+            await controller.invalidatePreparedMediaInformation(for: lifecycle)
+
+            // User-control ingress and pause-owner admission are separate Registry
+            // transactions. The MainActor AVPlayer relay can start the original
+            // pause runner between them while the controller's own actor runs.
+            // Reproduce the resulting legitimate ownership state without a sleep
+            // or a test hook in either production executor.
+            if !routeLoss {
+                let safety = registry.executor.safetyIngress.snapshot
+                let control = OutputUserControlRequest(kind: .pause,
+                    sessionIdentity: context.sessionIdentity, expectedOwner: context.owner,
+                    contextNonce: context.contextNonce, interruptionEpoch: safety.interruptionEpoch,
+                    mediaServicesEpoch: safety.mediaServicesEpoch,
+                    resetPreRouteBinding: context.resetPreRouteBinding)
+                XCTAssertEqual(registry.performOutputUserControl(control), .acceptedWaiting)
+            }
+            let owner = try XCTUnwrap(registry.beginOutputTransition(
+                contextNonce: context.contextNonce, reason: .pause,
+                anchorInstant: registry.clock.nowNanoseconds, teardown: false))
+            let suspend = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+            _ = registry.startOutputSuspendOperation(suspend.task, owner: owner)
+            guard case .succeeded = await registry.joinOutputBackendOperation(suspend.task) else {
+                return XCTFail("The original production suspension must physically finish")
+            }
+            XCTAssertFalse(registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "First-start must still reject an already-started exact runner")
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: lifecycle),
+                "Physical quiescence alone cannot bypass the unsettled pause owner")
+
+            if routeLoss { await controller.suspendActiveOutputForRouteUnavailable() }
+            else { await controller.setPaused(true) }
+
+            let diagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, routeLoss ? .recovering(request) : .paused(request), diagnostic)
+            let retained = try XCTUnwrap(registry.outputResourceContextSnapshot(), diagnostic)
+            XCTAssertNil(retained.owner, diagnostic)
+            XCTAssertNil(retained.suspend, diagnostic)
+            XCTAssertNil(retained.interval, diagnostic)
+            XCTAssertNil(registry.phase(of: suspend.task), "Only the joined runner may be retired")
+            XCTAssertEqual(retained.prepareTicket, context.prepareTicket)
+            // This fixture keeps the same fake route admissible: exercise pause
+            // settlement and the exact lifecycle refresh, not physical route loss.
+            if routeLoss { await controller.refreshPreparedMediaInformation(for: lifecycle) }
+            let paused = await self.currentMediaInformation(controller)
+            XCTAssertEqual(paused, initial, diagnostic)
+            XCTAssertEqual(registry.preparedHLSMediaInformation(for: lifecycle)?.information, initial, diagnostic)
+
+            await controller.stop()
+            await registry.joinOwnedTerminalCleanup()
+            await controller.refreshPreparedMediaInformation(for: lifecycle)
+            let stopped = await self.currentMediaInformation(controller)
+            XCTAssertNil(stopped)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: lifecycle))
+        }
+    }
+
     func testProductionHLSAdmissibleRetainedPauseReplaysMediaWithoutActivation() async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
         defer { fixture.server?.stop() }

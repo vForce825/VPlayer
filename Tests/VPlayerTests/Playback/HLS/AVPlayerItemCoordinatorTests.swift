@@ -1968,6 +1968,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 reason: .pause, at: harness.graph.registry.clock.nowNanoseconds))
             let revoked = try XCTUnwrap(harness.backend.lastActivationInvocation)
             let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertEqual(harness.graph.registry.phase(of: suspend.task), .queued)
             // These are original KVO deliveries selected before revocation,
             // arriving before the owned physical stop can enter MainActor.
             let queuedStatuses: [AVPlayer.TimeControlStatus] = [.waitingToPlayAtSpecifiedRate, .playing, .paused]
@@ -1982,8 +1983,39 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                 "The relay fences state; only the original registered stop may pause")
             XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.owner, owner)
             XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, suspend)
-            _ = try await harness.stop()
+            XCTAssertEqual(harness.graph.registry.phase(of: suspend.task), .queued,
+                "Queued native status must not dispatch an existing pause owner's runner")
+            harness.driver.holdAudioConnectionCompletion = true
+            defer {
+                harness.driver.holdAudioConnectionCompletion = false
+                harness.driver.releaseAudioConnection()
+            }
+            XCTAssertTrue(harness.graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "The original pause owner must retain its first-start admission")
+            let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+            XCTAssertTrue(disconnectHeld)
+            guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertFalse(harness.graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "First-start admission must remain single-flight once the original runner starts")
+            XCTAssertTrue(revoked.requestAutomaticSuspend(item: harness.item),
+                "A duplicate status may recognize the exact in-flight owner without restarting it")
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval,
+                "A held physical disconnect cannot manufacture quiescence")
             XCTAssertEqual(harness.backend.suspendCallCount, 1)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            guard case .succeeded = await harness.graph.registry.joinOutputBackendOperation(suspend.task) else {
+                throw harness.backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+            XCTAssertEqual(receipt.suspendTicket, suspend)
+            XCTAssertTrue(harness.coordinator.accept(receipt))
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time,
+                prepared.identity.playerItemTime)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.pauseCallCount, 1)
             XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
             let resumed = try await harness.resumeThroughRegistry()
             XCTAssertNotEqual(resumed, .rejected)
@@ -1994,6 +2026,60 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
             XCTAssertEqual(harness.coordinator.invalidationCount, 0)
             XCTAssertEqual(harness.driver.installCount, 1)
+        }
+    }
+
+    func testPauseIntentRevocationBeforeOwnerAdmissionJoinsAutomaticRunner() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            let registry = harness.graph.registry
+            let invocation = try XCTUnwrap(harness.backend.lastActivationInvocation)
+            XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .pause)),
+                .acceptedWaiting)
+            XCTAssertFalse(invocation.revalidateCurrentAuthority())
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.owner,
+                "User intent revokes rate before the separate pause-owner transaction")
+            harness.driver.holdAudioConnectionCompletion = true
+            defer {
+                harness.driver.holdAudioConnectionCompletion = false
+                harness.driver.releaseAudioConnection()
+            }
+            XCTAssertTrue(invocation.requestAutomaticSuspend(item: harness.item))
+            let automatic = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let stop = try XCTUnwrap(automatic.suspend)
+            let owner = try XCTUnwrap(harness.graph.coordinator.begin(
+                contextNonce: automatic.contextNonce, reason: .pause, at: registry.clock.nowNanoseconds))
+            XCTAssertEqual(owner, automatic.owner)
+            XCTAssertFalse(registry.startOutputSuspendOperation(stop.task, owner: owner),
+                "The callback won admission, so the explicit caller must join the exact started runner")
+            let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+            XCTAssertTrue(disconnectHeld)
+            guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertEqual(harness.backend.suspendCallCount, 1)
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNotNil(registry.outputResourceContextSnapshot()?.interval)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            guard case .succeeded = await registry.joinOutputBackendOperation(stop.task) else {
+                throw harness.backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+            XCTAssertEqual(receipt.suspendTicket, stop)
+            XCTAssertTrue(harness.coordinator.accept(receipt))
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time,
+                prepared.identity.playerItemTime)
+            XCTAssertEqual(harness.driver.pauseCallCount, 1)
+            XCTAssertTrue(registry.finishOutputPause(owner: owner))
+            XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .resume)),
+                .acceptedWaiting)
+            let resumed = try await harness.resumeThroughRegistry()
+            XCTAssertNotEqual(resumed, .rejected)
+            XCTAssertEqual(harness.driver.installCount, 1)
+            XCTAssertEqual(harness.driver.playCallCount, 2)
         }
     }
 
@@ -10654,9 +10740,10 @@ private final class Task21RealIntegrationFixture {
             let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
                 reason: .pause, at: graph.registry.clock.nowNanoseconds))
             let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
-            XCTAssertTrue(joined)
+            XCTAssertTrue(joined, "Native pause cycle \(cycle) must join its original activation")
             let suspend = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
-            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner))
+            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "Native pause cycle \(cycle) must retain the original owner's first-start admission")
             guard case .succeeded = await graph.registry.joinOutputBackendOperation(suspend.task) else {
                 throw backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
             }

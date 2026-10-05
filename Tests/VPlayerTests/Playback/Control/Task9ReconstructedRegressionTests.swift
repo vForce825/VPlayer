@@ -3989,11 +3989,38 @@ final class Task9RuntimeOwnershipTests: XCTestCase {
     }
 
     func testStopAndReplacementJoinTheOriginalPauseSuspensionTail() async throws {
+        try await checkStopAndReplacementJoinPauseSuspensionTail(alreadyStarted: false)
+    }
+
+    func testStopAndReplacementSupersedeControllerJoiningAlreadyStartedPause() async throws {
+        try await checkStopAndReplacementJoinPauseSuspensionTail(alreadyStarted: true)
+    }
+
+    private func checkStopAndReplacementJoinPauseSuspensionTail(alreadyStarted: Bool) async throws {
         let gate = Task9OperationGate()
         let fixture = try Task9RuntimeFixture(factory: .init(suspensionGate: gate))
         await fixture.controller.play(fixture.request())
+        if alreadyStarted {
+            let context = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(fixture.registry.beginOutputTransition(
+                contextNonce: context.contextNonce, reason: .pause,
+                anchorInstant: fixture.registry.clock.nowNanoseconds, teardown: false))
+            let suspend = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertTrue(fixture.registry.startOutputSuspendOperation(suspend.task, owner: owner))
+            await gate.waitUntilEntered()
+        }
         let pause = Task { await fixture.controller.setPaused(true) }
         await gate.waitUntilEntered()
+        if alreadyStarted {
+            let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+            while !fixture.registry.executor.safetyIngress.snapshot.userPaused,
+                  ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertTrue(fixture.registry.executor.safetyIngress.snapshot.userPaused,
+                "The controller must adopt the pre-existing runner before stronger cleanup arrives")
+            // The actor read runs only after the pause call's synchronous prefix
+            // yields. It does not manufacture an interleaving within that prefix.
+            _ = await fixture.controller.currentStateForTesting
+        }
         let original = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.suspend)
         let finished = PlaybackStreamRecorder<Bool>()
         let stop = Task { await fixture.controller.stop(); finished.append(true) }
@@ -4026,6 +4053,8 @@ final class Task9RuntimeOwnershipTests: XCTestCase {
         XCTAssertEqual(fixture.factory.backends.count, 2)
         XCTAssertEqual(fixture.factory.backends.first?.retirementEpochs.count, 1)
         XCTAssertEqual(fixture.factory.backends.last?.activationCount, 1)
+        XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.sessionIdentity.requestID, request.id,
+            "The old pause waiter must not settle the successor's output context")
         XCTAssertEqual(fixture.factory.outputConcurrency.maximum, 1)
         await fixture.controller.stop()
         XCTAssertNil(fixture.registry.cleanupReservationSnapshot())

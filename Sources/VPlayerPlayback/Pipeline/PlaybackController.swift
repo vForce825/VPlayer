@@ -860,8 +860,16 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             let coordinator = OutputCleanupCoordinator(registry: registry)
             guard let owner = try? coordinator.begin(contextNonce: context.contextNonce,
                 reason: .pause, at: registry.clock.nowNanoseconds), owner.reason == .pause,
-                let original = registry.outputResourceContextSnapshot(), let stop = original.suspend,
-                registry.startOutputSuspendOperation(stop.task, owner: owner) else { return }
+                let original = registry.outputResourceContextSnapshot(), original.owner == owner,
+                original.contextNonce == context.contextNonce,
+                original.sessionIdentity == sessionIdentity,
+                original.candidateBackendIdentity == context.candidateBackendIdentity,
+                let stop = original.suspend else { return }
+            // The MainActor relay can start this exact runner after user-control
+            // ingress revokes rate and before this actor admits the pause owner.
+            // First-start remains strict; losing that race still joins the same
+            // captured ticket, never a newer owner's or successor's suspension.
+            _ = registry.startOutputSuspendOperation(stop.task, owner: owner)
             guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
                   ownsUserControl(controlRun, revision: controlRevision),
                   registry.finishOutputPause(owner: owner) else { return }
@@ -1228,16 +1236,21 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         publishRouteRecovering(request: request)
         controllerState.activeRoutePorts = nil
         guard let context = registry.outputResourceContextSnapshot(),
-              context.owner == nil, context.phase == .installed, context.prepared else {
+              context.owner == nil || context.owner?.reason == .pause,
+              context.phase == .installed, context.prepared else {
             return
         }
         let coordinator = OutputCleanupCoordinator(registry: registry)
         guard let owner = try? coordinator.begin(contextNonce: context.contextNonce,
             reason: .pause, at: registry.clock.nowNanoseconds), owner.reason == .pause,
-            let original = registry.outputResourceContextSnapshot(), let stop = original.suspend,
-            registry.startOutputSuspendOperation(stop.task, owner: owner) else {
+            let original = registry.outputResourceContextSnapshot(), original.owner == owner,
+            original.contextNonce == context.contextNonce,
+            original.sessionIdentity == context.sessionIdentity,
+            original.candidateBackendIdentity == context.candidateBackendIdentity,
+            let stop = original.suspend else {
             return
         }
+        _ = registry.startOutputSuspendOperation(stop.task, owner: owner)
         switch await registry.joinOutputBackendOperation(stop.task) {
         case .succeeded:
             guard registry.finishOutputPause(owner: owner) else { return }

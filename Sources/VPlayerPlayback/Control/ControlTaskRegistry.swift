@@ -9208,7 +9208,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
         defer { notifyPlaybackProgress() }
         return executor.sync {
             func admitSuspend(reason: OutputTransitionReason, output: inout PlaybackOutputSafetyState)
-                throws -> OutputTransitionOwnerTicket? {
+                throws -> (owner: OutputTransitionOwnerTicket, startsRunner: Bool)? {
                 guard case .installed(var context, let backend) = authority.resourceState,
                       let sourceTask = context.sourceTask, sourceTask.nonce == sourceTaskNonce,
                       let interval = context.interval, interval.activation == activation,
@@ -9227,24 +9227,32 @@ final class ControlTaskRegistry: @unchecked Sendable {
                           stop.priorActivation == activation,
                           context.closeClaim?.suspendTicket == stop,
                           context.closeClaim?.intervalKey == interval else { return nil }
-                    // Preserve the existing owner, including stronger cleanup.
-                    return owner
+                    // Preserve both the existing owner and its dispatch. Native
+                    // status can arrive after explicit pause admission but before
+                    // that caller starts its original single-flight runner.
+                    return (owner, false)
                 }
-                return try beginOutputTransitionLocked(context: &context, reason: reason,
+                guard let owner = try beginOutputTransitionLocked(context: &context, reason: reason,
                     anchorInstant: monotonicClock.nowNanoseconds, teardown: reason.releasesLease,
-                    sourceActivation: activation, output: &output)
+                    sourceActivation: activation, output: &output) else { return nil }
+                return (owner, true)
             }
             // Ordinary admission must commit revoked output/readiness bits.
             // Cleanup-only barriers restore those bits; use that path only after
             // the Cell has already folded a safety failure and closed them.
-            let owner = try? transaction(operationDescriptor: .resourceOwnership,
+            let admission = try? transaction(operationDescriptor: .resourceOwnership,
                 safetyFailureFallback: { output in
                     try admitSuspend(reason: .terminal, output: &output)
                 }) { output in
                     try admitSuspend(reason: .pause, output: &output)
                 }
-            guard let owner, let context = outputResourceContextSnapshot(),
-                  context.owner == owner, let stop = context.suspend else { return false }
+            guard let admission, let context = outputResourceContextSnapshot(),
+                  context.owner == admission.owner, let stop = context.suspend else { return false }
+            let owner = admission.owner
+            // Only this call's new automatic owner needs dispatch. An existing
+            // pause owner must still succeed at its own first-start gate; already
+            // started automatic owners retain their exact runner and physical join.
+            guard admission.startsRunner else { return true }
             // Recovery/terminal owners already own their execution path. Never
             // replace their task or consume a new publication-replacement capability.
             if owner.reason != .pause { return true }
