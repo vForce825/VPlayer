@@ -16,7 +16,7 @@
       "parallelizable": false,
       "target": {
         "containerPath": "container:VPlayer.xcodeproj",
-        "identifier": "REQUIRES_PINNED_XCODEGEN_READBACK",
+        "identifier": "188A39E4D90077DC73044B8D",
         "name": "VPlayerHLSAcceptanceTests"
       }
     }
