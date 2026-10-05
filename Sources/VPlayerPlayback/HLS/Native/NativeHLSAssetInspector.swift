@@ -241,21 +241,38 @@ private struct NativeHLSSelectedVideoAppearance {
             guard let value = raw as? String, value.utf8.count <= 128 else { throw HLSSourceError.unsupportedMedia }
             return value
         }
-        switch try value(kCMFormatDescriptionExtension_ColorPrimaries) {
-        case (kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String): primaries = .bt709
-        case (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String): primaries = .bt2020
-        default: throw HLSSourceError.unsupportedMedia
+        let actualPrimaries: String = try value(kCMFormatDescriptionExtension_ColorPrimaries)
+        let primaries709: String = kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String
+        let primaries2020: String = kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String
+        if actualPrimaries == primaries709 {
+            primaries = .bt709
+        } else if actualPrimaries == primaries2020 {
+            primaries = .bt2020
+        } else {
+            throw HLSSourceError.unsupportedMedia
         }
-        switch try value(kCMFormatDescriptionExtension_TransferFunction) {
-        case (kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String): transfer = .bt709; range = .sdr
-        case (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String): transfer = .pq; range = .pq
-        case (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String): transfer = .hlg; range = .hlg
-        default: throw HLSSourceError.unsupportedMedia
+        let actualTransfer: String = try value(kCMFormatDescriptionExtension_TransferFunction)
+        let transfer709: String = kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String
+        let transferPQ: String = kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
+        let transferHLG: String = kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String
+        if actualTransfer == transfer709 {
+            transfer = .bt709; range = .sdr
+        } else if actualTransfer == transferPQ {
+            transfer = .pq; range = .pq
+        } else if actualTransfer == transferHLG {
+            transfer = .hlg; range = .hlg
+        } else {
+            throw HLSSourceError.unsupportedMedia
         }
-        switch try value(kCMFormatDescriptionExtension_YCbCrMatrix) {
-        case (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String): matrix = .bt709
-        case (kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String): matrix = .bt2020Nonconstant
-        default: throw HLSSourceError.unsupportedMedia
+        let actualMatrix: String = try value(kCMFormatDescriptionExtension_YCbCrMatrix)
+        let matrix709: String = kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String
+        let matrix2020: String = kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String
+        if actualMatrix == matrix709 {
+            matrix = .bt709
+        } else if actualMatrix == matrix2020 {
+            matrix = .bt2020Nonconstant
+        } else {
+            throw HLSSourceError.unsupportedMedia
         }
         // Unknown alternate transfer declarations cannot be silently discarded
         // while inheriting preflight SDR. Only the exposed effective transfer
