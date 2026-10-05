@@ -14,7 +14,34 @@ import XCTest
 /// Short controls run on the candidate before either capped observation. These
 /// exercise native components, not a second playback or resource-stability run.
 final class AcceptanceNativeControlTests: XCTestCase {
+    private func checkAccessLogCompletionStates() throws {
+        let completed = AcceptanceAccessLogCapture(deadline: 2)
+        completed.complete(droppedFrames: 3, stalls: 1, at: 1)
+        let observed = try completed.finish()
+        XCTAssertEqual(observed.status, .available)
+        XCTAssertEqual(observed.droppedFrames, 3)
+        XCTAssertEqual(observed.stalls, 1)
+        completed.complete(droppedFrames: 99, stalls: 99, at: 1.5)
+        XCTAssertEqual(try completed.finish(), observed, "Only the first completion is observable")
+
+        let unavailable = AcceptanceAccessLogCapture(deadline: 2)
+        unavailable.complete(droppedFrames: nil, stalls: nil, at: 1)
+        let absent = try unavailable.finish()
+        XCTAssertEqual(absent.status, .unavailable)
+        XCTAssertNil(absent.droppedFrames)
+        XCTAssertNil(absent.stalls)
+
+        let timeout = AcceptanceAccessLogCapture(deadline: 2)
+        XCTAssertThrowsError(try timeout.finish())
+        timeout.complete(droppedFrames: 0, stalls: 0, at: 3)
+        XCTAssertThrowsError(try timeout.finish(), "Late delivery cannot convert timeout into success")
+        let late = AcceptanceAccessLogCapture(deadline: 2)
+        late.complete(droppedFrames: 0, stalls: 0, at: 2)
+        XCTAssertThrowsError(try late.finish(), "A callback must finish before its deadline")
+    }
+
     func testNativeObservationControlsRejectFiveFaults() throws {
+        try checkAccessLogCompletionStates()
         var positive: [String: Any] = [:]
         var negative: [String: Any] = [:]
 

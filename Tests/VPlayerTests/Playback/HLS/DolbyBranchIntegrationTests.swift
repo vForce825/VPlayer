@@ -221,7 +221,7 @@ final class DolbyBranchIntegrationTests: XCTestCase {
 }
 
 private struct DolbyBranchFixture: Sendable {
-    let codec: AudioCodec
+    let codec: VPlayerPlayback.AudioCodec
     let frames: [Data]
     let channelMask: UInt64
     var accessUnit: Data { frames.reduce(into: Data()) { $0.append($1) } }

@@ -135,9 +135,15 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let media = player.currentTime().seconds - mediaStart
             let cpuSeconds = try processCPUSeconds() - cpuStart
             let transport = server.transportSnapshot
-            let access = item.accessLog()?.events
-            let dropped = access?.reduce(0) { $0 + $1.numberOfDroppedVideoFrames }
-            let stalls = access?.reduce(0) { $0 + $1.numberOfStalls }
+            // Request telemetry only after the common source/player deadline.
+            // SDK27: fetchAccessLog(completionHandler:) delivers a sending log;
+            // reduce it inside the callback and retain only scalar observations.
+            let access = AcceptanceAccessLogCapture(deadline: AcceptanceClock.now + 2)
+            item.fetchAccessLog(completionHandler: { log in
+                let events = log?.events
+                access.complete(droppedFrames: events?.reduce(0) { $0 + $1.numberOfDroppedVideoFrames },
+                    stalls: events?.reduce(0) { $0 + $1.numberOfStalls }, at: AcceptanceClock.now)
+            })
             let cleanupStart = AcceptanceClock.now
             player.replaceCurrentItem(with: nil)
             let retired = await assembler.retireAndAwaitReceipt()
@@ -148,6 +154,14 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             }
             let tracks = try capture.finish()
             let cleanupSeconds = AcceptanceClock.now - cleanupStart
+            // Retirement is physically joined before any remaining telemetry wait
+            // or timeout failure. This wait is outside playback and cleanup time.
+            let accessWaitStart = AcceptanceClock.now
+            while !access.hasResult && AcceptanceClock.now < access.deadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let accessSnapshot = try access.finish()
+            let accessWaitSeconds = AcceptanceClock.now - accessWaitStart
             let decodeStart = AcceptanceClock.now
             var renditions: [[String: Any]] = []
             for track in tracks { renditions.append(try await decode(track)) }
@@ -165,13 +179,14 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "startup_seconds":(firstProgress ?? playbackStart) - start,
                 "first_clock_advance_seconds":(firstProgress ?? playbackStart) - playbackStart,
                 "cleanup_seconds":cleanupSeconds,"decode_seconds":decodeSeconds,
+                "access_log_wait_seconds":accessWaitSeconds,"access_log_status":accessSnapshot.status.rawValue,
                 "whole_test_seconds":AcceptanceClock.now - wholeTestStart,
                 "route":"local-loopback-AVPlayer; physical HomePod and AirPlay unavailable",
                 "paced_transport_bps":38_000_000,"ts_muxrate_bps":37_000_000,
                 "source_bytes_delivered":transport.bytes,
                 "measured_transport_bps":Double(transport.bytes) * 8 / max(0.001, start + measured - (transport.start ?? start))]
-            report["dropped_video_frames"] = dropped.map { $0 as Any } ?? NSNull()
-            report["access_log_stalls"] = stalls.map { $0 as Any } ?? NSNull()
+            report["dropped_video_frames"] = accessSnapshot.droppedFrames.map { $0 as Any } ?? NSNull()
+            report["access_log_stalls"] = accessSnapshot.stalls.map { $0 as Any } ?? NSNull()
             #if !HLS_ACCEPTANCE_BASELINE
             let final = probe.snapshot
             guard final.isComplete else { throw AcceptanceError.invalid("incomplete native diagnostics") }
@@ -271,6 +286,41 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
         result.merge(AcceptanceReport.fragment(track.continuity)) { _, new in new }
         if track.kind == "audio" { result.merge(AcceptanceReport.audio(audio)) { _, new in new } }
         return result
+    }
+}
+
+/// Bounded completion state shared by the real SDK callback and short controls.
+/// No AVPlayerItem, access log, event array, graph or media owner is retained here.
+final class AcceptanceAccessLogCapture: @unchecked Sendable {
+    enum Status: String, Sendable { case available, unavailable, timedOut = "timed_out" }
+    struct Snapshot: Sendable, Equatable {
+        let status: Status
+        let droppedFrames: Int?
+        let stalls: Int?
+        static let timedOut = Self(status: .timedOut, droppedFrames: nil, stalls: nil)
+    }
+    let deadline: Double
+    private let lock = NSLock()
+    private var value: Snapshot?
+    init(deadline: Double) { self.deadline = deadline }
+    var hasResult: Bool { lock.withLock { value != nil } }
+    func complete(droppedFrames: Int?, stalls: Int?, at instant: Double) {
+        lock.withLock {
+            guard value == nil else { return }
+            guard instant.isFinite, instant < deadline else { value = .timedOut; return }
+            value = .init(status: droppedFrames == nil && stalls == nil ? .unavailable : .available,
+                droppedFrames: droppedFrames, stalls: stalls)
+        }
+    }
+    func finish() throws -> Snapshot {
+        try lock.withLock {
+            let result = value ?? .timedOut
+            value = result
+            guard result.status != .timedOut else {
+                throw AcceptanceError.invalid("AVPlayer access-log callback exceeded the two-second post-stop deadline")
+            }
+            return result
+        }
     }
 }
 

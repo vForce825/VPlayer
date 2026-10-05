@@ -517,7 +517,7 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
     var failReady = false
     var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
-    private var clock = ExactMediaTime.zero
+    private var clock = ExactMediaTime(value: 0, timescale: 1)
     func advanceMedia(to time: ExactMediaTime) { clock = time }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws { throw HLSSourceError.unboundOwner }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {

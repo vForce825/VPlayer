@@ -10,7 +10,7 @@ import XCTest
 @MainActor
 final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
     func testActualDolbyWriterTrialEitherPublishesCompressedOrJoinsOwnedAACRetry() async throws {
-        for codec in [AudioCodec.ac3, .eac3] {
+        for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
             let bytes = try OrdinaryOwnedDolbyTS.make(codec: codec, bundle: Bundle(for: Self.self))
             XCTAssertLessThan(bytes.count, 4 * 1_024 * 1_024)
             let origin = try NativeHLSHTTPFixture(resources: ["/source.ts": .init(data: bytes, contentType: "video/mp2t")], credential: "dolby fixture")
@@ -112,7 +112,7 @@ final class NativeOwnedDolbyFallbackSmokeTests: XCTestCase {
 private final class OwnedDolbyPreparationObservation: @unchecked Sendable {
     private let lock = NSLock()
     struct Audio: Sendable {
-        let codec: AudioCodec?
+        let codec: VPlayerPlayback.AudioCodec?
         let sampleRate: Int32
         let channelCount: Int32
         let formatValidated: Bool
@@ -169,7 +169,7 @@ private final class OwnedDolbySmokeFactory: PlaybackBackendFactory, @unchecked S
 /// Repackages unchanged public fixture syncframes into ordinary single-program
 /// TS with exact frame PTS/PCR. No encoder or FFmpeg muxer is used.
 private enum OrdinaryOwnedDolbyTS {
-    static func make(codec: AudioCodec, bundle: Bundle) throws -> Data {
+    static func make(codec: VPlayerPlayback.AudioCodec, bundle: Bundle) throws -> Data {
         let frames: [Data], sampleCount: Int64
         if codec == .eac3 {
             let bytes = try Data(contentsOf: XCTUnwrap(bundle.url(forResource: "eac3-main-6x1block-5.1", withExtension: "eac3")))
@@ -228,7 +228,7 @@ private enum OrdinaryOwnedDolbyTS {
         }
         return result
     }
-    private static func psi(codec: AudioCodec, continuity: UInt8) -> Data {
+    private static func psi(codec: VPlayerPlayback.AudioCodec, continuity: UInt8) -> Data {
         func packet(pid: UInt16, section: [UInt8]) -> Data {
             var crc: UInt32 = 0xFFFF_FFFF
             for byte in section {

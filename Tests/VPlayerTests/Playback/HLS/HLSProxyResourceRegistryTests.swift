@@ -73,7 +73,7 @@ final class HLSProxyResourceRegistryTests: XCTestCase {
             return try XCTUnwrap(HLSManifestGraph.parse(data: Data(text.utf8), responseURL: url).document(for: url))
         }
         let original = try master(1, note: "same,IV=retained")
-        XCTAssertEqual(try HLSManifestRewriter.masterTransportSkeleton(original), HLSManifestRewriter.masterTransportSkeleton(master(2, note: "same,IV=retained")))
-        XCTAssertNotEqual(try HLSManifestRewriter.masterTransportSkeleton(original), HLSManifestRewriter.masterTransportSkeleton(master(3, note: "same,IV=changed")))
+        XCTAssertEqual(try HLSManifestRewriter.masterTransportSkeleton(original), try HLSManifestRewriter.masterTransportSkeleton(master(2, note: "same,IV=retained")))
+        XCTAssertNotEqual(try HLSManifestRewriter.masterTransportSkeleton(original), try HLSManifestRewriter.masterTransportSkeleton(master(3, note: "same,IV=changed")))
     }
 }
