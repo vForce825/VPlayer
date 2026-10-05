@@ -9,6 +9,10 @@ protocol PlaybackNaturalEndDeadlineReceiving: AnyObject, Sendable {
     func naturalEndDeadlineFired(identity: UUID)
 }
 
+protocol PlaybackHLSProgressDeadlineReceiving: AnyObject, Sendable {
+    func hlsProgressDeadlineFired(identity: UUID)
+}
+
 /// 八张准确票的一次Authority投影；仅在reconcile栈上存在，不是第二份常驻账本。
 struct PlaybackDeadlineScheduleSnapshot: Sendable, Equatable {
     var acquisition: AudioSessionAcquisitionDeadline?
@@ -78,6 +82,7 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
         case playbackOperation(PlaybackOperationDeadlineArmTicket)
         case suspend(OutputSuspendTicket)
         case naturalEnd(UUID)
+        case hlsProgress(UUID)
     }
 
     private enum Scheduled: Sendable, Equatable {
@@ -103,6 +108,7 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
             MemoryLayout<Slot<AudioSessionReactivationCutoffArmTicket>?>.stride +
             MemoryLayout<Slot<PlaybackOperationDeadlineArmTicket>?>.stride +
             MemoryLayout<Slot<OutputSuspendTicket>?>.stride +
+            MemoryLayout<HLSProgressSlot?>.stride +
             MemoryLayout<@Sendable () -> Void>.stride
     }
 
@@ -135,6 +141,46 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
         var deliveryInFlight = false
     }
     private var naturalEnd: NaturalEndSlot?
+    private struct HLSProgressSlot {
+        let identity: UUID
+        let invocation: ControlTaskRegistry.BackendPositiveRateInvocation
+        let item: AVPlayerItemInstanceIdentity
+        let notAfterInstant: UInt64
+        weak var receiver: (any PlaybackHLSProgressDeadlineReceiving)?
+        var deliveryInFlight = false
+    }
+    private var hlsProgress: HLSProgressSlot?
+
+    func armHLSProgress(invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
+                        item: AVPlayerItemInstanceIdentity, identity: UUID,
+                        receiver: any PlaybackHLSProgressDeadlineReceiving,
+                        delayNanoseconds: UInt64 = 250_000_000) -> Bool {
+        registry.executor.sync {
+            guard (1...250_000_000).contains(delayNanoseconds),
+                  let snapshot = invocation.currentSnapshot,
+                  snapshot.interval.outputLifecycle == item.outputLifecycleEpoch,
+                  snapshot.interval.itemGeneration == item.itemGeneration else { return false }
+            let deadline = registry.clock.nowNanoseconds.addingReportingOverflow(delayNanoseconds)
+            guard !deadline.overflow else { return false }
+            return lock.withLock {
+                guard hlsProgress == nil else { return false }
+                hlsProgress = .init(identity: identity, invocation: invocation, item: item,
+                    notAfterInstant: deadline.partialValue, receiver: receiver)
+                rescheduleLocked()
+                return true
+            }
+        }
+    }
+
+    func cancelHLSProgress(_ identity: UUID) {
+        lock.withLock {
+            guard hlsProgress?.identity == identity else { return }
+            hlsProgress = nil
+            rescheduleLocked()
+        }
+    }
+
+    func hlsProgressIdentitySnapshot() -> UUID? { lock.withLock { hlsProgress?.identity } }
 
     func armNaturalEnd(invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
                        item: AVPlayerItemInstanceIdentity, identity: UUID,
@@ -223,6 +269,7 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
                 playbackOperation = nil
                 suspend = nil
                 naturalEnd = nil
+                hlsProgress = nil
                 rescheduleLocked()
             }
         }
@@ -231,6 +278,12 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
     /// 准确差异才arm/cancel；同票reconcile不再次签发ordinary arm或续绝对边界。
     func reconcile(_ snapshot: PlaybackDeadlineScheduleSnapshot) {
         registry.executor.sync {
+            // Revocation can precede the MainActor stop callback. Close this
+            // exact observation immediately without retaining obsolete work.
+            let observed = lock.withLock { hlsProgress }
+            if let observed, !observed.invocation.revalidateCurrentAuthority() {
+                cancelHLSProgress(observed.identity)
+            }
             func update<Value: Sendable & Equatable>(_ expected: Value?,
                 at path: ReferenceWritableKeyPath<PlaybackDeadlineScheduler, Slot<Value>?>,
                 delivery: (Value) -> Delivery) {
@@ -327,6 +380,9 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
         if let naturalEnd, !naturalEnd.deliveryInFlight {
             earliest = min(earliest ?? naturalEnd.notAfterInstant, naturalEnd.notAfterInstant)
         }
+        if let hlsProgress, !hlsProgress.deliveryInFlight {
+            earliest = min(earliest ?? hlsProgress.notAfterInstant, hlsProgress.notAfterInstant)
+        }
         guard let earliest else {
             timer.schedule(notAfterInstant: nil)
             return
@@ -353,6 +409,10 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
            naturalEnd.notAfterInstant <= (selected?.wake ?? .max) {
             selected = (naturalEnd.notAfterInstant, 8)
         }
+        if let hlsProgress, !hlsProgress.deliveryInFlight,
+           hlsProgress.notAfterInstant <= (selected?.wake ?? .max) {
+            selected = (hlsProgress.notAfterInstant, 9)
+        }
         guard let ordinal = selected?.ordinal else { return nil }
         switch ordinal {
         case 0: acquisition!.deliveryInFlight = true; return .acquisition(acquisition!.value)
@@ -363,7 +423,8 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
         case 5: reactivation!.deliveryInFlight = true; return .reactivation(reactivation!.value)
         case 6: playbackOperation!.deliveryInFlight = true; return .playbackOperation(playbackOperation!.value)
         case 7: suspend!.deliveryInFlight = true; return .suspend(suspend!.value)
-        default: naturalEnd!.deliveryInFlight = true; return .naturalEnd(naturalEnd!.identity)
+        case 8: naturalEnd!.deliveryInFlight = true; return .naturalEnd(naturalEnd!.identity)
+        default: hlsProgress!.deliveryInFlight = true; return .hlsProgress(hlsProgress!.identity)
         }
     }
 
@@ -375,6 +436,26 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
             return value
         }
         guard let due else { return }
+        if case .hlsProgress(let identity) = due {
+            let slot = lock.withLock { hlsProgress?.identity == identity ? hlsProgress : nil }
+            guard let slot else { return }
+            guard registry.clock.nowNanoseconds >= slot.notAfterInstant else {
+                lock.withLock {
+                    if hlsProgress?.identity == identity { hlsProgress?.deliveryInFlight = false }
+                    rescheduleLocked()
+                }
+                return
+            }
+            guard let snapshot = slot.invocation.currentSnapshot,
+                  snapshot.interval.outputLifecycle == slot.item.outputLifecycleEpoch,
+                  snapshot.interval.itemGeneration == slot.item.itemGeneration,
+                  let receiver = slot.receiver else {
+                cancelHLSProgress(identity)
+                return
+            }
+            receiver.hlsProgressDeadlineFired(identity: identity)
+            return
+        }
         if case .naturalEnd(let identity) = due {
             let slot = lock.withLock { naturalEnd?.identity == identity ? naturalEnd : nil }
             guard let slot else { return }
@@ -408,7 +489,7 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
     private func deliver(_ value: Delivery, suspendNotAfter: inout UInt64?) -> Scheduled? {
         let application: OutputControlApplication?
         switch value {
-        case .naturalEnd: return nil
+        case .naturalEnd, .hlsProgress: return nil
         case .acquisition(let deadline):
             application = registry.executor.performPlaybackBudget(.acquisitionTimer(deadline))
         case .cleanup(let budget):
@@ -481,7 +562,7 @@ final class PlaybackDeadlineScheduler: @unchecked Sendable {
             slot?.value == expected && slot?.deliveryInFlight == true
         }
         switch delivered {
-        case .naturalEnd: return
+        case .naturalEnd, .hlsProgress: return
         case .acquisition(let expected): guard matches(expected, acquisition) else { return }; acquisition = nil
         case .cleanup(let expected): guard matches(expected, cleanup) else { return }; cleanup = nil
         case .ordinaryRoute(let expected): guard matches(expected, ordinaryRoute) else { return }; ordinaryRoute = nil

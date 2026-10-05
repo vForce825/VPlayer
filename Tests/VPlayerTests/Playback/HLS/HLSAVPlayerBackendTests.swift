@@ -504,9 +504,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         do {
             _ = try await assembler.startUntilPlayablePrefix()
             let publisher = try XCTUnwrap(publication.publisher)
+            print("EOF_WAKE_INITIAL sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
             for expected in UInt64(1)..<13 {
                 let pending = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
-                XCTAssertTrue(pending)
+                XCTAssertTrue(pending, "expected=\(expected) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) failure=\(String(describing: authority.failureDiagnostic))")
                 clock.advance(nanoseconds: 1_000_000_000)
                 let published = try await waitForLiveTestCondition {
                     publisher.visible?.publicationSequence == expected + 1
@@ -527,6 +528,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             server.finishBody() // Real demux EOF, encoder drain and terminal writer authorities.
             try await assembler.finishAtNaturalEOF()
             let final = try XCTUnwrap(publisher.visible)
+            print("EOF_WAKE_FINAL sequence=\(final.publicationSequence) media=\(final.media.mapValues { $0.logicalSequences }) coverage=\(final.coverage)")
             XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
             XCTAssertEqual(final.publicationSequence, 14)
             XCTAssertNil(authority.failureDiagnostic)
@@ -586,6 +588,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         do {
             _ = try await assembler.startUntilPlayablePrefix()
             let publisher = try XCTUnwrap(publication.publisher)
+            print("CAPACITY_WAKE_INITIAL outcome=\(outcome) sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
             let store = try XCTUnwrap(publication.store)
             let lastBeforeCapacity: UInt64 = outcome == .naturalEnd ? 12 : 4
             callbacks.releaseThrough(lastBeforeCapacity + 2)
@@ -607,7 +610,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 if expected < lastBeforeCapacity { clock.advance(nanoseconds: 1_000_000_000) }
             }
             let ready = try await waitForLiveTestCondition { publisher.pendingLogicalSequenceCount > 0 }
-            XCTAssertTrue(ready)
+            XCTAssertTrue(ready, "sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) failure=\(String(describing: authority.failureDiagnostic))")
             clock.advance(nanoseconds: 1_000_000_000)
             let blocked = try await waitForLiveTestCondition { store.capacityWaiterCount == 1 }
             XCTAssertTrue(blocked, "The actual production graph must block on a real snapshot reservation")
@@ -670,6 +673,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                     }
                 }
                 try await assembler.finishAtNaturalEOF()
+                print("CAPACITY_WAKE_FINAL sequence=\(publisher.visible?.publicationSequence ?? 0) media=\(String(describing: publisher.visible?.media.mapValues { $0.logicalSequences })) coverage=\(String(describing: publisher.visible?.coverage))")
                 XCTAssertTrue(publisher.visible!.media.values.allSatisfy { $0.isFinal })
                 expectedFinal = try XCTUnwrap(publisher.visible?.publicationSequence)
             }

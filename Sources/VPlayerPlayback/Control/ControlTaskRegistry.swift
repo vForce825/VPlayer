@@ -116,6 +116,12 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var outputLifecycleEpoch: OutputLifecycleEpoch {
             replacementAuthority.lifecycle
         }
+
+        /// Preparation may continue while paused, but never after its original
+        /// work command has been revoked, replaced or handed to cleanup.
+        func revalidateCurrentPreparation() -> Bool {
+            replacementAuthority.revalidatePreparation(ticket: ticket)
+        }
     }
 
     /// prepare 时由 Registry 签发、与当前 backend lifecycle 精确绑定的单次替换能力。
@@ -146,6 +152,40 @@ final class ControlTaskRegistry: @unchecked Sendable {
             registry?.requestBackendPublicationReplacement(self) == true
         }
 
+        func requestWatchdogRecovery(activation: ActivationEpoch) -> Bool {
+            registry?.requestBackendPublicationReplacement(self, watchdogActivation: activation) == true
+        }
+
+        fileprivate func revalidatePreparation(ticket: PrepareTicket) -> Bool {
+            guard let registry else { return false }
+            return registry.projection {
+                guard !self.consumed,
+                      case .installed(let context, let backend) = registry.authority.resourceState,
+                      backend.lifecycle == self.lifecycle, backend.identity == ticket.backendIdentity,
+                      context.prepareTicket == ticket, context.owner == nil,
+                      !context.poisoned, !context.teardownRequested,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      let record = registry.authority.commands.first(where: {
+                          $0?.controlTaskTicket.nonce == self.sourceTaskNonce
+                      }) ?? nil else { return false }
+                return record.slot == .prepare && record.phase == .running
+                    && record.groupTicket == context.reservation.workGroup
+            }
+        }
+
+        func ownsRetainedReplacementRetirement(_ epoch: OutputLifecycleEpoch) -> Bool {
+            guard lifecycle == epoch, let registry else { return false }
+            return registry.projection {
+                guard self.consumed, let context = registry.authority.outputContext,
+                      context.owner?.reason == .recovery, !context.teardownRequested,
+                      !context.poisoned, context.pendingReset == nil,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      context.suspend?.lifecycle == epoch,
+                      registry.authority.ownedBackendResources?.lifecycle == epoch else { return false }
+                return true
+            }
+        }
+
         func matches(lifecycle: OutputLifecycleEpoch,
                      ticket: PrepareTicket) -> Bool {
             guard self.lifecycle == lifecycle, let registry else { return false }
@@ -174,6 +214,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         func requestReplacement() -> Bool {
             withLock { authority }?.requestReplacement() == true
+        }
+
+        func requestWatchdogRecovery(activation: ActivationEpoch) -> Bool {
+            withLock { authority }?.requestWatchdogRecovery(activation: activation) == true
         }
 
         func currentAuthority() -> BackendPublicationReplacementAuthority? {
@@ -295,6 +339,21 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         func retireNaturalEnd(identity: UUID) { capability.retireNaturalEnd(identity: identity) }
 
+        var observationInstant: UInt64? { capability.observationInstant }
+
+        func scheduleHLSProgress(item: AVPlayerItemInstanceIdentity, identity: UUID,
+                                 receiver: any PlaybackHLSProgressDeadlineReceiving,
+                                 delayNanoseconds: UInt64 = 250_000_000) -> Bool {
+            capability.scheduleHLSProgress(invocation: self, item: item,
+                identity: identity, receiver: receiver, delayNanoseconds: delayNanoseconds)
+        }
+
+        func retireHLSProgress(identity: UUID) { capability.retireHLSProgress(identity: identity) }
+
+        func completeObservedMediaProgress() -> Bool {
+            capability.completeObservedMediaProgress(activation: frozenActivation)
+        }
+
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.sourceTaskNonce == rhs.sourceTaskNonce
                 && lhs.frozenActivation == rhs.frozenActivation
@@ -316,6 +375,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         func retireNaturalEnd(identity: UUID) { registry?.deadlineScheduler?.cancelNaturalEnd(identity) }
+
+        var observationInstant: UInt64? { registry?.clock.nowNanoseconds }
+
+        func scheduleHLSProgress(invocation: BackendPositiveRateInvocation,
+                                 item: AVPlayerItemInstanceIdentity, identity: UUID,
+                                 receiver: any PlaybackHLSProgressDeadlineReceiving,
+                                 delayNanoseconds: UInt64) -> Bool {
+            registry?.deadlineScheduler?.armHLSProgress(invocation: invocation,
+                item: item, identity: identity, receiver: receiver,
+                delayNanoseconds: delayNanoseconds) == true
+        }
+
+        func retireHLSProgress(identity: UUID) { registry?.deadlineScheduler?.cancelHLSProgress(identity) }
+
+        func completeObservedMediaProgress(activation: ActivationEpoch) -> Bool {
+            registry?.completeSampleBufferReadiness(activation.outputLifecycleEpoch.backendIdentity,
+                requiringActivation: activation) == true
+        }
 
         func snapshot(sourceTaskNonce: UInt64,
                       activation: ActivationEpoch) -> BackendPositiveRateInvocation.CurrentSnapshot? {
@@ -686,6 +763,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var outputConfigurationIncarnation: OutputConfigurationIncarnation?
         var cleanupReservation: CleanupReservation?
         var resourceState: OutputResourceState?
+        // This budget belongs to the user's request, never a replaceable item,
+        // activation, backend or work cycle. Fresh media progress cannot refill it.
+        var watchdogRecoverySession: PlaybackSessionIdentity?
+        var watchdogRecoveryCount: UInt8 = 0
         // 固定单槽只保存最新请求的原始身份/预算；前驱资源仍保留在resourceState直到原owner排空。
         var playbackRequestAdmission: CurrentPlaybackOperationDeadlineTicket?
         var stateSubscription: PlaybackStateSubscription?
@@ -5282,6 +5363,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   current === runner, current.joining else { return false }
             authority.commands[index]?.phase = .terminal(.canceled)
             authority.commands[index]?.payload = nil
+            if case .pipeline = current.relay,
+               let context = authority.outputContext, context.teardownRequested,
+               case .backend(let retiringBackend) = ticket.group.resourceIdentity,
+               context.candidateBackendIdentity == retiringBackend,
+               let groupIndex = authority.groups.firstIndex(where: {
+                   $0?.ticket == ticket.group && $0?.parent == context.reservation.ownerGroup
+               }),
+               authority.groups[groupIndex]?.sealed == true,
+               authority.commands.indices.allSatisfy({ other in
+                   other == index || authority.commands[other]?.groupTicket != ticket.group
+               }),
+               !authority.groups.contains(where: { $0?.parent == ticket.group }) {
+                // The exact relay has been closed and its original runner
+                // physically joined. A backend being destroyed cannot leave
+                // owner-group siblings behind across repeated route/reset cycles.
+                authority.commands[index] = nil
+                authority.groups[groupIndex] = nil
+            }
             return true
         }) == true
     }
@@ -5310,6 +5409,17 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         continue
                     }
                     if pipelineOnly, case .audio = runner.relay { continue }
+                    if pipelineOnly, case .pipeline = runner.relay,
+                       context.owner?.reason == .recovery, !context.teardownRequested,
+                       context.pendingReset == nil, !context.poisoned,
+                       context.disposition == .retainForSession(context.sessionIdentity),
+                       context.desiredBackendKind == .hlsAVPlayer,
+                       record.groupTicket.resourceIdentity == context.candidateBackendIdentity.map(ControlResourceIdentity.backend),
+                       !authority.isDescendant(record.groupTicket, of: context.reservation.workGroup) {
+                        // The retained HLS backend keeps its single event sink.
+                        // Its exact owner-group child survives renewable work.
+                        continue
+                    }
                     // ownerGroup还要承接reserved cleanup；只封同组relay record，不封其cleanup入口。
                     if record.groupTicket != cleanup.groupTicket { authority.groups[groupIndex]?.sealed = true }
                     authority.cancel(index)
@@ -7852,7 +7962,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
         return executor.performPlaybackBudget(.mediaProgress(receipt)) == .budget(.progressCompleted)
     }
 
-    func completeSampleBufferReadiness(_ backend: PlaybackBackendIdentity) -> Bool {
+    func completeSampleBufferReadiness(_ backend: PlaybackBackendIdentity,
+                                      requiringActivation: ActivationEpoch? = nil) -> Bool {
         defer { notifyPlaybackProgress() }
         var accepted = false
         executor.sync {
@@ -7870,6 +7981,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 }
                 guard !context.poisoned else { return nil }
                 guard context.owner == nil else { return nil }
+                if let requiringActivation, context.activation != requiringActivation { return nil }
                 guard context.disposition != .releaseAfterTeardown else { return nil }
                 guard context.desiredBackendKind == .sampleBuffer || context.desiredBackendKind == .hlsAVPlayer else { return nil }
                 guard owned.identity == backend else { return nil }
@@ -8992,9 +9104,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
     /// owner 与 registered suspend runner，后继 retirement/reprepare 继续由同一
     /// output cleanup 状态机推进。
     private func requestBackendPublicationReplacement(
-        _ capability: BackendPublicationReplacementAuthority
+        _ capability: BackendPublicationReplacementAuthority,
+        watchdogActivation: ActivationEpoch? = nil
     ) -> Bool {
         var started = false
+        var exhaustedOwner: OutputTransitionOwnerTicket?
         executor.sync {
             let runner = OwnedPlaybackBackendOperation(operation: .suspend)
             let prepared: BackendPublicationReplacementTransition? = try? transaction(
@@ -9016,8 +9130,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         prepareRecord.phase == .terminal(.completed),
                       context.suspend == nil, context.owner == nil,
                       context.disposition == .retainForSession(context.sessionIdentity),
-                      !context.poisoned,
-                      let owner = try beginOutputTransitionLocked(
+                      !context.poisoned else { return nil }
+                if let watchdogActivation {
+                    guard context.activation == watchdogActivation,
+                          context.interval?.activation == watchdogActivation,
+                          output.outputPermitPresent, output.routeObservationGateOpen,
+                          !authority.snapshot.userPaused, !authority.snapshot.interruptionVeto else { return nil }
+                    if authority.watchdogRecoverySession != context.sessionIdentity {
+                        authority.watchdogRecoverySession = context.sessionIdentity
+                        authority.watchdogRecoveryCount = 0
+                    }
+                    if authority.watchdogRecoveryCount >= 2 {
+                        exhaustedOwner = try beginOutputTransitionLocked(context: &context,
+                            reason: .terminal, anchorInstant: monotonicClock.nowNanoseconds,
+                            teardown: true, sourceActivation: watchdogActivation, output: &output)
+                        return nil
+                    }
+                }
+                guard let owner = try beginOutputTransitionLocked(
                         context: &context, reason: .recovery,
                         anchorInstant: monotonicClock.nowNanoseconds,
                         // publication replacement 只退休旧 item；backend/lease 由
@@ -9046,6 +9176,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     originalContextNonce: context.contextNonce,
                     shouldReactivate: suspend.priorActivation != nil)
                 capability.consumed = true
+                if watchdogActivation != nil { authority.watchdogRecoveryCount += 1 }
                 return transition
             }
             guard let prepared else { return }
@@ -9053,7 +9184,31 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 prepared.suspend.task, runner: runner,
                 publicationReplacement: prepared)
         }
+        if let exhaustedOwner, let receiver = executor.sync({ terminalReceiver }) {
+            return startOwnedTerminalCleanup(owner: exhaustedOwner, receiver: receiver,
+                terminalState: .failed(.init(code: "hls.watchdog.recovery-exhausted",
+                    userMessage: "播放持续停滞，已停止自动重试。请重试或切换频道。")))
+        }
         return started
+    }
+
+    /// Legacy controller requests share the exact same scoped owner and budget
+    /// as native progress callbacks; they never start an independent handoff.
+    func requestCurrentHLSWatchdogRecovery() async -> Bool {
+        let candidate: (BackendPublicationReplacementAuthoritySlot, ActivationEpoch,
+                        HLSAVPlayerPlaybackBackend?)? = projection {
+            guard let context = authority.outputContext, context.owner == nil,
+                  context.desiredBackendKind == .hlsAVPlayer, let activation = context.activation,
+                  let backend = authority.ownedBackendResources?.object
+                    as? any BackendPublicationReplacementAuthorityInstalling else { return nil }
+            return (backend.backendPublicationReplacementAuthoritySlot, activation,
+                authority.ownedBackendResources?.object as? HLSAVPlayerPlaybackBackend)
+        }
+        guard let candidate else { return false }
+        if let backend = candidate.2 {
+            return await backend.requestWatchdogRecovery(activation: candidate.1)
+        }
+        return candidate.0.requestWatchdogRecovery(activation: candidate.1)
     }
 
     func finishOutputPause(owner: OutputTransitionOwnerTicket) -> Bool {

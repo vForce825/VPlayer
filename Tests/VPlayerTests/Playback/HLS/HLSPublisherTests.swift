@@ -2100,7 +2100,15 @@ final class Task19Harness: @unchecked Sendable {
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
             ?? SealedMediaStore(token: sessionToken, itemGeneration: 19)
         self.audioOnly = audioOnly
-        boundary = try SegmentBoundaryCoordinator(mode: audioOnly ? .audioOnly(epochStart: .zero) : .audioVideo(epochStart: .zero, videoMode: .passthrough))
+        // The default passthrough contract permits at most two seconds. A
+        // planned 3/4-second synthetic GOP must declare its real legal bound;
+        // the variable-duration regression still asserts every original gate.
+        let maximumPlannedVideoDuration = plannedSegmentDurations?.max {
+            CMTimeCompare($0.cmTime, $1.cmTime) < 0
+        }?.cmTime
+        boundary = try SegmentBoundaryCoordinator(mode: audioOnly ? .audioOnly(epochStart: .zero)
+            : .audioVideo(epochStart: .zero, videoMode: .passthrough,
+                maximumPassthroughInterval: maximumPlannedVideoDuration))
         let specialAudio: [ExactMediaTime]? = audioBoundaryOffsets == nil ? nil
             : [Task19.time(49_152, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(47_104, 48_000)]
         let specialVideo: [ExactMediaTime]? = audioBoundaryOffsets == nil ? nil

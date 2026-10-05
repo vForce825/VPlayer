@@ -3066,6 +3066,30 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         if let immediate { deliverTimelineFailure(immediate, to: handler) }
     }
 
+    #if DEBUG
+    /// Read-only scalar diagnosis of the real terminal facts; never signs or
+    /// repairs membership, and retains no additional server/history owner.
+    func preparationSelectionDiagnostics(publicationSequence: UInt64) -> [String] {
+        queueSync {
+            guard let binding = authorityBindings[publicationSequence],
+                  let participants = participantsByPublication[publicationSequence] else {
+                return ["missing-publication"]
+            }
+            return completedResourceFacts.filter { $0.authority == binding }.prefix(24).map { fact in
+                guard let participant = participants[fact.participantID] else { return "missing-participant" }
+                let physical = fact.presentationRange
+                let effective = physical.flatMap { effectivePresentationRange($0, for: participant) }
+                let window = selectionContract(for: participant, binding: binding, intersecting: effective)
+                return "participant=\(fact.participantID) sequence=\(fact.key.logicalSequence) "
+                    + "member=\(participant.mediaKeys.contains(fact.key)) "
+                    + "complete=\(completedResourceFactsFullyCover(key: fact.key, backing: fact.backingIdentity, authority: binding)) "
+                    + "physical=\(String(describing: physical)) effective=\(String(describing: effective)) "
+                    + "horizon=\(participant.effectivePlaybackHorizon) window=\(String(describing: window))"
+            }
+        }
+    }
+    #endif
+
     func currentAudioSelectionCapability(itemGeneration: UInt64,
                                          publicationSequence: UInt64)
         -> LoopbackAudioMediaSelectionCapability? {

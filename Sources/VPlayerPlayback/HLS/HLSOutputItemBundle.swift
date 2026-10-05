@@ -196,7 +196,9 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         }
         guard mayStart else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
         do {
+            try Task.checkCancellation()
             let replacement = try await startProducer()
+            try Task.checkCancellation()
             let accepted = lock.withLock { () -> Bool in
                 guard lifecycle == .producing else { return false }
                 replacementStorage = replacement

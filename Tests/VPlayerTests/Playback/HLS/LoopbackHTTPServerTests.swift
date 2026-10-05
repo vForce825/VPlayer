@@ -3245,6 +3245,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
                 + (try media.map(first.server.path(for:))) {
                 XCTAssertEqual(try rawRequest(port: first.server.port, target: path).status, 200)
             }
+            if first.server.currentAudioSelectionCapability(itemGeneration: 19,
+                publicationSequence: snapshot.publicationSequence) == nil {
+                print("SELECTION_MEMBERSHIP_FAILURE \(first.server.preparationSelectionDiagnostics(publicationSequence: snapshot.publicationSequence))")
+            }
             selections.append(try XCTUnwrap(first.server.currentAudioSelectionCapability(
                 itemGeneration: 19, publicationSequence: snapshot.publicationSequence),
                 "selection iteration=\(iteration) retained=\(selections.count) "
@@ -6213,6 +6217,7 @@ private final class FinalReplacementHTTPFixture: @unchecked Sendable {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
+        print("REPLACEMENT_MEMBERSHIP_FAILURE \(server.preparationSelectionDiagnostics(publicationSequence: publicationSequence))")
         let selection = server.currentAudioSelectionCapability(
             itemGeneration: itemGeneration, publicationSequence: publicationSequence)
         let basis = server.preparationPublicationBasis(

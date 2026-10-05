@@ -135,6 +135,7 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
     /// 启动唯一 demux source 并等待真实 graph 签发 all-track prefix；没有 receipt 就不暴露
     /// replacement，故 server/item install 不能越过三秒真实覆盖 readiness。
     func startUntilPlayablePrefix() async throws -> AVPlayerItemReplacementBundle {
+        try Task.checkCancellation()
         let mayStart = condition.withLock { () -> Bool in
             guard phase == .configured else { return false }
             phase = .reading
@@ -177,9 +178,15 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("assembler_prefix_ready")
         #endif
-        condition.withLock {
+        let accepted = condition.withLock { () -> Bool in
+            guard !Task.isCancelled, phase == .reading, retirement == nil else { return false }
             self.prefix = prefix
             phase = .playable
+            return true
+        }
+        guard accepted else {
+            _ = await retireAndAwaitReceipt()
+            throw CancellationError()
         }
         return prefix.replacement
     }

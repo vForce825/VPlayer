@@ -23,6 +23,112 @@ private final class TestClock: @unchecked Sendable {
 }
 
 final class BackendDiagnosticsTests: XCTestCase {
+    func testExpiredProgressDeadlineNeverRequestsNanosecondPolling() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 1, at: 250_000_000))
+        XCTAssertEqual(watch.nextPollDelay(at: 3_250_000_000), 250_000_000,
+            "An unavailable observation must never produce a one-nanosecond polling loop")
+    }
+
+    func testLiveProgressWatchNeedsStrictAdvanceAndLatchesOneStall() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: Double.nan, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 10, at: 0))
+        XCTAssertFalse(watch.observe(mediaTime: 10, at: 90_000_000_000),
+            "A startup waiting item has not yet made real progress")
+        XCTAssertFalse(watch.hasObservedProgress)
+        XCTAssertFalse(watch.observe(mediaTime: 10.5, at: 90_250_000_000))
+        XCTAssertTrue(watch.hasObservedProgress)
+        XCTAssertFalse(watch.observe(mediaTime: 10.5, at: 93_249_999_999))
+        XCTAssertTrue(watch.observe(mediaTime: 10.5, at: 93_250_000_000))
+        XCTAssertFalse(watch.observe(mediaTime: 100, at: 96_250_000_000),
+            "A retired observation cannot reopen itself even if a late sample advances")
+    }
+
+    func testLiveProgressWatchFreshActivationRequiresFreshProgress() {
+        var watch = HLSPlaybackProgressWatch()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 0))
+        for sample in 1...280 {
+            XCTAssertFalse(watch.observe(mediaTime: Double(sample) / 4,
+                at: UInt64(sample) * 250_000_000))
+        }
+        XCTAssertTrue(watch.observe(mediaTime: 70, at: 73_000_000_000))
+        watch = .init()
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 74_000_000_000))
+        XCTAssertFalse(watch.observe(mediaTime: 0, at: 90_000_000_000))
+        XCTAssertFalse(watch.hasObservedProgress)
+    }
+
+    func testHLSWatchdogCompletedRecoveryCannotLoopWithoutNewActivation() async {
+        let recovery = PlaybackRecoveryCoordinator()
+        let clock = TestClock()
+        let calls = WatchdogRecoveryRecorder()
+        recovery.setWatchdogRecoveryHandler { reason, _ in calls.record(reason) }
+        let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: recovery, now: { clock.now() })
+        await watchdog.arm(activationEpoch: 1, hasObservedProgress: true)
+        await watchdog.recordMediaProgress(mediaTimeSeconds: 10)
+        clock.advance(by: 3)
+        let first = await watchdog.pollAndEvaluate(currentTimeSeconds: 10, isPlaying: true)
+        XCTAssertTrue(first)
+        await recovery.waitForCurrentRecovery()
+
+        // The completed transaction is not evidence that this item recovered.
+        // Continue a minute of actual production polls at the same media clock.
+        for _ in 0..<120 {
+            clock.advance(by: 0.5)
+            _ = await watchdog.pollAndEvaluate(currentTimeSeconds: 10, isPlaying: true)
+            await recovery.waitForCurrentRecovery()
+        }
+        XCTAssertEqual(calls.reasons, [.playbackStalled],
+            "A completed handler must not refill the stalled activation's recovery budget")
+    }
+
+    func testHLSWatchdogQueuedRecoveryIsRevokedByDisarmBeforeDelivery() async {
+        let recovery = PlaybackRecoveryCoordinator()
+        let clock = TestClock()
+        let gate = WatchdogRecoveryGate()
+        let calls = WatchdogRecoveryRecorder()
+        recovery.setWatchdogRecoveryHandler { reason, _ in calls.record(reason) }
+        // Own the scheduler's preceding transaction so the watchdog is queued,
+        // then exercise the real disarm boundary before its handler can execute.
+        recovery.scheduleRecoveryTransaction { _ in await gate.wait() }
+        let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: recovery, now: { clock.now() })
+        await watchdog.arm(activationEpoch: 1, hasObservedProgress: true)
+        await watchdog.recordMediaProgress(mediaTimeSeconds: 10)
+        clock.advance(by: 3)
+        let triggered = await watchdog.pollAndEvaluate(currentTimeSeconds: 10, isPlaying: true)
+        XCTAssertTrue(triggered)
+        await watchdog.disarm()
+        gate.open()
+        await recovery.waitForCurrentRecovery()
+        XCTAssertTrue(calls.reasons.isEmpty,
+            "A queued observation cannot restart output after pause, end, or replacement revoked it")
+    }
+
+    func testHLSWatchdogContinuousProgressBeyondSixtyFiveSecondsThenStall() async {
+        let recovery = PlaybackRecoveryCoordinator()
+        let clock = TestClock()
+        let calls = WatchdogRecoveryRecorder()
+        recovery.setWatchdogRecoveryHandler { reason, _ in calls.record(reason) }
+        let watchdog = HLSPlaybackWatchdog(recoveryCoordinator: recovery, now: { clock.now() })
+        await watchdog.arm(activationEpoch: 1, hasObservedProgress: true)
+        await watchdog.recordMediaProgress(mediaTimeSeconds: 0)
+        for sample in 1...140 {
+            clock.advance(by: 0.5)
+            let triggered = await watchdog.pollAndEvaluate(
+                currentTimeSeconds: Double(sample) * 0.5, isPlaying: true)
+            XCTAssertFalse(triggered, "Healthy live progress must not exhaust a duration-based budget")
+        }
+        clock.advance(by: 2.5)
+        let early = await watchdog.pollAndEvaluate(currentTimeSeconds: 70, isPlaying: true)
+        XCTAssertFalse(early)
+        clock.advance(by: 0.5)
+        let due = await watchdog.pollAndEvaluate(currentTimeSeconds: 70, isPlaying: true)
+        XCTAssertTrue(due, "A real stall remains bounded to three seconds after prolonged live playback")
+        await recovery.waitForCurrentRecovery()
+        XCTAssertEqual(calls.reasons, [.playbackStalled])
+    }
 
     func testBackendMetricsAreTypedAndDoNotSynthesizeFakeSampleBufferCounters() throws {
         // HLS Metrics Snapshot
@@ -246,5 +352,40 @@ final class BackendDiagnosticsTests: XCTestCase {
         XCTAssertFalse(triggered)
         let reason = await watchdog.lastTriggerReason
         XCTAssertNil(reason)
+    }
+}
+
+private final class WatchdogRecoveryRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [HLSPlaybackWatchdog.TriggerReason] = []
+    var reasons: [HLSPlaybackWatchdog.TriggerReason] { lock.withLock { values } }
+    func record(_ reason: HLSPlaybackWatchdog.TriggerReason) {
+        lock.withLock { values.append(reason) }
+    }
+}
+
+private final class WatchdogRecoveryGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var opened = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { pending in
+            let resume = lock.withLock {
+                if opened { return true }
+                continuation = pending
+                return false
+            }
+            if resume { pending.resume() }
+        }
+    }
+
+    func open() {
+        let pending = lock.withLock {
+            opened = true
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume()
     }
 }

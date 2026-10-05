@@ -89,7 +89,22 @@ jobs:
             -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testLiveLongGOPPendingSegmentPublishesWithoutAnotherCallback \
             -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testLivePublicationCommitUsesTheLoopbackMonotonicTimeDomain \
             -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously \
-            -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute
+            -only-testing:VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testCanceledHeldPrefixCannotInstallAndJoinsProducerRetirement \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testQueuedStatusAfterOwnedPauseRevocationCannotInvalidateResumableItem \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testObservedStallsReprepareRealHLSBackendAndExhaustRequestBudget \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testOriginalQueuedProgressDeliveryCannotAdoptActualRouteReplacement \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testInitiallyInvalidCurrentItemClockKeepsPollingUntilProgressThenStall \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testInvalidCurrentItemClockAfterProgressTriggersOnceWithoutTimerSpin \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testForeignPhysicalItemCancelsProgressWithoutAdoptingReplacementClock \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRegistryDeadlineDetectsWaitingOnlyAfterActualMediaClockAdvance \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testQueuedProgressDeadlineCannotRecoverCanceledActivation \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testPendingNaturalEndCancelsProgressPollingWithoutReplacement \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testHLSWatchdogRecoveryBudgetSurvivesFreshPrepareAndActivation \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testRepeatedHLSRouteReplacementReclaimsDestroyedRelayChildren \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testHLSWatchdogRecoveryRetainsCurrentRelayAndRejectsOldPrepareFailure \
+            -only-testing:VPlayerTests/PlaybackControllerTests/testHLSAutomaticReplacementAuthorityWithRealRelayRepreparesAndReactivates \
+            -only-testing:VPlayerTests/BackendDiagnosticsTests
       - name: Report bounded exact-head failures
         if: ${{ always() }}
         timeout-minutes: 3

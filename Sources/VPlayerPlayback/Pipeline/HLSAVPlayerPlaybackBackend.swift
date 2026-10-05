@@ -167,7 +167,9 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 return
             } catch let failure as HLSPrepareAttemptFailure {
                 completedAttemptCount += 1
-                if HLSPrepareRetryPolicy.shouldRetry(
+                if !Task.isCancelled, invocation.revalidateCurrentPreparation(),
+                   !(failure.underlying is CancellationError),
+                   HLSPrepareRetryPolicy.shouldRetry(
                     completedAttemptCount: completedAttemptCount,
                     maximumAttemptCount: maximumAttemptCount,
                     producerRetirementConfirmed: failure.producerRetirementConfirmed,
@@ -202,12 +204,13 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             return true
         }
         guard installedPreparing else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
-        var playerInstallationAttempted = false
         do {
+            try validatePreparation(invocation)
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("hls_prepareProducer")
             #endif
             try await next.prepareProducer()
+            try validatePreparation(invocation)
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("hls_producerPrepared")
             #endif
@@ -219,23 +222,27 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             PlaybackDiagnosticTracker.shared.set("hls_coordFactory")
             #endif
             let createdCoordinator = try await coordinatorFactory(next.replacement)
+            try validatePreparation(invocation)
             #if DEBUG
             PlaybackDiagnosticTracker.shared.append("hls_coordInstall")
             #endif
             // 从这一刻起即使 install 抛错，也不能再用 producer-only 凭据证明
             // AVPlayer 已清理；后续必须走 coordinator 的物理停止路径。
             let cache = await createdCoordinator.logSnapshotCache
-            lock.withLock {
-                precondition(preparingBundle === next, "preparing bundle owner 不匹配")
-                coordinator = createdCoordinator
-                bundle = next
-                preparingBundle = nil
-                latestReceipt = nil
-                logSnapshotCache = cache
-            }
-            playerInstallationAttempted = true
+            try validatePreparation(invocation)
             do {
                 try await MainActor.run {
+                    try self.validatePreparation(invocation)
+                    // This same synchronous stack commits ownership immediately
+                    // before installation; a canceled actor hop owns only producer cleanup.
+                    self.lock.withLock {
+                        precondition(self.preparingBundle === next, "preparing bundle owner 不匹配")
+                        self.coordinator = createdCoordinator
+                        self.bundle = next
+                        self.preparingBundle = nil
+                        self.latestReceipt = nil
+                        self.logSnapshotCache = cache
+                    }
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("hls_c_inst_pre")
                     #endif
@@ -263,7 +270,9 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             PlaybackDiagnosticTracker.shared.append("hls_prepCurrentItem")
             #endif
             do {
+                try validatePreparation(invocation)
                 _ = try await createdCoordinator.prepareCurrentItem(invocation: invocation)
+                try validatePreparation(invocation)
             } catch {
                 #if DEBUG
                 PlaybackDiagnosticTracker.shared.append("hls_prep_err_\(error)")
@@ -279,6 +288,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             PlaybackDiagnosticTracker.shared.append("hls_catch_\(error)")
             #endif
             let producerRetirementConfirmed = await next.retireProducerGraph()
+            let playerInstallationAttempted = lock.withLock { bundle === next }
             lock.withLock {
                 // After installation begins, only the signed suspend receipt and
                 // physical coordinator cleanup may release these owners.
@@ -291,6 +301,14 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 producerRetirementConfirmed: producerRetirementConfirmed,
                 playerInstallationAttempted: playerInstallationAttempted)
         }
+    }
+
+    private func validatePreparation(_ invocation: ControlTaskRegistry.BackendPrepareInvocation) throws {
+        try Task.checkCancellation()
+        guard invocation.outputLifecycleEpoch.backendIdentity == identity else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        guard invocation.revalidateCurrentPreparation() else { throw CancellationError() }
     }
 
     private func makeNextBundle(
@@ -339,19 +357,22 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             throw AVPlayerItemCoordinatorFailure.operationInFlight
         }
         do {
+            try validatePreparation(invocation)
             try await next.prepareProducer()
+            try validatePreparation(invocation)
             guard next.replacement.request.item.outputLifecycleEpoch
                     == invocation.outputLifecycleEpoch,
                   invocation.outputLifecycleEpoch.backendIdentity == identity else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
-            lock.withLock {
-                precondition(preparingBundle === next, "replacement bundle owner 不匹配")
-                bundle = next
-                preparingBundle = nil
-                latestReceipt = nil
-            }
             try await MainActor.run {
+                try self.validatePreparation(invocation)
+                self.lock.withLock {
+                    precondition(self.preparingBundle === next, "replacement bundle owner 不匹配")
+                    self.bundle = next
+                    self.preparingBundle = nil
+                    self.latestReceipt = nil
+                }
                 try coordinator.installReplacement(
                     next.replacement,
                     invocation: invocation
@@ -359,7 +380,9 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 try coordinator.bindRuntimeFailureRelay(next.runtimeFailureRelay,
                     invocation: invocation)
             }
+            try validatePreparation(invocation)
             _ = try await coordinator.prepareCurrentItem(invocation: invocation)
+            try validatePreparation(invocation)
             next.armRuntimeFailure()
         } catch {
             let producerRetirementConfirmed = await next.retireProducerGraph()
@@ -375,6 +398,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 playerInstallationAttempted: playerInstallationAttempted)
             throw next.preservingFirstPreparationFailure(error)
         }
+    }
+
+    func requestWatchdogRecovery(activation: ActivationEpoch) async -> Bool {
+        guard let coordinator = lock.withLock({ self.coordinator }) else { return false }
+        return await coordinator.requestWatchdogRecovery(activation: activation)
     }
 
     func activateOutput(
