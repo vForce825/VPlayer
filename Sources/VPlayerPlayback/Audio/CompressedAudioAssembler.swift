@@ -16,6 +16,7 @@ final class CompressedAudioSourceStream: @unchecked Sendable {
     private var drained = false
     private var lastFrameID: UInt64?
     private var rendition: UUID?
+    private var hasClaimedInput = false
 
     fileprivate static func make(_ copies: HLSAudioCopyOwnership) throws -> CompressedAudioSourceStream {
         guard let lease = copies.compressedInput.acquire(bytes: 2_048) else {
@@ -49,6 +50,20 @@ final class CompressedAudioSourceStream: @unchecked Sendable {
     }
     func acceptsRendition(_ identity: UUID) -> Bool {
         lock.withLock { valid && rendition == identity }
+    }
+    fileprivate func claimInput(for identity: UUID) -> Bool {
+        lock.withLock {
+            guard valid, rendition == identity else { return false }
+            hasClaimedInput = true
+            return true
+        }
+    }
+    func abandonBeforeClaim() -> Bool {
+        lock.withLock {
+            guard !hasClaimedInput else { return false }
+            valid = false
+            return true
+        }
     }
 }
 
@@ -100,7 +115,7 @@ final class CompressedAudioSourceProof: @unchecked Sendable {
     /// reset a consumed source AU or let it enter a second native writer.
     func claim(for rendition: UUID) -> Bool {
         claimLock.withLock {
-            guard !claimed, stream.acceptsRendition(rendition) else { return false }
+            guard !claimed, stream.claimInput(for: rendition) else { return false }
             claimed = true
             return true
         }
@@ -120,6 +135,7 @@ final class CompressedAudioAssembler {
     private let profile: any CompressedAudioCodecProfile
     private let hlsCopyOwnership: HLSAudioCopyOwnership?
     let sourceStream: CompressedAudioSourceStream?
+    private var sourceAACProofEnabled = true
     private var framer: (any CompressedAudioFramingStrategy)?
     private var nextID: UInt64?
     private var systemFormat: SystemCompressedAudioFormat?
@@ -150,7 +166,8 @@ final class CompressedAudioAssembler {
         self.formatState = formatState
         self.binding = binding
         self.hlsCopyOwnership = hlsCopyOwnership
-        sourceStream = try hlsCopyOwnership.map(CompressedAudioSourceStream.make)
+        sourceStream = descriptor.codec == .aac
+            ? try hlsCopyOwnership.map(CompressedAudioSourceStream.make) : nil
         nextID = startingID
         try configureProfileAndFramer()
     }
@@ -158,6 +175,13 @@ final class CompressedAudioAssembler {
     deinit {
         sourceStream?.abandonUnlessDrained()
         framer?.destroy()
+    }
+
+    /// Before any native/source claim, fallback keeps this exact framer and its
+    /// partial AU carry. Existing queued frame aliases keep their paid backing.
+    func useCompatibleAudioBeforeSourceAppend() throws {
+        guard sourceStream?.abandonBeforeClaim() ?? true else { throw SourceAACFailure.sourceAlreadyConsumed }
+        sourceAACProofEnabled = false
     }
 
     func push(_ packet: DemuxPacket) throws {
@@ -307,7 +331,7 @@ final class CompressedAudioAssembler {
             guard duration.isNumeric, CMTimeCompare(duration, .zero) > 0 else {
                 throw Self.validationError()
             }
-            if inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
+            if sourceAACProofEnabled, inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
                let hlsCopyOwnership, let sourceStream {
                 guard let ownedPayload = payloadTail ?? framed.hlsCopyTail,
                       let proofLease = hlsCopyOwnership.compressedInput.acquire(bytes: 2_048) else {

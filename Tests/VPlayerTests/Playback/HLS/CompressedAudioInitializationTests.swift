@@ -41,6 +41,30 @@ final class CompressedAudioInitializationTests: XCTestCase {
             XCTAssertNil(absent.channelLayout, "Missing layout is not inferred by parser")
         }
     }
+    func testDolbyValidationUsesEmittedLayoutAndConfigurationForBothCodecs() throws {
+        let ac3 = try AC3CompressedAudioConfiguration(inspection: .init(frameSize: 1_536,
+            sampleRate: 48_000, sampleCount: 1_536, channelCount: 6,
+            fscod: 0, bsid: 8, bsmod: 0, acmod: 7, lfeon: true, frmsizecod: 20))
+        let eac3 = try EAC3CompressedAudioConfiguration(sampleRate: 48_000, bsid: 16,
+            bsmod: 0, audioCodingMode: 7, hasLFE: true, asvc: false, maximumDataRateKbps: 6_144)
+        for config: CompressedAudioFormatConfiguration in [.ac3(ac3), .eac3(eac3)] {
+            let entry = config.codec == .ac3 ? "ac-3" : "ec-3"
+            for mask: UInt64 in [0x3F, 0x60F] {
+                let source = AudioChannelLayout(channelCount: 6, nativeMask: mask)
+                let bytes = Self.initialization(entry: entry, children: config.serializedBox + Self.channel(bitmap: UInt32(mask)))
+                let evidence = try DolbyWriterInitializationEvidence.validate(bytes, configuration: config, sourceLayout: source)
+                XCTAssertEqual(evidence.channelPositions, UInt32(mask))
+                XCTAssertThrowsError(try DolbyWriterInitializationEvidence.validate(
+                    Self.initialization(entry: entry, children: config.serializedBox),
+                    configuration: config, sourceLayout: source)) { error in
+                    XCTAssertEqual(error as? CompressedAudioInitializationRejection, .invalidConfiguration)
+                }
+                XCTAssertThrowsError(try DolbyWriterInitializationEvidence.validate(bytes,
+                    configuration: config, sourceLayout: .init(channelCount: 6, nativeMask: mask == 0x3F ? 0x60F : 0x3F)))
+            }
+        }
+    }
+
     func testWrongAACDescriptorDoesNotBecomeSourceConfigurationEvidence() throws {
         let cookie = try AudioSpecificConfig.parse(Data([0x11, 0x90])).coreAudioMagicCookie
         var wrongObjectType = cookie

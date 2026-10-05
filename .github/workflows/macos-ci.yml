@@ -316,6 +316,9 @@ jobs:
           python3 Scripts/Tests/test_hls_generation_readback.py
           python3 Scripts/Tests/test_hls_fixture_provisioning.py
           python3 Scripts/Tests/test_hls_fixture_preparation.py
+          python3 Scripts/Tests/test_source_fixture_padding.py
+          python3 Scripts/Tests/test_he_aac_fixture_observation.py
+          python3 Scripts/Tests/test_source_fixture_manifest.py
 
   fixture-validation:
     name: Strict HTTP playback and 900-second 4K timeline

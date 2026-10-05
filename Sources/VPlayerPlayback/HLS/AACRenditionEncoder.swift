@@ -155,12 +155,22 @@ final class AACLiveEncodingContext: @unchecked Sendable {
     let calibratedLeadingFrames: Int
     private let lock = NSLock()
     private var writerBinding: FMP4WriterBinding?
+    private let writerPacketPool: AACCalibrationWorkspace.ReusablePacketReservation?
+    private let writerBoundaryProfile: AACWriterBoundaryProfile?
+    var hasNextWriterBoundaryHeadroom: Bool {
+        guard let writerPacketPool, let writerBoundaryProfile, !writerPacketPool.isDraining else { return true }
+        return writerPacketPool.nextBoundaryCapacity >= writerBoundaryProfile.packetReservationBytes
+    }
 
     init(encoderIdentity: AACEncoderIdentity, format: CMFormatDescription,
-         calibratedLeadingFrames: Int) {
+         calibratedLeadingFrames: Int,
+         writerPacketPool: AACCalibrationWorkspace.ReusablePacketReservation? = nil,
+         writerBoundaryProfile: AACWriterBoundaryProfile? = nil) {
         self.encoderIdentity = encoderIdentity
         formatIdentity = ObjectIdentifier(format)
         self.calibratedLeadingFrames = calibratedLeadingFrames
+        self.writerPacketPool = writerPacketPool
+        self.writerBoundaryProfile = writerBoundaryProfile
     }
 
     func bind(to binding: FMP4WriterBinding) -> Bool {
@@ -331,24 +341,15 @@ final class AACIncrementalEmission: @unchecked Sendable {
         return total.partialValue
     }
 
+    func markWriterAccepted() { frozenLease.markWriterAccepted() }
+
     func materializeSampleBuffer() throws -> CMSampleBuffer {
-        var block: CMBlockBuffer?
-        try AACRenditionEncoder.check(CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: payload.length,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: payload.length,
-            flags: 0,
-            blockBufferOut: &block))
-        guard let block else { throw AACRenditionFailure.invalidInput }
-        try AACRenditionEncoder.check(CMBlockBufferReplaceDataBytes(
-            with: payload.bytes,
-            blockBuffer: block,
-            offsetIntoDestination: 0,
-            dataLength: payload.length))
+        let lifetime = WriterInputLifetime { [packetLease, formatLease, frozenLease] in
+            withExtendedLifetime((packetLease, formatLease, frozenLease)) {}
+        }
+        let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(length: payload.length, lifetime: lifetime)
+        try AACRenditionEncoder.check(CMBlockBufferReplaceDataBytes(with: payload.bytes,
+            blockBuffer: block, offsetIntoDestination: 0, dataLength: payload.length))
         var buffer: CMSampleBuffer?
         try AACRenditionEncoder.check(
             CMAudioSampleBufferCreateReadyWithPacketDescriptions(
@@ -598,6 +599,19 @@ final class AACRenditionEncoder: @unchecked Sendable {
         }
     }
     func markVisible() { presentationTerminal.markVisible() }
+    private var writerMaximumBoundarySeconds: Int?
+    private var writerAdmissionSnapshotStorage: AACWriterAdmissionSnapshot?
+    var writerAdmissionSnapshot: AACWriterAdmissionSnapshot? { stateLock.withLock { writerAdmissionSnapshotStorage } }
+    func configureWriterBoundary(maximumDuration: CMTime) -> Bool {
+        let seconds = CMTimeGetSeconds(maximumDuration)
+        guard seconds.isFinite, seconds > 0, seconds <= 6 else { return false }
+        return stateLock.withLock {
+            guard stream == nil, !liveRunning else { return false }
+            writerMaximumBoundarySeconds = Int(ceil(seconds))
+            return true
+        }
+    }
+
     private final class StreamState {
         let sourceLease: AACCalibrationWorkspace.Lease
         let packetLease: AACCalibrationWorkspace.Lease
@@ -608,6 +622,8 @@ final class AACRenditionEncoder: @unchecked Sendable {
         let frozen: AACFinalizedPassSignature
         let liveContext: AACLiveEncodingContext
         let maximumPacket: UInt32
+        let writerPacketPool: AACCalibrationWorkspace.ReusablePacketReservation?
+        let writerBoundaryProfile: AACWriterBoundaryProfile?
         let tailCount: Int
         var pending: [Packet] = []
         var output: [UInt8]
@@ -619,6 +635,19 @@ final class AACRenditionEncoder: @unchecked Sendable {
         init(encoder: AACRenditionEncoder, frozen: AACFinalizedPassSignature, maximumPacket: UInt32) throws {
             sourceLease = try encoder.workspace.acquire(.sourcePCM, bytes: 262_144)
             packetLease = try encoder.workspace.acquire(.aacPackets, bytes: 131_072)
+            if let seconds = encoder.writerMaximumBoundarySeconds {
+                let profile = try AACWriterBoundaryProfile(maximumBoundarySeconds: seconds,
+                    maximumNativePacketBytes: Int(maximumPacket))
+                let poolBytes = AACCalibrationWorkspace.aacPacketCapacity / encoder.identity.plan.entries.count - 131_072
+                encoder.stateLock.withLock {
+                    encoder.writerAdmissionSnapshotStorage = .init(maximumNativePacketBytes: Int(maximumPacket),
+                        maximumBoundarySeconds: seconds, nextBoundaryInputCount: profile.nextBoundaryInputCount,
+                        nextBoundaryPacketBytes: profile.packetReservationBytes, reservedPacketBytes: poolBytes)
+                }
+                guard profile.packetReservationBytes <= poolBytes else { throw AACRenditionFailure.capacityExceeded }
+                writerPacketPool = try encoder.workspace.reserveReusablePackets(bytes: poolBytes)
+                writerBoundaryProfile = profile
+            } else { writerPacketPool = nil; writerBoundaryProfile = nil }
             formatLease = try encoder.workspace.acquire(.nonPayload, bytes: 8_192 + frozen.finalizedCookie.count + frozen.actualLayout.count)
             format = try encoder.makeFormat(asbd: frozen.actualASBD, cookie: frozen.finalizedCookie)
             bandwidth = try AACPayloadBandwidthWindow(configuredBitrate: encoder.identity.request.bitrate, workspace: encoder.workspace)
@@ -627,7 +656,8 @@ final class AACRenditionEncoder: @unchecked Sendable {
             liveContext = AACLiveEncodingContext(
                 encoderIdentity: encoder.identity,
                 format: format,
-                calibratedLeadingFrames: encoder.leadingSampleCount)
+                calibratedLeadingFrames: encoder.leadingSampleCount,
+                writerPacketPool: writerPacketPool, writerBoundaryProfile: writerBoundaryProfile)
             tailCount = Int((Int64(encoder.leadingSampleCount) + Int64(frozen.trailingPrimeFrames) + 1_023) / 1_024) + 2
             guard tailCount < 32, maximumPacket > 0, maximumPacket <= 65_536 else { throw AACRenditionFailure.capacityExceeded }
             pending.reserveCapacity(64)
@@ -682,10 +712,13 @@ final class AACRenditionEncoder: @unchecked Sendable {
             }
             let reservation: AACCalibrationWorkspace.Reservation
             do {
-                reservation = try workspace.reserveAvailable(
-                    .aacPackets,
-                    preferredBytes: Self.maximumSignedPumpAllocationBytes,
-                    minimumBytes: firstFillCharge.partialValue)
+                if let pool = state.writerPacketPool {
+                    reservation = try pool.reserveAvailable(preferredBytes: Self.maximumSignedPumpAllocationBytes,
+                        minimumBytes: firstFillCharge.partialValue)
+                } else {
+                    reservation = try workspace.reserveAvailable(.aacPackets,
+                        preferredBytes: Self.maximumSignedPumpAllocationBytes, minimumBytes: firstFillCharge.partialValue)
+                }
             } catch AACRenditionFailure.capacityExceeded {
                 // 尚未接受输入、尚未 Fill；既有 writer ownership 退休后可由调用方
                 // 原样重试，不能把暂时余额不足升级为 encoder 终态。
@@ -785,6 +818,7 @@ final class AACRenditionEncoder: @unchecked Sendable {
                         packetCount: state.pending.count).addingReportingOverflow(1_024)
                     guard !finalCharge.overflow else { throw AACRenditionFailure.capacityExceeded }
                     try reservation.reduceUnclaimed(to: finalCharge.partialValue)
+                    state.writerPacketPool?.retireUnusedCapacity()
                     let final = Pass(identity: identity, packets: state.pending, cookieBacking: try cookie(at: .finalDrain),
                         format: try actualFormat(), packetLease: state.packetLease, bandwidth: state.bandwidth.evidence)
                     try validateLiveFinal(final)
@@ -1219,11 +1253,10 @@ final class AACRenditionEncoder: @unchecked Sendable {
         var q = 0
         for (index, range) in groups.enumerated() {
             let packetBytes = range.reduce(0) { $0 + pass.packets[$1].data.count }
-            var block: CMBlockBuffer?
-            try Self.check(CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
-                blockLength: packetBytes, blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
-                offsetToData: 0, dataLength: packetBytes, flags: 0, blockBufferOut: &block))
-            guard let block else { throw AACRenditionFailure.calibrationMismatch }
+            let lifetime = WriterInputLifetime { [packetLease = pass.packetLease, formatLease] in
+                withExtendedLifetime((packetLease, formatLease)) {}
+            }
+            let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(length: packetBytes, lifetime: lifetime)
             var descriptions: [AudioStreamPacketDescription] = []; var offset = 0; var frames = 0
             for packetIndex in range {
                 let packet = pass.packets[packetIndex]

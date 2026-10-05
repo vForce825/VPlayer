@@ -201,8 +201,14 @@ struct CompressedAudioAccessUnit: @unchecked Sendable {
     }
 
     @discardableResult
-    func confirmWriterTerminal(using coordinator: AudioServiceSemanticCoordinator) -> Int {
+    func confirmWriterInputLastUse(using coordinator: AudioServiceSemanticCoordinator) -> Int {
         coordinator.finishCompressedAudioWriterSubmission(writerSubmission)
+    }
+
+    /// Compatibility spelling for the exact single-AU last-use completion only.
+    @discardableResult
+    func confirmWriterTerminal(using coordinator: AudioServiceSemanticCoordinator) -> Int {
+        confirmWriterInputLastUse(using: coordinator)
     }
 
     static func direct(

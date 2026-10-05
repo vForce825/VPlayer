@@ -814,6 +814,13 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(audio.ranges.first?.start, Task19.time(96_256, 48_000))
         XCTAssertEqual(audio.ranges.last?.end, Task19.time(384_000, 48_000))
         try Task19FormalBoundaryChecks.checkAccumulatingDrift()
+        for track in h.tracks.values {
+            let usage = track.sink.formalWriterProbe.snapshot
+            XCTAssertEqual(usage.nativeWriterCount, 1)
+            XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+            XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+            XCTAssertTrue(usage.isComplete)
+        }
     }
 
     func testReviewI5AudioCandidatesUseUniqueItemBundlesAndRejectTicketReplay() async throws {
@@ -1279,6 +1286,17 @@ final class HLSPublisherTests: XCTestCase {
             XCTAssertLessThanOrEqual(h.store.usage.tombstoneCount, 192)
             XCTAssertLessThanOrEqual(h.store.usage.snapshotCount, 9)
             XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 28)
+            for track in h.tracks.values {
+                let usage = track.sink.formalWriterProbe.snapshot
+                XCTAssertEqual(usage.nativeWriterCount, 1, "long publication uses one actual native writer per rendition")
+                XCTAssertEqual(usage.hardInputCount, track.mediaType == .video ? 1_024 : 640)
+                XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+                XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+                XCTAssertLessThanOrEqual(usage.evidenceCount, usage.hardEvidenceCount)
+                XCTAssertLessThanOrEqual(usage.pendingCallbacks, usage.hardCallbackCount)
+                XCTAssertEqual(usage.acceptedInputCount - usage.releasedInputCount, UInt64(usage.liveInputCount))
+                XCTAssertTrue(usage.isComplete)
+            }
         }
         let coverage = try XCTUnwrap(h.publisher.visible?.coverage)
         XCTAssertEqual(coverage.logicalSequences, Array(96...101))
@@ -1564,6 +1582,7 @@ final class Task19Track: @unchecked Sendable {
 }
 
 final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendable {
+    let formalWriterProbe = HLSWriterAcceptanceProbe()
     let binding: FMP4WriterBinding
     weak var relay: SegmentReportRelay?
     private let lock = NSCondition()
@@ -1685,12 +1704,13 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
                        continuing previous: SegmentedFMP4Writer?, terminalSegment: Bool = false,
                        formatVariant: Task19.FormatVariant = .baseline) async throws -> SegmentedFMP4Writer {
         let relay = try XCTUnwrap(relay)
-        // 本层长播放测试冻结为最多128个逻辑段；不在每段偷偷重建同身份实例。
-        // Task17 的 rollover 算法另由小容量最小回归覆盖；生产标准256/384保持不变。
+        // Use the genuine persistent per-kind live-input policy. The real native
+        // writer controls backing release across flush; this fixture neither raises
+        // cumulative caps nor substitutes callbacks for final native alias release.
         let writer = try previous ?? SegmentedFMP4Writer(binding: binding, trackKind: mediaType == .video ? .video : .aac,
             sourceFormatHint: format, boundarySession: boundary.session, compressedFormatConfiguration: nil,
-            ownershipLimits: .init(rolloverThreshold: 6_144, hardCapacity: 6_145),
-            relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
+            relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: formalWriterProbe),
+            acceptanceProbe: formalWriterProbe)
         if previous == nil { try writer.start(at: start.cmTime) }
         if mediaType == .video {
             let count = Int(CMTimeConvertScale(duration.cmTime, timescale: 24, method: .default).value)

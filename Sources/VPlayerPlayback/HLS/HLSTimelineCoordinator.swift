@@ -466,6 +466,19 @@ final class HLSTimelineCoordinator {
 
     deinit { sourceAudioStream?.invalidate() }
 
+    func useCompatibleAudioBeforeSourceAppend() throws {
+        if let sharedControlExecutor {
+            try sharedControlExecutor.sync { try useCompatibleAudioBeforeSourceAppendIsolated() }
+        } else { try useCompatibleAudioBeforeSourceAppendIsolated() }
+    }
+    private func useCompatibleAudioBeforeSourceAppendIsolated() throws {
+        if let assembler = state?.audioAssembler {
+            try assembler.useCompatibleAudioBeforeSourceAppend()
+        } else if sourceAudioStream?.abandonBeforeClaim() == false {
+            throw SourceAACFailure.sourceAlreadyConsumed
+        }
+    }
+
     /// Joins graph retirement without releasing any independently retained AU tail.
     func retireCompressedGeneration() {
         if let sharedControlExecutor {

@@ -190,8 +190,10 @@ final class HLSVideoRemuxSubmission: @unchecked Sendable {
                     throw HLSVideoRemuxSubmissionFailure.writerAttemptMismatch
                 }
             } else {
-                guard binding == writerBinding,
-                      previous == writerBinding else {
+                // `previous` is set only by an already-authorized exact attempt's
+                // abort. Retry on that same writer needs no second migration claim;
+                // moving to any other binding still requires a fresh continuation.
+                guard binding == previous else {
                     throw HLSVideoRemuxSubmissionFailure.writerAttemptMismatch
                 }
             }
@@ -259,7 +261,10 @@ final class HLSVideoRemuxSubmission: @unchecked Sendable {
                 presentationTimeStamp: presentationTimeStamp,
                 decodeTimeStamp: decodeTimeStamp,
                 duration: duration,
-                isIDR: isIDR
+                isIDR: isIDR,
+                lifetime: WriterInputLifetime { [outputLease, formatAuthority] in
+                    withExtendedLifetime((outputLease, formatAuthority)) {}
+                }
             )
         }
     }
@@ -282,27 +287,10 @@ final class HLSVideoRemuxSubmission: @unchecked Sendable {
         presentationTimeStamp: ExactMediaTime,
         decodeTimeStamp: ExactMediaTime?,
         duration: ExactMediaTime,
-        isIDR: Bool
+        isIDR: Bool,
+        lifetime: WriterInputLifetime
     ) throws -> CMSampleBuffer {
-        var block: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil,
-            blockLength: payload.count, blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil, offsetToData: 0,
-            dataLength: payload.count, flags: 0, blockBufferOut: &block
-        )
-        guard status == noErr, let block else {
-            throw HLSVideoRemuxSubmissionFailure.sampleMaterializationFailed(status)
-        }
-        status = payload.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(
-                with: $0.baseAddress!, blockBuffer: block,
-                offsetIntoDestination: 0, dataLength: payload.count
-            )
-        }
-        guard status == noErr else {
-            throw HLSVideoRemuxSubmissionFailure.sampleMaterializationFailed(status)
-        }
+        let block = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(copying: payload, lifetime: lifetime)
         var timing = CMSampleTimingInfo(
             duration: duration.cmTime,
             presentationTimeStamp: presentationTimeStamp.cmTime,
@@ -310,7 +298,7 @@ final class HLSVideoRemuxSubmission: @unchecked Sendable {
         )
         var size = payload.count
         var sample: CMSampleBuffer?
-        status = CMSampleBufferCreateReady(
+        let status = CMSampleBufferCreateReady(
             allocator: kCFAllocatorDefault, dataBuffer: block,
             formatDescription: format, sampleCount: 1,
             sampleTimingEntryCount: 1, sampleTimingArray: &timing,

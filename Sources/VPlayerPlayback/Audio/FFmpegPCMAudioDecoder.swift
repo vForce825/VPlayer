@@ -7,6 +7,7 @@ import CoreMedia
 import Foundation
 
 final class HLSAudioCopyOwnership: @unchecked Sendable {
+    private let fixedApplicationCharge: HLSCompressedAudioApplicationReservation?
     enum Phase: Sendable, Equatable { case compressedInput, nativePacket, pcmData, cmBlock, framing }
     struct CopyEvent: Sendable, Equatable { let phase: Phase; let wasChargedBeforeCopy: Bool }
     let compressedInput: HLSDataPlaneAdmission
@@ -22,7 +23,9 @@ final class HLSAudioCopyOwnership: @unchecked Sendable {
     private let observationLock = NSLock()
     private weak var drainObservation: FFmpegDrainCancelOrderingObservation?
     init(maximumCompressedBytes: Int, maximumPCMBytes: Int, capacity: Int,
-         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared) {
+         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
+         fixedApplicationCharge: HLSCompressedAudioApplicationReservation? = nil) {
+        self.fixedApplicationCharge = fixedApplicationCharge
         compressedInput = .init(capacity: capacity, maximumBytes: maximumCompressedBytes, applicationLedger: applicationLedger)
         nativeAllocation = .init(capacity: capacity, maximumBytes: maximumCompressedBytes, applicationLedger: applicationLedger)
         pcmTemporary = .init(capacity: capacity, maximumBytes: maximumPCMBytes, applicationLedger: applicationLedger)

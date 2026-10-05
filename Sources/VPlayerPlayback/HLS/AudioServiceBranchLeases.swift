@@ -13,7 +13,7 @@ enum AudioServiceRegistryCapacity {
     static let compressedWriterInputs = SegmentedFMP4WriterOwnershipLimits.standard.hardCapacity
     static let maximumCompressedConstituents = 6
     /// 16 个尚未转交的 active/decoder tail，加上一个媒体 owner 的 AU 与
-    /// 单个当前物理 writer hard envelope；EAC3 sibling 逐 proof 索引。
+    /// 跨全部物理 writer 的真实存活 input hard envelope；EAC3 sibling 逐 proof 索引。
     static let authoritativeAdmittedProofs = admittedProofs
         + (audioAccessUnits + compressedWriterInputs) * maximumCompressedConstituents
     static let branchGates = 16
@@ -578,7 +578,9 @@ final class AudioServiceLeaseState: @unchecked Sendable {
     private var admittedProofIndex: AudioServiceAdmittedProofIndex?
     var branchGates = AudioServiceFixedReferenceSlots<AudioServiceBranchGateRecord>()
     var issuedBranchLeaseCount = 0
+    /// Cumulative successful claims, never reset by release or rollover.
     var claimedCompressedWriterSubmissionCount = 0
+    var liveCompressedWriterSubmissionCount = 0
     var compressedOutputPlanBinding: CompressedAudioOutputPlanBinding?
     let pcm = PCMConsumerLeaseState()
 
@@ -683,6 +685,17 @@ extension AudioServiceSemanticCoordinator {
 
     var claimedCompressedWriterSubmissionCount: Int {
         withAudioServiceCAS { audioServiceLeaseState.claimedCompressedWriterSubmissionCount }
+    }
+
+    var liveCompressedWriterSubmissionCount: Int {
+        withAudioServiceCAS { audioServiceLeaseState.liveCompressedWriterSubmissionCount }
+    }
+
+    var hasCompressedWriterSubmissionCapacity: Bool {
+        withAudioServiceCAS {
+            audioServiceLeaseState.liveCompressedWriterSubmissionCount
+                < AudioServiceRegistryCapacity.compressedWriterInputs
+        }
     }
 
     var audioServiceRegistryUsage: AudioServiceRegistryUsage {
@@ -1294,6 +1307,9 @@ extension AudioServiceSemanticCoordinator {
                     guard expectedOwner == nil else { return (.identityMismatch, nil) }
                 case let .transferred(owner):
                     guard expectedOwner == owner else { return (.identityMismatch, nil) }
+                    // A claimed compressed AU (including all six EAC3 siblings)
+                    // belongs to its native tail, not an individual lease caller.
+                    guard !located.record.writerClaimed else { return (.invalidTransition, nil) }
                 }
                 releaseRecord(located.record, proof: located.proof, gate: located.participation.gate)
                 let ownership = takeOwnershipForReleaseIfFinished(located.proof)
@@ -1317,7 +1333,9 @@ extension AudioServiceSemanticCoordinator {
                   acceptsCompressedAuthorizationInCurrentCAS(authorization) else { return false }
             let (nextCount, overflow) = audioServiceLeaseState.claimedCompressedWriterSubmissionCount
                 .addingReportingOverflow(1)
-            guard !overflow else { return false }
+            guard !overflow,
+                  audioServiceLeaseState.liveCompressedWriterSubmissionCount
+                    < AudioServiceRegistryCapacity.compressedWriterInputs else { return false }
 
             switch submission.bundleIdentity {
             case let .direct(bundle):
@@ -1347,11 +1365,13 @@ extension AudioServiceSemanticCoordinator {
                 records.forEach { $0.writerClaimed = true }
             }
             audioServiceLeaseState.claimedCompressedWriterSubmissionCount = nextCount
+            audioServiceLeaseState.liveCompressedWriterSubmissionCount += 1
             return true
         }
     }
 
-    /// terminal 只释放已领取 writer 权限且 owner 仍精确匹配的 lease。
+    /// Only the final native input use releases the exact claimed AU as one CAS.
+    /// Physical writer terminal/rollover does not reset the shared live gate.
     func finishCompressedAudioWriterSubmission(_ submission: CompressedAudioWriterSubmission) -> Int {
         let decision: (count: Int, ownerships: [AudioServiceInputUnitOwnership]) = withAudioServiceCAS {
             let expectedOwner: AudioServiceBranchTransferOwnerIdentity
@@ -1381,6 +1401,9 @@ extension AudioServiceSemanticCoordinator {
                 entries.append(located)
             }
 
+            guard !entries.isEmpty else { return (0, []) }
+            precondition(audioServiceLeaseState.liveCompressedWriterSubmissionCount > 0)
+            audioServiceLeaseState.liveCompressedWriterSubmissionCount -= 1
             var ownerships: [AudioServiceInputUnitOwnership] = []
             for entry in entries {
                 releaseRecord(entry.record, proof: entry.proof, gate: entry.participation.gate)

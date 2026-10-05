@@ -914,14 +914,62 @@ struct FMP4CompressedAudioInitialization: Sendable {
     let channelLayout: FMP4AudioChannelLayout?
     let sampleEntryDigest: Data
 }
+/// Parsed metadata only: this object is not a callback seal or a publication
+/// capability. Its last alias retains the exact prepaid parser storage envelope.
+final class SourceAACFragmentInspection: @unchecked Sendable {
+    let writtenRange: FMP4PresentationRange
+    private let commonByteSpans: [Range<Int>]
+    private let samples: [SealedDecodeSampleEntry]
+    private let charge: HLSCompressedAudioApplicationReservation
+    var sampleCount: Int { samples.count }
+    var commonSpanCount: Int { commonByteSpans.count }
+    func sample(at index: Int) -> SealedDecodeSampleEntry? {
+        samples.indices.contains(index) ? samples[index] : nil
+    }
+    func commonSpan(at index: Int) -> Range<Int>? {
+        commonByteSpans.indices.contains(index) ? commonByteSpans[index] : nil
+    }
+    fileprivate init(range: FMP4PresentationRange, common: [Range<Int>], samples: [SealedDecodeSampleEntry],
+                     charge: HLSCompressedAudioApplicationReservation) {
+        writtenRange = range; commonByteSpans = common; self.samples = samples; self.charge = charge
+    }
+}
 enum FMP4CompressedAudioInspection {
     static func initialization(_ data: Data) throws -> FMP4CompressedAudioInitialization {
         guard data.count <= 65_536 else { throw CompletedMediaEvidenceError.capacityExceeded }
         return try data.withUnsafeBytes { try FMP4DecodeMapParser.compressedAudioInitialization(in: $0) }
     }
+
+    static func sourceAACFragment(initialization: Data, media: Data,
+                                  configuration: SourceAACWriterConfiguration,
+                                  expectedDuration: ExactMediaTime,
+                                  applicationLedger: HLSDeliveryApplicationChargeLedger = .shared) throws -> SourceAACFragmentInspection {
+        guard configuration.authority.stream.isCurrent else { throw SourceAACFailure.sourceMismatch }
+        guard media.count <= 8 * 1_024 * 1_024 else { throw CompletedMediaEvidenceError.capacityExceeded }
+        // Two arrays account for decode and presentation ordering; init sample-entry
+        // hashing may copy at most the separately bounded 64 KiB initialization.
+        let storage = 65_536 + 2 * 320 * MemoryLayout<SealedDecodeSampleEntry>.stride + 8_192
+        guard storage <= 131_072 else { throw CompletedMediaEvidenceError.capacityExceeded }
+        let charge = try HLSCompressedAudioApplicationReservation.reserve(bytes: storage, ledger: applicationLedger)
+        _ = try SourceAACInitializationEvidence.validate(initialization, configuration: configuration)
+        let range = try FMP4DecodeMapParser.sourceAudioRange(initialization: initialization,
+            media: media, duration: expectedDuration)
+        let result = try FMP4DecodeMapParser.parse(initialization: initialization, media: media, mediaType: .audio,
+            expectedPresentationRange: range, sampleCountLimit: .sourceAAC)
+        let cadence = ExactMediaTime(value: 1_024, timescale: configuration.sampleRate)
+        guard result.samples.allSatisfy({ $0.presentationRange.duration == cadence }) else {
+            throw CompletedMediaEvidenceError.invalidDecodeMap
+        }
+        return SourceAACFragmentInspection(range: range, common: result.commonByteSpans,
+            samples: result.samples, charge: charge)
+    }
 }
 
 private enum FMP4DecodeMapParser {
+    enum SampleCountLimit: Equatable {
+        case ordinary, sourceAAC
+        var value: Int { self == .ordinary ? 256 : 320 }
+    }
     private struct Box {
         let start: Int
         let payloadStart: Int
@@ -952,7 +1000,8 @@ private enum FMP4DecodeMapParser {
     }
 
     static func parse(initialization: Data, media: Data, mediaType: FinalFMP4MediaType,
-                      expectedPresentationRange: FMP4PresentationRange) throws -> Result {
+                      expectedPresentationRange: FMP4PresentationRange,
+                      sampleCountLimit: SampleCountLimit = .ordinary) throws -> Result {
         try initialization.withUnsafeBytes { initBytes in
             try media.withUnsafeBytes { mediaBytes in
                 let facts = try initializationFacts(in: initBytes, mediaType: mediaType)
@@ -966,7 +1015,7 @@ private enum FMP4DecodeMapParser {
                 let initialDecodeTime = decodeTime
                 var payloadCursor = mdat.payloadStart
                 var samples: [SealedDecodeSampleEntry] = []
-                samples.reserveCapacity(256)
+                samples.reserveCapacity(sampleCountLimit.value)
                 var nearestRandomAccess: UInt16?
                 var childOffset = traf.payloadStart
                 while childOffset < traf.end {
@@ -975,7 +1024,7 @@ private enum FMP4DecodeMapParser {
                         try appendRun(child, moofStart: moof.start, defaults: defaults,
                             facts: facts, bytes: mediaBytes, decodeTime: &decodeTime,
                             payloadCursor: &payloadCursor, nearestRandomAccess: &nearestRandomAccess,
-                            samples: &samples)
+                            samples: &samples, sampleCountLimit: sampleCountLimit)
                     }
                     childOffset = child.end
                 }
@@ -1282,6 +1331,21 @@ private enum FMP4DecodeMapParser {
         return result
     }
 
+    static func sourceAudioRange(initialization: Data, media: Data,
+                                 duration: ExactMediaTime) throws -> FMP4PresentationRange {
+        let scale = try initialization.withUnsafeBytes {
+            try compressedAudioInitialization(in: $0).timescale
+        }
+        return try media.withUnsafeBytes { bytes in
+            let moof = try uniqueBox(0x6d6f6f66, in: 0..<bytes.count, bytes: bytes)
+            let traf = try uniqueBox(0x74726166, in: moof.payload, bytes: bytes)
+            let tfdt = try uniqueBox(0x74666474, in: traf.payload, bytes: bytes)
+            let raw = try baseDecodeTime(tfdt, bytes: bytes)
+            guard let start = Int64(exactly: raw) else { throw CompletedMediaEvidenceError.invalidDecodeMap }
+            return try FMP4PresentationRange(start: ExactMediaTime(value: start, timescale: scale), duration: duration)
+        }
+    }
+
     private static func trackDefaults(_ tfhd: Box, moofStart: Int,
                                       bytes: UnsafeRawBufferPointer) throws -> TrackDefaults {
         try require(tfhd.payloadStart, 8, within: tfhd.end)
@@ -1326,7 +1390,7 @@ private enum FMP4DecodeMapParser {
                                   facts: InitializationFacts, bytes: UnsafeRawBufferPointer,
                                   decodeTime: inout UInt64, payloadCursor: inout Int,
                                   nearestRandomAccess: inout UInt16?,
-                                  samples: inout [SealedDecodeSampleEntry]) throws {
+                                  samples: inout [SealedDecodeSampleEntry], sampleCountLimit: SampleCountLimit) throws {
         try require(run.payloadStart, 8, within: run.end)
         let version = bytes[run.payloadStart]
         let flags = readUInt32(run.payloadStart, bytes: bytes) & 0x00ff_ffff
@@ -1334,7 +1398,7 @@ private enum FMP4DecodeMapParser {
             throw CompletedMediaEvidenceError.invalidDecodeMap
         }
         guard let count = Int(exactly: readUInt32(run.payloadStart + 4, bytes: bytes)),
-              count > 0, samples.count + count <= 256 else {
+              count > 0, count <= sampleCountLimit.value - samples.count else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         var offset = run.payloadStart + 8

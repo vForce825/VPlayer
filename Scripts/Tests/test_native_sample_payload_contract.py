@@ -30,7 +30,9 @@ class NativeSamplePayloadContractTests(unittest.TestCase):
         self.assertNotIn("Data(count:", helper)
 
     def test_validation_checkpoints_are_preserved(self):
-        self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 5)
+        # Five original validation sites plus the two-sided zero-copy wrapper check.
+        self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 7)
+        self.assertIn("NativeSampleFacts.freeze(native) == NativeSampleFacts.freeze(sample)", SOURCE)
         self.assertIn("try validatesSource(facts)", SOURCE)
         self.assertIn("try operation.validatesSource(operation.facts)", SOURCE)
         self.assertIn("try Task.checkCancellation()", SOURCE)

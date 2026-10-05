@@ -143,13 +143,110 @@ final class AACPassthroughTests: XCTestCase {
         XCTAssertFalse(submission.claimForAppend())
     }
 
+    func testSourceAACInitializationChecksExactASCAndPreservesMonoAndMultichannel() throws {
+        for (channels, config, mask) in [(1, 1, UInt64(4)), (6, 6, UInt64(0x3F))] {
+            let asc = Self.asc(frequency: 4, channelConfiguration: config)
+            let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+            _ = try timeline.consume(.tracks(Self.tracks(rate: 44_100, channels: channels, mask: mask, asc: asc)))
+            let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21]), rate: 44_100))))
+            let facts = HLSSourceAudioFacts(codec: .aac, profile: 1, sampleRate: 44_100,
+                channelCount: Int32(channels), channelMask: mask, decoderConfiguration: asc,
+                priming: .notSignaledPreserveTimestamps, service: .independentMain, formatValidated: true)
+            let configuration = try SourceAACWriterConfiguration(first: unit, source: facts, binding: Self.binding())
+            let cookie = try AudioSpecificConfig.parse(asc).coreAudioMagicCookie
+            let bytes = CompressedAudioInitializationTests.initialization(entry: "mp4a",
+                children: CompressedAudioInitializationTests.box("esds", Data(repeating: 0, count: 4) + cookie),
+                timescale: 44_100)
+            XCTAssertEqual(try SourceAACInitializationEvidence.validate(bytes,
+                configuration: configuration).timescale, 44_100)
+            let other = try AudioSpecificConfig.parse(Data([0x11, 0x90])).coreAudioMagicCookie
+            XCTAssertThrowsError(try SourceAACInitializationEvidence.validate(
+                CompressedAudioInitializationTests.initialization(entry: "mp4a",
+                    children: CompressedAudioInitializationTests.box("esds", Data(repeating: 0, count: 4) + other)),
+                configuration: configuration)) { error in
+                XCTAssertEqual(error as? CompressedAudioInitializationRejection, .invalidConfiguration)
+            }
+        }
+    }
+
+    func testSourceAACFragmentInspectionCoversSixSecondAndBoundaryCounts() throws {
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21])))))
+        let configuration = try SourceAACWriterConfiguration(first: unit, source: Self.facts(), binding: Self.binding())
+        let cookie = try AudioSpecificConfig.parse(Data([0x11, 0x90])).coreAudioMagicCookie
+        let initialization = CompressedAudioInitializationTests.initialization(entry: "mp4a",
+            children: CompressedAudioInitializationTests.box("esds", Data(repeating: 0, count: 4) + cookie))
+        for count in [255, 256, 259, 282, 319, 320] {
+            let ledger = HLSDeliveryApplicationChargeLedger()
+            var inspection: SourceAACFragmentInspection? = try FMP4CompressedAudioInspection.sourceAACFragment(
+                initialization: initialization, media: Self.fragment(sampleCount: count), configuration: configuration,
+                expectedDuration: .init(value: Int64(count * 1_024), timescale: 48_000), applicationLedger: ledger)
+            XCTAssertEqual(inspection?.sampleCount, count)
+            XCTAssertEqual(inspection?.sample(at: count - 1)?.decodeOrdinal, UInt16(count - 1))
+            XCTAssertGreaterThan(ledger.chargedBytes, 0)
+            inspection = nil
+            XCTAssertEqual(ledger.chargedBytes, 0)
+        }
+        XCTAssertThrowsError(try FMP4CompressedAudioInspection.sourceAACFragment(initialization: initialization,
+            media: Self.fragment(sampleCount: 321), configuration: configuration,
+            expectedDuration: .init(value: 321 * 1_024, timescale: 48_000)))
+        timeline.retireCompressedGeneration()
+        XCTAssertThrowsError(try FMP4CompressedAudioInspection.sourceAACFragment(initialization: initialization,
+            media: Self.fragment(sampleCount: 47), configuration: configuration,
+            expectedDuration: .init(value: 47 * 1_024, timescale: 48_000)))
+    }
+
+    private static func fragment(sampleCount: Int) -> Data {
+        func u32(_ value: UInt32) -> Data { CompressedAudioInitializationTests.u32(value) }
+        func box(_ type: String, _ data: Data) -> Data { CompressedAudioInitializationTests.box(type, data) }
+        let header = box("tfhd", u32(0x020018) + u32(1) + u32(1_024) + u32(1))
+        let decode = box("tfdt", u32(0x01000000) + u32(0) + u32(0))
+        let sequence = box("mfhd", u32(0) + u32(1))
+        func movie(offset: UInt32) -> Data {
+            box("moof", sequence + box("traf", header + decode + box("trun", u32(1) + u32(UInt32(sampleCount)) + u32(offset))))
+        }
+        return movie(offset: UInt32(movie(offset: 0).count + 8)) + box("mdat", Data(repeating: 0x21, count: sampleCount))
+    }
+
+    func testPreappendCompatibilityFallbackKeepsPartialFramerAndPaidNextAU() throws {
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+        _ = try timeline.consume(.tracks(Self.tracks(asc: Data())))
+        let next = Self.adts(Data([0x22]))
+        let first = try Self.unit(timeline.consume(.packet(Self.packet(Self.adts(Data([0x21])) + Data(next.prefix(5))))))
+        let configuration = try SourceAACWriterConfiguration(first: first, source: Self.facts(), binding: Self.binding())
+        try timeline.useCompatibleAudioBeforeSourceAppend()
+        XCTAssertFalse(configuration.validates(first))
+        let fallback = try Self.unit(timeline.consume(.packet(Self.packet(Data(next.dropFirst(5)), withoutPTS: true))))
+        XCTAssertEqual(fallback.source.payload, Data([0x22]))
+        XCTAssertEqual(fallback.source.id, first.source.id + 1)
+        XCTAssertEqual(fallback.timing.presentationTimeStamp,
+                       try first.timing.presentationTimeStamp.adding(.init(value: 1_024, timescale: 48_000)))
+        XCTAssertNil(fallback.source.sourceProof)
+        XCTAssertNil(fallback.sourceMappingIdentity)
+    }
+
+    func testClaimedSourceCannotBeReclassifiedAsPreappendFallback() throws {
+        let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: Self.copies())
+        _ = try timeline.consume(.tracks(Self.tracks()))
+        let unit = try Self.unit(timeline.consume(.packet(Self.packet(Data([0x21])))))
+        let config = try SourceAACWriterConfiguration(first: unit, source: Self.facts(), binding: Self.binding())
+        let submission = try SourceAACAccessUnit(timed: unit, configuration: config, binding: Self.binding())
+        XCTAssertTrue(submission.claimForAppend())
+        XCTAssertThrowsError(try timeline.useCompatibleAudioBeforeSourceAppend())
+        XCTAssertTrue(config.validates(unit))
+    }
+
     private static func facts(priming: HLSSourceAudioPriming = .notSignaledPreserveTimestamps) -> HLSSourceAudioFacts {
         .init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2, channelMask: 3,
             decoderConfiguration: Data([0x11, 0x90]), priming: priming,
             service: .independentMain, formatValidated: true)
     }
     private static func binding() -> FMP4WriterBinding {
-        .init(outputLifecycleEpoch: .init(rawValue: 1), itemGeneration: .init(rawValue: 2),
+        .init(outputLifecycleEpoch: .init(backendIdentity: .init(
+                sessionIdentity: .init(sessionID: 1,
+                    requestID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!),
+                backendGeneration: 1), outputNonce: 1), itemGeneration: .init(rawValue: 2),
             mediaEpoch: .init(rawValue: 3), publicationParticipantID: .init(rawValue: 4),
             renditionIdentity: .init(rawValue: 5), writerIdentity: .init(rawValue: 6))
     }
