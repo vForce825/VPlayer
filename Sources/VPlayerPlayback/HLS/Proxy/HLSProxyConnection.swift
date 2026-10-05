@@ -96,7 +96,7 @@ final class HLSProxyConnection: @unchecked Sendable {
     func sendBytes(_ bytes: Data) async throws {
         nativeSends.enter(); io.beginSend(bytes.count)
         let count = bytes.count
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
             connection.send(content: bytes, completion: .contentProcessed { [nativeSends, io] error in
                 io.endSend(count); nativeSends.leave()
                 if error != nil { continuation.resume(throwing: HLSSourceError.network) } else { continuation.resume() }

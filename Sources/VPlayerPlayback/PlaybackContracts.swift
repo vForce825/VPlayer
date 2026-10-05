@@ -18,7 +18,7 @@ public struct PlaybackRequest: Identifiable, Equatable, Sendable, CustomStringCo
     public var sourceContext: PlaybackSourceContext { get throws { try contextResult.get() } }
     public var description: String { "PlaybackRequest(id=\(id), transport=redacted)" }
     public var debugDescription: String { description }
-    public var customMirror: Mirror { Mirror(self, children: ["id": id, "transport": "redacted"] as [String: Any]) }
+    public var customMirror: Mirror { Mirror(self, children: ["id": id, "transport": "redacted"]) }
 
     public init(sourceProfileID: UUID, channelID: String, streamURL: URL, title: String, attributes: [String: String] = [:], explicitExpiry: Date? = nil) {
         self.id = UUID()

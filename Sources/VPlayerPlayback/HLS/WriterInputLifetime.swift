@@ -85,7 +85,7 @@ final class WriterInputAdmission: @unchecked Sendable {
                 throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
             }
             let metadata = Self.metadataBytes + (sampleCount - 1) * 256
-            guard let lease = metadataAdmission.acquire(bytes: metadata, applicationBytes: metadata) else {
+            guard let lease = metadataAdmission.acquire(units: 1, bytes: metadata, applicationBytes: metadata) else {
                 throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
             }
             // Payload occupancy is a separate local bound. Its original allocator

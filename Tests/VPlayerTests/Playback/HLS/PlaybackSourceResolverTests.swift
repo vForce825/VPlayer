@@ -8,6 +8,22 @@ import XCTest
 
 @MainActor
 final class PlaybackSourceResolverTests: XCTestCase {
+    func testRequestMirrorContainsOnlyIdentityAndRedactedTransport() throws {
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "synthetic-channel",
+            streamURL: URL(string: "https://example.test/synthetic.m3u8?sig=fixture-token")!,
+            title: "Synthetic title", attributes: ["Authorization": "Bearer fixture-header"])
+        let children = Array(Mirror(reflecting: request).children)
+        XCTAssertEqual(children.count, 2)
+        XCTAssertEqual(children.compactMap(\.label), ["id", "transport"])
+        XCTAssertEqual(children.first { $0.label == "id" }?.value as? UUID, request.id)
+        XCTAssertEqual(children.first { $0.label == "transport" }?.value as? String, "redacted")
+        var diagnostic = ""
+        dump(request, to: &diagnostic)
+        for value in ["example.test", "synthetic-channel", "Synthetic title", "fixture-token", "fixture-header"] {
+            XCTAssertFalse(diagnostic.contains(value))
+        }
+    }
+
     func testScopedHeadersKeepExactOriginAndRedactDiagnostics() throws {
         let context = try sourceContext(attributes: ["HTTP-User-Agent": "fixture", "Authorization": "Bearer secret with spaces", "Cookie": "ignored"])
         XCTAssertEqual(context.headers.fields(for: URL(string: "https://example.test/path")!)["Authorization"], "Bearer secret with spaces")

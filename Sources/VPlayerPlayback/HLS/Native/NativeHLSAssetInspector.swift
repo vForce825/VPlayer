@@ -91,7 +91,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
             // A nil SDK track can be non-audio text. The final expected-audio
             // and expected-video guards still require real selected format proof.
             guard let asset else { continue }
-            let type = try await asset.load(.mediaType)
+            let type: AVMediaType = asset.mediaType
             try validate()
             if type != .video && type != .audio { continue }
             let formats = try await asset.load(.formatDescriptions)
@@ -242,19 +242,19 @@ private struct NativeHLSSelectedVideoAppearance {
             return value
         }
         switch try value(kCMFormatDescriptionExtension_ColorPrimaries) {
-        case kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String: primaries = .bt709
-        case kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String: primaries = .bt2020
+        case (kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String): primaries = .bt709
+        case (kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String): primaries = .bt2020
         default: throw HLSSourceError.unsupportedMedia
         }
         switch try value(kCMFormatDescriptionExtension_TransferFunction) {
-        case kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String: transfer = .bt709; range = .sdr
-        case kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String: transfer = .pq; range = .pq
-        case kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String: transfer = .hlg; range = .hlg
+        case (kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String): transfer = .bt709; range = .sdr
+        case (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String): transfer = .pq; range = .pq
+        case (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String): transfer = .hlg; range = .hlg
         default: throw HLSSourceError.unsupportedMedia
         }
         switch try value(kCMFormatDescriptionExtension_YCbCrMatrix) {
-        case kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String: matrix = .bt709
-        case kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String: matrix = .bt2020Nonconstant
+        case (kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String): matrix = .bt709
+        case (kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String): matrix = .bt2020Nonconstant
         default: throw HLSSourceError.unsupportedMedia
         }
         // Unknown alternate transfer declarations cannot be silently discarded

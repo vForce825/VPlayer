@@ -8,6 +8,22 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class WriterInputLifetimeTests: XCTestCase {
+    func testMultiSampleMetadataStillUsesOnePhysicalInputSlot() throws {
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        let admission = WriterInputAdmission(capacity: 1, maximumBytes: 128, applicationLedger: ledger)
+        let lifetime = try admission.admit(bytes: 128, sampleCount: 64)
+        defer { lifetime.releaseBacking() }
+        XCTAssertEqual(admission.usage.count, 1)
+        XCTAssertEqual(admission.usage.bytes, 128)
+        XCTAssertEqual(ledger.chargedBytes, WriterInputAdmission.metadataBytes + 63 * 256)
+        XCTAssertThrowsError(try admission.admit(bytes: 1))
+        lifetime.releaseBacking()
+        XCTAssertEqual(admission.usage.count, 0)
+        XCTAssertEqual(admission.usage.bytes, 0)
+        XCTAssertEqual(admission.releaseCount, 1)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
     func testLastNativeAliasReleasesInputBudgetExactlyOnce() throws {
         for bytes in [4, 4_033, 8_192, 262_144] {
             let ledger = HLSDeliveryApplicationChargeLedger()
