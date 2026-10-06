@@ -5,6 +5,7 @@
 import AudioToolbox
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import CryptoKit
 import Foundation
 
@@ -522,7 +523,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         }
         return (matching, selectedFixedFrameRate(parameterSets: sets, codec: codec))
     }
-    private static func audioFacts(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws -> (HLSSourceAudioFacts, Data) {
+    static func audioFacts(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws -> (HLSSourceAudioFacts, Data) {
         guard let pointer = CMAudioFormatDescriptionGetStreamBasicDescription(format) else { throw HLSSourceError.incompleteEvidence }
         let asbd = pointer.pointee
         guard asbd.mSampleRate.isFinite, asbd.mSampleRate > 0, asbd.mSampleRate <= 192_000,
@@ -542,35 +543,36 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let cookie = CMAudioFormatDescriptionGetMagicCookie(format, sizeOut: &size)
         guard size >= 0, size <= 64 * 1_024, size == 0 || cookie != nil else { throw HLSSourceError.byteLimit }
         let bytes = cookie.map { Data(bytes: $0, count: size) } ?? Data()
-        let configuration: Data
+        let configurationIdentity: Data
         let matching: HLSSourceAudioFacts?
         if codec == .aac {
-            configuration = try NativeAACDecoderConfiguration.extract(bytes)
-            let aac = try AudioSpecificConfig.parse(configuration)
-            guard aac.kind == .aacLC, aac.outputSampleRate == Int32(asbd.mSampleRate),
-                  aac.outputChannelCount == Int32(asbd.mChannelsPerFrame) else { throw HLSSourceError.unsupportedMedia }
+            let aac = try NativeAACDecoderConfiguration.LCIdentity(configuration: NativeAACDecoderConfiguration.extract(bytes))
+            guard aac.sampleRate == Int32(asbd.mSampleRate), aac.channelCount == Int32(asbd.mChannelsPerFrame),
+                  asbd.mFramesPerPacket == 0 || asbd.mFramesPerPacket == 1_024 else { throw HLSSourceError.unsupportedMedia }
+            configurationIdentity = aac.canonicalBytes
             matching = expected.media.flatMap(\.audio).first {
                 $0.codec == .aac && $0.profile == 1 && $0.formatValidated && $0.service == .independentMain &&
                     $0.sampleRate == Int32(asbd.mSampleRate) && $0.channelCount == Int32(asbd.mChannelsPerFrame) &&
-                    $0.channelMask == UInt64(positions) && $0.decoderConfiguration == configuration
+                    $0.channelMask == UInt64(positions) &&
+                    (try? NativeAACDecoderConfiguration.LCIdentity(configuration: $0.decoderConfiguration)) == aac
             }
         } else {
             let actual = try NativeDolbyAudioConfiguration.parse(cookie: bytes, codec: codec, sampleRate: Int32(asbd.mSampleRate))
             guard actual.channelCount == Int32(asbd.mChannelsPerFrame) else { throw HLSSourceError.unsupportedMedia }
-            configuration = actual.canonicalBox
+            configurationIdentity = actual.canonicalBox
             matching = expected.media.flatMap(\.audio).first { actual.matches($0, observedChannelMask: UInt64(positions)) }
         }
         guard let matching else { throw HLSSourceError.unsupportedMedia }
-        return (matching, Data(SHA256.hash(data: configuration)))
+        return (matching, Data(SHA256.hash(data: configurationIdentity)))
     }
 }
 
 /// Compare the current effective Core Media description, including container
 /// color that need not be present in otherwise unchanged SPS/PPS/VPS bytes.
 private struct NativeHLSSelectedVideoAppearance {
-    let primaries: DemuxColorPrimaries
-    let transfer: DemuxColorTransfer
-    let matrix: DemuxColorMatrix
+    let primaries: String
+    let transfer: String
+    let matrix: String
     let range: HLSVideoRange
     let sampleEntry: String
 
@@ -580,36 +582,19 @@ private struct NativeHLSSelectedVideoAppearance {
             guard let value = raw as? String, value.utf8.count <= 128 else { throw HLSSourceError.unsupportedMedia }
             return value
         }
-        let actualPrimaries: String = try value(kCMFormatDescriptionExtension_ColorPrimaries)
-        let primaries709: String = kCMFormatDescriptionColorPrimaries_ITU_R_709_2 as String
-        let primaries2020: String = kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String
-        if actualPrimaries == primaries709 {
-            primaries = .bt709
-        } else if actualPrimaries == primaries2020 {
-            primaries = .bt2020
-        } else {
-            throw HLSSourceError.unsupportedMedia
-        }
-        let actualTransfer: String = try value(kCMFormatDescriptionExtension_TransferFunction)
-        let transfer709: String = kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String
-        let transferPQ: String = kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String
-        let transferHLG: String = kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String
-        if actualTransfer == transfer709 {
-            transfer = .bt709; range = .sdr
-        } else if actualTransfer == transferPQ {
-            transfer = .pq; range = .pq
-        } else if actualTransfer == transferHLG {
-            transfer = .hlg; range = .hlg
-        } else {
-            throw HLSSourceError.unsupportedMedia
-        }
-        let actualMatrix: String = try value(kCMFormatDescriptionExtension_YCbCrMatrix)
-        let matrix709: String = kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2 as String
-        let matrix2020: String = kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String
-        if actualMatrix == matrix709 {
-            matrix = .bt709
-        } else if actualMatrix == matrix2020 {
-            matrix = .bt2020Nonconstant
+        primaries = try value(kCMFormatDescriptionExtension_ColorPrimaries)
+        transfer = try value(kCMFormatDescriptionExtension_TransferFunction)
+        matrix = try value(kCMFormatDescriptionExtension_YCbCrMatrix)
+        // Core Video may expose equivalent H.273 codes through one string.
+        // Keep that representation local to comparison; never replace the
+        // original source code points or configuration fingerprint.
+        let rec601Transfer = CVTransferFunctionGetStringForIntegerCodePoint(6).map { $0.takeUnretainedValue() as String }
+        if transfer == kCMFormatDescriptionTransferFunction_ITU_R_709_2 as String || transfer == rec601Transfer {
+            range = .sdr
+        } else if transfer == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String {
+            range = .pq
+        } else if transfer == kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String {
+            range = .hlg
         } else {
             throw HLSSourceError.unsupportedMedia
         }
@@ -629,13 +614,14 @@ private struct NativeHLSSelectedVideoAppearance {
         }
     }
     func matches(_ expected: HLSVideoFacts, container: HLSMediaFacts.Container) -> Bool {
-        guard expected.colorPrimaries == primaries, expected.colorTransfer == transfer,
-              expected.colorMatrix == matrix, expected.videoRange == range else { return false }
-        if range == .sdr {
-            guard primaries == .bt709, matrix == .bt709 else { return false }
-        } else {
-            guard primaries == .bt2020, matrix == .bt2020Nonconstant, expected.bitDepth == 10 else { return false }
-        }
+        guard let sourcePrimaries = expected.colorPrimaries, let sourceTransfer = expected.colorTransfer,
+              let sourceMatrix = expected.colorMatrix, expected.videoRange == range,
+              HLSVideoCapability.supportsNativeColor(expected),
+              let mappedPrimaries = CVColorPrimariesGetStringForIntegerCodePoint(Int32(sourcePrimaries.rawValue)),
+              let mappedTransfer = CVTransferFunctionGetStringForIntegerCodePoint(Int32(sourceTransfer.rawValue)),
+              primaries == mappedPrimaries.takeUnretainedValue() as String,
+              transfer == mappedTransfer.takeUnretainedValue() as String,
+              matchesMatrix(sourceMatrix) else { return false }
         if let original = expected.sampleEntry {
             // No silent avc3/avc1 or hev1/hvc1 equivalence: normalized subtypes
             // lacking matching original-entry evidence fail this admission.
@@ -645,11 +631,58 @@ private struct NativeHLSSelectedVideoAppearance {
         // decoding subtype; the full admitted parameter-set digest still matches.
         return container == .mpegTS && expected.codec == .h264 && sampleEntry == "avc1"
     }
+
+    private func matchesMatrix(_ expected: DemuxColorMatrix) -> Bool {
+        func matchesCode(_ code: DemuxColorMatrix) -> Bool {
+            guard let mapped = CVYCbCrMatrixGetStringForIntegerCodePoint(Int32(code.rawValue)) else { return false }
+            return matrix == mapped.takeUnretainedValue() as String
+        }
+        // H.273 Table 4 defines identical coefficients for codes 5 and 6.
+        // Core Video can preserve two labels rather than canonicalizing them.
+        // This comparison runs only after the native color-family guard;
+        // the original source code and fingerprint remain unchanged.
+        if expected.isRec601 { return matchesCode(.bt470BG) || matchesCode(.smpte170M) }
+        return matchesCode(expected)
+    }
 }
 
 /// A bounded public AAC cookie may be raw ASC or an ES descriptor. Ignore only
 /// transport bitrate fields; retain and validate the complete decoder config.
-private enum NativeAACDecoderConfiguration {
+enum NativeAACDecoderConfiguration {
+    /// Comparison only for source and selected formats already established as
+    /// LC by audioFacts; never decoder extradata or a writer cookie. Plain ASC
+    /// can allow a decoder to discover implicit SBR, so this identity alone
+    /// does not establish payload semantics. Full ASC validation fixes AOT=LC,
+    /// 1024 samples and all core/extension flags. Only the optional explicit
+    /// SBR-absent extension has a shared identity within that admitted LC scope.
+    struct LCIdentity: Equatable {
+        let sampleRate: Int32
+        let channelCount: Int32
+        private let frequencyIndex: UInt8
+        private let channelConfiguration: UInt8
+
+        init(configuration: Data) throws {
+            let parsed = try AudioSpecificConfig.parse(configuration)
+            guard parsed.kind == .aacLC else { throw HLSSourceError.unsupportedMedia }
+            sampleRate = parsed.outputSampleRate; channelCount = parsed.outputChannelCount
+            // The complete parser above established these LC header positions.
+            // Preserve indexed versus explicit frequency until equivalence on
+            // the native decoder path is independently established.
+            let start = configuration.startIndex
+            frequencyIndex = ((configuration[start] & 7) << 1) | (configuration[start + 1] >> 7)
+            channelConfiguration = (configuration[start + (frequencyIndex == 15 ? 4 : 1)] >> 3) & 15
+        }
+
+        var canonicalBytes: Data {
+            var result = Data("VPlayer native AAC-LC identity v1".utf8)
+            result.append(frequencyIndex)
+            var rate = UInt32(sampleRate).bigEndian
+            withUnsafeBytes(of: &rate) { result.append(contentsOf: $0) }
+            result.append(channelConfiguration)
+            return result
+        }
+    }
+
     static func extract(_ bytes: Data) throws -> Data {
         if (try? AudioSpecificConfig.parse(bytes)) != nil { return bytes }
         var offset = 0

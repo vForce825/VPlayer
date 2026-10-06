@@ -101,7 +101,7 @@ private struct SourceManifestParser {
     typealias Graph = HLSManifestGraph
     let data: Data
     let url: URL
-    private struct Attribute { let value: String; let span: Range<Int> }
+    private struct Attribute { let value: String; let span: Range<Int>; let quoted: Bool }
     func parse() throws -> Graph.Document {
         _ = try PlaybackSourceOrigin(url)
         guard data.count <= Graph.maximumPlaylistBytes else { throw HLSSourceError.byteLimit }
@@ -210,6 +210,18 @@ private struct SourceManifestParser {
                 case "#EXT-X-DISCONTINUITY":
                     guard discontinuity < Int.max else { throw HLSSourceError.malformedManifest }
                     discontinuity += 1
+                case "#EXT-X-SESSION-DATA":
+                    let fields = try attributes(payload, offset: offset)
+                    guard fields["DATA-ID"]?.quoted == true,
+                          (fields["VALUE"] != nil) != (fields["URI"] != nil),
+                          ["VALUE", "URI", "LANGUAGE"].allSatisfy({ fields[$0]?.quoted ?? true }) else { throw HLSSourceError.malformedManifest }
+                    // Only a quoted VALUE is descriptive text. Preserve the existing
+                    // resource-marker restriction everywhere else; never load metadata.
+                    let hasResourceMarker = fields.contains { name, attribute in
+                        name != "VALUE" && (name.hasSuffix("URI") || name.hasSuffix("URL") ||
+                            attribute.value.contains("URI=") || attribute.value.contains("URL="))
+                    }
+                    if hasResourceMarker || payload.contains("{$") { unsupported.insert("unmanaged-uri-extension") }
                 case "#EXT-X-DEFINE", "#EXT-X-PART", "#EXT-X-PART-INF", "#EXT-X-PRELOAD-HINT", "#EXT-X-SERVER-CONTROL", "#EXT-X-SKIP", "#EXT-X-RENDITION-REPORT", "#EXT-X-CONTENT-STEERING":
                     unsupported.insert("unsupported-extension")
                 default:
@@ -246,7 +258,7 @@ private struct SourceManifestParser {
             let end = index
             guard let value = String(bytes: bytes[start..<end], encoding: .utf8), !value.contains("\r"), !value.contains("\n") else { throw HLSSourceError.malformedManifest }
             if quoted { guard index < bytes.count else { throw HLSSourceError.malformedManifest }; index += 1 }
-            result[key] = Attribute(value: value, span: (offset+start)..<(offset+end))
+            result[key] = Attribute(value: value, span: (offset+start)..<(offset+end), quoted: quoted)
             guard result.count <= 64 else { throw HLSSourceError.graphLimit }
             if index < bytes.count {
                 guard bytes[index] == 44, index+1 < bytes.count else { throw HLSSourceError.malformedManifest }

@@ -21,6 +21,53 @@ final class HLSCompatibilityProbeTests: XCTestCase {
         XCTAssertEqual(facts.audio.first?.priming, .notSignaledPreserveTimestamps)
         XCTAssertEqual(facts.audio.first?.formatValidated, true)
     }
+    func testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "progressive-h264-aac", withExtension: "ts"))
+        let original = try Data(contentsOf: url), inspector = FFmpegHLSContainerInspector()
+        let control = try await inspector.inspect(data: original, url: url, deadline: HLSMonotonicClock.deadline(seconds: 10))
+        for packet in ordinaryDVBInformationPackets() {
+            for offset in [0, 188 * 30, original.count] {
+                let input = Data(original.prefix(offset)) + packet + Data(original.dropFirst(offset))
+                let facts = try await inspector.inspect(data: input, url: url, deadline: HLSMonotonicClock.deadline(seconds: 10))
+                XCTAssertEqual(facts.container, control.container)
+                XCTAssertEqual(facts.video, control.video)
+                XCTAssertEqual(facts.audio, control.audio)
+                XCTAssertEqual(facts.hasUnsupportedTracks, control.hasUnsupportedTracks)
+            }
+        }
+    }
+    func testRawTSPrefixAcquiresLaterTablesWithoutChangingUnknownEvidenceRules() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "task22-progressive-h264-aac-16s", withExtension: "ts"))
+        let original = try Data(contentsOf: url)
+        let prefix = Data(original.dropFirst(3 * 188).prefix(1_048_576))
+        let facts = try await FFmpegHLSContainerInspector().inspect(data: prefix, url: url,
+            deadline: HLSMonotonicClock.deadline(seconds: 10), completeness: .prefix)
+        XCTAssertEqual(facts.video?.codec, .h264)
+        XCTAssertEqual(facts.video?.scan, .progressive)
+        XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+        XCTAssertEqual(facts.video?.width, 1280)
+        XCTAssertEqual(facts.audio.first?.sampleRate, 48_000)
+        XCTAssertEqual(facts.audio.first?.channelCount, 2)
+        XCTAssertEqual(facts.audio.first?.channelMask, 3)
+        XCTAssertEqual(facts.audio.first?.formatValidated, true)
+    }
+    private func ordinaryDVBInformationPackets() -> [Data] {
+        func crcSection(_ bytes: [UInt8]) -> [UInt8] {
+            var crc: UInt32 = 0xFFFF_FFFF
+            for byte in bytes {
+                crc ^= UInt32(byte) << 24
+                for _ in 0..<8 { crc = (crc << 1) ^ (crc & 0x8000_0000 != 0 ? 0x04C1_1DB7 : 0) }
+            }
+            return bytes + [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: crc >> $0) }
+        }
+        func packet(_ pid: UInt8, _ section: [UInt8]) -> Data {
+            Data([0x47, 0x40, pid, 0x10, 0] + section + [UInt8](repeating: 0xFF, count: 183 - section.count))
+        }
+        // Empty current NIT/EIT and ordinary TDT, ETSI EN 300 468 sections 5.2.1/4/5.
+        return [packet(0x10, crcSection([0x40, 0xB0, 0x0D, 0, 1, 0xC1, 0, 0, 0xF0, 0, 0xF0, 0])),
+            packet(0x12, crcSection([0x4E, 0xB0, 0x0F, 0, 1, 0xC1, 0, 0, 0, 1, 0, 1, 0, 0x4E])),
+            packet(0x14, [0x70, 0x70, 5, 0xEA, 0x60, 0x12, 0x34, 0x56])]
+    }
     func testFMP4FactsComeFromRealInitAndMedia() async throws {
         let input = try sourceFixture("progressive-init.mp4") + sourceFixture("progressive-0.m4s")
         let facts = try await FFmpegHLSContainerInspector().inspect(data: input, url: URL(string: "https://example.test/media")!, deadline: HLSMonotonicClock.deadline(seconds: 10))
@@ -76,7 +123,10 @@ final class HLSCompatibilityProbeTests: XCTestCase {
         let unsupported: [([UInt8], VideoAccessUnitInspectionError)] = [
             (largeSourceH264SPS(primaries: 0, transfer: 1, matrix: 1), .unsupportedColorPrimaries(0)),
             (largeSourceH264SPS(primaries: 1, transfer: 0, matrix: 1), .unsupportedColorTransfer(0)),
-            (largeSourceH264SPS(primaries: 1, transfer: 1, matrix: 0), .unsupportedColorMatrix(0))
+            (largeSourceH264SPS(primaries: 1, transfer: 1, matrix: 0), .unsupportedColorMatrix(0)),
+            (largeSourceH264SPS(primaries: 3, transfer: 1, matrix: 1), .unsupportedColorPrimaries(3)),
+            (largeSourceH264SPS(primaries: 5, transfer: 5, matrix: 5), .unsupportedColorTransfer(5)),
+            (largeSourceH264SPS(primaries: 6, transfer: 6, matrix: 3), .unsupportedColorMatrix(3))
         ]
         for (sps, expected) in unsupported {
             XCTAssertThrowsError(try VideoSequenceParameterSetInspector.sourceFormat(sps, codec: .h264)) { error in
@@ -84,6 +134,55 @@ final class HLSCompatibilityProbeTests: XCTestCase {
             }
         }
     }
+    func testCompleteRec601TransportPreservesSourceEvidence() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "progressive-h264-aac", withExtension: "ts"))
+        let original = try Data(contentsOf: url)
+        let originalSPS = Data([0x67, 0x64, 0x00, 0x29, 0xac, 0xd9, 0x40, 0x50, 0x05, 0xbb, 0x01, 0x6a,
+            0x02, 0x02, 0x02, 0x80, 0x00, 0x00, 0x03, 0x00, 0x80, 0x00, 0x00, 0x19, 0x47, 0x8c, 0x18, 0xcb])
+        for code: UInt8 in [5, 6] {
+            // Only the ordinary, equally sized VUI fields change. TS/PES lengths,
+            // timestamps, pictures and audio remain the complete fixture's bytes.
+            var replacement = originalSPS
+            replacement[12] = code << 1; replacement[13] = 6 << 1; replacement[14] = code << 1
+            var input = original, offset = 0, count = 0
+            while let range = input.range(of: originalSPS, in: offset..<input.count) {
+                input.replaceSubrange(range, with: replacement); offset = range.upperBound; count += 1
+            }
+            XCTAssertEqual(count, 2)
+            let facts = try await FFmpegHLSContainerInspector().inspect(data: input, url: url,
+                deadline: HLSMonotonicClock.deadline(seconds: 10))
+            XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+            XCTAssertEqual(facts.video?.scan, .progressive)
+            XCTAssertEqual(facts.video?.frameRate, MediaRational(num: 25, den: 1))
+            XCTAssertEqual(facts.video?.videoRange, .sdr)
+            XCTAssertEqual(facts.video?.colorPrimaries?.rawValue, UInt16(code))
+            XCTAssertEqual(facts.video?.colorTransfer?.rawValue, 6)
+            XCTAssertEqual(facts.video?.colorMatrix?.rawValue, UInt16(code))
+            XCTAssertEqual(facts.audio.first?.decoderConfiguration, Data([0x11, 0x90]))
+        }
+    }
+
+    func testSourceRec601SPSPreservesExactCodePointsWithoutUnlockingGeneratedColor() throws {
+        // ITU-T H.273 tables 2/3/4: distinct 625/525 primaries, common
+        // Rec.601 transfer, and numerically equivalent (but retained) matrices.
+        for primaries: UInt8 in [5, 6] {
+            for transfer: UInt8 in [1, 6] {
+                for matrix: UInt8 in [5, 6] {
+                    let sps = largeSourceH264SPS(primaries: primaries, transfer: transfer, matrix: matrix)
+                    let proof = try VideoSequenceParameterSetInspector.sourceProof(sps, codec: .h264)
+                    let format = try VideoSequenceParameterSetInspector.sourceFormat(sps, codec: .h264)
+                    XCTAssertEqual(proof.width, 3840)
+                    XCTAssertEqual(format.primaries?.rawValue, UInt16(primaries))
+                    XCTAssertEqual(format.transfer?.rawValue, UInt16(transfer))
+                    XCTAssertEqual(format.matrix?.rawValue, UInt16(matrix))
+                    XCTAssertThrowsError(try VideoSequenceParameterSetInspector.inspectH264(sps)) {
+                        XCTAssertEqual($0 as? VideoAccessUnitInspectionError, .unsupportedColorPrimaries(UInt16(primaries)))
+                    }
+                }
+            }
+        }
+    }
+
     func testSourceHEVCScanWithoutExclusiveFlagsStaysUnknown() throws {
         // Committed hevc-sdr.mp4 SPS with only the progressive_source_flag
         // cleared. Neither scan flag establishes progressive-only evidence.
@@ -180,6 +279,23 @@ extension HLSCompatibilityProbeTests {
             container: 0, parser: 0)) { error in
             guard case HLSSourceVideoProjection.Failure.unsupportedColor = error else { return XCTFail("identity matrix gained supported evidence") }
         }
+    }
+
+    func testRec601ProjectionKeepsRawCodesAndRejectsConflictingEvidence() throws {
+        XCTAssertEqual(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorPrimaries.bt470BG,
+            container: 5, parser: 2)?.rawValue, 5)
+        XCTAssertEqual(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorTransfer.smpte170M,
+            container: 6, parser: 2)?.rawValue, 6)
+        XCTAssertEqual(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorMatrix.bt470BG,
+            container: 5, parser: 2)?.rawValue, 5)
+        // Native appearance aliases cannot erase conflicting raw SPS/container
+        // declarations, even for functionally equivalent transfer/matrix codes.
+        XCTAssertThrowsError(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorPrimaries.bt470BG,
+            container: 6, parser: 2))
+        XCTAssertThrowsError(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorTransfer.smpte170M,
+            container: 1, parser: 2))
+        XCTAssertThrowsError(try HLSSourceVideoProjection.reconcileColor(parameterSet: DemuxColorMatrix.bt470BG,
+            container: 6, parser: 2))
     }
 
     func testVideoColorProjectionKeepsUnobservedParserAndUnspecifiedUnknown() throws {

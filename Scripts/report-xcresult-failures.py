@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: 2026 VPlayer contributors
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
-"""Print bounded summary scalars/failure text; never export bundles or attachments."""
+"""Publish bounded summary scalars/failure text; never export bundles or attachments."""
+import html
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -119,25 +121,58 @@ def report(schema, summary):
     return lines
 
 
+def job_summary(lines):
+    # HTML-escaped preformatted code keeps assertion text, including Markdown
+    # and closing tags, literal. Include this formatting in the existing cap.
+    prefix, suffix = "\n<pre><code>\n", "</code></pre>\n"
+    marker = "CI_TEST_FAILURE_SUMMARY_TRUNCATED=1\n"
+    total = len((prefix + suffix + marker).encode("utf-8"))
+    parts = [prefix]
+    for line in lines:
+        escaped = html.escape(line, quote=False) + "\n"
+        size = len(escaped.encode("utf-8"))
+        if total + size > MAX_OUTPUT:
+            parts.append(marker)
+            break
+        parts.append(escaped)
+        total += size
+    return "".join(parts) + suffix
+
+
+def emit_report(lines):
+    for line in lines:
+        print(line)
+    destination = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not destination:
+        return
+    try:
+        # GitHub provides one Markdown file per step; preserve prior content.
+        content = job_summary(lines)
+        with open(destination, "a", encoding="utf-8") as output:
+            output.write(content)
+    except (OSError, UnicodeError) as error:
+        # The optional summary must never replace the primary report outcome.
+        print("CI_TEST_FAILURE_SUMMARY_UNAVAILABLE=" + type(error).__name__, file=sys.stderr)
+
+
 def main():
     if len(sys.argv) != 2:
         raise ValueError("expected one scoped xcresult bundle path")
     bundle = Path(sys.argv[1])
     if bundle.suffix != ".xcresult" or not bundle.is_dir():
-        print("CI_TEST_FAILURE_REPORT_UNAVAILABLE=bundle_missing")
+        emit_report(["CI_TEST_FAILURE_REPORT_UNAVAILABLE=bundle_missing"])
         return
     help_text = run(["help", "get", "test-results", "summary"])
     if "--path" not in help_text or "--schema" not in help_text:
         raise RuntimeError("installed xcresulttool does not advertise required summary options")
     schema = json.loads(run(["get", "test-results", "summary", "--schema"]))
     summary = json.loads(run(["get", "test-results", "summary", "--path", str(bundle)]))
-    for line in report(schema, summary):
-        print(line)
+    emit_report(report(schema, summary))
 
 
 if __name__ == "__main__":
     try:
         main()
     except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired) as error:
-        print("CI_TEST_FAILURE_REPORT_ERROR=" + type(error).__name__ + ": " + str(error)[:512])
+        emit_report(["CI_TEST_FAILURE_REPORT_ERROR=" + type(error).__name__ + ": " + str(error)[:512]])
         raise SystemExit(1)

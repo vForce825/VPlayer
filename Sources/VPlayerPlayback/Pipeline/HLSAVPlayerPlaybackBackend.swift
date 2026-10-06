@@ -640,8 +640,16 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 sourceFailureMetadata = failureMetadata; sourceActivation = nil; pendingCompatibleOwner = nil
             }
         }) else { throw CancellationError() }
+        var diagnostics: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(metadataOwner: failureMetadata)
+        var failureStage = HLSPreparationDiagnostics.Frozen.admission
         do {
-            var owned = try await dependencies.prepare(invocation: invocation)
+            guard let diagnosticBytes = diagnostics?.knownAllocationUpperBoundBytes,
+                  diagnosticBytes <= HLSRuntimeFailureMetadataOwner.reservationBytes else { throw HLSSourceError.capacity }
+            var owned = try await dependencies.prepare(invocation: invocation, diagnostics: diagnostics)
+            if let diagnostics { failureStage = diagnostics.freeze() }
+            // End the mutable paid record before original runtime failure tasks
+            // can start. Later phases retain only this small scalar value.
+            diagnostics = nil
             try validatePreparation(invocation)
             if lock.withLock({ audioRejection?.matches(owned) == true }) {
                 let compatible = owned.usingCompatibleAudio(); owned.retireGeneratedAttempt(); owned = compatible
@@ -649,6 +657,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             try installSource(owned, invocation: invocation)
             let managed = !dependencies.context.headers.isEmpty || dependencies.context.explicitExpiry != nil
             if owned.plan.transport == .proxy || (owned.plan.transport == .generated && managed) {
+                failureStage = failureStage.entering(.proxy)
                 let original = owned
                 let proxy = try await HLSByteProxy.start(source: owned.source, lifecycle: invocation.outputLifecycleEpoch,
                     resolver: owned.resolver, sourceRetention: owned.sourceCharge, manifestAuthority: owned.makeProxyManifestAuthority(),
@@ -660,8 +669,12 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 } catch { _ = await proxy.retire(); throw error }
             }
             if owned.plan.transport == .generated {
+                failureStage = failureStage.entering(.generated)
                 try await prepareGeneratedSource(owned, invocation: invocation)
             } else {
+                // No task-local scope here: player observers and producer tasks
+                // must never inherit or extend the preparation diagnostic owner.
+                failureStage = failureStage.entering(.nativePrepare)
                 let original = owned
                 let coordinator = try await MainActor.run {
                     try NativeHLSItemCoordinator(driver: lease.driver, inspector: dependencies.makeInspector(lease.driver),
@@ -676,6 +689,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 try validatePreparation(invocation)
             }
         } catch {
+            let failure = diagnostics?.freeze() ?? failureStage
+            diagnostics = nil
             let native = lock.withLock { nativeAdapter }
             let installed = await native?.coordinator.hasInstalledItem ?? false
             let noGraph = lock.withLock { bundle == nil && preparingBundle == nil }
@@ -691,7 +706,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                         producerRetirementConfirmed: true, playerInstallationAttempted: false)
                 }
             }
-            throw error
+            throw failure.project(error)
         }
     }
 

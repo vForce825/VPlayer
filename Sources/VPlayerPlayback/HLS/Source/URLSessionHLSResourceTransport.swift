@@ -18,7 +18,8 @@ public struct URLSessionHLSResourceTransport: HLSResourceTransport {
             guard range.offset >= 0, range.length > 0, range.length <= Int64(request.maximumBytes),
                   !range.offset.addingReportingOverflow(range.length).overflow else { throw HLSSourceError.byteLimit }
         }
-        let transfer = BoundedSourceTransfer(request: request, configuration: makeConfiguration())
+        let transfer = BoundedSourceTransfer(request: request, configuration: makeConfiguration(),
+            preparationDiagnostics: HLSPreparationDiagnostics.current)
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             let response = try await transfer.run()
@@ -34,6 +35,9 @@ public struct URLSessionHLSResourceTransport: HLSResourceTransport {
 private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let request: HLSResourceRequest
     private let configuration: URLSessionConfiguration
+    // URLSession delegates do not inherit task-local values. This alias is
+    // joined by session invalidation before the preflight scope can return.
+    private var preparationDiagnostics: HLSPreparationDiagnostics?
     private let lock = NSLock()
     private var session: URLSession?
     private var task: URLSessionDataTask?
@@ -48,8 +52,10 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
     private var redirects = 0
     private var visited: Set<URL> = []
 
-    init(request: HLSResourceRequest, configuration: URLSessionConfiguration) {
+    init(request: HLSResourceRequest, configuration: URLSessionConfiguration,
+         preparationDiagnostics: HLSPreparationDiagnostics?) {
         self.request = request; self.configuration = configuration
+        self.preparationDiagnostics = preparationDiagnostics
     }
     func run() async throws -> HLSResourceResponse {
         try await withCheckedThrowingContinuation { continuation in
@@ -107,7 +113,10 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
             guard let http = response as? HTTPURLResponse, let url = http.url, (try? PlaybackSourceOrigin(url)) != nil else { failure = HLSSourceError.network; return false }
             guard (200...299).contains(http.statusCode) else { failure = HLSSourceError.httpStatus(http.statusCode); return false }
             let encoding = http.value(forHTTPHeaderField: "Content-Encoding")?.lowercased()
-            guard encoding == nil || encoding == "identity" else { failure = HLSSourceError.unsupportedMedia; return false }
+            guard encoding == nil || encoding == "identity" else {
+                preparationDiagnostics?.reject(.httpEncoding, status: Int32(clamping: http.statusCode))
+                failure = HLSSourceError.unsupportedMedia; return false
+            }
             let range = http.value(forHTTPHeaderField: "Content-Range").flatMap(HLSHTTPContentRange.init)
             if http.statusCode == 206 {
                 guard let range else { failure = HLSSourceError.incompleteEvidence; return false }
@@ -166,6 +175,7 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
         let completed: (CheckedContinuation<HLSResourceResponse, any Error>?, Result<HLSResourceResponse, any Error>) = lock.withLock {
             let continuation = self.continuation
             self.continuation = nil; self.session = nil
+            preparationDiagnostics = nil
             let result = self.result ?? .failure(HLSSourceError.network)
             self.result = nil; return (continuation, result)
         }

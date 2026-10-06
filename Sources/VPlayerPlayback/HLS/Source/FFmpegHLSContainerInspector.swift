@@ -11,20 +11,32 @@ public struct FFmpegHLSContainerInspector: HLSContainerInspecting {
         try await inspect(data: data, url: url, deadline: deadline, completeness: .complete)
     }
     public func inspect(data: Data, url: URL, deadline: UInt64, completeness: HLSMediaCompleteness) async throws -> HLSMediaFacts {
-        let state = SourceInspectionState(input: data)
+        // GCD does not inherit task locals. The state clears this paid alias
+        // before resuming its caller; playback work cannot retain it.
+        let state = SourceInspectionState(input: data, diagnostics: HLSPreparationDiagnostics.current)
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async {
                     let now = HLSMonotonicClock.now
-                    guard now < deadline else { continuation.resume(throwing: HLSSourceError.deadline); return }
+                    guard now < deadline else {
+                        state.releaseDiagnostics(); continuation.resume(throwing: HLSSourceError.deadline); return
+                    }
                     var container: Int32 = 0
+                    var diagnostic = VPFFSourceDiagnostic()
                     let result = state.inspectInput(completeness: completeness,
-                        timeout: Int64(min(10_000_000, (deadline-now)/1_000)), container: &container)
-                    if state.isCancelled { continuation.resume(throwing: CancellationError()) }
-                    else if HLSMonotonicClock.now >= deadline { continuation.resume(throwing: HLSSourceError.deadline) }
-                    else if result < 0 { continuation.resume(throwing: HLSSourceError.unsupportedMedia) }
-                    else { continuation.resume(with: Result { try state.facts(url: url, container: container, deadline: deadline) }) }
+                        timeout: Int64(min(10_000_000, (deadline-now)/1_000)), container: &container, diagnostic: &diagnostic)
+                    let outcome: Result<HLSMediaFacts, any Error>
+                    if state.isCancelled { outcome = .failure(CancellationError()) }
+                    else if HLSMonotonicClock.now >= deadline { outcome = .failure(HLSSourceError.deadline) }
+                    else if result < 0 {
+                        state.rejectedContainer(diagnostic)
+                        outcome = .failure(HLSSourceError.unsupportedMedia)
+                    } else {
+                        outcome = Result { try state.facts(url: url, container: container, deadline: deadline) }
+                    }
+                    state.releaseDiagnostics()
+                    continuation.resume(with: outcome)
                 }
             }
         } onCancel: { state.cancel() }
@@ -58,22 +70,26 @@ private final class SourceInspectionState: @unchecked Sendable {
     private var pendingAudio: [(VPFFSourceTrack, Data, Data, Data)] = []
     private var unsupported = false
     private var input: Data?
-    init(input: Data) { self.input = input }
+    private var diagnostics: HLSPreparationDiagnostics?
+    init(input: Data, diagnostics: HLSPreparationDiagnostics?) { self.input = input; self.diagnostics = diagnostics }
+    func rejectedContainer(_ diagnostic: VPFFSourceDiagnostic) { diagnostics?.rejectedContainer(diagnostic) }
+    func releaseDiagnostics() { diagnostics = nil }
     /// Dispatch captures this small owner, not a separate input Data alias.
     /// Release the media backing synchronously after native cleanup and before
     /// resuming the awaiting caller or entering the independent AAC phase.
-    func inspectInput(completeness: HLSMediaCompleteness, timeout: Int64, container: inout Int32) -> Int32 {
+    func inspectInput(completeness: HLSMediaCompleteness, timeout: Int64, container: inout Int32,
+                      diagnostic: inout VPFFSourceDiagnostic) -> Int32 {
         defer { input = nil }
         guard let bytes = input else { return -1 }
         return bytes.withUnsafeBytes { buffer in
-            vp_ffmpeg_inspect_source_bytes_with_completeness(buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count,
+            vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics(buffer.bindMemory(to: UInt8.self).baseAddress, buffer.count,
                 completeness == .prefix ? 1 : 0, timeout, { context in
                     guard let context else { return 1 }
                     return Unmanaged<SourceInspectionState>.fromOpaque(context).takeUnretainedValue().isCancelled ? 1 : 0
                 }, { context, track in
                     guard let context, let track else { return }
                     Unmanaged<SourceInspectionState>.fromOpaque(context).takeUnretainedValue().receive(track.pointee)
-                }, Unmanaged.passUnretained(self).toOpaque(), &container)
+                }, Unmanaged.passUnretained(self).toOpaque(), &container, &diagnostic)
         }
     }
     var isCancelled: Bool { lock.withLock { cancelled } }
@@ -119,7 +135,10 @@ private final class SourceInspectionState: @unchecked Sendable {
         pendingAudio.removeAll()
         if isCancelled { throw CancellationError() }
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
-        guard !videos.isEmpty || !audio.isEmpty else { throw HLSSourceError.unsupportedMedia }
+        guard !videos.isEmpty || !audio.isEmpty else {
+            diagnostics?.reject(.noTracks)
+            throw HLSSourceError.unsupportedMedia
+        }
         return HLSMediaFacts(url: url, container: container == 1 ? .mpegTS : container == 2 ? .fragmentedMP4 : .isoBMFF,
             video: videos.first, audio: audio, hasUnsupportedTracks: unsupported || videos.count > 1)
     }
@@ -167,7 +186,7 @@ private final class SourceInspectionState: @unchecked Sendable {
             else { scan = .unknown }
             let profileMatches = track.profile < 0 || (track.profile & 255) == Int32(proof.profileIDC)
             let range: HLSVideoRange?
-            switch transfer { case .bt709: range = .sdr; case .pq: range = .pq; case .hlg: range = .hlg; default: range = nil }
+            switch transfer { case .bt709, .smpte170M: range = .sdr; case .pq: range = .pq; case .hlg: range = .hlg; default: range = nil }
             return HLSVideoFacts(codec: codec, profile: Int32(proof.profileIDC), scan: profileMatches ? scan : .contradictory,
                 parameterSetsValidated: profileMatches && !contradiction,
                 configurationFingerprint: try HLSVideoConfigurationFingerprint.make(codec: codec, parameterSets: units),

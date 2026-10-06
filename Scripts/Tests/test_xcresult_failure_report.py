@@ -4,9 +4,17 @@
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 """Portable allowlist and byte-bound tests; no Apple SDK or result export required."""
 import importlib.util
+from contextlib import redirect_stderr, redirect_stdout
+import html
+import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "report-xcresult-failures.py"
@@ -149,6 +157,133 @@ class XCResultSummaryReportTests(unittest.TestCase):
         self.assertIn("CI_TEST_FAILURE_COUNT=30", lines)
         self.assertEqual(lines[-1], "CI_TEST_FAILURE_OUTPUT_TRUNCATED=1")
         self.assertLessEqual(len(("\n".join(lines) + "\n").encode("utf-8")), REPORT.MAX_OUTPUT)
+
+
+class XCResultJobSummaryTests(unittest.TestCase):
+    def environment(self, summary_path):
+        environment = dict(os.environ)
+        environment.pop("GITHUB_STEP_SUMMARY", None)
+        if summary_path is not None:
+            environment["GITHUB_STEP_SUMMARY"] = str(summary_path)
+        return environment
+
+    def invoke_main(self, summary_path=None, document=None, missing=False):
+        document = document if document is not None else {"testFailures": [
+            {"testName": "Suite.test", "failureText": "expected 1, got 0"}]}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "Scoped.xcresult"
+            if not missing:
+                bundle.mkdir()
+            with patch.dict(os.environ, self.environment(summary_path), clear=True), \
+                    patch.object(sys, "argv", [str(HELPER), str(bundle)]), \
+                    patch.object(REPORT, "run", side_effect=[
+                        "--path --schema", json.dumps(schema()), json.dumps(document)]), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                result = REPORT.main()
+        return result, stdout.getvalue(), stderr.getvalue()
+
+    def code_text(self, content):
+        self.assertTrue(content.startswith("\n<pre><code>\n"))
+        self.assertTrue(content.endswith("</code></pre>\n"))
+        encoded = content[len("\n<pre><code>\n"):-len("</code></pre>\n")]
+        self.assertNotIn("<", encoded)
+        self.assertNotIn(">", encoded)
+        return html.unescape(encoded)
+
+    def read_summary(self, path):
+        self.assertTrue(path.is_file(), "the report should create the optional job summary")
+        return path.read_text(encoding="utf-8")
+
+    def test_missing_summary_environment_preserves_stdout(self):
+        document = {"testFailures": [{"failureText": "expected 1, got 0"}]}
+        result, stdout, stderr = self.invoke_main(document=document)
+        self.assertIsNone(result)
+        self.assertEqual(stdout, "\n".join(REPORT.report(schema(), document)) + "\n")
+        self.assertEqual(stderr, "")
+
+    def test_summary_appends_the_same_report_without_replacing_existing_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            existing = "Earlier step detail\n"
+            summary_path.write_text(existing, encoding="utf-8")
+            result, stdout, stderr = self.invoke_main(summary_path)
+            content = self.read_summary(summary_path)
+        self.assertIsNone(result)
+        self.assertEqual(stderr, "")
+        self.assertTrue(content.startswith(existing))
+        self.assertEqual(self.code_text(content[len(existing):]), stdout)
+
+    def test_unavailable_bundle_is_also_published_without_changing_exit_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            result, stdout, stderr = self.invoke_main(summary_path, missing=True)
+            content = self.read_summary(summary_path)
+        self.assertIsNone(result)
+        self.assertEqual(stdout, "CI_TEST_FAILURE_REPORT_UNAVAILABLE=bundle_missing\n")
+        self.assertEqual(stderr, "")
+        self.assertEqual(self.code_text(content), stdout)
+
+    def test_error_record_keeps_exit_one_with_summary_present_absent_or_unwritable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            for destination in (None, summary_path, Path(directory)):
+                with self.subTest(destination=destination):
+                    result = subprocess.run([sys.executable, str(HELPER)],
+                                            env=self.environment(destination),
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertEqual(result.stdout, "CI_TEST_FAILURE_REPORT_ERROR=ValueError: "
+                                     "expected one scoped xcresult bundle path\n")
+                    if destination == summary_path:
+                        self.assertEqual(self.code_text(self.read_summary(summary_path)),
+                                         result.stdout)
+
+    def test_summary_io_failure_does_not_change_primary_success_or_unavailable_report(self):
+        baseline = self.invoke_main()[1]
+        with tempfile.TemporaryDirectory() as directory:
+            for missing in (False, True):
+                with self.subTest(missing=missing):
+                    result, stdout, stderr = self.invoke_main(Path(directory), missing=missing)
+                    self.assertIsNone(result)
+                    self.assertEqual(stdout, "CI_TEST_FAILURE_REPORT_UNAVAILABLE=bundle_missing\n"
+                                     if missing else baseline)
+                    self.assertIn("CI_TEST_FAILURE_SUMMARY_UNAVAILABLE=", stderr)
+
+    def test_assertion_markup_is_preserved_as_plain_code_text(self):
+        document = {"testFailures": [{"failureText":
+            'expected <value> & "actual"\n```\n[diagnostic](https://example.test)\n</code></pre>'}]}
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            _, stdout, _ = self.invoke_main(summary_path, document)
+            content = self.read_summary(summary_path)
+        self.assertEqual(self.code_text(content), stdout)
+        self.assertIn("&lt;value&gt; &amp;", content)
+
+    def test_summary_byte_cap_includes_escaped_text_wrappers_and_truncation_marker(self):
+        document = {"testFailures": [{"testName": "Suite.test", "failureText": "<&界" * 2000}] * 30}
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            _, stdout, _ = self.invoke_main(summary_path, document)
+            content = self.read_summary(summary_path)
+        self.assertLessEqual(len(content.encode("utf-8")), REPORT.MAX_OUTPUT)
+        decoded = self.code_text(content)
+        marker = "CI_TEST_FAILURE_SUMMARY_TRUNCATED=1\n"
+        self.assertTrue(decoded.endswith(marker))
+        self.assertTrue(stdout.startswith(decoded[:-len(marker)]))
+        self.assertIn("CI_TEST_FAILURE_COUNT=30\n", decoded)
+        self.assertIn("CI_TEST_FAILURE ", decoded)
+        self.assertNotIn("CI_TEST_FAILURE_SUMMARY_TRUNCATED", stdout)
+
+    def test_zero_failure_records_do_not_create_a_pass_result_or_missing_totals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            summary_path = Path(directory) / "summary.md"
+            _, stdout, _ = self.invoke_main(summary_path, {"testFailures": []})
+            content = self.read_summary(summary_path)
+        self.assertEqual(self.code_text(content), stdout)
+        self.assertIn("CI_TEST_FAILURE_COUNT=0\nCI_TEST_FAILURE_COUNT_KIND=records\n", stdout)
+        self.assertIn("CI_TEST_SUMMARY_SCALARS={}\n", stdout)
+        self.assertIn('"passedTests"', stdout)
 
 
 if __name__ == "__main__":

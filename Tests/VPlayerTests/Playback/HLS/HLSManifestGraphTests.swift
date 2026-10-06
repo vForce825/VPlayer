@@ -38,4 +38,71 @@ final class HLSManifestGraphTests: XCTestCase {
             XCTAssertFalse(graph.unsupportedFeatures.isEmpty)
         }
     }
+    func testSessionDataValuePreservesLiteralResourceMarkersWithoutReferences() throws {
+        let url = URL(string: "https://example.test/master")!
+        for value in ["Programme title", "URI=label", "URL=label", "URI=first, URL=second", ""] {
+            let text = "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"com.example.title\",LANGUAGE=\"en\",VALUE=\"\(value)\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo\n"
+            let graph = try HLSManifestGraph.parse(data: Data(text.utf8), responseURL: url)
+            let document = try XCTUnwrap(graph.document(for: url))
+            XCTAssertTrue(graph.unsupportedFeatures.isEmpty, value)
+            XCTAssertEqual(document.kind, .master)
+            XCTAssertEqual(document.rawData, Data(text.utf8))
+            XCTAssertEqual(document.references.count, 1)
+            XCTAssertEqual(document.references.first?.kind, .variant)
+            XCTAssertEqual(document.references.first?.url, URL(string: "https://example.test/video"))
+        }
+    }
+    func testSessionDataResourcesAndVariablesRemainUnsupportedWithoutReferences() throws {
+        let url = URL(string: "https://example.test/master")!
+        for attributes in [
+            "DATA-ID=\"x\",URI=\"metadata.json\"",
+            "DATA-ID=\"x\",VALUE=\"title\",URL=\"metadata.json\"",
+            "DATA-ID=\"x\",VALUE=\"title\",X-URI=\"metadata.json\"",
+            "DATA-ID=\"x\",VALUE=\"title\",X-METADATA=\"URI=metadata\"",
+            "DATA-ID=\"URI=label\",VALUE=\"title\"",
+            "DATA-ID=\"x\",VALUE=\"{$title}\"",
+            "DATA-ID=\"x\",URI=\"{$metadata}\""
+        ] {
+            let text = "#EXTM3U\n#EXT-X-SESSION-DATA:\(attributes)\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo\n"
+            let graph = try HLSManifestGraph.parse(data: Data(text.utf8), responseURL: url)
+            let document = try XCTUnwrap(graph.document(for: url))
+            XCTAssertEqual(graph.unsupportedFeatures, ["unmanaged-uri-extension"], attributes)
+            XCTAssertEqual(document.references.count, 1)
+            XCTAssertEqual(document.references.first?.kind, .variant)
+        }
+    }
+    func testSessionDataRejectsMalformedAttributeShapes() {
+        let url = URL(string: "https://example.test/master")!
+        for attributes in [
+            "VALUE=\"title\"",
+            "DATA-ID=\"x\"",
+            "DATA-ID=\"x\",VALUE=\"title\",URI=\"metadata.json\"",
+            "DATA-ID=\"x\",VALUE=\"first\",VALUE=\"second\"",
+            "DATA-ID=x,VALUE=\"title\"",
+            "DATA-ID=\"x\",VALUE=title",
+            "DATA-ID=\"x\",URI=metadata.json",
+            "DATA-ID=\"x\",VALUE=\"title\",LANGUAGE=en",
+            "DATA-ID=\"x\",VALUE=\"unterminated",
+            "DATA-ID=\"x\",VALUE=\"title\","
+        ] {
+            let text = "#EXTM3U\n#EXT-X-SESSION-DATA:\(attributes)\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo\n"
+            XCTAssertThrowsError(try HLSManifestGraph.parse(data: Data(text.utf8), responseURL: url), attributes) { error in
+                XCTAssertEqual(error as? HLSSourceError, .malformedManifest, attributes)
+            }
+        }
+    }
+    func testSessionDataValueDoesNotRelaxOtherExtensionRestrictions() throws {
+        let url = URL(string: "https://example.test/master")!
+        for tag in [
+            "#EXT-X-OTHER:URI=\"metadata.json\"",
+            "#EXT-X-OTHER:VALUE=\"URL=metadata\"",
+            "#EXT-X-DEFINE:NAME=\"title\",VALUE=\"example\"",
+            "#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES",
+            "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"key\""
+        ] {
+            let text = "#EXTM3U\n#EXT-X-SESSION-DATA:DATA-ID=\"x\",VALUE=\"URI=first, URL=second\"\n\(tag)\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nvideo\n"
+            let graph = try HLSManifestGraph.parse(data: Data(text.utf8), responseURL: url)
+            XCTAssertFalse(graph.unsupportedFeatures.isEmpty, tag)
+        }
+    }
 }

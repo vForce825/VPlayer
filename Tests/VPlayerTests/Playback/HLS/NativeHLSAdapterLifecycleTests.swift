@@ -10,6 +10,68 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.probe.failUnsupported = true
+            fixture.play(); try await fixture.until { fixture.failure != nil }
+            let failure = try XCTUnwrap(fixture.failure)
+            XCTAssertEqual(failure.code, "playback.backend.prepare")
+            XCTAssertEqual(failure.diagnosticCode, "playback.backend.prepare.VPlayerPlayback.HLSSourceError")
+            XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
+            XCTAssertTrue(failure.userMessage.contains("phase=probe reason=none source=hls-master"))
+            XCTAssertFalse(failure.userMessage.contains("native-fixture"))
+            XCTAssertEqual(fixture.driver.installs, 0)
+            XCTAssertTrue(fixture.probe.observedDiagnostic)
+            try await fixture.until { !fixture.probe.diagnosticAlive }
+        }
+    }
+
+    func testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence() async throws {
+        try await NativeAdapterFixture.withFixture(generated: true) { fixture in
+            fixture.probe.unknownScan = true
+            fixture.play(); try await fixture.until { fixture.failure != nil }
+            let failure = try XCTUnwrap(fixture.failure)
+            XCTAssertTrue(failure.userMessage.contains("phase=planner reason=none source=hls-media"))
+            XCTAssertTrue(failure.userMessage.contains("scan=unknown"))
+            XCTAssertEqual(fixture.driver.installs, 0)
+            XCTAssertTrue(fixture.factory.retry.decisions.isEmpty)
+        }
+    }
+
+    func testMasterPlannerRejectionStillRequiresExplicitServiceSelection() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.probe.unknownScan = true
+            fixture.play(); try await fixture.until { fixture.failure != nil }
+            let failure = try XCTUnwrap(fixture.failure)
+            XCTAssertEqual(failure.diagnosticCode, "playback.backend.prepare.VPlayerPlayback.HLSSelectedServiceRequired")
+            XCTAssertFalse(failure.userMessage.contains("phase="))
+            XCTAssertEqual(fixture.driver.installs, 0)
+        }
+    }
+
+    func testNativeRejectionUsesCoarseStageWithoutInheritingPreflightScope() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.inspector.failUnsupported = true
+            fixture.play(); try await fixture.until { fixture.failure != nil }
+            XCTAssertTrue(try XCTUnwrap(fixture.failure).userMessage.contains("phase=native-prepare"))
+            XCTAssertEqual(fixture.driver.installs, 1)
+            XCTAssertFalse(fixture.inspector.observedPreparationDiagnostic)
+            XCTAssertFalse(fixture.inspector.retainedPreflightDiagnosticAtEntry)
+            try await fixture.until { !fixture.probe.diagnosticAlive }
+        }
+    }
+
+    func testSuccessfulNativePreparationReleasesScalarRecordBeforePlaybackObservers() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            XCTAssertTrue(fixture.probe.observedDiagnostic)
+            XCTAssertFalse(fixture.inspector.observedPreparationDiagnostic)
+            XCTAssertFalse(fixture.inspector.retainedPreflightDiagnosticAtEntry)
+            try await fixture.until { !fixture.probe.diagnosticAlive }
+            XCTAssertNil(fixture.failure)
+        }
+    }
+
     func testQuantumBindingMaskRequiresBothPresenceAndEveryOriginalField() {
         XCTAssertTrue(NativeHLSFinalPresentationQuantum.compareBindings(prior: nil, current: nil).matches)
         for presence in [UInt8(1), UInt8(2)] {
@@ -313,6 +375,8 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
                 try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
                 XCTAssertEqual(fixture.driver.plays, 0, "Late \(phase) continuation consumed revoked authority")
                 XCTAssertNil(fixture.driver.currentItemIdentity)
+                XCTAssertNil(fixture.failure, "Canceled preflight must not become a diagnostic preparation failure")
+                try await fixture.until { !fixture.probe.diagnosticAlive }
                 if phase == .probe { XCTAssertEqual(fixture.driver.installs, 0) }
             }
         }
@@ -587,6 +651,7 @@ private final class NativeAdapterFixture {
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
+        inspector.preflightDiagnosticAlive = { [weak probe] in probe?.diagnosticAlive == true }
     }
     static func withFixture(generated: Bool = false, clock: ManualPlaybackClock? = nil,
                             _ body: (NativeAdapterFixture) async throws -> Void) async throws {
@@ -611,6 +676,10 @@ private final class NativeAdapterFixture {
         guard let context, let task = context.sourceTask else { return false }
         return context.prepared && context.interval != nil && registry.phase(of: task) == .terminal(.completed)
             && driver.rate > 0 && driver.currentItemIdentity != nil
+    }
+    var failure: PlaybackFailure? {
+        if case let .failed(failure) = registry.playbackStateSnapshot() { return failure }
+        return nil
     }
     func spawn(_ body: @escaping @MainActor () async -> Void) { tasks.append(Task { await body() }) }
     func play() {
@@ -734,11 +803,17 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     private let lock = NSLock()
     private var gateValue: NativeFixtureGate?
     private var generatedValue = false
+    private var failUnsupportedValue = false, unknownScanValue = false, observedDiagnosticValue = false
+    private weak var lastDiagnostic: HLSPreparationDiagnostics?
+    var failUnsupported: Bool { get { lock.withLock { failUnsupportedValue } } set { lock.withLock { failUnsupportedValue = newValue } } }
+    var unknownScan: Bool { get { lock.withLock { unknownScanValue } } set { lock.withLock { unknownScanValue = newValue } } }
+    var observedDiagnostic: Bool { lock.withLock { observedDiagnosticValue } }
+    var diagnosticAlive: Bool { lock.withLock { lastDiagnostic != nil } }
     var generated: Bool { get { lock.withLock { generatedValue } } set { lock.withLock { generatedValue = newValue } } }
     var gate: NativeFixtureGate? { get { lock.withLock { gateValue } } set { lock.withLock { gateValue = newValue } } }
     static func video(width: Int32 = 1_920, rate: MediaRational? = MediaRational(num: 25, den: 1),
-        sequenceRate: MediaRational? = MediaRational(num: 25, den: 1)) -> HLSVideoFacts {
-        .init(codec: .h264, profile: 100, scan: .progressive, parameterSetsValidated: true,
+        sequenceRate: MediaRational? = MediaRational(num: 25, den: 1), scan: HLSScanEvidence = .progressive) -> HLSVideoFacts {
+        .init(codec: .h264, profile: 100, scan: scan, parameterSetsValidated: true,
             configurationFingerprint: Data([UInt8(width == 1_920 ? 1 : 2)]), width: width, height: width == 1_920 ? 1_080 : 720,
             chromaFormat: 1, bitDepth: 8, level: 40, parserProgressiveFrames: 2, compatibilityFlags: 0,
             tier: .main, frameRate: rate, explicitSequenceFrameRate: sequenceRate, videoRange: .sdr,
@@ -753,12 +828,16 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
             bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])], nativeAudioCodecs: [.aac], supportsGenerated: true)
     }
     func inspect(_ source: ResolvedPlaybackSource) async throws -> HLSCompatibilityFacts {
+        let diagnostic = HLSPreparationDiagnostics.current
+        lock.withLock { lastDiagnostic = diagnostic; observedDiagnosticValue = observedDiagnosticValue || diagnostic != nil }
         await gate?.wait()
+        if failUnsupported { throw HLSSourceError.unsupportedMedia }
         guard case let .hls(graph) = source.topology else { throw HLSSourceError.unsupportedMedia }
         let audio = generated ? HLSSourceAudioFacts(codec: .ac3, profile: 8, sampleRate: 48_000, channelCount: 6,
             channelMask: 0x3F, priming: .notSignaledPreserveTimestamps, service: .independentMain, formatValidated: true) : Self.audio
         let media = graph.orderedDocuments.filter { $0.kind == .media }.map {
-            HLSMediaFacts(url: $0.responseURL, container: .mpegTS, video: Self.video(width: $0.responseURL.path == "/alternate" ? 1_280 : 1_920), audio: [audio], hasUnsupportedTracks: false)
+            HLSMediaFacts(url: $0.responseURL, container: .mpegTS, video: Self.video(width: $0.responseURL.path == "/alternate" ? 1_280 : 1_920,
+                scan: unknownScan ? .unknown : .progressive), audio: [audio], hasUnsupportedTracks: false)
         }
         return .init(source: source, media: media, complete: true, inspectedBytes: 188)
     }
@@ -769,10 +848,16 @@ private final class NativeFixtureInspector: NativeHLSAssetInspecting {
     private let driver: NativeFixtureDriver
     var gate: NativeFixtureGate?
     var reads = 0, useAlternate = false, rejectFormat = false, missingExpectedAudio = false
+    var failUnsupported = false, observedPreparationDiagnostic = false
+    var preflightDiagnosticAlive: (() -> Bool)?
+    var retainedPreflightDiagnosticAtEntry = false
     var duration: ExactMediaTime?
     init(driver: NativeFixtureDriver) { self.driver = driver }
     func snapshot(item: AVPlayerItemInstanceIdentity, source: HLSOwnedSourcePlan) async throws -> NativeHLSSelectionSnapshot {
         reads += 1
+        observedPreparationDiagnostic = observedPreparationDiagnostic || HLSPreparationDiagnostics.current != nil
+        retainedPreflightDiagnosticAtEntry = retainedPreflightDiagnosticAtEntry || preflightDiagnosticAlive?() == true
+        if failUnsupported { throw HLSSourceError.unsupportedMedia }
         let physical = try XCTUnwrap(driver.physical), selection = driver.selectionRevision
         await gate?.wait()
         guard source.isCurrent, driver.currentItemIdentity == item, driver.physical === physical,

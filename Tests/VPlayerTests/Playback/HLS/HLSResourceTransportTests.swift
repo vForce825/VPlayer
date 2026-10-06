@@ -4,6 +4,7 @@
 
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 @MainActor
@@ -16,6 +17,29 @@ final class HLSResourceTransportTests: XCTestCase {
         let context = try sourceContext(attributes: ["authorization": "Bearer fixture"])
         return .init(url: URL(string: "https://example.test\(path)")!, headers: context.headers,
             range: range, maximumBytes: maximumBytes, deadline: HLSMonotonicClock.deadline(seconds: 10), mode: mode)
+    }
+    func testContentEncodingDiagnosticCrossesDelegateBoundaryWithoutRetainingTheScope() async throws {
+        let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+        var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(
+            metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+        let observed = TestWeakReference(diagnostic)
+        XCTAssertNotNil(observed.value)
+        diagnostic?.begin(.resolve)
+        do {
+            _ = try await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
+                try await transport().fetch(request("/encoded"))
+            }
+            XCTFail("The existing identity-encoding contract must still reject this response")
+        } catch { XCTAssertEqual(error as? HLSSourceError, .unsupportedMedia) }
+        let snapshot = try XCTUnwrap(diagnostic?.freeze().project(HLSSourceError.unsupportedMedia) as? ErrorDiagnosticSnapshot)
+        XCTAssertTrue(snapshot.summary.contains("phase=resolve reason=http-encoding"))
+        XCTAssertTrue(snapshot.summary.contains("http=200"))
+        XCTAssertFalse(snapshot.summary.contains("private-encoding"))
+        XCTAssertFalse(snapshot.summary.contains("example.test"))
+        diagnostic = nil
+        XCTAssertNil(observed.value, "The invalidated URLSession delegate must release its diagnostic alias before returning")
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertNil(HLSPreparationDiagnostics.current)
     }
     func testPartial206CannotClaimACompleteManifestAtTCPCompletion() async throws {
         let response = try await transport().fetch(request("/prefix-manifest"))
@@ -69,6 +93,7 @@ private final class SourceHTTPProtocol: URLProtocol, @unchecked Sendable {
         let status: Int
         var headers: [String: String] = [:]
         switch url.path {
+        case "/encoded": body = Data("fixture".utf8); status = 200; headers["Content-Encoding"] = "private-encoding"
         case "/prefix-manifest", "/whole-manifest":
             body = Data("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\npart\n".utf8)
             status = 206

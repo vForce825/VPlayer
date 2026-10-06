@@ -12,6 +12,131 @@ import VPlayerCore
 /// Task22-F 的 production 装配边界。整图 fixture 由 root runner 在模拟器上执行；这里先
 /// 固定系统 builder 不能接受第二条 source 或脱离同一 lifecycle 的 graph authority。
 final class HLSAVPlayerBackendTests: XCTestCase {
+    @MainActor
+    func testSourcePreparationDiagnosticPreservesTerminalClassificationWithoutRawErrorText() throws {
+        let application = HLSDeliveryApplicationChargeLedger()
+        let ledger = PlaybackResourceContextLedger(applicationLedger: application)
+        let owner = try HLSRuntimeFailureMetadataOwner.reserve(in: ledger)
+        let diagnostic = HLSPreparationDiagnostics(metadataOwner: owner)
+        diagnostic.begin(.resolve)
+        diagnostic.reject(.httpEncoding, status: 200)
+        let frozen = diagnostic.freeze()
+        diagnostic.begin(.nativePrepare)
+        diagnostic.reject(.manifestFeatures)
+        let projected = frozen.project(HLSSourceError.unsupportedMedia)
+        let snapshot = try XCTUnwrap(projected as? ErrorDiagnosticSnapshot,
+            "Direct backend callers receive the bounded terminal snapshot, not a new public error family")
+        let original = HLSSourceError.unsupportedMedia as NSError
+        XCTAssertEqual(snapshot.typeName, String(reflecting: HLSSourceError.self))
+        XCTAssertTrue(snapshot.summary.contains("\(original.domain)(\(original.code))"))
+        XCTAssertTrue(snapshot.summary.contains("phase=resolve reason=http-encoding"))
+        XCTAssertFalse(snapshot.summary.contains("native"))
+        let mapped = PlaybackController.failure(for: .capture(projected, stage: "backend.prepare"))
+        let prior = PlaybackController.failure(for: .capture(HLSSourceError.unsupportedMedia, stage: "backend.prepare"))
+        XCTAssertEqual(mapped.code, prior.code)
+        XCTAssertEqual(mapped.diagnosticCode, prior.diagnosticCode)
+        XCTAssertEqual(mapped.retryDisposition, prior.retryDisposition)
+        XCTAssertTrue(mapped.userMessage.contains("播放器准备失败"))
+        XCTAssertLessThanOrEqual(diagnostic.knownAllocationUpperBoundBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+    }
+
+    func testPreparationDiagnosticLeavesCancellationAndMasterSelectionErrorsUntouched() throws {
+        let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+        let diagnostic = HLSPreparationDiagnostics(metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+        diagnostic.begin(.planner)
+        let frozen = diagnostic.freeze()
+        XCTAssertTrue(frozen.project(CancellationError()) is CancellationError)
+        let selection = HLSSelectedServiceRequired(variantCount: 2, audioChoiceCount: 1, subtitleChoiceCount: 0)
+        let projected = try XCTUnwrap(frozen.project(selection) as? HLSSelectedServiceRequired)
+        XCTAssertEqual(projected.variantCount, 2)
+        XCTAssertEqual(frozen.project(HLSSourceError.staleResolution) as? HLSSourceError, .staleResolution)
+        XCTAssertEqual(frozen.project(AVPlayerItemCoordinatorFailure.selectionChanged) as? AVPlayerItemCoordinatorFailure, .selectionChanged)
+    }
+
+    func testPreparationDiagnosticNewStageClearsPriorReasonAndRetainsOnlySourceCategory() throws {
+        let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+        let diagnostic = HLSPreparationDiagnostics(metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+        let context = try sourceContext(url: URL(string: "https://private-fixture.invalid/private-channel?secret=plain-secret")!,
+            attributes: ["Authorization": "raw-credential"])
+        let source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL,
+            generation: 1, topology: .media(Data("body-secret".utf8)), mediaCompleteness: .prefix)
+        diagnostic.begin(.resolve)
+        diagnostic.reject(.httpEncoding, status: 200)
+        diagnostic.resolved(source)
+        diagnostic.begin(.probe)
+        let snapshot = try XCTUnwrap(diagnostic.freeze().project(HLSSourceError.unsupportedMedia) as? ErrorDiagnosticSnapshot)
+        XCTAssertTrue(snapshot.summary.contains("phase=probe reason=none source=direct"))
+        XCTAssertFalse(snapshot.summary.contains("http-encoding"))
+        for secret in ["private-fixture", "private-channel", "plain-secret", "raw-credential", "body-secret"] {
+            XCTAssertFalse(snapshot.summary.contains(secret))
+        }
+    }
+
+    func testPreparationDiagnosticScopeJoinsBeforeNativeAndReleasesItsOriginalCharge() async throws {
+        let application = HLSDeliveryApplicationChargeLedger()
+        let ledger = PlaybackResourceContextLedger(applicationLedger: application)
+        var owner: HLSRuntimeFailureMetadataOwner? = try HLSRuntimeFailureMetadataOwner.reserve(in: ledger)
+        var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(metadataOwner: try XCTUnwrap(owner))
+        let weakDiagnostic = TestWeakReference(diagnostic)
+        XCTAssertNotNil(weakDiagnostic.value)
+        XCTAssertNil(HLSPreparationDiagnostics.current)
+        let inherited = await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
+            await Task { HLSPreparationDiagnostics.current != nil }.value
+        }
+        XCTAssertTrue(inherited)
+        XCTAssertNil(HLSPreparationDiagnostics.current,
+            "Native/player/producer tasks created after joined preflight must not inherit the paid record")
+        let nativeInherited = await Task { HLSPreparationDiagnostics.current != nil }.value
+        XCTAssertFalse(nativeInherited)
+        owner = nil
+        XCTAssertEqual(ledger.chargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
+        diagnostic = nil
+        XCTAssertNil(weakDiagnostic.value)
+        XCTAssertEqual(ledger.chargedBytes, 0)
+        XCTAssertEqual(application.chargedBytes, 0)
+    }
+
+    func testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText() throws {
+        for stage in [Int32(2), Int32(6)] {
+            let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+            let diagnostic = HLSPreparationDiagnostics(metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+            diagnostic.begin(.probe)
+            var native = VPFFSourceDiagnostic()
+            native.stage = stage; native.reason = stage == 2 ? 4 : 11
+            native.native_result = -22; native.container_kind = 1
+            native.input_bytes = 8 * 1_024 * 1_024; native.usable_bytes = 8 * 1_024 * 1_024 - 1
+            diagnostic.rejectedContainer(native)
+            let snapshot = try XCTUnwrap(diagnostic.freeze().project(HLSSourceError.unsupportedMedia) as? ErrorDiagnosticSnapshot)
+            XCTAssertTrue(snapshot.summary.contains("phase=probe reason=container"))
+            XCTAssertTrue(snapshot.summary.contains("cstage=\(stage)"))
+            XCTAssertTrue(snapshot.summary.contains("status=-22"))
+            XCTAssertTrue(snapshot.summary.contains("usable=8388607"), "The final scalar must fit the original detail capacity")
+            XCTAssertLessThanOrEqual(snapshot.summary.utf8.count, 384 + 3)
+        }
+    }
+
+    func testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow() async throws {
+        let context = try sourceContext()
+        let text = "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-PART:DURATION=0.5,URI=\"private-part\"\n#EXTINF:1,\nprivate-segment\n"
+        let graph = try HLSManifestGraph.parse(data: Data(text.utf8), responseURL: context.entryURL)
+        let source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL, generation: 1, topology: .hls(graph))
+        let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+        let diagnostic = HLSPreparationDiagnostics(metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+        diagnostic.resolved(source); diagnostic.begin(.probe)
+        let transport = SourceTestTransport(responses: [:])
+        do {
+            _ = try await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
+                try await HLSCompatibilityProbe(transport: transport).inspect(source)
+            }
+            XCTFail("Unsupported manifest feature must retain its original rejection")
+        } catch { XCTAssertEqual(error as? HLSSourceError, .unsupportedMedia) }
+        let requests = await transport.requests
+        XCTAssertTrue(requests.isEmpty)
+        let snapshot = try XCTUnwrap(diagnostic.freeze().project(HLSSourceError.unsupportedMedia) as? ErrorDiagnosticSnapshot)
+        XCTAssertTrue(snapshot.summary.contains("phase=probe reason=manifest-features source=hls-media"))
+        XCTAssertFalse(snapshot.summary.contains("private-"))
+    }
+
     func testDormantRuntimeFirstFailureReplaysOnceOutsideRelayLock() throws {
         print("HLS 有域首错实际尺寸：eventStride=\(MemoryLayout<PlaybackPipelineEvent>.stride) " +
             "ticketStride=\(MemoryLayout<PrepareTicket>.stride) " +

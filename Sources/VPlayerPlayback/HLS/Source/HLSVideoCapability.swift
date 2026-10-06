@@ -31,10 +31,29 @@ public struct HLSVideoCapability: Sendable {
               let rate = facts.frameRate, rate.num > 0, rate.den > 0, maximumFrameRate.num > 0,
               Int64(rate.num) * Int64(maximumFrameRate.den) <= Int64(maximumFrameRate.num) * Int64(rate.den),
               facts.colorPrimaries != nil, facts.colorTransfer != nil, facts.colorMatrix != nil else { return false }
-        switch range {
-        case .sdr: return facts.colorPrimaries == .bt709 && facts.colorTransfer == .bt709 && facts.colorMatrix == .bt709
-        case .pq: return codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .pq && facts.colorMatrix == .bt2020Nonconstant
-        case .hlg: return codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .hlg && facts.colorMatrix == .bt2020Nonconstant
+        return Self.supportsNativeColor(facts)
+    }
+
+    static func supportsNativeColor(_ facts: HLSVideoFacts) -> Bool {
+        switch facts.videoRange {
+        case .sdr:
+            if facts.colorPrimaries == .bt709 && facts.colorTransfer == .bt709 && facts.colorMatrix == .bt709 { return true }
+            // Rec.601: keep distinct primaries and source codes; native AVPlayer
+            // owns their interpretation. H.273 transfer 6 equals 1, matrix 5 equals 6.
+            return facts.colorPrimaries?.isRec601 == true && facts.colorMatrix?.isRec601 == true &&
+                (facts.colorTransfer == .bt709 || facts.colorTransfer == .smpte170M)
+        case .pq: return facts.codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .pq && facts.colorMatrix == .bt2020Nonconstant
+        case .hlg: return facts.codec == .hevc && facts.bitDepth == 10 && facts.colorPrimaries == .bt2020 && facts.colorTransfer == .hlg && facts.colorMatrix == .bt2020Nonconstant
+        case nil: return false
         }
+    }
+}
+
+// Source recognition is broader than the current generated color contract.
+// Missing evidence retains its existing policy; only newly recognized codes
+// are fenced here, before any fallback can normalize them to BT.709.
+extension HLSVideoFacts {
+    var requiresNativeRec601Color: Bool {
+        colorPrimaries?.isRec601 == true || colorTransfer?.isRec601 == true || colorMatrix?.isRec601 == true
     }
 }
