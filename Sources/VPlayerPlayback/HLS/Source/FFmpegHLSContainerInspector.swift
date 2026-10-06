@@ -174,7 +174,9 @@ private final class SourceInspectionState: @unchecked Sendable {
                 width: proof.width, height: proof.height, chromaFormat: proof.chromaFormatIDC, bitDepth: proof.bitDepthLuma, level: proof.levelIDC,
                 parserProgressiveFrames: track.progressive_frames, parserInterlacedFrames: track.interlaced_frames,
                 compatibilityFlags: proof.compatibilityFlags, constraintIndicatorFlags: proof.hevcConstraintIndicatorFlags,
-                tier: format.tier == .main ? .main : .high, frameRate: rate, videoRange: range,
+                tier: format.tier == .main ? .main : .high, frameRate: rate,
+                explicitSequenceFrameRate: codec == .h264 && flags.progressiveOnly ? format.frameRate : nil,
+                videoRange: range,
                 colorPrimaries: primaries, colorTransfer: transfer, colorMatrix: matrix, sampleEntry: sampleEntry(track.sample_entry))
         } catch HLSSourceVideoProjection.Failure.contradictory {
             return HLSVideoFacts(codec: codec, profile: track.profile, scan: .contradictory, parameterSetsValidated: false)

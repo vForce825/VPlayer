@@ -35,12 +35,23 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
     }
 
-    func testNativeTruncatedHTTPResponseFailsWithoutNormalEndNotification() async throws {
+    func testNativeInterruptedResponseDoesNotCompleteDuringBoundedObservation() async throws {
         let bytes = try fixtureBytes()
         let result = try await runEndpointControl(.defaultEnd, bytes: bytes, disconnectAfterBodyBytes: min(32 * 188, bytes.count / 2))
-        XCTAssertTrue(result.sdkFailed, "A real SDK transport failure is required; a test timeout is not evidence")
-        XCTAssertNotEqual(result.errorDomain, "control.deadline")
-        XCTAssertFalse(result.endedNormally, "The failed transport must not be mislabeled as normal EOF")
+        XCTAssertGreaterThan(result.interruptedBodies, 0, "The origin must actually send a prefix and close its connection")
+        XCTAssertFalse(result.endedNormally, "An interrupted response must not become normal EOF during this observation")
+        if result.errorDomain == "control.deadline" {
+            // tvOS can keep retrying without reaching ready or an SDK error.
+            // This is bounded pre-ready non-completion, not a transport-failure
+            // or native-driver terminal proof. The paused early-EOF test below
+            // separately checks authority-backed premature-end rejection.
+            XCTAssertFalse(result.sdkFailed)
+            XCTAssertEqual(result.stageBeforeCleanup, "ready")
+            XCTAssertEqual(result.statusBeforeCleanup, AVPlayerItem.Status.unknown.rawValue)
+            XCTAssertFalse(result.progressed)
+        } else {
+            XCTAssertTrue(result.sdkFailed, "An earlier terminal result must be an independently observed SDK failure")
+        }
     }
 
     func testNativeTruncationControlKeepsFirstFailureOwnership() {
@@ -103,6 +114,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let physical = try XCTUnwrap(player.currentItem)
                 let driver = try XCTUnwrap(backend.nativeSystemDriverForTesting)
                 let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+                XCTAssertTrue(coordinator.owned.facts.media.compactMap(\.video).allSatisfy {
+                    $0.explicitSequenceFrameRate == MediaRational(num: 30, den: 1)
+                })
                 let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
                 XCTAssertTrue(quantum.isCurrent(item: coordinator.item, physical: physical))
                 let videoTrack = try XCTUnwrap(physical.tracks.first { $0.isEnabled && $0.assetTrack?.mediaType == .video })
@@ -167,6 +181,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let activation = try XCTUnwrap(coordinator.currentActivation)
                 let endpoint = try ExactMediaTime(physical.duration)
                 let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+                XCTAssertTrue(coordinator.owned.facts.media.compactMap(\.video).allSatisfy {
+                    $0.explicitSequenceFrameRate == MediaRational(num: 30, den: 1)
+                })
                 let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
                 XCTAssertEqual(quantum.period, ExactMediaTime(value: 1, timescale: 30))
                 XCTAssertEqual(endpoint, ExactMediaTime(value: 80, timescale: 1))
@@ -280,7 +297,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             "/part.ts": .init(data: bytes, contentType: "video/mp2t", disconnectAfterBodyBytes: disconnectAfterBodyBytes)], credential: managed ? "ordinary fixture" : nil)
     }
     private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data, disconnectAfterBodyBytes: Int? = nil) async throws
-        -> (progressed: Bool, errorDomain: String?, errorCode: Int?, endedNormally: Bool, sdkFailed: Bool) {
+        -> (progressed: Bool, errorDomain: String?, errorCode: Int?, endedNormally: Bool, sdkFailed: Bool,
+            interruptedBodies: Int, statusBeforeCleanup: Int, stageBeforeCleanup: String) {
         let origin = try makeOrigin(bytes: bytes, managed: false, disconnectAfterBodyBytes: disconnectAfterBodyBytes)
         let player = AVPlayer()
         let item = AVPlayerItem(url: origin.url("master.m3u8"))
@@ -295,13 +313,17 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             }
         let endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item, queue: nil) { _ in signal.didEnd() }
+        var stage = "ready", progressed = false
+        var statusBeforeCleanup = item.status.rawValue, stageBeforeCleanup = stage
+        var interruptedBodies = 0
         let timeout = Task { @MainActor [weak player] in
             do { try await Task.sleep(for: .seconds(20)) } catch { return }
+            statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage
+            interruptedBodies = origin.completedInterruptedBodies
             signal.fail(domain: "control.deadline", code: 0)
             player?.cancelPendingPrerolls()
             player?.currentItem?.asset.cancelLoading()
         }
-        var stage = "ready", progressed = false
         do {
             player.replaceCurrentItem(with: item)
             while item.status != .readyToPlay {
@@ -353,13 +375,18 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             }
         }
         let failure = signal.snapshot
+        if failure?.0 != "control.deadline" {
+            statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage
+            interruptedBodies = origin.completedInterruptedBodies
+        }
         // Only the first recorded signal owns classification. A deadline first
         // cancels SDK work, whose resulting item.error is not transport evidence.
         let sdkFailed = signal.sdkFailed
         let current = item.currentTime(), end = item.forwardPlaybackEndTime
         print("NATIVE_HLS_ENDPOINT_CONTROL diagnostic-only=true boundary=\(boundary.rawValue) stage=\(stage) progressed=\(progressed) " +
             "failure-domain=\(failure?.0 ?? "none") failure-code=\(failure?.1 ?? 0) status=\(item.status.rawValue) " +
-            "current=\(current.value)/\(current.timescale):\(current.flags.rawValue) end=\(end.value)/\(end.timescale):\(end.flags.rawValue)")
+            "current=\(current.value)/\(current.timescale):\(current.flags.rawValue) end=\(end.value)/\(end.timescale):\(end.flags.rawValue) " +
+            "interrupted-bodies=\(interruptedBodies) status-before-cleanup=\(statusBeforeCleanup) stage-before-cleanup=\(stageBeforeCleanup)")
         timeout.cancel(); await timeout.value
         player.cancelPendingPrerolls(); player.pause()
         await withCheckedContinuation { continuation in player.setDisconnectedFromSystemAudio(true) { continuation.resume() } }
@@ -369,7 +396,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let endedNormally = signal.endedNormally
         signal.close()
         await origin.close()
-        return (progressed, failure?.0, failure?.1, endedNormally, sdkFailed)
+        return (progressed, failure?.0, failure?.1, endedNormally, sdkFailed, interruptedBodies, statusBeforeCleanup, stageBeforeCleanup)
     }
 
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }

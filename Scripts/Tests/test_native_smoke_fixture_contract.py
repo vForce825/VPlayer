@@ -51,6 +51,17 @@ class NativeSmokeFixtureContract(unittest.TestCase):
         declared = float(re.search(r'#EXTINF:([0-9.]+),', source).group(1))
         self.assertAlmostEqual(declared, float(actual['format']['duration']), delta=0.1)
 
+    def test_native_fixture_has_explicit_progressive_fixed_sps_timing(self):
+        result = subprocess.run([
+            'ffmpeg', '-hide_banner', '-i', str(ROOT / 'Tests/Fixtures/Video/homepod-live-h264-aac-80s.ts'),
+            '-map', '0:v:0', '-c', 'copy', '-bsf:v', 'trace_headers', '-frames:v', '1', '-f', 'null', '-'],
+            check=True, text=True, capture_output=True)
+        for field, value in [('frame_mbs_only_flag', 1), ('fixed_frame_rate_flag', 1),
+                             ('num_units_in_tick', 1), ('time_scale', 60)]:
+            matches = re.findall(r'\b' + field + r'\s+[01]+ = (\d+)', result.stderr)
+            self.assertTrue(matches, field)
+            self.assertEqual(set(map(int, matches)), {value}, field)
+
 
 if __name__ == '__main__':
     unittest.main()

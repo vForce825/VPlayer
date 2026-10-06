@@ -75,6 +75,46 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testUnknownSDKMinimumRequiresSelectedFixedTimingAcrossDistinctVariants() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let source = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+            let video = try XCTUnwrap(source.facts.media.first?.video)
+            let fixed = try XCTUnwrap(video.frameRate)
+            for unknown in [nil, CMTime.invalid] as [CMTime?] {
+                XCTAssertEqual(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: unknown,
+                    selectedFixedFrameRate: fixed, video: video, expected: source.facts), ExactMediaTime(value: 1, timescale: 25))
+                XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: unknown,
+                    video: video, expected: source.facts), "Nominal/source average alone cannot grant a quantum")
+            }
+            for contradictory in [CMTime.zero, .indefinite, CMTime(value: -1, timescale: 25), CMTime(value: 0, timescale: 0, flags: [], epoch: 1),
+                                  CMTime(value: 1, timescale: 30), CMTime(value: 1, timescale: 25, flags: .valid, epoch: 1)] {
+                XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: contradictory,
+                    selectedFixedFrameRate: fixed, video: video, expected: source.facts))
+            }
+            XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: .invalid,
+                selectedFixedFrameRate: MediaRational(num: 30, den: 1), video: video, expected: source.facts))
+            let differentConfiguration = HLSMediaFacts(url: source.facts.media[0].url, container: .mpegTS,
+                video: NativeFixtureProbe.video(width: 1_280, rate: fixed), audio: [], hasUnsupportedTracks: false)
+            let mixed = HLSCompatibilityFacts(source: source.source, media: source.facts.media + [differentConfiguration],
+                complete: true, inspectedBytes: 188)
+            XCTAssertEqual(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: .invalid,
+                selectedFixedFrameRate: fixed, video: video, expected: mixed), ExactMediaTime(value: 1, timescale: 25),
+                "Ordinary different-resolution ABR may share explicit fixed timing")
+            for sequenceRate in [nil, MediaRational(num: 30, den: 1)] as [MediaRational?] {
+                let missingOrContradictory = HLSMediaFacts(url: source.facts.media[0].url, container: .mpegTS,
+                    video: NativeFixtureProbe.video(width: 1_280, rate: fixed, sequenceRate: sequenceRate),
+                    audio: [], hasUnsupportedTracks: false)
+                let unsupported = HLSCompatibilityFacts(source: source.source, media: source.facts.media + [missingOrContradictory],
+                    complete: true, inspectedBytes: 188)
+                XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: .invalid,
+                    selectedFixedFrameRate: fixed, video: video, expected: unsupported))
+                XCTAssertNotEqual(unsupported.formatFingerprint, mixed.formatFingerprint,
+                    "Timing provenance participates in source authority identity")
+            }
+        }
+    }
+
     func testNativeFinalQuantumAcceptsObservedClocksAndRejectsOutsideOrMissingEvidence() throws {
         let end = ExactMediaTime(value: 80, timescale: 1)
         let quantum = ExactMediaTime(value: 1, timescale: 30)
@@ -612,11 +652,12 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     private var generatedValue = false
     var generated: Bool { get { lock.withLock { generatedValue } } set { lock.withLock { generatedValue = newValue } } }
     var gate: NativeFixtureGate? { get { lock.withLock { gateValue } } set { lock.withLock { gateValue = newValue } } }
-    static func video(width: Int32 = 1_920, rate: MediaRational? = MediaRational(num: 25, den: 1)) -> HLSVideoFacts {
+    static func video(width: Int32 = 1_920, rate: MediaRational? = MediaRational(num: 25, den: 1),
+        sequenceRate: MediaRational? = MediaRational(num: 25, den: 1)) -> HLSVideoFacts {
         .init(codec: .h264, profile: 100, scan: .progressive, parameterSetsValidated: true,
             configurationFingerprint: Data([UInt8(width == 1_920 ? 1 : 2)]), width: width, height: width == 1_920 ? 1_080 : 720,
             chromaFormat: 1, bitDepth: 8, level: 40, parserProgressiveFrames: 2, compatibilityFlags: 0,
-            tier: .main, frameRate: rate, videoRange: .sdr,
+            tier: .main, frameRate: rate, explicitSequenceFrameRate: sequenceRate, videoRange: .sdr,
             colorPrimaries: .bt709, colorTransfer: .bt709, colorMatrix: .bt709, sampleEntry: "avc1")
     }
     static let audio = HLSSourceAudioFacts(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2,

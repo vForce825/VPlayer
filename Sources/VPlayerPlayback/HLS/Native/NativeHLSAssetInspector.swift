@@ -41,7 +41,7 @@ final class NativeHLSSelectionRevision: @unchecked Sendable {
     func matches(_ revision: UInt64) -> Bool { lock.withLock { !exhausted && value == revision } }
 }
 
-/// Selected SDK timing evidence, not evidence that every final sample rendered.
+/// Selected SDK/configuration timing evidence, not proof that every final sample rendered.
 /// Its allocation and aliases remain covered by the selected snapshot's charge.
 final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
     let period: ExactMediaTime
@@ -164,6 +164,9 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let expectsVideo = source.facts.media.contains { $0.video != nil }
         var video: HLSVideoFacts?, audio: HLSSourceAudioFacts?, audioDigest: Data?, observedRate: Double?
         var videoQuantum: (period: ExactMediaTime, track: ObjectIdentifier, asset: ObjectIdentifier)?
+        #if DEBUG
+        var quantumDetail = "reason=no-selected-video"
+        #endif
         for (index, asset) in assets.enumerated() {
             // A nil SDK track can be non-audio text. The final expected-audio
             // and expected-video guards still require real selected format proof.
@@ -176,7 +179,8 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
             guard formats.count == 1, let format = formats.first else { throw HLSSourceError.incompleteEvidence }
             if type == .video {
                 guard video == nil else { throw HLSSourceError.unsupportedMedia }
-                let actual = try Self.videoFacts(format, expected: source.facts)
+                let selectedVideo = try Self.videoEvidence(format, expected: source.facts)
+                let actual = selectedVideo.facts
                 let rate = try await asset.load(.nominalFrameRate)
                 try validate()
                 if rate.isFinite, rate > 0 {
@@ -187,10 +191,18 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
                 }
                 let minimum = try? await asset.load(.minFrameDuration)
                 try validate()
-                if let minimum, let period = Self.validatedPresentationQuantum(minimumFrameDuration: minimum,
-                    video: actual, expected: source.facts) {
+                let decision = Self.presentationQuantumDecision(minimumFrameDuration: minimum,
+                    selectedFixedFrameRate: selectedVideo.fixedFrameRate, video: actual, expected: source.facts)
+                if let period = decision.period {
                     videoQuantum = (period, trackIDs[index], ObjectIdentifier(asset))
                 }
+                #if DEBUG
+                quantumDetail = "reason=\(decision.reason) source-rate=\(actual.frameRate?.num ?? 0)/\(actual.frameRate?.den ?? 0) " +
+                    "source-explicit-rate=\(actual.explicitSequenceFrameRate?.num ?? 0)/\(actual.explicitSequenceFrameRate?.den ?? 0) " +
+                    "fixed-sps-rate=\(selectedVideo.fixedFrameRate?.num ?? 0)/\(selectedVideo.fixedFrameRate?.den ?? 0) " +
+                    "sdk-nominal=\(rate) sdk-min=\(minimum?.value ?? 0)/\(minimum?.timescale ?? 0):\(minimum?.epoch ?? 0):\(minimum?.flags.rawValue ?? 0) " +
+                    "sdk-min-loaded=\(minimum != nil) variants=\(source.facts.media.compactMap(\.video).count)"
+                #endif
                 video = actual
             } else {
                 guard audio == nil else { throw HLSSourceError.unsupportedMedia }
@@ -224,26 +236,72 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
                 source: source, video: video, revision: revision,
                 selectionRevision: driver.nativeSelectionRevision, retention: retained)
         } else { quantum = nil }
+        #if DEBUG
+        print("NATIVE_HLS_QUANTUM item=\(identity.itemGeneration) present=\(quantum != nil) duration=\(duration?.value ?? 0)/\(duration?.timescale ?? 0) \(quantumDetail)")
+        #endif
         return .init(item: identity, physicalItem: ObjectIdentifier(item), audioSelection: selectedAudio.map(ObjectIdentifier.init),
             video: video, audio: audio, audioConfigurationDigest: audioDigest, observedFrameRate: observedRate,
             sourceOwner: source, retention: retained, duration: duration, finalPresentationQuantum: quantum)
     }
 
-    static func validatedPresentationQuantum(minimumFrameDuration: CMTime, video: HLSVideoFacts,
-        expected: HLSCompatibilityFacts) -> ExactMediaTime? {
+    static func validatedPresentationQuantum(minimumFrameDuration: CMTime?, selectedFixedFrameRate: MediaRational? = nil,
+        video: HLSVideoFacts, expected: HLSCompatibilityFacts) -> ExactMediaTime? {
+        presentationQuantumDecision(minimumFrameDuration: minimumFrameDuration,
+            selectedFixedFrameRate: selectedFixedFrameRate, video: video, expected: expected).period
+    }
+
+    private static func presentationQuantumDecision(minimumFrameDuration: CMTime?, selectedFixedFrameRate: MediaRational?,
+        video: HLSVideoFacts, expected: HLSCompatibilityFacts) -> (period: ExactMediaTime?, reason: String) {
         guard expected.complete, video.parameterSetsValidated, video.scan == .progressive,
-              let rate = video.frameRate, rate.num > 0, rate.den > 0,
-              let minimum = try? ExactMediaTime(minimumFrameDuration), minimum.value > 0 else { return nil }
+              let rate = video.frameRate, rate.num > 0, rate.den > 0 else { return (nil, "source-timing-incomplete") }
         let period = ExactMediaTime(value: Int64(rate.den), timescale: rate.num)
-        guard minimum == period else { return nil }
         let variants = expected.media.compactMap(\.video)
         guard !variants.isEmpty, variants.allSatisfy({ video in
             video.parameterSetsValidated && video.scan == .progressive && video.frameRate == rate
-        }) else { return nil }
-        return period
+        }) else { return (nil, "variant-period-mismatch") }
+        // Only absent/invalid is unknown. Zero, indefinite, epoch and numeric
+        // contradictions cannot borrow a period from selected source timing.
+        guard (minimumFrameDuration?.epoch ?? 0) == 0 else { return (nil, "sdk-minimum-contradiction") }
+        if minimumFrameDuration?.isValid != true {
+            guard video.codec == .h264, selectedFixedFrameRate == rate else {
+                return (nil, "sdk-minimum-unknown-without-selected-fixed-sps")
+            }
+            guard video.explicitSequenceFrameRate == rate else { return (nil, "source-explicit-period-missing-or-mismatch") }
+            guard variants.allSatisfy({ $0.codec == .h264 && $0.explicitSequenceFrameRate == rate }) else {
+                return (nil, "variant-explicit-period-missing-or-mismatch")
+            }
+            return (period, "selected-fixed-h264-sps")
+        }
+        guard let minimumFrameDuration, let minimum = try? ExactMediaTime(minimumFrameDuration),
+              minimum.value > 0, minimum == period else { return (nil, "sdk-minimum-contradiction") }
+        return (period, "sdk-minimum")
+    }
+
+    /// H.264 fixed_frame_rate_flag plus progressive frame pictures provides an
+    /// explicit source presentation period. Average/nominal rates, variable-rate
+    /// SPS and HEVC POC timing alone do not. This parses only the already bounded,
+    /// selected parameter sets whose complete digest is matched below.
+    static func selectedFixedFrameRate(parameterSets: [Data], codec: VideoCodec) -> MediaRational? {
+        guard codec == .h264, parameterSets.count <= HLSVideoConfigurationFingerprint.maximumParameterSets,
+              parameterSets.allSatisfy({ !$0.isEmpty && $0.count <= HLSVideoConfigurationFingerprint.maximumBytes }),
+              parameterSets.reduce(0, { $0 + $1.count }) <= HLSVideoConfigurationFingerprint.maximumBytes else { return nil }
+        let sequence = parameterSets.filter { $0[0] & 31 == 7 }
+        guard !sequence.isEmpty else { return nil }
+        var rate: MediaRational?
+        for sps in sequence {
+            guard let format = try? VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: codec),
+                  format.progressiveSourceFlag == true, let fixed = format.frameRate,
+                  rate == nil || rate == fixed else { return nil }
+            rate = fixed
+        }
+        return rate
     }
 
     static func videoFacts(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws -> HLSVideoFacts {
+        try videoEvidence(format, expected: expected).facts
+    }
+    private static func videoEvidence(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws
+        -> (facts: HLSVideoFacts, fixedFrameRate: MediaRational?) {
         let codec: VideoCodec
         switch CMFormatDescriptionGetMediaSubType(format) {
         case kCMVideoCodecType_H264, 0x61766333: codec = .h264
@@ -285,7 +343,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         if appearance.range == .pq || appearance.range == .hlg {
             guard AVPlayer.eligibleForHDRPlayback else { throw HLSSourceError.unsupportedMedia }
         }
-        return matching
+        return (matching, selectedFixedFrameRate(parameterSets: sets, codec: codec))
     }
     private static func audioFacts(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws -> (HLSSourceAudioFacts, Data) {
         guard let pointer = CMAudioFormatDescriptionGetStreamBasicDescription(format) else { throw HLSSourceError.incompleteEvidence }

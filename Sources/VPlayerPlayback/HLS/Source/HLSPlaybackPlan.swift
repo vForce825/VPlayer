@@ -28,6 +28,9 @@ public struct HLSVideoFacts: Sendable, Hashable {
     public let constraintIndicatorFlags: UInt64?
     public let tier: HLSVideoTier?
     public let frameRate: MediaRational?
+    /// Explicit fixed progressive H.264 SPS timing, never parser/average-rate fallback.
+    /// Unknown and HEVC timing remain nil until equivalent fixed-cadence proof exists.
+    public let explicitSequenceFrameRate: MediaRational?
     public let videoRange: HLSVideoRange?
     public let colorPrimaries: DemuxColorPrimaries?
     public let colorTransfer: DemuxColorTransfer?
@@ -38,7 +41,8 @@ public struct HLSVideoFacts: Sendable, Hashable {
                 chromaFormat: UInt8 = 0, bitDepth: UInt8 = 0, level: UInt8 = 0,
                 parserProgressiveFrames: Int32 = 0, parserInterlacedFrames: Int32 = 0,
                 compatibilityFlags: UInt32? = nil, constraintIndicatorFlags: UInt64? = nil,
-                tier: HLSVideoTier? = nil, frameRate: MediaRational? = nil, videoRange: HLSVideoRange? = nil,
+                tier: HLSVideoTier? = nil, frameRate: MediaRational? = nil, explicitSequenceFrameRate: MediaRational? = nil,
+                videoRange: HLSVideoRange? = nil,
                 colorPrimaries: DemuxColorPrimaries? = nil, colorTransfer: DemuxColorTransfer? = nil,
                 colorMatrix: DemuxColorMatrix? = nil, sampleEntry: String? = nil) {
         self.codec = codec; self.profile = profile; self.scan = scan; self.parameterSetsValidated = parameterSetsValidated
@@ -46,7 +50,7 @@ public struct HLSVideoFacts: Sendable, Hashable {
         self.chromaFormat = chromaFormat; self.bitDepth = bitDepth; self.level = level
         self.parserProgressiveFrames = parserProgressiveFrames; self.parserInterlacedFrames = parserInterlacedFrames
         self.compatibilityFlags = compatibilityFlags; self.constraintIndicatorFlags = constraintIndicatorFlags
-        self.tier = tier; self.frameRate = frameRate; self.videoRange = videoRange
+        self.tier = tier; self.frameRate = frameRate; self.explicitSequenceFrameRate = explicitSequenceFrameRate; self.videoRange = videoRange
         self.colorPrimaries = colorPrimaries; self.colorTransfer = colorTransfer; self.colorMatrix = colorMatrix; self.sampleEntry = sampleEntry
     }
 }
@@ -112,6 +116,7 @@ public struct HLSCompatibilityFacts: Sendable, CustomStringConvertible, CustomRe
             components.append(item.container.rawValue)
             if let video = item.video {
                 components.append("video:\(video.codec?.rawValue ?? 0):\(video.profile):\(video.scan.rawValue):\(video.configurationFingerprint.base64EncodedString())")
+                components.append("explicit-sequence-rate:\(String(describing: video.explicitSequenceFrameRate))")
                 components.append("entry:\(String(describing: video.sampleEntry)):\(String(describing: video.compatibilityFlags)):\(String(describing: video.constraintIndicatorFlags))")
                 components.append("format:\(video.width):\(video.height):\(video.level):\(String(describing: video.tier)):\(String(describing: video.frameRate)):\(String(describing: video.videoRange)):\(video.chromaFormat):\(video.bitDepth):\(String(describing: video.colorPrimaries)):\(String(describing: video.colorTransfer)):\(String(describing: video.colorMatrix))")
             }

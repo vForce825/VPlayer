@@ -38,6 +38,20 @@ final class NativeHLSSelectedVideoFormatTests: XCTestCase {
         XCTAssertNoThrow(try SystemNativeHLSAssetInspector.videoFacts(format, expected: fixture.facts(sampleEntry: nil, container: .mpegTS)))
         XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(format, expected: fixture.facts(sampleEntry: nil, container: .fragmentedMP4)))
     }
+    func testSelectedSPSPeriodRequiresExplicitProgressiveFixedTiming() throws {
+        let fixed = try NativeColorFixture(fixedTiming: true)
+        XCTAssertEqual(SystemNativeHLSAssetInspector.selectedFixedFrameRate(parameterSets: fixed.parameters, codec: .h264),
+            MediaRational(num: 25, den: 1))
+        for unsupported in [try NativeColorFixture(), try NativeColorFixture(fixedTiming: false)] {
+            XCTAssertNil(SystemNativeHLSAssetInspector.selectedFixedFrameRate(parameterSets: unsupported.parameters, codec: .h264))
+        }
+        XCTAssertNil(SystemNativeHLSAssetInspector.selectedFixedFrameRate(parameterSets: fixed.parameters, codec: .hevc),
+            "HEVC POC timing alone is not an explicit fixed presentation cadence")
+        let different = try NativeColorFixture(fixedTiming: true, timeScale: 60)
+        XCTAssertNil(SystemNativeHLSAssetInspector.selectedFixedFrameRate(
+            parameterSets: fixed.parameters + [different.parameters[0]], codec: .h264))
+    }
+
     private func parameterSets(_ format: CMFormatDescription) throws -> [Data] {
         var count = 0, width: Int32 = 0
         var values: [Data] = []
@@ -58,7 +72,7 @@ final class NativeHLSSelectedVideoFormatTests: XCTestCase {
 private struct NativeColorFixture {
     let parameters: [Data]
     let base: CMFormatDescription
-    init() throws {
+    init(fixedTiming: Bool? = nil, timeScale: UInt64 = 50) throws {
         var sps = NativeColorBits()
         sps.write(100, count: 8); sps.write(0, count: 8); sps.write(40, count: 8)
         sps.ue(0); sps.ue(1); sps.ue(0); sps.ue(0)
@@ -66,7 +80,13 @@ private struct NativeColorFixture {
         sps.ue(0); sps.ue(0); sps.ue(0); sps.ue(4); sps.write(0, count: 1)
         sps.ue(119); sps.ue(67); sps.write(1, count: 1); sps.write(1, count: 1)
         sps.write(1, count: 1); sps.ue(0); sps.ue(0); sps.ue(0); sps.ue(4)
-        sps.write(0, count: 1) // no VUI, deliberately identical across every test
+        if let fixedTiming {
+            sps.write(1, count: 1) // VUI, with no appearance overrides
+            sps.write(0, count: 1); sps.write(0, count: 1); sps.write(0, count: 1); sps.write(0, count: 1)
+            sps.write(1, count: 1); sps.write(1, count: 32); sps.write(timeScale, count: 32)
+            sps.write(fixedTiming ? 1 : 0, count: 1)
+            sps.write(0, count: 1); sps.write(0, count: 1); sps.write(0, count: 1); sps.write(0, count: 1)
+        } else { sps.write(0, count: 1) } // no VUI in appearance regressions
         var pps = NativeColorBits()
         pps.ue(0); pps.ue(0); pps.write(0, count: 1); pps.write(0, count: 1)
         pps.ue(0); pps.ue(0); pps.ue(0); pps.write(0, count: 1); pps.write(0, count: 2)

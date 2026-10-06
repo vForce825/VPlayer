@@ -93,9 +93,39 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('return (progressed, failure?.0', smoke)
         self.assertIn('let sdkFailed = signal.sdkFailed\n', smoke)
         self.assertNotIn('signal.sdkFailed || item.error', smoke)
-        self.assertIn('XCTAssertNotEqual(result.errorDomain, "control.deadline")', smoke)
+        self.assertIn('testNativeInterruptedResponseDoesNotCompleteDuringBoundedObservation', smoke)
+        self.assertIn('XCTAssertGreaterThan(result.interruptedBodies, 0,', smoke)
         self.assertIn('testNativeTruncationControlKeepsFirstFailureOwnership', smoke)
         self.assertIn('XCTAssertLessThan(CMTimeCompare(early.cmTime, finalQuantumStart.cmTime), 0)', smoke)
+
+    def test_unknown_sdk_timing_needs_selected_fixed_bitstream_evidence(self):
+        source = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSAssetInspector.swift').read_text()
+        self.assertIn('selectedFixedFrameRate(parameterSets: sets, codec: codec)', source)
+        self.assertIn('VideoSequenceParameterSetInspector.sourceFormat', source)
+        self.assertIn('guard codec == .h264', source)
+        self.assertIn('selectedFixedFrameRate == rate', source)
+        self.assertIn('explicitSequenceFrameRate == rate', source)
+        self.assertNotIn('configurationFingerprint == video.configurationFingerprint', source)
+        facts = (ROOT / 'Sources/VPlayerPlayback/HLS/Source/HLSPlaybackPlan.swift').read_text()
+        self.assertIn('explicitSequenceFrameRate: MediaRational? = nil', facts)
+        self.assertIn('String(describing: video.explicitSequenceFrameRate)', facts)
+        self.assertIn('sdk-minimum-contradiction', source)
+        self.assertIn('NATIVE_HLS_QUANTUM', source)
+        self.assertIn('minimumFrameDuration?.isValid != true', source)
+        self.assertNotIn('minimumFrameDuration?.isNumeric != true', source)
+
+    def test_interrupted_control_requires_observed_delivery_without_inventing_sdk_failure(self):
+        smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        fixture = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSHTTPFixture.swift').read_text()
+        self.assertIn('XCTAssertGreaterThan(result.interruptedBodies, 0,', smoke)
+        self.assertIn('XCTAssertFalse(result.endedNormally', smoke)
+        self.assertIn('if result.errorDomain == "control.deadline"', smoke)
+        self.assertIn('XCTAssertFalse(result.sdkFailed)', smoke)
+        self.assertIn('completedInterruptedBodiesValue', fixture)
+        self.assertIn('didCompleteInterruptedBody', fixture)
+        timeout = smoke.split('let timeout = Task', 1)[1].split('player?.cancelPendingPrerolls()', 1)[0]
+        self.assertIn('interruptedBodies = origin.completedInterruptedBodies', timeout)
+        self.assertIn('statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage', timeout)
 
 
 if __name__ == '__main__':

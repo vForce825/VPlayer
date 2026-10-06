@@ -43,7 +43,11 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
     private var listenerDone = false
     private var listenerWaiter: CheckedContinuation<Void, Never>?
     private var requestCountValue = 0, authenticatedCountValue = 0, deniedCountValue = 0, completedHeadersValue = 0
+    private var completedInterruptedBodiesValue = 0
+    private var interruptedClosures: Set<ObjectIdentifier> = []
     let baseURL: URL
+    // Partial origin send plus connection cancellation, not client consumption.
+    var completedInterruptedBodies: Int { lock.withLock { completedInterruptedBodiesValue } }
     var requestCount: Int { lock.withLock { requestCountValue } }
     var completedHeaders: Int { lock.withLock { completedHeadersValue } }
     var pausedBodyCount: Int { lock.withLock { pausedBodies.count } }
@@ -101,7 +105,11 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             if case .cancelled = state {
-                let removed = self.lock.withLock { self.clients.removeValue(forKey: ObjectIdentifier(connection)) != nil }
+                let removed = self.lock.withLock {
+                    let id = ObjectIdentifier(connection)
+                    if self.interruptedClosures.remove(id) != nil { self.completedInterruptedBodiesValue += 1 }
+                    return self.clients.removeValue(forKey: id) != nil
+                }
                 if removed { self.connections.leave() }
                 connection.stateUpdateHandler = nil
             }
@@ -159,7 +167,8 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
                 let transmitted = resource.disconnectAfterBodyBytes.map {
                     range.lowerBound..<(range.lowerBound + min($0, range.count))
                 } ?? range
-                send(resource, range: transmitted, connection: connection)
+                send(resource, range: transmitted, connection: connection,
+                    didCompleteInterruptedBody: !transmitted.isEmpty && transmitted.count < range.count)
             })
         } catch { connection.cancel() }
     }
@@ -167,14 +176,26 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
         callbacks.enter()
         connection.send(content: Data(header.utf8) + body, completion: .contentProcessed { [self] _ in callbacks.leave(); connection.cancel() })
     }
-    private func send(_ resource: Resource, range: Range<Int>, connection: NWConnection, didPause: Bool = false) {
-        guard !range.isEmpty else { connection.cancel(); return }
+    private func send(_ resource: Resource, range: Range<Int>, connection: NWConnection, didPause: Bool = false,
+        didCompleteInterruptedBody: Bool = false) {
+        guard !range.isEmpty else {
+            // Reached only after every prefix send completed successfully. Count
+            // the interruption after this exact connection reports cancellation.
+            if didCompleteInterruptedBody {
+                lock.withLock {
+                    let id = ObjectIdentifier(connection)
+                    if !closed, clients[id] != nil { _ = interruptedClosures.insert(id) }
+                }
+            }
+            connection.cancel(); return
+        }
         if !didPause, let stop = resource.pauseAfterBodyBytes, range.lowerBound >= stop {
             lock.withLock {
                 guard !closed else { return }
                 precondition(pausedBodies.count < 16)
                 pausedBodies[ObjectIdentifier(connection)] = { [self] in
-                    send(resource, range: range, connection: connection, didPause: true)
+                    send(resource, range: range, connection: connection, didPause: true,
+                        didCompleteInterruptedBody: didCompleteInterruptedBody)
                 }
             }
             return
@@ -187,7 +208,8 @@ final class NativeHLSHTTPFixture: @unchecked Sendable {
             connection.send(content: resource.data.subdata(in: offset..<(offset + count)), completion: .contentProcessed { [self] error in
                 defer { callbacks.leave() }
                 guard error == nil else { connection.cancel(); return }
-                send(resource, range: (range.lowerBound + count)..<range.upperBound, connection: connection, didPause: didPause)
+                send(resource, range: (range.lowerBound + count)..<range.upperBound, connection: connection, didPause: didPause,
+                    didCompleteInterruptedBody: didCompleteInterruptedBody)
             })
         }
         if resource.chunkDelay > 0 { queue.asyncAfter(deadline: .now() + resource.chunkDelay, execute: transmit) }
