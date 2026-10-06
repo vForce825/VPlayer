@@ -43,7 +43,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
 
     func testNativeEOSOriginalDeadlineRejectsUnsettledTransportAndInvalidEvidence() async throws {
         for outcome in [NativeEOSSettlementOutcome.positiveRate, .playingControl, .changedClock,
-                        .earlyClock, .staleRevision] {
+                        .earlyClock, .staleRevision, .supersededInstall] {
             try await verifyNativeEOSSettlement(firstRate: 1, outcome: outcome)
         }
     }
@@ -58,6 +58,115 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
 
     func testNativeEOSProgressPollPreservesOriginalFirstReadAndDeadline() async throws {
         try await verifyNativeEOSSettlement(firstRate: 1, outcome: .progressPoll)
+    }
+
+    func testNativeRefreshRetriesSupersededReturnedSnapshotWithinOriginalEOFWindow() async throws {
+        try await verifyNativeRefreshReturnEdge(.once)
+        try await verifyNativeRefreshReturnEdge(.mixed)
+    }
+
+    func testNativeRefreshBoundsSupersessionAndRejectsBindingChangeAndRevocation() async throws {
+        for mode in [NativeRefreshReturnMode.exhausted, .bindingChanged, .revoked] {
+            try await verifyNativeRefreshReturnEdge(mode)
+        }
+    }
+
+    private func verifyNativeRefreshReturnEdge(_ mode: NativeRefreshReturnMode) async throws {
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let player = NativeEOSObservationPlayer()
+        let deadlines = NativeEOSManualDeadlineScheduler()
+        let driver = try SystemAVPlayerDriver.make(player: player, deadlineScheduler: deadlines)
+        var failure: (any Error)?
+        do {
+            try await withController(driver: driver) { [self] controller, registry, factory in
+                defer { factory.trace.snapshotReturn = nil; player.observation = nil }
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "native-refresh-return",
+                    streamURL: origin.url("master.m3u8"), title: "Native refresh return edge"))
+                try await until(registry: registry, factory: factory, phase: "refresh-return-startup", managed: false) {
+                    factory.backend?.nativeCoordinatorForTesting?.currentActivation != nil && player.currentTime().seconds > 0.25
+                }
+                let backend = try XCTUnwrap(factory.backend)
+                let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let physical = try XCTUnwrap(player.currentItem)
+                let activation = try XCTUnwrap(coordinator.currentActivation)
+                let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+                let endpoint = try ExactMediaTime(physical.duration)
+                player.observation = .init(time: try endpoint.subtracting(.init(value: 1, timescale: 60)).cmTime,
+                    rate: 0, control: .paused)
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
+                try await until(registry: registry, factory: factory, phase: "refresh-return-first-read", managed: false) {
+                    driver.naturalEndObservation != nil && factory.trace.selectedRevision == driver.nativeSelectionRevision.current
+                }
+                await nativeEOSMainQueueTurn()
+                let first = try XCTUnwrap(driver.naturalEndObservation)
+                let originalDeadline = try XCTUnwrap(deadlines.nextIdentity)
+                let control = NativeRefreshReturnControl()
+                factory.trace.snapshotReturn = { snapshot, source, currentDriver in
+                    guard NativeRefreshReturnScope.identity == control.identity,
+                          snapshot.item == coordinator.item else { return snapshot }
+                    control.calls += 1
+                    // The real inspector has already validated/returned this
+                    // receipt. Model a callback invalidating it at that edge.
+                    if mode == .mixed, control.calls == 1 { throw AVPlayerItemCoordinatorFailure.selectionChanged }
+                    if mode == .exhausted || mode == .bindingChanged || mode == .revoked ||
+                        (mode == .once && control.calls == 1) || (mode == .mixed && control.calls == 2) {
+                        currentDriver.nativeSelectionRevision.invalidate(reason: .accessLog)
+                    }
+                    if mode == .revoked {
+                        let safety = registry.executor.safetyIngress.snapshot
+                        let request = OutputUserControlRequest(kind: .pause, sessionIdentity: context.sessionIdentity,
+                            expectedOwner: context.owner, contextNonce: context.contextNonce,
+                            interruptionEpoch: safety.interruptionEpoch, mediaServicesEpoch: safety.mediaServicesEpoch,
+                            resetPreRouteBinding: context.resetPreRouteBinding)
+                        XCTAssertEqual(registry.performOutputUserControl(request), .acceptedWaiting)
+                    }
+                    if mode == .bindingChanged {
+                        // Omit timing evidence; do not fabricate another quantum.
+                        // A pending window's present-to-nil binding remains terminal
+                        // even though the same callback also superseded revision.
+                        return try .init(item: snapshot.item, physicalItem: snapshot.physicalItem,
+                            audioSelection: snapshot.audioSelection, video: snapshot.video, audio: snapshot.audio,
+                            audioConfigurationDigest: snapshot.audioConfigurationDigest, observedFrameRate: snapshot.observedFrameRate,
+                            sourceOwner: source, retention: HLSApplicationLifetimeCharge(bytes: 8 * 1_024),
+                            duration: snapshot.duration, finalPresentationQuantum: nil)
+                    }
+                    return snapshot
+                }
+                await NativeRefreshReturnScope.$identity.withValue(control.identity) {
+                    await coordinator.observeSelectedFormatChangeForTesting()
+                }
+                factory.trace.snapshotReturn = nil
+                if mode == .once || mode == .mixed {
+                    XCTAssertEqual(control.calls, mode == .once ? 2 : 3,
+                        "Inspector retry and post-return install retry share exactly three total attempts")
+                    XCTAssertNil(coordinator.firstFailureDiagnosticForTesting)
+                    XCTAssertTrue(backend.nativeCoordinatorForTesting === coordinator)
+                    XCTAssertTrue(player.currentItem === physical)
+                    XCTAssertEqual(registry.outputResourceContextSnapshot()?.activation, activation)
+                    XCTAssertEqual(deadlines.nextIdentity, originalDeadline)
+                    XCTAssertEqual(deadlines.nextDelay, 0.1)
+                    XCTAssertEqual(driver.naturalEndObservation?.firstCurrentTime, first.firstCurrentTime)
+                    XCTAssertTrue(deadlines.fireNext())
+                    await nativeEOSMainQueueTurn()
+                    XCTAssertTrue(coordinator.naturalEndVerifiedForTesting)
+                } else if mode == .revoked {
+                    XCTAssertEqual(control.calls, 1)
+                    XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                    await controller.setPaused(true)
+                } else {
+                    XCTAssertEqual(control.calls, mode == .exhausted ? 3 : 1)
+                    XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                    let detail = try XCTUnwrap(coordinator.firstFailureDiagnosticForTesting)
+                    XCTAssertTrue(detail.contains("step=quantum-install"), detail)
+                    XCTAssertTrue(detail.contains(mode == .exhausted ? "predicate=refresh.quantum.revision" : "predicate=refresh.pendingBinding"), detail)
+                }
+                player.observation = nil
+            }
+            XCTAssertEqual(deadlines.count, 0)
+        } catch { failure = error }
+        player.observation = nil
+        await origin.close()
+        if let failure { throw failure }
     }
 
     /// Deterministic SDK-observation ordering controls, not real media-end
@@ -138,6 +247,17 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     rate: outcome == .positiveRate ? 1 : 0,
                     control: outcome == .playingControl ? .playing : .paused)
                 if outcome == .staleRevision { driver.nativeSelectionRevision.invalidate() }
+                if outcome == .supersededInstall {
+                    let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+                    driver.nativeSelectionRevision.invalidate(reason: .accessLog)
+                    do {
+                        try driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: coordinator.item)
+                        XCTFail("The returned snapshot must be superseded before installation")
+                    } catch { XCTAssertTrue(error is NativeHLSQuantumRevisionSuperseded) }
+                    XCTAssertEqual(driver.naturalEndQuantumUpdateFailureDiagnosticForTesting?.predicate, .refreshQuantum)
+                    XCTAssertNil(driver.naturalEndFailureDiagnosticForTesting,
+                        "An install rejection must leave the original EOF diagnostic slot available")
+                }
                 if outcome != .positiveRate && outcome != .playingControl {
                     driver.eventHub.receive(.paused, item: coordinator.item, activation: activation)
                     await nativeEOSMainQueueTurn()
@@ -184,7 +304,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         case .positiveRate: predicate = "confirm.rate"
                         case .playingControl: predicate = "confirm.control"
                         case .earlyClock: predicate = "confirm.finalClock"
-                        case .staleRevision: predicate = "confirm.quantum.revision"
+                        case .staleRevision, .supersededInstall: predicate = "confirm.quantum.revision"
                         default: predicate = nil
                         }
                         if let predicate {
@@ -257,6 +377,18 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let visible = String(("failed - " + report).prefix(1_024))
         XCTAssertTrue(visible.contains("predicate=confirm.quantum.revision"))
         XCTAssertTrue(visible.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
+        let install = AVPlayerNaturalEndFailureDiagnostic(predicate: .refreshQuantum, quantumFailure: .revision,
+            revision: .init(expected: .max, current: .max, exhausted: false, reason: .privateEOSRefresh),
+            first: widest, stable: nil, expected: widest, effective: widest, quantum: widest)
+        let installRetained = "stage=selection.refresh reason=unsupportedMedia detail={step=quantum-install attempts=3 error=revisionSuperseded \(install.summary)}"
+        XCTAssertLessThanOrEqual(installRetained.utf8.count, 384)
+        XCTAssertTrue(installRetained.hasSuffix(" q=\(widest.value)/\(widest.timescale)}"))
+        let installReport = NativeSmokeFailureReport.message(phase: "full-eof-completion", managed: true, reason: "deadline",
+            context: String(repeating: "c", count: 512),
+            detail: "original-output=\(UInt64.max) original-activation=\(UInt64.max) original-failure={\(installRetained)}", trace: "")
+        let installVisible = String(("failed - " + installReport).prefix(1_024))
+        XCTAssertTrue(installVisible.contains("step=quantum-install attempts=3 error=revisionSuperseded"))
+        XCTAssertTrue(installVisible.contains("predicate=refresh.quantum.revision r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh"))
         let absent = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmFinalClock, quantumFailure: nil)
         XCTAssertTrue(absent.summary.hasSuffix(" q=none"))
     }
@@ -755,7 +887,14 @@ private enum NativeEndpointControl: String, CaseIterable {
 }
 
 private enum NativeEOSSettlementOutcome: Equatable {
-    case settled, positiveRate, playingControl, changedClock, earlyClock, staleRevision, cancelled, failedToEnd, progressPoll
+    case settled, positiveRate, playingControl, changedClock, earlyClock, staleRevision, supersededInstall, cancelled, failedToEnd, progressPoll
+}
+
+private enum NativeRefreshReturnMode: Equatable { case once, mixed, exhausted, bindingChanged, revoked }
+private enum NativeRefreshReturnScope { @TaskLocal static var identity: UUID? = nil }
+@MainActor private final class NativeRefreshReturnControl {
+    let identity = UUID()
+    var calls = 0
 }
 
 private func nativeEOSMainQueueTurn() async {
@@ -931,6 +1070,7 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
 /// A bounded test trace only. The forwarding inspector performs the unchanged
 /// production inspection, without additional asynchronous reads or minted facts.
 private final class NativeSmokeTrace: @unchecked Sendable {
+    @MainActor var snapshotReturn: ((NativeHLSSelectionSnapshot, HLSOwnedSourcePlan, SystemAVPlayerDriver) throws -> NativeHLSSelectionSnapshot)?
     private let lock = NSLock()
     private var lines: [String] = []
     private var revision: UInt64?
@@ -963,7 +1103,7 @@ private final class NativeSmokeTracingInspector: NativeHLSAssetInspecting {
             }
             let duration = result.duration.map { "\($0.value)/\($0.timescale)" } ?? "none"
             record("inspect-success video=\(result.video != nil) audio=\(result.audio != nil) selected-duration=\(duration)", item: item)
-            return result
+            return try trace.snapshotReturn?(result, source, driver) ?? result
         } catch {
             record("inspect-failure \(error)", item: item)
             throw error

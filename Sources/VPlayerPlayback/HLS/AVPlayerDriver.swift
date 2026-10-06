@@ -118,6 +118,11 @@ enum AVPlayerNaturalEndFailurePredicate: String, Sendable {
     case confirmFirstEndpoint = "confirm.firstEndpoint"
     case confirmEffectiveEndpoint = "confirm.effectiveEndpoint"
     case confirmFinalClock = "confirm.finalClock"
+    case refreshBoundary = "refresh.boundary"
+    case refreshIdentity = "refresh.identity"
+    case refreshQuantum = "refresh.quantum"
+    case refreshDuration = "refresh.duration"
+    case refreshPendingBinding = "refresh.pendingBinding"
 }
 
 #if DEBUG
@@ -752,6 +757,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private(set) var naturalEndTerminalResult: AVPlayerNaturalEndTerminalResult?
     #if DEBUG
     private(set) var naturalEndFailureDiagnosticForTesting: AVPlayerNaturalEndFailureDiagnostic?
+    private(set) var naturalEndQuantumUpdateFailureDiagnosticForTesting: AVPlayerNaturalEndFailureDiagnostic?
     #endif
     private let naturalEndIssuerIdentity = UUID()
     private var naturalEndTerminalIssued = false
@@ -1425,9 +1431,30 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     func updateNaturalPlaybackEndQuantum(_ quantum: NativeHLSFinalPresentationQuantum?, item identity: AVPlayerItemInstanceIdentity) throws {
-        guard case .natural = endpointBoundary, currentItemIdentity == identity, let item, player.currentItem === item,
-              quantum.map({ $0.isCurrent(item: identity, physical: item) && (try? ExactMediaTime(item.duration)) == $0.duration }) ?? true else {
-            throw AVPlayerItemCoordinatorFailure.selectionChanged
+        #if DEBUG
+        naturalEndQuantumUpdateFailureDiagnosticForTesting = nil
+        #endif
+        var observedDuration: ExactMediaTime?
+        func reject(_ predicate: AVPlayerNaturalEndFailurePredicate,
+                    cause: NativeHLSQuantumValidationFailure? = nil,
+                    revision: NativeHLSSelectionRevisionMismatch? = nil) -> AVPlayerItemCoordinatorFailure {
+            #if DEBUG
+            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision,
+                first: naturalEndObservation?.firstCurrentTime, stable: nil,
+                expected: quantum?.duration ?? nativeEndQuantum?.duration, effective: observedDuration, quantum: quantum?.period)
+            #endif
+            return .selectionChanged
+        }
+        guard case .natural = endpointBoundary else { throw reject(.refreshBoundary) }
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { throw reject(.refreshIdentity) }
+        // Establish every terminal condition before classifying a stale revision
+        // as retryable. A changed binding cannot hide behind simultaneous staleness.
+        if let quantum {
+            if let failure = quantum.validationFailure(item: identity, physical: item, requiresFreshness: false) {
+                throw reject(.refreshQuantum, cause: failure.cause)
+            }
+            observedDuration = try? ExactMediaTime(item.duration)
+            guard observedDuration == quantum.duration else { throw reject(.refreshDuration) }
         }
         if endpointStabilityDeadline != nil {
             let same: Bool
@@ -1436,7 +1463,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             case let (prior?, quantum?): same = quantum.hasSameBinding(as: prior)
             default: same = false
             }
-            guard same else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
+            guard same else { throw reject(.refreshPendingBinding) }
+        }
+        if let mismatch = quantum?.revisionMismatch() {
+            let terminal = reject(.refreshQuantum, cause: .revision, revision: mismatch)
+            guard !mismatch.exhausted else { throw terminal }
+            throw NativeHLSQuantumRevisionSuperseded()
         }
         nativeEndQuantum = quantum
     }
@@ -1746,6 +1778,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         nativeEndQuantum = nil
         #if DEBUG
         naturalEndFailureDiagnosticForTesting = nil
+        naturalEndQuantumUpdateFailureDiagnosticForTesting = nil
         #endif
         eventHub.cancelEndpoint()
     }

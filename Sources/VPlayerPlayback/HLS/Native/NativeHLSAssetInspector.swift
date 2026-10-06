@@ -17,7 +17,9 @@ struct NativeHLSSelectionRevisionMismatch: Sendable {
     #if DEBUG
     let expected: UInt64
     let current: UInt64
+    #endif
     let exhausted: Bool
+    #if DEBUG
     let reason: NativeHLSSelectionInvalidationReason
     #endif
 }
@@ -65,7 +67,7 @@ final class NativeHLSSelectionRevision: @unchecked Sendable {
             #if DEBUG
             return .init(expected: revision, current: value, exhausted: exhausted, reason: lastInvalidationReason)
             #else
-            return .init()
+            return .init(exhausted: exhausted)
             #endif
         }
     }
@@ -79,6 +81,10 @@ struct NativeHLSQuantumValidationRejection: Sendable {
     let cause: NativeHLSQuantumValidationFailure
     var revision: NativeHLSSelectionRevisionMismatch?
 }
+
+/// Only a non-exhausted revision supersession after every terminal installation
+/// guard passes may use the remaining attempts of the original snapshot operation.
+struct NativeHLSQuantumRevisionSuperseded: Error, Sendable {}
 
 /// Selected SDK/configuration timing evidence, not proof that every final sample rendered.
 /// Its allocation and aliases remain covered by the selected snapshot's charge.
@@ -106,6 +112,7 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
     @MainActor func hasCurrentIdentity(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
         validationFailure(item: identity, physical: physical, requiresFreshness: false) == nil
     }
+    func revisionMismatch() -> NativeHLSSelectionRevisionMismatch? { selectionRevision.mismatch(revision) }
     /// Same short-circuit reads as the Boolean checks. The scalar cause lets the
     /// original failed read be diagnosed without checking mutable SDK state again.
     @MainActor func validationFailure(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,

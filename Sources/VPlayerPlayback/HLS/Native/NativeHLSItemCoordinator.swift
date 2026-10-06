@@ -90,15 +90,18 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         authorization = invocation
         // Reload before EVERY rate admission, including ordinary pause/resume.
         // A same-size SPS or audio-format change cannot hide behind cached facts.
-        let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
+        let snapshot = try await selectionSnapshot(commit: { snapshot in
+            guard alreadyArmed else { return }
+            if let selected = self.selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
+            if snapshot.duration != nil {
+                try self.driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: self.item)
+            }
+        }) { try self.validateActive(invocation) }
         try validateActive(invocation)
         if let selected { diagnoseTransition(snapshot, from: selected, stage: "activate.selected") }
         if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
         selected = snapshot
         if alreadyArmed {
-            if snapshot.duration != nil {
-                try driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: item)
-            }
             metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
             await metadataChanged(invocation.activation)
             try validateActive(invocation)
@@ -155,17 +158,28 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     /// ABR and media selection can move while the SDK loads a track. Retry only
     /// that transient condition on this same joined stack and original authority.
     /// Unsupported stable formats, missing audio and stale owners are never retried.
-    private func selectionSnapshot(validate: () throws -> Void) async throws -> NativeHLSSelectionSnapshot {
+    private func selectionSnapshot(commit: (NativeHLSSelectionSnapshot) throws -> Void = { _ in },
+                                   willInspect: (Int) -> Void = { _ in },
+                                   validate: () throws -> Void) async throws -> NativeHLSSelectionSnapshot {
         for attempt in 0..<3 {
+            willInspect(attempt + 1)
             try validate()
+            let value: NativeHLSSelectionSnapshot
             do {
-                let value = try await inspector.snapshot(item: item, source: owned)
+                value = try await inspector.snapshot(item: item, source: owned)
                 try validate()
-                return value
             } catch let error as AVPlayerItemCoordinatorFailure where error == .selectionChanged {
                 try validate()
                 guard attempt < 2 else { throw error }
+                continue
             }
+            do { try commit(value) }
+            catch let error as NativeHLSQuantumRevisionSuperseded {
+                try validate()
+                guard attempt < 2 else { throw error }
+                continue
+            }
+            return value
         }
         throw AVPlayerItemCoordinatorFailure.selectionChanged
     }
@@ -183,23 +197,43 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         guard !retired, !failureDelivered, armed, let invocation = authorization, invocation.revalidateCurrentAuthority() else { return }
         if failed { fail(.network, stage: "observation.failed"); return }
         if owned.source.refreshReason() != nil { fail(.network, stage: "source.expired"); return }
+        var step = "snapshot", attempts = 0
         do {
-            let snapshot = try await selectionSnapshot { try self.validateActive(invocation) }
+            let snapshot = try await selectionSnapshot(commit: { snapshot in
+                step = "transition"
+                if let selected = self.selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
+                if self.selected?.duration != nil {
+                    step = "quantum-install"
+                    try self.driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: self.item)
+                }
+            }, willInspect: { attempt in step = "snapshot"; attempts = attempt }) { try self.validateActive(invocation) }
             try validateActive(invocation)
             if let selected { diagnoseTransition(snapshot, from: selected, stage: "refresh.selected") }
-            if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
-            if selected?.duration != nil {
-                try driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: item)
-            }
             selected = snapshot
             metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
             await metadataChanged(invocation.activation)
         } catch is CancellationError {} catch {
             if authorization == invocation && invocation.revalidateCurrentAuthority() {
                 fail(.unsupportedMedia, stage: "selection.refresh",
-                    detail: "error-type=\(String(reflecting: type(of: error))) error-code=\((error as NSError).code)")
+                    detail: selectionRefreshFailureDetail(error, step: step, attempts: attempts))
             }
         }
+    }
+    private func selectionRefreshFailureDetail(_ error: any Error, step: String, attempts: Int) -> String {
+        let symbolic: String
+        if let known = error as? AVPlayerItemCoordinatorFailure { symbolic = String(describing: known) }
+        else if error is NativeHLSQuantumRevisionSuperseded { symbolic = "revisionSuperseded" }
+        else if let known = error as? HLSSourceError { symbolic = String(describing: known) }
+        else { symbolic = "other" }
+        var detail = "step=\(step) attempts=\(attempts) error=\(symbolic)"
+        #if DEBUG
+        if step == "quantum-install", let diagnostic = (driver as? SystemAVPlayerDriver)?.naturalEndQuantumUpdateFailureDiagnosticForTesting {
+            detail += " " + diagnostic.summary
+        } else {
+            detail += " error-type=\(String(reflecting: type(of: error))) error-code=\((error as NSError).code)"
+        }
+        #endif
+        return detail
     }
     private func diagnoseTransition(_ snapshot: NativeHLSSelectionSnapshot, from prior: NativeHLSSelectionSnapshot, stage: StaticString) {
         #if DEBUG

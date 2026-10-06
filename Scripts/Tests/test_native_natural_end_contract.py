@@ -10,6 +10,31 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class NativeNaturalEndContract(unittest.TestCase):
+    def test_snapshot_and_quantum_install_share_one_stage_specific_retry_budget(self):
+        native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
+        loop = native.split('private func selectionSnapshot(', 1)[1].split('#if DEBUG', 1)[0]
+        self.assertEqual(loop.count('for attempt in 0..<3'), 1)
+        self.assertEqual(loop.count('guard attempt < 2 else { throw error }'), 2)
+        inspector_catch = loop.index('catch let error as AVPlayerItemCoordinatorFailure where error == .selectionChanged')
+        commit = loop.index('do { try commit(value) }')
+        self.assertLess(inspector_catch, commit)
+        self.assertIn('catch let error as NativeHLSQuantumRevisionSuperseded', loop[commit:])
+        self.assertNotIn('catch let error as AVPlayerItemCoordinatorFailure', loop[commit:])
+        self.assertIn('try validate()\n                guard attempt < 2', loop[commit:])
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        install = driver.split('func updateNaturalPlaybackEndQuantum(', 1)[1].split('private func installEndpointObservation(', 1)[0]
+        ordered = ['case .natural = endpointBoundary', 'currentItemIdentity == identity',
+                   'requiresFreshness: false', 'observedDuration == quantum.duration',
+                   'quantum.hasSameBinding(as: prior)', 'quantum?.revisionMismatch()',
+                   'guard !mismatch.exhausted', 'nativeEndQuantum = quantum']
+        self.assertEqual([install.index(value) for value in ordered], sorted(install.index(value) for value in ordered))
+        self.assertIn('naturalEndQuantumUpdateFailureDiagnosticForTesting', install)
+        self.assertNotIn('naturalEndFailureDiagnosticForTesting =', install)
+        smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        self.assertIn('NativeRefreshReturnScope.identity == control.identity', smoke)
+        self.assertIn('NativeRefreshReturnScope.$identity.withValue(control.identity)', smoke)
+        self.assertIn('XCTAssertEqual(deadlines.nextIdentity, originalDeadline)', smoke)
+
     def test_only_native_route_preserves_the_untrimmed_sdk_endpoint(self):
         native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
         generated = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerItemCoordinator.swift').read_text()
@@ -115,8 +140,9 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertLess(ingress.index('nativeRevision?.receiveNativeEnd(token: observationIdentity)'), ingress.index('hub?.receiveEndpoint('))
         self.assertIn('guard endpointToken == token else { return nil }', inspector)
         native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
-        armed = native.split('if alreadyArmed {', 1)[1].split('let resuming', 1)[0]
-        self.assertIn('updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum', armed)
+        armed_commit = native.split('selectionSnapshot(commit:', 1)[1].split('selected = snapshot', 1)[0]
+        self.assertIn('guard alreadyArmed else { return }', armed_commit)
+        self.assertIn('updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum', armed_commit)
         smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
         self.assertIn('return (progressed, failure?.0', smoke)
         self.assertIn('let sdkFailed = signal.sdkFailed\n', smoke)

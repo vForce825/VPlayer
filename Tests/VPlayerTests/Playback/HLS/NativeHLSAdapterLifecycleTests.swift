@@ -153,6 +153,45 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testAlreadyArmedRefreshPublishesOnlyAfterBoundedQuantumInstall() async throws {
+        for terminal in [false, true] {
+            try await NativeAdapterFixture.withFixture { fixture in
+                fixture.inspector.duration = ExactMediaTime(value: 80, timescale: 1)
+                fixture.play(); try await fixture.until { fixture.isPlaying }
+                let backend = try XCTUnwrap(fixture.factory.backend)
+                let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let invocation = try XCTUnwrap(fixture.driver.lastPositiveInvocation)
+                let reads = fixture.inspector.reads
+                fixture.inspector.useAlternate = true
+                fixture.driver.quantumUpdateRejections = 1
+                fixture.driver.terminalQuantumUpdateRejection = terminal
+                fixture.driver.beforeQuantumUpdate = {
+                    XCTAssertEqual(backend.preparedMediaInformation(for: coordinator.item.outputLifecycleEpoch)?.information?.width, 1_920,
+                        "A failed install cannot publish the newly inspected selection")
+                }
+                defer { fixture.driver.beforeQuantumUpdate = nil }
+                do {
+                    try await coordinator.activate(invocation)
+                    XCTAssertFalse(terminal)
+                } catch {
+                    XCTAssertTrue(terminal)
+                    XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .selectionChanged)
+                }
+                XCTAssertEqual(fixture.inspector.reads - reads, terminal ? 1 : 2)
+                XCTAssertEqual(fixture.driver.quantumUpdates, terminal ? 1 : 2)
+                XCTAssertEqual(fixture.driver.plays, 1)
+                XCTAssertEqual(coordinator.currentActivation, invocation.activation)
+                XCTAssertEqual(backend.preparedMediaInformation(for: coordinator.item.outputLifecycleEpoch)?.information?.width,
+                    terminal ? 1_920 : 1_280)
+            }
+        }
+    }
+
+    func testSelectionChangedNSErrorBridgeMatchesCapturedRuntimeCode() {
+        XCTAssertEqual((AVPlayerItemCoordinatorFailure.selectionChanged as NSError).code, 4)
+        XCTAssertEqual((AVPlayerItemCoordinatorFailure.staleIdentity as NSError).code, 3)
+    }
+
     func testNaturalEndpointPolicyRequiresUntrimmedFiniteSameItemDuration() throws {
         let end = CMTime(value: 80, timescale: 1)
         XCTAssertEqual(AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: .invalid, duration: end),
@@ -323,7 +362,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
             let first = try XCTUnwrap(original.firstFailureDiagnosticForTesting)
             let expectedError = HLSSourceError.incompleteEvidence
             XCTAssertEqual(first, "stage=selection.refresh reason=unsupportedMedia " +
-                "detail={error-type=\(String(reflecting: type(of: expectedError))) error-code=\((expectedError as NSError).code)}")
+                "detail={step=snapshot attempts=1 error=incompleteEvidence error-type=\(String(reflecting: type(of: expectedError))) error-code=\((expectedError as NSError).code)}")
             XCTAssertLessThanOrEqual(first.utf8.count, 384)
             XCTAssertTrue(first.utf8.allSatisfy { (32...126).contains($0) })
             fixture.inspector.rejectFormat = false
@@ -746,6 +785,9 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var naturalEndObservations = 0, explicitEndMutations = 0
     var failReady = false
     var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
+    var quantumUpdateRejections = 0, quantumUpdates = 0
+    var terminalQuantumUpdateRejection = false
+    var beforeQuantumUpdate: (() -> Void)?
     private var clock = ExactMediaTime(value: 0, timescale: 1)
     func advanceMedia(to time: ExactMediaTime) { clock = time }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws { throw HLSSourceError.unboundOwner }
@@ -787,6 +829,14 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     func observeNaturalPlaybackEnd(expected time: ExactMediaTime, presentationQuantum: NativeHLSFinalPresentationQuantum?, item: AVPlayerItemInstanceIdentity) throws {
         guard currentItemIdentity == item, time.value > 0 else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
         naturalEndObservations += 1
+    }
+    func updateNaturalPlaybackEndQuantum(_ quantum: NativeHLSFinalPresentationQuantum?, item: AVPlayerItemInstanceIdentity) throws {
+        beforeQuantumUpdate?(); quantumUpdates += 1
+        if quantumUpdateRejections > 0 {
+            quantumUpdateRejections -= 1
+            if terminalQuantumUpdateRejection { throw AVPlayerItemCoordinatorFailure.selectionChanged }
+            throw NativeHLSQuantumRevisionSuperseded()
+        }
     }
     func installNaturalEndTerminalHandler(item: AVPlayerItemInstanceIdentity, handler: @escaping @MainActor @Sendable (AVPlayerNaturalEndTerminalCapability, AVPlayerItemInstanceIdentity) -> Void) throws {}
     func consumeNaturalEndTerminal(_ capability: AVPlayerNaturalEndTerminalCapability, item: AVPlayerItemInstanceIdentity) -> AVPlayerNaturalEndTerminalResult? { nil }
