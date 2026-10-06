@@ -34,6 +34,10 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('NativeRefreshReturnScope.identity == control.identity', smoke)
         self.assertIn('NativeRefreshReturnScope.$identity.withValue(control.identity)', smoke)
         self.assertIn('XCTAssertEqual(deadlines.nextIdentity, originalDeadline)', smoke)
+        self.assertTrue('typealias SnapshotReturnHook = @MainActor (' in smoke)
+        self.assertTrue('private var snapshotReturnStorage: SnapshotReturnHook?' in smoke)
+        self.assertTrue('@MainActor var snapshotReturn: SnapshotReturnHook? {' in smoke)
+        self.assertNotIn('@MainActor\nprivate final class NativeSmokeTrace', smoke)
 
     def test_only_native_route_preserves_the_untrimmed_sdk_endpoint(self):
         native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()

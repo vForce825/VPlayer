@@ -1070,7 +1070,14 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
 /// A bounded test trace only. The forwarding inspector performs the unchanged
 /// production inspection, without additional asynchronous reads or minted facts.
 private final class NativeSmokeTrace: @unchecked Sendable {
-    @MainActor var snapshotReturn: ((NativeHLSSelectionSnapshot, HLSOwnedSourcePlan, SystemAVPlayerDriver) throws -> NativeHLSSelectionSnapshot)?
+    typealias SnapshotReturnHook = @MainActor (NativeHLSSelectionSnapshot, HLSOwnedSourcePlan, SystemAVPlayerDriver) throws -> NativeHLSSelectionSnapshot
+    // Ordinary nil storage keeps this shared trace's synthesized init nonisolated.
+    // The hook is only accessed and invoked on MainActor.
+    private var snapshotReturnStorage: SnapshotReturnHook?
+    @MainActor var snapshotReturn: SnapshotReturnHook? {
+        get { snapshotReturnStorage }
+        set { snapshotReturnStorage = newValue }
+    }
     private let lock = NSLock()
     private var lines: [String] = []
     private var revision: UInt64?
