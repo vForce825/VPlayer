@@ -15,6 +15,47 @@ BACKEND = ROOT / 'Sources/VPlayerPlayback/Pipeline/HLSAVPlayerPlaybackBackend.sw
 
 
 class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
+    def test_endpoint_mismatch_retains_exact_predicate_before_original_recovery(self):
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertTrue('private(set) var naturalEndFailureDiagnosticForTesting:' in driver)
+        for code in ['ingress.endpoint', 'ingress.notReady', 'ingress.itemError', 'ingress.quantum',
+                     'confirm.notReady', 'confirm.itemError', 'confirm.rate', 'confirm.control',
+                     'confirm.quantum', 'confirm.firstEndpoint', 'confirm.effectiveEndpoint', 'confirm.finalClock']:
+            self.assertIn('"' + code + '"', driver)
+        self.assertIn('first: first, stable: nil, expected: endpoint, effective: constrained', driver)
+        self.assertIn('first: prior.firstCurrentTime, stable: stable,', driver)
+        self.assertIn('expected: prior.expectedEndpoint, effective: constraint', driver)
+        self.assertIn('String(value.prefix(288))', driver)
+        coordinator = COORDINATOR.read_text()
+        self.assertIn('detail: naturalEndFailureDetail(reason)', coordinator)
+        self.assertIn('naturalEndFailureDiagnosticForTesting', coordinator)
+        smoke = SMOKE.read_text()
+        self.assertIn('testNativeEOFPredicateDiagnosticFitsOriginalFailureAndUIBounds', smoke)
+        self.assertIn('predicate=confirm.quantum.revision', smoke)
+        self.assertIn('String(message.prefix(1_024))', smoke)
+
+    def test_quantum_failure_classification_preserves_validation_order_without_rereads(self):
+        source = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSAssetInspector.swift').read_text()
+        self.assertTrue('func validationFailure(' in source)
+        helper = source.split('func validationFailure(', 1)[1].split('func hasSameBinding(', 1)[0]
+        ordered = ['selectionRevision.mismatch(revision)', 'identity == item',
+                   'ObjectIdentifier(physical) == physicalItem', 'source.sourceIsCurrent',
+                   'physical.tracks.filter', 'enabled.count <= 16', 'videos.count == 1',
+                   'track.assetTrack', 'ObjectIdentifier(track) == videoTrack',
+                   'ObjectIdentifier(asset) == videoAsset']
+        self.assertEqual([helper.index(value) for value in ordered], sorted(helper.index(value) for value in ordered))
+        self.assertEqual(helper.count('selectionRevision.mismatch(revision)'), 1)
+        self.assertNotIn('await ', helper)
+        self.assertNotIn('Task {', helper)
+        mismatch = source.split('func mismatch(', 1)[1].split('\n}\n', 1)[0]
+        self.assertEqual(mismatch.count('lock.withLock'), 1)
+        self.assertIn('guard exhausted || value != revision else { return nil }', mismatch)
+        self.assertIn('expected: revision, current: value, exhausted: exhausted, reason: lastInvalidationReason', mismatch)
+        observation = OBSERVATION.read_text()
+        for reason in ['presentationSize', 'tracks', 'status', 'mediaSelection', 'accessLog', 'errorLog', 'failedToEnd', 'hdrEligibility', 'privateEOSRefresh']:
+            self.assertIn('.' + reason, observation)
+        self.assertIn('selectionRevision.invalidate(reason: reason)', observation)
+
     def test_smoke_wait_failures_identify_the_route_and_actual_wait_phase(self):
         source = SMOKE.read_text()
         self.assertEqual(set(re.findall(r'phase: "([a-z-]+)"', source)), {

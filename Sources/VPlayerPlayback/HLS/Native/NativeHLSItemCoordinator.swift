@@ -260,7 +260,18 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         guard self.item == item, authorization?.revalidateCurrentAuthority() == true,
               let result = driver.consumeNaturalEndTerminal(capability, item: item) else { return }
         if case .success = result { naturalEndVerified = true; cancelProgress() }
-        else if case let .failure(reason) = result { fail(.network, stage: "naturalEnd.rejected", detail: "endpoint-reason=\(reason)") }
+        else if case let .failure(reason) = result { fail(.network, stage: "naturalEnd.rejected", detail: naturalEndFailureDetail(reason)) }
+    }
+    private func naturalEndFailureDetail(_ reason: AVPlayerNaturalEndTerminalFailure) -> String {
+        var detail = "endpoint-reason=\(reason)"
+        #if DEBUG
+        // fail() evaluates this before recovery can retire/reuse the driver.
+        // Copy only the scalar record captured by the rejected original reads.
+        if let diagnostic = (driver as? SystemAVPlayerDriver)?.naturalEndFailureDiagnosticForTesting {
+            detail += " " + diagnostic.summary
+        }
+        #endif
+        return detail
     }
     private func startProgress(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) {
         cancelProgress()

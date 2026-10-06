@@ -8,18 +8,38 @@ import CoreMedia
 import CryptoKit
 import Foundation
 
+enum NativeHLSSelectionInvalidationReason: String, Sendable {
+    case initial, unspecified, presentationSize, tracks, status, mediaSelection, accessLog, errorLog, failedToEnd
+    case hdrEligibility, privateEOS, privateEOSRefresh
+}
+
+struct NativeHLSSelectionRevisionMismatch: Sendable {
+    #if DEBUG
+    let expected: UInt64
+    let current: UInt64
+    let exhausted: Bool
+    let reason: NativeHLSSelectionInvalidationReason
+    #endif
+}
+
 final class NativeHLSSelectionRevision: @unchecked Sendable {
     private let lock = NSLock()
     private var value: UInt64 = 0
     private var exhausted = false
     private var endRefresh: (owner: ObjectIdentifier, wake: @Sendable () -> Void)?
     private var endpointToken: UUID?
+    #if DEBUG
+    private var lastInvalidationReason: NativeHLSSelectionInvalidationReason = .initial
+    #endif
     var current: UInt64? { lock.withLock { exhausted ? nil : value } }
-    func invalidate() {
-        lock.withLock { advanceLocked() }
+    func invalidate(reason: NativeHLSSelectionInvalidationReason = .unspecified) {
+        lock.withLock { advanceLocked(reason: reason) }
     }
-    private func advanceLocked() {
+    private func advanceLocked(reason: NativeHLSSelectionInvalidationReason) {
         guard !exhausted else { return }
+        #if DEBUG
+        lastInvalidationReason = reason
+        #endif
         if value == .max { exhausted = true } else { value += 1 }
     }
     func installEndRefresh(owner: ObjectIdentifier, wake: @escaping @Sendable () -> Void) {
@@ -33,12 +53,31 @@ final class NativeHLSSelectionRevision: @unchecked Sendable {
     func receiveNativeEnd(token: UUID) {
         let wake = lock.withLock { () -> (@Sendable () -> Void)? in
             guard endpointToken == token else { return nil }
-            advanceLocked(); return endRefresh?.wake
+            advanceLocked(reason: .privateEOS); return endRefresh?.wake
         }
         // Never hold the revision lock while offering work to the observation owner.
         wake?()
     }
-    func matches(_ revision: UInt64) -> Bool { lock.withLock { !exhausted && value == revision } }
+    func matches(_ revision: UInt64) -> Bool { mismatch(revision) == nil }
+    func mismatch(_ revision: UInt64) -> NativeHLSSelectionRevisionMismatch? {
+        lock.withLock {
+            guard exhausted || value != revision else { return nil }
+            #if DEBUG
+            return .init(expected: revision, current: value, exhausted: exhausted, reason: lastInvalidationReason)
+            #else
+            return .init()
+            #endif
+        }
+    }
+}
+
+enum NativeHLSQuantumValidationFailure: String, Sendable {
+    case revision, logicalItem, physicalItem, source, trackCount, videoCount, videoAsset, videoTrack, videoAssetIdentity
+}
+
+struct NativeHLSQuantumValidationRejection: Sendable {
+    let cause: NativeHLSQuantumValidationFailure
+    var revision: NativeHLSSelectionRevisionMismatch?
 }
 
 /// Selected SDK/configuration timing evidence, not proof that every final sample rendered.
@@ -62,15 +101,29 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
         self.video = video; self.revision = revision; self.selectionRevision = selectionRevision
     }
     @MainActor func isCurrent(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
-        selectionRevision.matches(revision) && hasCurrentIdentity(item: identity, physical: physical)
+        validationFailure(item: identity, physical: physical, requiresFreshness: true) == nil
     }
     @MainActor func hasCurrentIdentity(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
-        guard identity == item, ObjectIdentifier(physical) == physicalItem, source.sourceIsCurrent else { return false }
+        validationFailure(item: identity, physical: physical, requiresFreshness: false) == nil
+    }
+    /// Same short-circuit reads as the Boolean checks. The scalar cause lets the
+    /// original failed read be diagnosed without checking mutable SDK state again.
+    @MainActor func validationFailure(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,
+                                     requiresFreshness: Bool) -> NativeHLSQuantumValidationRejection? {
+        if requiresFreshness, let mismatch = selectionRevision.mismatch(revision) {
+            return .init(cause: .revision, revision: mismatch)
+        }
+        guard identity == item else { return .init(cause: .logicalItem) }
+        guard ObjectIdentifier(physical) == physicalItem else { return .init(cause: .physicalItem) }
+        guard source.sourceIsCurrent else { return .init(cause: .source) }
         let enabled = physical.tracks.filter(\.isEnabled)
-        guard enabled.count <= 16 else { return false }
+        guard enabled.count <= 16 else { return .init(cause: .trackCount) }
         let videos = enabled.filter { $0.assetTrack?.mediaType == .video }
-        guard videos.count == 1, let track = videos.first, let asset = track.assetTrack else { return false }
-        return ObjectIdentifier(track) == videoTrack && ObjectIdentifier(asset) == videoAsset
+        guard videos.count == 1, let track = videos.first else { return .init(cause: .videoCount) }
+        guard let asset = track.assetTrack else { return .init(cause: .videoAsset) }
+        guard ObjectIdentifier(track) == videoTrack else { return .init(cause: .videoTrack) }
+        guard ObjectIdentifier(asset) == videoAsset else { return .init(cause: .videoAssetIdentity) }
+        return nil
     }
     func hasSameBinding(as other: NativeHLSFinalPresentationQuantum) -> Bool {
         item == other.item && physicalItem == other.physicalItem && videoTrack == other.videoTrack &&

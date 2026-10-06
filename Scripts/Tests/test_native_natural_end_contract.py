@@ -36,19 +36,23 @@ class NativeNaturalEndContract(unittest.TestCase):
         ingress = source.split('eventHub.installEndpoint(endpoint: time, token: observationIdentity)', 1)[1].split('let hub = eventHub', 1)[0]
         self.assertNotIn('self.player.rate == 0', ingress)
         self.assertNotIn('self.player.timeControlStatus == .paused', ingress)
-        self.assertIn('item.status == .readyToPlay, item.error == nil', ingress)
-        self.assertIn('nativeEndQuantum?.hasCurrentIdentity', ingress)
+        for predicate in ['item.status == .readyToPlay', 'item.error == nil',
+                          'checkNaturalEndQuantum(item: observedIdentity, physical: item, requiresFreshness: false)']:
+            self.assertIn(predicate, ingress)
         self.assertIn('firstCurrentTime: first', ingress)
         self.assertIn('scheduler.schedule(after: 0.1', ingress)
         self.assertIn('guard self.endpointStabilityDeadline == nil else { return }', ingress)
         final_read = source.split('private func completeNaturalEndRead(', 1)[1].split('private func cancelNaturalEndDeadline(', 1)[0]
-        for predicate in ['item.status == .readyToPlay, item.error == nil',
-                          'player.rate == 0, player.timeControlStatus == .paused',
-                          'nativeEndQuantum?.isCurrent', 'prior.firstCurrentTime == stable',
+        predicates = ['item.status == .readyToPlay', 'item.error == nil',
+                          'player.rate == 0', 'player.timeControlStatus == .paused',
+                          'checkNaturalEndQuantum(item: currentItemIdentity, physical: item, requiresFreshness: true)', 'prior.firstCurrentTime == stable',
                           'constraint == prior.expectedEndpoint',
                           'endpointBoundary.containsFinalClock(',
-                          'naturalEndAuthority?.revalidateCurrentAuthority() == true']:
+                          'naturalEndAuthority?.revalidateCurrentAuthority() == true']
+        for predicate in predicates:
             self.assertIn(predicate, final_read)
+        self.assertEqual([final_read.index(value) for value in predicates[:-1]],
+                         sorted(final_read.index(value) for value in predicates[:-1]))
         self.assertNotIn('schedule(', final_read)
         pending = source.split('func hasPendingNaturalEndVerification(item identity:', 1)[1].split('private func completeNaturalEndRead(', 1)[0]
         self.assertIn('player.rate == 0, player.timeControlStatus == .paused', pending)
@@ -98,13 +102,13 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('minimum == period', inspector)
         self.assertIn('video.frameRate == rate', inspector)
         self.assertIn('endpointBoundary.containsFinalClock(', driver)
-        self.assertIn('nativeEndQuantum?.isCurrent', driver)
+        self.assertIn('nativeEndQuantum?.validationFailure', driver)
         self.assertIn('quantum.hasSameBinding(as: prior)', driver)
         self.assertIn('driver.nativeSelectionRevision.matches(revision)', inspector)
         observer = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSObservation.swift').read_text()
-        self.assertLess(observer.index('selectionRevision.invalidate()'), observer.index('pending = true;'))
+        self.assertLess(observer.index('selectionRevision.invalidate(reason: reason)'), observer.index('pending = true;'))
         second_read = driver.split('private func completeNaturalEndRead(', 1)[1].split('private func cancelNaturalEndDeadline(', 1)[0]
-        self.assertIn('nativeEndQuantum?.isCurrent', second_read)
+        self.assertIn('checkNaturalEndQuantum(item: currentItemIdentity, physical: item, requiresFreshness: true)', second_read)
         self.assertIn('selectionRevision.installEndRefresh(owner: ObjectIdentifier(self))', observer)
         self.assertIn('selectionRevision.clearEndRefresh(owner: ObjectIdentifier(self))', observer)
         ingress = driver.split('let nativeRevision: NativeHLSSelectionRevision?', 1)[1].split('callbackLease.inspectRegistration()', 1)[0]

@@ -43,13 +43,20 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         let fence = NativeHLSSelectionRevision()
         let original = try XCTUnwrap(fence.current)
         XCTAssertTrue(fence.matches(original))
-        fence.invalidate()
+        fence.invalidate(reason: .accessLog)
         XCTAssertFalse(fence.matches(original), "Object identity alone cannot keep old timing evidence current")
         let renewed = try XCTUnwrap(fence.current)
         XCTAssertNotEqual(renewed, original)
         XCTAssertTrue(fence.matches(renewed))
-        fence.invalidate()
+        let captured = try XCTUnwrap(fence.mismatch(original))
+        XCTAssertEqual(captured.expected, original)
+        XCTAssertEqual(captured.current, renewed)
+        XCTAssertEqual(captured.reason, .accessLog)
+        XCTAssertFalse(captured.exhausted)
+        fence.invalidate(reason: .tracks)
         XCTAssertFalse(fence.matches(renewed))
+        XCTAssertEqual(try XCTUnwrap(fence.mismatch(renewed)).reason, .tracks)
+        XCTAssertEqual(captured.reason, .accessLog, "A later event cannot rewrite the failed read's scalar snapshot")
     }
 
     func testQuantumRequiresSDKMinimumAndAllAdmittedVideoPeriodsToAgree() async throws {

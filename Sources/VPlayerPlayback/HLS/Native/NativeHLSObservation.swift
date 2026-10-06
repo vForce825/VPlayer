@@ -26,8 +26,8 @@ final class NativeHLSObservation: @unchecked Sendable {
         // physical alias after KVO/notification removal and this worker's return.
         let callback = try driver.reserveSDKCallbackLease(.nativeObservation)
         observations = [
-            item.observe(\.presentationSize, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false) },
-            item.observe(\.tracks, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false) },
+            item.observe(\.presentationSize, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false, reason: .presentationSize) },
+            item.observe(\.tracks, options: [.new]) { [weak self] _, _ in callback.assertRegistered(); self?.offer(failed: false, reason: .tracks) },
             item.observe(\.status, options: [.new]) { [weak self] item, _ in
                 callback.assertRegistered()
                 #if DEBUG
@@ -36,12 +36,19 @@ final class NativeHLSObservation: @unchecked Sendable {
                     print("NATIVE_HLS_SDK_FAILURE signal=status error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0)")
                 }
                 #endif
-                self?.offer(failed: item.status == .failed)
+                self?.offer(failed: item.status == .failed, reason: .status)
             }
         ]
         for name in [AVPlayerItem.mediaSelectionDidChangeNotification, AVPlayerItem.newAccessLogEntryNotification,
                      AVPlayerItem.newErrorLogEntryNotification, AVPlayerItem.failedToPlayToEndTimeNotification] {
             let failure = name == AVPlayerItem.failedToPlayToEndTimeNotification
+            let reason: NativeHLSSelectionInvalidationReason
+            switch name {
+            case AVPlayerItem.mediaSelectionDidChangeNotification: reason = .mediaSelection
+            case AVPlayerItem.newAccessLogEntryNotification: reason = .accessLog
+            case AVPlayerItem.newErrorLogEntryNotification: reason = .errorLog
+            default: reason = .failedToEnd
+            }
             notifications.append(NotificationCenter.default.addObserver(forName: name, object: item, queue: nil) { [weak self] notification in
                 callback.assertRegistered()
                 #if DEBUG
@@ -50,19 +57,19 @@ final class NativeHLSObservation: @unchecked Sendable {
                     print("NATIVE_HLS_SDK_FAILURE signal=failed-to-end error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0)")
                 }
                 #endif
-                self?.offer(failed: failure)
+                self?.offer(failed: failure, reason: reason)
             })
         }
         notifications.append(NotificationCenter.default.addObserver(forName: AVPlayer.eligibleForHDRPlaybackDidChangeNotification,
-            object: nil, queue: nil) { [weak self] _ in callback.assertRegistered(); self?.offer(failed: false) })
-        selectionRevision.installEndRefresh(owner: ObjectIdentifier(self)) { [weak self] in self?.offer(failed: false) }
+            object: nil, queue: nil) { [weak self] _ in callback.assertRegistered(); self?.offer(failed: false, reason: .hdrEligibility) })
+        selectionRevision.installEndRefresh(owner: ObjectIdentifier(self)) { [weak self] in self?.offer(failed: false, reason: .privateEOSRefresh) }
     }
-    func offer(failed: Bool) {
+    func offer(failed: Bool, reason: NativeHLSSelectionInvalidationReason = .unspecified) {
         lock.withLock {
             guard !closed else { return }
             // Revoke cached timing synchronously, before the joined worker can
             // suspend in SDK loads. Even same-object format changes need a new seal.
-            selectionRevision.invalidate()
+            selectionRevision.invalidate(reason: reason)
             pending = true; self.failed = self.failed || failed
             guard work == nil else { return }
             work = Task { @MainActor [self] in

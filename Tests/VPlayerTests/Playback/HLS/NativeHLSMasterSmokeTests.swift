@@ -179,6 +179,28 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
                         let expected = outcome == .changedClock ? "unstableDirectRead" : "endpointMismatch"
                         XCTAssertTrue(coordinator.firstFailureDiagnosticForTesting?.contains("endpoint-reason=\(expected)") == true)
+                        let predicate: String?
+                        switch outcome {
+                        case .positiveRate: predicate = "confirm.rate"
+                        case .playingControl: predicate = "confirm.control"
+                        case .earlyClock: predicate = "confirm.finalClock"
+                        case .staleRevision: predicate = "confirm.quantum.revision"
+                        default: predicate = nil
+                        }
+                        if let predicate {
+                            let originalFailure = try XCTUnwrap(coordinator.firstFailureDiagnosticForTesting)
+                            XCTAssertTrue(originalFailure.contains("predicate=\(predicate)"), originalFailure)
+                            if outcome == .staleRevision {
+                                XCTAssertTrue(originalFailure.contains(" r="))
+                                XCTAssertTrue(originalFailure.contains(" why="))
+                            }
+                            XCTAssertTrue(originalFailure.contains(" f=\(first.firstCurrentTime.value)/\(first.firstCurrentTime.timescale)"))
+                            XCTAssertLessThanOrEqual(originalFailure.utf8.count, 384)
+                            player.observation = nil
+                            await controller.stop(); await registry.joinOwnedTerminalCleanup()
+                            XCTAssertEqual(coordinator.firstFailureDiagnosticForTesting, originalFailure,
+                                "Retirement must not replace the original read's predicate with successor state")
+                        }
                     }
                     XCTAssertNotEqual(deadlines.nextIdentity, original)
                     player.observation = nil
@@ -206,6 +228,37 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             XCTAssertTrue(reported.contains("detail={original-output=1"))
             XCTAssertTrue(reported.hasSuffix("latest-inspection}"))
         }
+    }
+
+    func testNativeEOFPredicateDiagnosticFitsOriginalFailureAndUIBounds() {
+        XCTAssertLessThanOrEqual(MemoryLayout<AVPlayerNaturalEndFailureDiagnostic?>.stride, 256)
+        let widest = ExactMediaTime(value: .min, timescale: .max)
+        let diagnostic = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmQuantum, quantumFailure: .videoAssetIdentity,
+            first: widest, stable: widest, expected: widest, effective: widest, quantum: widest)
+        let summary = diagnostic.summary
+        XCTAssertLessThanOrEqual(summary.utf8.count, 288)
+        XCTAssertTrue(summary.hasSuffix(" q=\(widest.value)/\(widest.timescale)"), "Every clock scalar must fit without truncation")
+        let retained = "stage=naturalEnd.rejected reason=network detail={endpoint-reason=endpointMismatch \(summary)}"
+        XCTAssertLessThanOrEqual(retained.utf8.count, 384)
+        let message = "original-output=\(UInt64.max) original-activation=\(UInt64.max) original-failure={\(retained)} " + String(repeating: "x", count: 2_048)
+        XCTAssertTrue(String(message.prefix(1_024)).contains(retained))
+        let stale = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmQuantum, quantumFailure: .revision,
+            revision: .init(expected: .max, current: .max, exhausted: true, reason: .privateEOSRefresh),
+            first: widest, stable: widest, expected: widest, effective: widest, quantum: widest)
+        XCTAssertTrue(stale.summary.contains("predicate=confirm.quantum.revision"))
+        XCTAssertTrue(stale.summary.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
+        XCTAssertTrue(stale.summary.hasSuffix(" q=\(widest.value)/\(widest.timescale)"))
+        let staleRetained = "stage=naturalEnd.rejected reason=network detail={endpoint-reason=endpointMismatch \(stale.summary)}"
+        XCTAssertLessThanOrEqual(staleRetained.utf8.count, 384)
+        let staleMessage = "original-output=\(UInt64.max) original-activation=\(UInt64.max) original-failure={\(staleRetained)} " + String(repeating: "x", count: 2_048)
+        XCTAssertTrue(String(staleMessage.prefix(1_024)).contains(staleRetained))
+        let report = NativeSmokeFailureReport.message(phase: "full-eof-completion", managed: false, reason: "deadline",
+            context: String(repeating: "c", count: 512), detail: staleMessage, trace: String(repeating: "t", count: 1_536))
+        let visible = String(("failed - " + report).prefix(1_024))
+        XCTAssertTrue(visible.contains("predicate=confirm.quantum.revision"))
+        XCTAssertTrue(visible.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
+        let absent = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmFinalClock, quantumFailure: nil)
+        XCTAssertTrue(absent.summary.hasSuffix(" q=none"))
     }
 
     func testNativeInterruptedResponseDoesNotCompleteDuringBoundedObservation() async throws {
