@@ -22,7 +22,8 @@ final class HLSResourceTransportTests: XCTestCase {
         let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
         var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(
             metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
-        weak var observed = diagnostic
+        let observed = TestWeakReference(diagnostic)
+        XCTAssertNotNil(observed.value)
         diagnostic?.begin(.resolve)
         do {
             _ = try await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
@@ -36,7 +37,7 @@ final class HLSResourceTransportTests: XCTestCase {
         XCTAssertFalse(snapshot.summary.contains("private-encoding"))
         XCTAssertFalse(snapshot.summary.contains("example.test"))
         diagnostic = nil
-        XCTAssertNil(observed, "The invalidated URLSession delegate must release its diagnostic alias before returning")
+        XCTAssertNil(observed.value, "The invalidated URLSession delegate must release its diagnostic alias before returning")
         XCTAssertEqual(ledger.chargedBytes, 0)
         XCTAssertNil(HLSPreparationDiagnostics.current)
     }

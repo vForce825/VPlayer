@@ -111,16 +111,16 @@ extension NativeHLSCapabilitiesTests {
     }
 
     func testNativeAACIdentityRejectsHEAndIncompleteOrUnsupportedLCConfigurations() throws {
-        let rejected = [
-            Data([0x2B, 0x11, 0x88, 0]), Data([0xEB, 0x09, 0x88, 0]), // explicit HE-AAC v1/v2
-            Data([0x0B, 0x90]), Data([0x11, 0x80]), Data([0x16, 0x90]), // object type, PCE, reserved rate
-            Data([0x11, 0x94]), Data([0x11, 0x92]), Data([0x11, 0x91]), // frame length, core coder, extension
-            Data([0x11, 0x90, 0x56]), Data([0x11, 0x90, 0x56, 0xE5]),
-            Data([0x11, 0x90, 0x56, 0xE5, 0x80]), Data([0x11, 0x90, 0x56, 0xE5, 1]),
-            Data([0x11, 0x90, 0]), Data([0x11, 0x90, 0x56, 0xE5, 0, 0])
+        let rejectedBytes: [[UInt8]] = [
+            [0x2B, 0x11, 0x88, 0], [0xEB, 0x09, 0x88, 0], // explicit HE-AAC v1/v2
+            [0x0B, 0x90], [0x11, 0x80], [0x16, 0x90], // object type, PCE, reserved rate
+            [0x11, 0x94], [0x11, 0x92], [0x11, 0x91], // frame length, core coder, extension
+            [0x11, 0x90, 0x56], [0x11, 0x90, 0x56, 0xE5],
+            [0x11, 0x90, 0x56, 0xE5, 0x80], [0x11, 0x90, 0x56, 0xE5, 1],
+            [0x11, 0x90, 0], [0x11, 0x90, 0x56, 0xE5, 0, 0]
         ]
-        for configuration in rejected {
-            XCTAssertThrowsError(try NativeAACDecoderConfiguration.LCIdentity(configuration: configuration))
+        for bytes in rejectedBytes {
+            XCTAssertThrowsError(try NativeAACDecoderConfiguration.LCIdentity(configuration: Data(bytes)))
         }
         let ordinary = try NativeAACDecoderConfiguration.LCIdentity(configuration: Data([0x11, 0x90]))
         let extended = try NativeAACDecoderConfiguration.LCIdentity(configuration: Data([0x11, 0x90, 0x56, 0xE5, 0]))

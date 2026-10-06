@@ -77,7 +77,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let ledger = PlaybackResourceContextLedger(applicationLedger: application)
         var owner: HLSRuntimeFailureMetadataOwner? = try HLSRuntimeFailureMetadataOwner.reserve(in: ledger)
         var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(metadataOwner: try XCTUnwrap(owner))
-        weak var weakDiagnostic = diagnostic
+        let weakDiagnostic = TestWeakReference(diagnostic)
+        XCTAssertNotNil(weakDiagnostic.value)
         XCTAssertNil(HLSPreparationDiagnostics.current)
         let inherited = await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
             await Task { HLSPreparationDiagnostics.current != nil }.value
@@ -90,7 +91,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         owner = nil
         XCTAssertEqual(ledger.chargedBytes, HLSRuntimeFailureMetadataOwner.reservationBytes)
         diagnostic = nil
-        XCTAssertNil(weakDiagnostic)
+        XCTAssertNil(weakDiagnostic.value)
         XCTAssertEqual(ledger.chargedBytes, 0)
         XCTAssertEqual(application.chargedBytes, 0)
     }
