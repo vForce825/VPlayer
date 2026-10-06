@@ -60,6 +60,12 @@ cleanup_generated_check() {
     unlink "$temporary/VPlayer.xcodeproj/project.xcworkspace/contents.xcworkspacedata"
   test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme" || \
     unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme"
+  for scheme in VPlayerReleaseBoundaryTests VPlayerReleaseStartupTests VPlayerHLSAcceptance; do
+    test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme" || \
+      unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme"
+  done
+  test ! -L "$temporary/VPlayerHLSAcceptance.xctestplan" || \
+    unlink "$temporary/VPlayerHLSAcceptance.xctestplan"
   rmdir "$temporary/VPlayer.xcodeproj/project.xcworkspace" 2>/dev/null || true
   rmdir "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes" 2>/dev/null || true
   rmdir "$temporary/VPlayer.xcodeproj/xcshareddata" 2>/dev/null || true
@@ -71,6 +77,7 @@ cleanup_generated_check() {
 }
 trap cleanup_generated_check EXIT
 
+ln -s "$repo/VPlayerHLSAcceptance.xctestplan" "$temporary/VPlayerHLSAcceptance.xctestplan"
 ln -s "$repo/Sources" "$temporary/Sources"
 ln -s "$repo/Tests" "$temporary/Tests"
 ln -s "$repo/Vendor" "$temporary/Vendor"

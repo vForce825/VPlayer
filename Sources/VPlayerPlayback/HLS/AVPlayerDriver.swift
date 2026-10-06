@@ -61,9 +61,38 @@ func inspectNativePreparationWeakSideTable(_ role: String, _ object: AnyObject,
 }
 #endif
 
+enum AVPlayerPlaybackEndBoundary: Sendable {
+    case constrained, natural
+
+    func containsFinalClock(_ current: ExactMediaTime, expected: ExactMediaTime, quantum: ExactMediaTime?) -> Bool {
+        if case .constrained = self { return CMTimeCompare(current.cmTime, expected.cmTime) >= 0 }
+        guard let quantum else { return CMTimeCompare(current.cmTime, expected.cmTime) >= 0 }
+        guard quantum.value > 0, CMTimeCompare(quantum.cmTime, expected.cmTime) < 0,
+              let lower = try? expected.subtracting(quantum) else { return false }
+        // Native presentation recognition only. Strictly inside the final
+        // quantum: a complete missing frame at the lower boundary is rejected.
+        return CMTimeCompare(current.cmTime, lower.cmTime) > 0 && CMTimeCompare(current.cmTime, expected.cmTime) <= 0
+    }
+
+    func observedEndpoint(forwardEnd: CMTime, duration: CMTime) -> ExactMediaTime? {
+        let observed: CMTime
+        switch self {
+        case .constrained: observed = forwardEnd
+        case .natural:
+            // AVPlayer's invalid/default forward end delegates to item.duration.
+            // A later explicit trim cannot reuse this full-source observation.
+            guard !forwardEnd.isValid else { return nil }
+            observed = duration
+        }
+        guard let result = try? ExactMediaTime(observed), result.value > 0 else { return nil }
+        return result
+    }
+}
+
 struct AVPlayerNaturalEndObservation: Sendable, Equatable {
     let item: AVPlayerItemInstanceIdentity
     let expectedEndpoint: ExactMediaTime
+    /// Directly observed effective endpoint: explicit trim or native duration.
     let constrainedEndpoint: ExactMediaTime
     let firstCurrentTime: ExactMediaTime
     let stableCurrentTime: ExactMediaTime?
@@ -75,6 +104,62 @@ enum AVPlayerNaturalEndTerminalFailure: Sendable, Equatable {
     case deadlineCapacityExceeded
     case staleItem
 }
+
+enum AVPlayerNaturalEndFailurePredicate: String, Sendable {
+    case ingressEndpoint = "ingress.endpoint"
+    case ingressNotReady = "ingress.notReady"
+    case ingressItemError = "ingress.itemError"
+    case ingressQuantum = "ingress.quantum"
+    case confirmNotReady = "confirm.notReady"
+    case confirmItemError = "confirm.itemError"
+    case confirmRate = "confirm.rate"
+    case confirmControl = "confirm.control"
+    case confirmQuantum = "confirm.quantum"
+    case confirmFirstEndpoint = "confirm.firstEndpoint"
+    case confirmEffectiveEndpoint = "confirm.effectiveEndpoint"
+    case confirmFinalClock = "confirm.finalClock"
+    case confirmStableClock = "confirm.stableClock"
+    case ingressAuthority = "ingress.authority"
+    case ingressDeadlineCapacity = "ingress.deadlineCapacity"
+    case ingressRegistryDeadline = "ingress.registryDeadline"
+    case refreshBoundary = "refresh.boundary"
+    case refreshIdentity = "refresh.identity"
+    case refreshQuantum = "refresh.quantum"
+    case refreshDuration = "refresh.duration"
+    case refreshPendingBinding = "refresh.pendingBinding"
+}
+
+#if DEBUG
+/// One fixed scalar slot, no SDK/error/source objects or retained event history.
+struct AVPlayerNaturalEndFailureDiagnostic: Sendable {
+    let predicate: AVPlayerNaturalEndFailurePredicate
+    let quantumFailure: NativeHLSQuantumValidationFailure?
+    var revision: NativeHLSSelectionRevisionMismatch?
+    var binding: NativeHLSQuantumBindingComparison?
+    var sdkIdentity: NativeHLSQuantumSDKIdentityComparison?
+    var first: ExactMediaTime?
+    var stable: ExactMediaTime?
+    var expected: ExactMediaTime?
+    var effective: ExactMediaTime?
+    var quantum: ExactMediaTime?
+
+    var summary: String {
+        func time(_ value: ExactMediaTime?) -> String {
+            value.map { "\($0.value)/\($0.timescale)" } ?? "none"
+        }
+        let code = predicate.rawValue + (quantumFailure.map { "." + $0.rawValue } ?? "")
+        let revisionDetail = revision.map {
+            " r=\($0.expected)/\($0.current) why=\($0.reason.rawValue)" + ($0.exhausted ? " x=1" : "")
+        } ?? ""
+        let bindingDetail = binding.map { " b=\($0.presence)/\($0.equalFields)/\($0.visualSelections)" } ?? ""
+        let sdkDetail = sdkIdentity.map { " i=\($0.equalFields)/\($0.visualSelection.rawValue)" } ?? ""
+        let value = "predicate=\(code)\(revisionDetail)\(bindingDetail)\(sdkDetail) f=\(time(first)) s=\(time(stable)) e=\(time(expected)) a=\(time(effective)) q=\(time(quantum))"
+        // Scalar values and enum codes are ASCII. Keep the complete diagnosis
+        // inside the original coordinator's 384-byte first-failure record.
+        return String(value.prefix(288))
+    }
+}
+#endif
 
 enum AVPlayerNaturalEndTerminalResult: Sendable, Equatable {
     case success(AVPlayerNaturalEndObservation)
@@ -110,7 +195,7 @@ struct AVPlayerDriverAdmission: Sendable {
 
 /// 实际交给SDK的callback持有本租约；执行、取消和driver退休均不提前归还。
 final class AVPlayerSDKCallbackLease: @unchecked Sendable {
-    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio }
+    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio, nativeObservation }
     nonisolated(unsafe) private static var occupied: UInt8 = 0
     private let slot: UInt8
     let kind: Kind
@@ -586,6 +671,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     nonisolated fileprivate static let creationLock = PreparationStorageLock()
     nonisolated(unsafe) private static var admissionGeneration: UInt64 = 0
     nonisolated(unsafe) private static var admissionReferences: UInt16 = 0
+    nonisolated(unsafe) private static var nativeTailWaiter: (UInt64, CheckedContinuation<Void, Never>)?
 
     nonisolated fileprivate static func isAdmissionActiveLocked(_ admission: AVPlayerDriverAdmission) -> Bool {
         admissionReferences > 0 && admissionGeneration == admission.generation
@@ -600,6 +686,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     nonisolated fileprivate static func releaseAdmissionLocked(_ admission: AVPlayerDriverAdmission) {
         precondition(isAdmissionActiveLocked(admission), "只能归还准确原driver准入引用，不能下溢或消费后继世代")
         admissionReferences -= 1
+        // Driver + hub are the two canonical owners. Every additional reference
+        // is an original SDK callback/credit whose physical tail must retire.
+        if admissionReferences == 2, let waiter = nativeTailWaiter, waiter.0 == admission.generation {
+            nativeTailWaiter = nil
+            waiter.1.resume()
+        }
     }
 
     static func make(
@@ -659,6 +751,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private var accessLogObserver: NSObjectProtocol?
     private var errorLogObserver: NSObjectProtocol?
     private var logRefreshTask: Task<Void, Never>?
+    private var nativeTailJoinTask: Task<Void, Never>?
     private let logReader: any AVPlayerLogReading
     private var systemAudioTransitionInFlight = false
     private var pausedResumeCallbackPool: AVPlayerSDKCallbackCreditPool?
@@ -666,7 +759,15 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private var endpointStabilityDeadline: UUID?
     private var endpointObservationIdentity: UUID?
     private(set) var naturalEndObservation: AVPlayerNaturalEndObservation?
+    private var endpointBoundary = AVPlayerPlaybackEndBoundary.constrained
+    private var nativeEndQuantum: NativeHLSFinalPresentationQuantum?
+    private var nativeEndQuantumWindow = NativeHLSQuantumWindow()
+    nonisolated let nativeSelectionRevision = NativeHLSSelectionRevision()
     private(set) var naturalEndTerminalResult: AVPlayerNaturalEndTerminalResult?
+    #if DEBUG
+    private(set) var naturalEndFailureDiagnosticForTesting: AVPlayerNaturalEndFailureDiagnostic?
+    private(set) var naturalEndQuantumUpdateFailureDiagnosticForTesting: AVPlayerNaturalEndFailureDiagnostic?
+    #endif
     private let naturalEndIssuerIdentity = UUID()
     private var naturalEndTerminalIssued = false
     private var naturalEndTerminalConsumed = false
@@ -833,28 +934,71 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     var rate: Float { player.rate }
     var timeControlStatus: AVPlayer.TimeControlStatus { player.timeControlStatus }
+
+    func playbackTime(item identity: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        guard case .currentItem(let time) = playbackClockObservation(item: identity) else { return nil }
+        return time
+    }
+
+    func playbackClockObservation(item identity: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { return .staleItem }
+        return .currentItem(try? ExactMediaTime(player.currentTime()))
+    }
     var activeWaiterCount: Int {
         (prepareWait.isActive ? 1 : 0)
             + (pausedResumeCallbackPool?.hasOperationReturnWaiter == true ? 1 : 0)
     }
     var fixedTimerCount: Int { 0 }
 
-    func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
-        guard !systemAudioTransitionInFlight else {
-            throw AVPlayerItemCoordinatorFailure.operationInFlight
+    func nativeCurrentItem(_ identity: AVPlayerItemInstanceIdentity) -> AVPlayerItem? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { return nil }
+        return item
+    }
+
+    func joinNativeCallbackTails() async {
+        if let nativeTailJoinTask { await nativeTailJoinTask.value; return }
+        let task = Task { [self] in
+            let logs = logRefreshTask
+            logs?.cancel()
+            await logs?.value
+            await withCheckedContinuation { continuation in
+                let ready = Self.creationLock.withLock { () -> Bool in
+                    precondition(Self.isAdmissionActiveLocked(eventHub.admission))
+                    if Self.admissionReferences == 2 { return true }
+                    precondition(Self.nativeTailWaiter == nil)
+                    Self.nativeTailWaiter = (eventHub.admission.generation, continuation)
+                    return false
+                }
+                if ready { continuation.resume() }
+            }
         }
+        nativeTailJoinTask = task
+        await task.value
+        nativeTailJoinTask = nil
+    }
+
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
+        try install(url: url, identity: identity, admission: { operation in operation(); return true })
+    }
+
+    func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {
+        guard !systemAudioTransitionInFlight else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        // These can deliver/cancel callbacks and must precede the Registry lock.
         cancelAllWaiters()
         installationResourceContextReservation = nil
         eventHub.releaseInstallationResourceContext()
         player.pause()
         player.automaticallyWaitsToMinimizeStalling = true
         let installed = AVPlayerItem(url: url)
-        installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(
-            configured: preferredForwardBufferDuration)
+        installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(configured: preferredForwardBufferDuration)
         installed.canUseNetworkResourcesForLiveStreamingWhilePaused = true
-        player.replaceCurrentItem(with: installed)
-        item = installed
-        currentItemIdentity = identity
+        // No app observer is installed on the new item yet. Only the exact SDK
+        // mutation and driver identity CAS run under the original prepare fence.
+        guard try admission({
+            player.replaceCurrentItem(with: installed)
+            item = installed
+            currentItemIdentity = identity
+        }) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         eventHub.activate(identity)
         logSnapshotCache.activate(item: identity, objectIdentity: ObjectIdentifier(installed))
     }
@@ -952,6 +1096,25 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                                    actualTime: try ExactMediaTime(player.currentTime()))
     }
 
+    func seekNative(to time: ExactMediaTime, item identity: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime {
+        guard currentItemIdentity == identity else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+        try await awaitPausedResumeOperationCredit(item: identity)
+        let callbackLease = try reserveSDKCallbackLease(.seek)
+        let gate = prepareWait
+        let token = try gate.begin(.seek)
+        defer { gate.retire(token) }
+        let succeeded = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.install(continuation, token: token)
+                player.seek(to: time.cmTime, toleranceBefore: .zero, toleranceAfter: .zero) { success in
+                    callbackLease.assertRegistered(); gate.resolve(.success(success), token: token)
+                }
+            }
+        } onCancel: { gate.resolve(.failure(CancellationError()), token: token) }
+        guard succeeded, nativeCurrentItem(identity) != nil else { throw AVPlayerItemCoordinatorFailure.seekMismatch }
+        return try ExactMediaTime(player.currentTime())
+    }
+
     func waitForLoadedTimeRanges(item identity: AVPlayerItemInstanceIdentity,
                                  playhead: PreparedPlayheadIdentity,
                                  covering requested: ExactMediaInterval) async throws
@@ -1004,6 +1167,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+        try await awaitPausedResumeOperationCredit(item: identity)
         let callbackLease = try reserveSDKCallbackLease(.preroll)
         let gate = prepareWait
         let token = try gate.begin(.preroll)
@@ -1259,18 +1423,91 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item identity: AVPlayerItemInstanceIdentity) throws {
+        try installEndpointObservation(expected: time, item: identity, boundary: .constrained)
+    }
+
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime,
+                                   presentationQuantum: NativeHLSFinalPresentationQuantum?,
+                                   item identity: AVPlayerItemInstanceIdentity) throws {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
+                  duration: item.duration) == time,
+              presentationQuantum.map({ $0.duration == time && $0.isCurrent(item: identity, physical: item) }) ?? true else {
+            throw AVPlayerItemCoordinatorFailure.invalidTimeline
+        }
+        try installEndpointObservation(expected: time, item: identity, boundary: .natural)
+        nativeEndQuantum = presentationQuantum
+    }
+
+    func updateNaturalPlaybackEndQuantum(_ quantum: NativeHLSFinalPresentationQuantum?, item identity: AVPlayerItemInstanceIdentity) throws {
+        #if DEBUG
+        naturalEndQuantumUpdateFailureDiagnosticForTesting = nil
+        #endif
+        var observedDuration: ExactMediaTime?
+        func reject(_ predicate: AVPlayerNaturalEndFailurePredicate,
+                    cause: NativeHLSQuantumValidationFailure? = nil,
+                    revision: NativeHLSSelectionRevisionMismatch? = nil,
+                    binding: NativeHLSQuantumBindingComparison? = nil,
+                    sdkIdentity: NativeHLSQuantumSDKIdentityComparison? = nil) -> AVPlayerItemCoordinatorFailure {
+            #if DEBUG
+            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision, binding: binding, sdkIdentity: sdkIdentity,
+                first: naturalEndObservation?.firstCurrentTime, stable: nil,
+                expected: quantum?.duration ?? nativeEndQuantum?.duration, effective: observedDuration, quantum: quantum?.period)
+            #endif
+            return .selectionChanged
+        }
+        guard case .natural = endpointBoundary else { throw reject(.refreshBoundary) }
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { throw reject(.refreshIdentity) }
+        // Establish every terminal condition before classifying a stale revision
+        // as retryable. A changed binding cannot hide behind simultaneous staleness.
+        var currentSDKIdentity: NativeHLSQuantumSDKIdentityComparison?
+        if let quantum {
+            let validation = quantum.validation(item: identity, physical: item, requiresFreshness: false)
+            currentSDKIdentity = validation.sdkIdentity
+            if let failure = validation.rejection {
+                throw reject(.refreshQuantum, cause: failure.cause, sdkIdentity: failure.sdkIdentity)
+            }
+            observedDuration = try? ExactMediaTime(item.duration)
+            guard observedDuration == quantum.duration else { throw reject(.refreshDuration) }
+        }
+        var usedWrapperRenewal = false
+        if endpointStabilityDeadline != nil {
+            let binding = NativeHLSFinalPresentationQuantum.compareBindings(prior: nativeEndQuantum, current: quantum)
+            guard binding.matchesPendingWindow else { throw reject(.refreshPendingBinding, binding: binding) }
+            guard nativeEndQuantumWindow.permits(quantum?.visualSelection) else {
+                throw reject(.refreshQuantum, cause: .visualSelection, binding: binding, sdkIdentity: currentSDKIdentity)
+            }
+            usedWrapperRenewal = binding.usesWrapperRenewal
+        }
+        if let mismatch = quantum?.revisionMismatch() {
+            let terminal = reject(.refreshQuantum, cause: .revision, revision: mismatch)
+            guard !mismatch.exhausted else { throw terminal }
+            throw NativeHLSQuantumRevisionSuperseded()
+        }
+        nativeEndQuantum = quantum
+        nativeEndQuantumWindow.recordWrapperRenewal(usedWrapperRenewal)
+    }
+
+    private func installEndpointObservation(expected time: ExactMediaTime,
+        item identity: AVPlayerItemInstanceIdentity, boundary: AVPlayerPlaybackEndBoundary) throws {
         guard currentItemIdentity == identity, let item,
               player.currentItem === item, time.value > 0 else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let callbackLease = try reserveSDKCallbackLease(.endpoint)
         removeEndpointObserver()
-        item.forwardPlaybackEndTime = time.cmTime
+        endpointBoundary = boundary
+        if case .constrained = boundary { item.forwardPlaybackEndTime = time.cmTime }
+        naturalEndObservation = nil
         naturalEndTerminalIssued = false
         naturalEndTerminalConsumed = false
         naturalEndTerminalResult = nil
+        #if DEBUG
+        naturalEndFailureDiagnosticForTesting = nil
+        #endif
         let observationIdentity = UUID()
         endpointObservationIdentity = observationIdentity
+        if case .natural = boundary { nativeSelectionRevision.installEndpoint(token: observationIdentity) }
         eventHub.installEndpoint(endpoint: time, token: observationIdentity) {
             [weak self, weak item] observedIdentity, endpoint in
             guard let self else { return }
@@ -1280,19 +1517,40 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                   self.currentItemIdentity == observedIdentity,
                   self.item === item, self.player.currentItem === item,
                   let first = try? ExactMediaTime(self.player.currentTime()),
-                  let constrained = try? ExactMediaTime(item.forwardPlaybackEndTime) else {
+                  let constrained = self.endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
+                      duration: item.duration) else {
                 self.publishNaturalEnd(.failure(.staleItem), item: observedIdentity)
                 return
             }
-            guard constrained == endpoint else {
+            guard self.checkNaturalEndPredicate(constrained == endpoint, .ingressEndpoint) else {
+                self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                 self.publishNaturalEnd(.failure(.endpointMismatch), item: observedIdentity)
                 return
             }
+            if case .natural = self.endpointBoundary {
+                // Native EOS can precede AVPlayer's rate/time-control settlement.
+                // Keep this notification's first clock and original deadline;
+                // completeNaturalEndRead still requires rate zero and paused.
+                guard self.checkNaturalEndPredicate(item.status == .readyToPlay, .ingressNotReady),
+                      self.checkNaturalEndPredicate(item.error == nil, .ingressItemError),
+                      self.checkNaturalEndQuantum(item: observedIdentity, physical: item, requiresFreshness: false) else {
+                    self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
+                    self.publishNaturalEnd(.failure(.endpointMismatch), item: observedIdentity)
+                    return
+                }
+            }
+            #if DEBUG
+            if case .natural = self.endpointBoundary {
+                print("NATIVE_EOF_NOTIFICATION output=\(observedIdentity.outputLifecycleEpoch.outputNonce) " +
+                    "current=\(first.value)/\(first.timescale) quantum=\(self.nativeEndQuantum.map { "\($0.period.value)/\($0.period.timescale)" } ?? "none")")
+            }
+            #endif
             self.naturalEndObservation = .init(item: observedIdentity,
                 expectedEndpoint: endpoint, constrainedEndpoint: constrained,
                 firstCurrentTime: first,
                 stableCurrentTime: nil)
-            guard self.naturalEndAuthority?.revalidateCurrentAuthority() == true else {
+            guard self.checkNaturalEndPredicate(self.naturalEndAuthority?.revalidateCurrentAuthority() == true, .ingressAuthority) else {
+                self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                 #if DEBUG
                 PlaybackDiagnosticTracker.shared.append(
                     "eos_first_read_authority_rejected_present_\(self.naturalEndAuthority != nil)")
@@ -1308,6 +1566,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 guard let deadline = scheduler.schedule(after: 0.1, handler: { [weak self] in
                     self?.naturalEndDeadlineFired(identity: observationIdentity)
                 }) else {
+                    _ = self.checkNaturalEndPredicate(false, .ingressDeadlineCapacity)
+                    self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("eos_manual_deadline_slot_rejected")
                     #endif
@@ -1316,8 +1576,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 }
                 self.endpointStabilityDeadline = deadline
             } else {
-                guard self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
-                    identity: observationIdentity, receiver: self) == true else {
+                guard self.checkNaturalEndPredicate(self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
+                    identity: observationIdentity, receiver: self) == true, .ingressRegistryDeadline) else {
+                    self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("eos_registry_deadline_rejected")
                     #endif
@@ -1328,8 +1589,13 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             }
         }
         let hub = eventHub
+        let nativeRevision: NativeHLSSelectionRevision?
+        if case .natural = boundary { nativeRevision = nativeSelectionRevision } else { nativeRevision = nil }
         let callback: @Sendable (Notification) -> Void = { [weak hub] _ in
             callbackLease.assertRegistered()
+            // This exact private EOS ingress, not another observer's ordering,
+            // revokes pre-EOS timing and requests the original joined refresh.
+            nativeRevision?.receiveNativeEnd(token: observationIdentity)
             hub?.receiveEndpoint(item: identity, token: observationIdentity)
         }
         callbackLease.inspectRegistration()
@@ -1363,13 +1629,28 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let observation = naturalEndObservation, observation.item == identity,
               observation.stableCurrentTime == nil,
               observation.constrainedEndpoint == observation.expectedEndpoint,
-              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime),
+              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration),
               constraint == observation.expectedEndpoint,
               naturalEndAuthority?.activation == activation,
-              naturalEndAuthority?.revalidateCurrentAuthority() == true else { return false }
+              naturalEndAuthority?.revalidateCurrentAuthority() == true,
+              acceptPendingNaturalEndQuantum(item: identity, physical: item) else { return false }
         // Only the private matching notification installs the first observation
         // and its original deadline. Completion, cancellation and owned pause
         // clear that deadline; this query creates no grace period or EOS proof.
+        return true
+    }
+
+    private func acceptPendingNaturalEndQuantum(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
+        guard case .natural = endpointBoundary else {
+            return nativeEndQuantum?.hasCurrentIdentity(item: identity, physical: physical) ?? true
+        }
+        let validation = nativeEndQuantum?.validation(item: identity, physical: physical,
+            requiresFreshness: false, allowingWrapperRenewal: true)
+        guard validation?.rejection == nil, nativeEndQuantumWindow.permits(nativeEndQuantum?.visualSelection) else { return false }
+        if let comparison = validation?.sdkIdentity, comparison.usesWrapperRenewal {
+            guard comparison.permitsPendingPause(isReady: physical.status == .readyToPlay, errorFree: physical.error == nil) else { return false }
+        }
+        nativeEndQuantumWindow.recordWrapperRenewal(validation?.sdkIdentity?.usesWrapperRenewal == true)
         return true
     }
 
@@ -1381,14 +1662,31 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let item, let currentItemIdentity, player.currentItem === item,
               let prior = naturalEndObservation, prior.item == currentItemIdentity,
               let stable = try? ExactMediaTime(player.currentTime()),
-              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime) else { return }
-        guard prior.firstCurrentTime == stable else {
+              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration) else { return }
+        if case .natural = endpointBoundary {
+            guard checkNaturalEndPredicate(item.status == .readyToPlay, .confirmNotReady),
+                  checkNaturalEndPredicate(item.error == nil, .confirmItemError),
+                  checkNaturalEndPredicate(player.rate == 0, .confirmRate),
+                  checkNaturalEndPredicate(player.timeControlStatus == .paused, .confirmControl),
+                  checkNaturalEndQuantum(item: currentItemIdentity, physical: item, requiresFreshness: true) else {
+                captureNaturalEndFailureClocks(first: prior.firstCurrentTime, stable: stable,
+                    expected: prior.expectedEndpoint, effective: constraint)
+                publishNaturalEnd(.failure(.endpointMismatch), item: currentItemIdentity)
+                return
+            }
+        }
+        guard checkNaturalEndPredicate(prior.firstCurrentTime == stable, .confirmStableClock) else {
+            captureNaturalEndFailureClocks(first: prior.firstCurrentTime, stable: stable,
+                expected: prior.expectedEndpoint, effective: constraint)
             publishNaturalEnd(.failure(.unstableDirectRead), item: currentItemIdentity)
             return
         }
-        guard prior.constrainedEndpoint == prior.expectedEndpoint,
-              constraint == prior.expectedEndpoint,
-              CMTimeCompare(stable.cmTime, prior.expectedEndpoint.cmTime) >= 0 else {
+        guard checkNaturalEndPredicate(prior.constrainedEndpoint == prior.expectedEndpoint, .confirmFirstEndpoint),
+              checkNaturalEndPredicate(constraint == prior.expectedEndpoint, .confirmEffectiveEndpoint),
+              checkNaturalEndPredicate(endpointBoundary.containsFinalClock(stable, expected: prior.expectedEndpoint,
+                  quantum: nativeEndQuantum?.period), .confirmFinalClock) else {
+            captureNaturalEndFailureClocks(first: prior.firstCurrentTime, stable: stable,
+                expected: prior.expectedEndpoint, effective: constraint, firstEffective: prior.constrainedEndpoint)
             publishNaturalEnd(.failure(.endpointMismatch), item: currentItemIdentity)
             return
         }
@@ -1400,12 +1698,60 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         publishNaturalEnd(.success(result), item: currentItemIdentity)
     }
 
+    /// Return each existing predicate unchanged. Only the first failed operand
+    /// writes diagnostics; conjunction order and the number of SDK reads stay fixed.
+    private func checkNaturalEndPredicate(_ accepted: Bool, _ predicate: AVPlayerNaturalEndFailurePredicate) -> Bool {
+        #if DEBUG
+        if !accepted, naturalEndFailureDiagnosticForTesting == nil {
+            naturalEndFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: nil)
+        }
+        #endif
+        return accepted
+    }
+
+    private func checkNaturalEndQuantum(item: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,
+                                       requiresFreshness: Bool) -> Bool {
+        let validation = nativeEndQuantum?.validation(item: item, physical: physical, requiresFreshness: requiresFreshness,
+            allowingWrapperRenewal: !requiresFreshness)
+        let failure = validation?.rejection ?? (nativeEndQuantumWindow.permits(nativeEndQuantum?.visualSelection) ? nil :
+            NativeHLSQuantumValidationRejection(cause: .visualSelection, sdkIdentity: validation?.sdkIdentity))
+        #if DEBUG
+        if let failure, naturalEndFailureDiagnosticForTesting == nil {
+            naturalEndFailureDiagnosticForTesting = .init(
+                predicate: requiresFreshness ? .confirmQuantum : .ingressQuantum,
+                quantumFailure: failure.cause, revision: failure.revision, sdkIdentity: failure.sdkIdentity)
+        }
+        #endif
+        if failure == nil, !requiresFreshness {
+            nativeEndQuantumWindow.recordWrapperRenewal(validation?.sdkIdentity?.usesWrapperRenewal == true)
+        }
+        // A missing quantum keeps exact-endpoint-only behavior only if this
+        // window has never borrowed the presentation-wrapper exception.
+        return failure == nil
+    }
+
+    private func captureNaturalEndFailureClocks(first: ExactMediaTime, stable: ExactMediaTime?,
+                                               expected: ExactMediaTime, effective: ExactMediaTime,
+                                               firstEffective: ExactMediaTime? = nil) {
+        #if DEBUG
+        guard !naturalEndTerminalIssued else { return }
+        naturalEndFailureDiagnosticForTesting?.first = first
+        naturalEndFailureDiagnosticForTesting?.stable = stable
+        naturalEndFailureDiagnosticForTesting?.expected = expected
+        // Report the endpoint used by the failed comparison, not a later read.
+        let observedEndpoint = naturalEndFailureDiagnosticForTesting?.predicate == .confirmFirstEndpoint ? firstEffective : effective
+        naturalEndFailureDiagnosticForTesting?.effective = observedEndpoint
+        naturalEndFailureDiagnosticForTesting?.quantum = nativeEndQuantum?.period
+        #endif
+    }
+
     private func cancelNaturalEndDeadline() {
         if let endpointStabilityDeadline {
             if let deadlineScheduler { deadlineScheduler.cancel(endpointStabilityDeadline) }
             else { naturalEndAuthority?.retireNaturalEnd(identity: endpointStabilityDeadline) }
         }
         endpointStabilityDeadline = nil
+        nativeEndQuantumWindow.reset()
     }
 
     func consumeNaturalEndTerminal(
@@ -1464,12 +1810,19 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
 
     private func removeEndpointObserver() {
+        if let token = endpointObservationIdentity { nativeSelectionRevision.clearEndpoint(token: token) }
         if let endpointObserver {
             NotificationCenter.default.removeObserver(endpointObserver)
         }
         endpointObserver = nil
         cancelNaturalEndDeadline()
         endpointObservationIdentity = nil
+        endpointBoundary = .constrained
+        nativeEndQuantum = nil
+        #if DEBUG
+        naturalEndFailureDiagnosticForTesting = nil
+        naturalEndQuantumUpdateFailureDiagnosticForTesting = nil
+        #endif
         eventHub.cancelEndpoint()
     }
 

@@ -44,3 +44,25 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
 public protocol PlaybackMediaInformationProviding: Actor {
     func playbackMediaInformation() -> AsyncStream<PlaybackMediaInformation?>
 }
+
+/// A prepared HLS graph owns one immutable value, including a valid audio-only
+/// nil. Its output lifecycle is distinct from the demuxer's media generation.
+struct PlaybackPreparedMediaInformation: Sendable, Equatable {
+    let lifecycle: OutputLifecycleEpoch
+    let information: PlaybackMediaInformation?
+}
+
+/// Notifications run on the existing owned backend task, outside Registry locks.
+/// Receivers only validate and publish; they must never join the notifying task.
+protocol PlaybackBackendMediaInformationReceiving: AnyObject, Sendable {
+    func refreshPreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) async
+    func invalidatePreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) async
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) async
+}
+
+extension PlaybackBackendMediaInformationReceiving {
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) async {
+        if invalidated { await invalidatePreparedMediaInformation(for: lifecycle) }
+        else { await refreshPreparedMediaInformation(for: lifecycle) }
+    }
+}

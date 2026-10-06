@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "status": "ineligible",
+  "head": "36f9f00044db05b707e25ea470b0da3cec62682c",
+  "tree": "5ea82c016a2557f3b8a8507e750a02dcce7ea5f3",
+  "reason_code": "sequence_clock_is_not_media_clock",
+  "source_blobs": {
+    "Sources/VPlayerPlayback/HLS/SystemHLSPublicationGraph.swift": "a3ce6cbf2251bf205d45a8d401e251e9a7038111",
+    "Sources/VPlayerPlayback/HLS/HLSPublicationCoordinator.swift": "88a0a938a60af69307dc13d3b0effe5e216f95b3"
+  },
+  "reason": "Old publication passes (logicalSequence + 1) * 1000000000 as now, while its coordinator gates publication by actual segment duration. Five-second GOPs advance this clock by only one second per segment.",
+  "source_locations": [
+    "SystemHLSPublicationGraph.swift:517-535",
+    "HLSPublicationCoordinator.swift:566-568"
+  ],
+  "runtime_observation": {
+    "run_id": 37324553211,
+    "job_id": 111811827361,
+    "outcome": "five-second AVPlayer stall; no valid completed baseline",
+    "source_observation_seconds": 40.716477042,
+    "stall_causal_chain_proven": false
+  },
+  "mfhd_note": "Basic mfhd continuation is already present; no missing-mfhd claim.",
+  "policy": "Do not repair or rerun this immutable old production as the reference. Relative performance is unavailable; candidate functional and existing memory-trend checks remain mandatory."
+}

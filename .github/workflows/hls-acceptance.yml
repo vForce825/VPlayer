@@ -1,0 +1,98 @@
+name: Five-minute native HLS acceptance
+
+"on":
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Sources/VPlayerPlayback/**'
+      - 'Sources/VPlayerCore/**'
+      - 'Sources/VPlayerApp/DependencyInjection/**'
+      - 'Sources/VPlayerApp/AppDependencies.swift'
+      - 'Tests/VPlayerHLSAcceptanceTests/**'
+      - 'Tests/VPlayerTests/Playback/**'
+      - 'Tests/VPlayerTests/PlaybackSupport/**'
+      - 'Tests/Fixtures/**'
+      - 'Tests/VPlayerTests/Fixtures/**'
+      - 'Scripts/**'
+      - 'ci_scripts/**'
+      - 'Vendor/FFmpeg/**'
+      - 'project.yml'
+      - 'VPlayer.xcodeproj/**'
+      - 'VPlayerHLSAcceptance.xctestplan'
+      - 'Mintfile'
+      - 'Brewfile'
+      - '.github/workflows/hls-acceptance.yml'
+      - '.github/workflows/macos-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hls-five-minute-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+  TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_ANALYTICS: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  five-minute-native-playback:
+    runs-on: xcode-27
+    timeout-minutes: 100
+    steps:
+      - name: Check out exact candidate, never the PR merge ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify immutable candidate and pinned Apple tools
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
+          test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = '27.0'
+      - name: Provision pinned host tools and prepare exact fixture inputs
+        timeout-minutes: 40
+        run: |
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
+          ./ci_scripts/ci_post_clone.sh
+          xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --acceptance
+          ./Scripts/bootstrap.sh --check
+          ./Scripts/verify-licenses.sh
+          python3 Scripts/Tests/test_persistent_hls_acceptance.py
+          python3 Scripts/Tests/test_hls_acceptance_workflows.py
+          python3 Scripts/Tests/test_hls_acceptance_configurator.py
+          python3 Scripts/Tests/test_hls_acceptance_fixture.py
+          python3 Scripts/Tests/test_hls_generation_readback.py
+          python3 Scripts/Tests/test_hls_fixture_provisioning.py
+          python3 Scripts/Tests/test_hls_fixture_preparation.py
+          python3 Scripts/Tests/test_source_fixture_padding.py
+          python3 Scripts/Tests/test_he_aac_fixture_observation.py
+          python3 Scripts/Tests/test_source_fixture_manifest.py
+      - name: Run short controls, classify exact old reference, then measure candidate
+        timeout-minutes: 45
+        run: |
+          udid="$(xcrun simctl list devices available -j | jq -er '
+            [.devices["com.apple.CoreSimulator.SimRuntime.tvOS-27-0"][] |
+             select(.name == "Apple TV 4K (3rd generation)")] |
+            if length == 1 then .[0].udid else error("expected one tvOS27 simulator") end')"
+          export TVOS_TEST_DESTINATION="platform=tvOS Simulator,id=$udid"
+          # Each source/player observation INCLUDING prebuffer stops before300s.
+          # Build, decode and joined retirement have separate durations.
+          ./Scripts/run-hls-baseline-and-candidate.sh "$CANDIDATE_SHA"

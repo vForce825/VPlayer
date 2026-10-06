@@ -3592,6 +3592,99 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
         XCTAssertNotEqual(.interruption(next), result)
     }
 
+    func testSuspendTimeoutBeforeClaimTransfersToRetirementWithoutCompletingRunningPrepare() throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let prepare = try XCTUnwrap(context.sourceTask)
+        XCTAssertTrue(registry.claimStart(prepare))
+        _ = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .stop, at: registry.clock.nowNanoseconds))
+        let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        XCTAssertEqual(registry.phase(of: stop.task), .queued)
+        XCTAssertEqual(registry.phase(of: prepare), .cancelRequested)
+        fixture.stable.acquisition.clock.set(stop.anchorInstant + 1_000_000_000)
+        XCTAssertTrue(registry.timeoutOutputSuspend(stop))
+        let timedOut = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertTrue(timedOut.suspendRequiresRetirement,
+            "A never-invoked suspend transfers stopping responsibility, not a quiescence receipt")
+        XCTAssertFalse(timedOut.suspendConfirmed)
+        XCTAssertFalse(timedOut.suspendPreparedPreserved)
+        XCTAssertFalse(timedOut.retirementConfirmed)
+        XCTAssertEqual(registry.phase(of: stop.task), .terminal(.canceled))
+        XCTAssertFalse(registry.claimStart(stop.task), "The original queued stop must never start after transfer")
+        XCTAssertFalse(registry.timeoutOutputSuspend(stop), "The transferred stop must reject a late timer")
+        let repeated = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertEqual(repeated.owner, timedOut.owner)
+        XCTAssertEqual(repeated.suspend, timedOut.suspend)
+        XCTAssertEqual(repeated.budget, timedOut.budget)
+        let owner = try XCTUnwrap(timedOut.owner)
+        let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: owner))
+        XCTAssertTrue(registry.claimStart(retirement))
+        XCTAssertFalse(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle),
+            "Physical retirement cannot skip the original prepare's cancellation join")
+        XCTAssertTrue(registry.completeOutputPrepare(prepare))
+        let wrong = OutputLifecycleEpoch(backendIdentity: fixture.lifecycle.backendIdentity,
+            outputNonce: fixture.lifecycle.outputNonce + 1)
+        XCTAssertFalse(fixture.coordinator.completeRetirement(retirement, lifecycle: wrong))
+        XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
+        let retired = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        XCTAssertTrue(retired.retirementConfirmed)
+        XCTAssertTrue(retired.suspendTimedOut)
+        XCTAssertTrue(retired.poisoned)
+        XCTAssertEqual(retired.budget, timedOut.budget, "Retirement must not renew the original deadline")
+        XCTAssertNotNil(try fixture.coordinator.advance(owner: owner))
+    }
+
+    func testSuspendTimeoutDoesNotCancelQueuedOwnedSuspendRunner() async throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        let prepare = try XCTUnwrap(context.sourceTask)
+        XCTAssertTrue(registry.claimStart(prepare))
+        XCTAssertTrue(registry.completeOutputPrepare(prepare))
+        let owner = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .pause, at: registry.clock.nowNanoseconds, teardown: false))
+        let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        registry.executor.sync {
+            // The same executor prevents the newly installed Task from claiming
+            // its stop until after we inspect the exact queued-with-runner state.
+            XCTAssertTrue(registry.startOutputSuspendOperation(stop.task, owner: owner))
+            XCTAssertEqual(registry.phase(of: stop.task), .queued)
+            fixture.stable.acquisition.clock.set(stop.anchorInstant + 1_000_000_000)
+            XCTAssertTrue(registry.timeoutOutputSuspend(stop))
+            XCTAssertEqual(registry.phase(of: stop.task), .queued)
+            XCTAssertFalse(registry.outputResourceContextSnapshot()?.suspendRequiresRetirement == true)
+            XCTAssertFalse(registry.outputResourceContextSnapshot()?.suspendConfirmed == true)
+        }
+        let result = await registry.joinOutputBackendOperation(stop.task)
+        guard case .succeeded = result else { return XCTFail("The original suspend runner must finish successfully") }
+        XCTAssertTrue(registry.outputResourceContextSnapshot()?.suspendConfirmed == true,
+            "The queued owned runner must still deliver its real late suspend receipt")
+    }
+
+    func testSuspendTimeoutCannotTransferCanceledInFlightSuspendWithoutReceipt() throws {
+        let fixture = try OutputGraphFixture()
+        let registry = fixture.registry
+        let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+        _ = try XCTUnwrap(fixture.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .stop, at: registry.clock.nowNanoseconds))
+        let stop = try XCTUnwrap(registry.outputResourceContextSnapshot()?.suspend)
+        let suspension = try claimGraphSuspend(registry, stop)
+        XCTAssertTrue(registry.requestCancel(stop.task))
+        XCTAssertEqual(registry.phase(of: stop.task), .cancelRequested)
+        fixture.stable.acquisition.clock.set(stop.anchorInstant + 1_000_000_000)
+        XCTAssertTrue(registry.timeoutOutputSuspend(stop))
+        XCTAssertFalse(registry.outputResourceContextSnapshot()?.suspendRequiresRetirement == true)
+        XCTAssertEqual(registry.phase(of: stop.task), .cancelRequested)
+        let terminal = try XCTUnwrap(registry.outputResourceContextSnapshot()?.owner)
+        let retirement = try XCTUnwrap(fixture.coordinator.advance(owner: terminal))
+        XCTAssertTrue(registry.claimStart(retirement))
+        XCTAssertFalse(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
+        XCTAssertTrue(suspension.complete(in: registry, preparedPreserved: false))
+        XCTAssertTrue(fixture.coordinator.completeRetirement(retirement, lifecycle: fixture.lifecycle))
+    }
+
     func testTimeoutKeepsOriginalStopAndForcedRetirementJoinedUntilLateReceipt() throws {
         let fixture = try OutputGraphFixture()
         let context = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot())
@@ -4141,13 +4234,52 @@ final class OutputCleanupCoordinatorTests: XCTestCase {
             let rebase = try XCTUnwrap(registry.rebaseRetainedOutput(contextNonce: retained.contextNonce,
                 stableCommit: fixture.stable, owner: nil))
             let claim = try XCTUnwrap(rebase.successorClaim)
-            XCTAssertThrowsError(try registry.claimOutputSuccessor(claim),
-                "outputLifecycle身份耗尽必须在claim-time失败关闭")
-            XCTAssertTrue(allocator.isExhausted)
-            XCTAssertNil(registry.executor.safetyIngress.snapshot.failure,
-                "claim-time局部失败关闭不伪造全局Cell失败")
-            XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
-            XCTAssertTrue(registry.cleanupReservationSnapshot()?.terminal == true)
+            let beforeClaim = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let reservation = try XCTUnwrap(registry.cleanupReservationSnapshot())
+            let occupancy = registry.occupancy
+            try registry.executor.sync {
+                // Hold the executor across the claim and its local projection so
+                // the already-registered asynchronous drain cannot win this check.
+                XCTAssertThrowsError(try registry.claimOutputSuccessor(claim)) {
+                    XCTAssertEqual($0 as? PlaybackIdentityAllocationError, .identitySpaceExhausted)
+                }
+                XCTAssertTrue(allocator.isExhausted)
+                XCTAssertNil(registry.executor.safetyIngress.snapshot.failure)
+                let unchanged = registry.outputResourceContextSnapshot()
+                XCTAssertEqual(unchanged?.phase, .pendingSuccessorLease)
+                XCTAssertEqual(unchanged?.contextNonce, beforeClaim.contextNonce)
+                XCTAssertEqual(unchanged?.retainedRebase?.successorClaim, claim)
+                XCTAssertNil(unchanged?.candidateBackendIdentity)
+                XCTAssertNil(unchanged?.prepareTicket)
+                XCTAssertEqual(unchanged?.sourceTask, beforeClaim.sourceTask)
+                XCTAssertEqual(registry.occupancy.ordinarySlots, occupancy.ordinarySlots,
+                    "The failed claim cannot publish a partial factory command")
+
+                // Exhaustion is sticky across all allocator domains. The next
+                // real barrier must revoke globally while preserving the exact
+                // original cleanup reservation; a read-only getter must not do it.
+                while true {
+                    switch registry.executor.withSafetyIngressBarrier(
+                        operationDescriptor: .cleanupOwnership, operation: { _ in () }) {
+                    case .retry: continue
+                    case .rejected: XCTFail("Terminal cleanup must remain admitted")
+                    case .performed: break
+                    }
+                    break
+                }
+                let safety = registry.executor.safetyIngress.snapshot
+                XCTAssertEqual(safety.failure, .identitySpaceExhausted)
+                XCTAssertFalse(safety.outputPermitPresent)
+                XCTAssertFalse(safety.readinessOpen)
+                XCTAssertFalse(safety.routeObservationGateOpen)
+                XCTAssertTrue(registry.outputResourceContextSnapshot()?.poisoned == true)
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.disposition, .releaseAfterTeardown)
+                let terminalReservation = registry.cleanupReservationSnapshot()
+                XCTAssertTrue(terminalReservation?.terminal == true)
+                XCTAssertEqual(terminalReservation?.ticket, reservation.ticket)
+                XCTAssertEqual(terminalReservation?.terminalOwner, reservation.terminalOwner)
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.reservation, reservation.ticket)
+            }
         }
 
         let allocator = PlaybackIdentityAllocator(initialIssuedValue: .max - 512,

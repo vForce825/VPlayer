@@ -230,6 +230,16 @@ final class HLSPublisherTests: XCTestCase {
             XCTAssertEqual(endpoint.receipt.terminalLogicalSequence, UInt64(5 + backlog))
             XCTAssertEqual(endpoint.media.count, 6 + backlog,
                 "The terminal authority must cover every real callback, including the pending prefix")
+            if backlog == 8 {
+                XCTAssertGreaterThan(endpoint.receipt.inputEvidenceCount,
+                    SegmentedFMP4WriterOwnershipLimits.audio.hardCapacity,
+                    "The full endpoint proof covers historical inputs beyond the live-input cap")
+                let usage = try XCTUnwrap(h.tracks[2]).sink.formalWriterProbe.snapshot
+                XCTAssertEqual(usage.nativeWriterCount, 1)
+                XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+                XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+                XCTAssertTrue(usage.isComplete)
+            }
             for index in 1...backlog {
                 let ticket = h.publisher.ticket
                 XCTAssertEqual(try h.publisher.publish(ticket: ticket, now: Int64(index) * Task19.second,
@@ -403,6 +413,187 @@ final class HLSPublisherTests: XCTestCase {
             "The failure cannot retroactively rewrite the already committed immutable snapshot")
         XCTAssertFalse(clock.hasScheduledDeadlineTimer)
         h.publisher.close()
+    }
+
+    func testLiveProducerBackpressureWaitsForCompleteCommonPrefixNotLeadingTrack() async throws {
+        let h = try await Task19Harness()
+        defer { h.publisher.close() }
+        try await h.initial()
+        try await h.offer(participant: 1, count: 4)
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 4)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer,
+            "Video skew must leave room for the matching audio to reach the publisher")
+        XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: 0), 3 * Task19.second,
+            "Missing audio waits on the original deadline, not a spinning due gate")
+        try await h.offer(participant: 2, count: 3)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer)
+        try await h.offer(participant: 2, count: 1)
+        XCTAssertTrue(h.publisher.shouldBackpressureProducer)
+        XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: 0), Task19.second)
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+        XCTAssertFalse(h.publisher.shouldBackpressureProducer,
+            "Consuming one common pending segment must release the bounded producer wait")
+    }
+
+    func testLiveGateFollowsVaryingRealSegmentDurationsAcrossOneBurst() async throws {
+        let durations = [4, 4, 4, 4, 4, 4, 4, 2, 1, 3].map { Task19.time(Int64($0)) }
+        let clock = ManualPlaybackClock(90 * UInt64(Task19.second))
+        let timing = try HLSNaturalEndPublicationClock.make(
+            clock: clock, usesAbsoluteMonotonicTime: true)
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 20 * Task19.second,
+            initialWindowMinimumSeconds: 3, publicationClock: timing,
+            plannedSegmentDurations: durations)
+        defer { h.publisher.close(); timing.stopWaiting() }
+        let origin = Int64(clock.nowNanoseconds)
+        try await h.offerBoth(count: 6, now: origin)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences, Array(0...5))
+        let initialTargets = try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+            playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+        }
+        try await h.offerBoth(count: 4, now: origin)
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 4)
+        var elapsed: Int64 = 0
+        for (offset, seconds) in [4, 2, 1, 3].enumerated() {
+            elapsed += Int64(seconds) * Task19.second
+            XCTAssertEqual(try h.publisher.nextLivePublicationWake(now: Int64(clock.nowNanoseconds)), origin + elapsed)
+            clock.set(UInt64(origin + elapsed - 1))
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: timing.now().logical), .waiting)
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(5 + offset))
+            clock.advance(nanoseconds: 1)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: timing.now().logical), .published)
+            XCTAssertEqual(h.publisher.visible?.media[1]?.logicalSequences.last, UInt64(6 + offset))
+            let visible = try XCTUnwrap(h.publisher.visible)
+            XCTAssertTrue(visible.media.values.allSatisfy { (6...7).contains($0.logicalSequences.count) })
+            XCTAssertEqual(visible.media.mapValues { playlist in
+                playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+            }, initialTargets, "A live playlist target is immutable across sliding windows")
+            XCTAssertFalse(visible.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
+        }
+        XCTAssertEqual(h.publisher.pendingLogicalSequenceCount, 0)
+    }
+
+    func testSlidingWindowKeepsInitialTargetAfterLongestSegmentLeaves() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 6 * Task19.second,
+            plannedSegmentDurations: (Array(repeating: 4, count: 6) + Array(repeating: 3, count: 7))
+                .map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        let initial = try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+            playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+        }
+        for index in 1...7 {
+            try await h.offerBoth(count: 1, now: Int64((index - 1) * 3) * Task19.second)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: Int64(index * 3) * Task19.second), .published)
+            XCTAssertEqual(try XCTUnwrap(h.publisher.visible).media.mapValues { playlist in
+                playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") }
+            }, initial)
+        }
+    }
+
+    func testLaterOverTargetSegmentCannotChangePreviouslyAdvertisedTarget() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 6 * Task19.second,
+            plannedSegmentDurations: [2, 2, 2, 2, 2, 2, 3].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        let previous = try XCTUnwrap(h.publisher.visible)
+        XCTAssertTrue(try XCTUnwrap(previous.media[1]).text.contains("#EXT-X-TARGETDURATION:2\n"))
+        try await h.offerBoth(count: 1)
+        XCTAssertThrowsError(try h.publisher.publish(ticket: h.publisher.ticket, now: 3 * Task19.second)) {
+            XCTAssertEqual($0 as? HLSPublicationFailure, .invalidDuration)
+        }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, previous.publicationSequence)
+        XCTAssertEqual(h.publisher.visible?.media[1]?.raw, previous.media[1]?.raw)
+        XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14)
+    }
+
+    func testLiveClockCoalescesCapacitySignalAcrossRearmWithoutInlineReentry() throws {
+        let clock = Task19HeldPublicationClock()
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock, usesAbsoluteMonotonicTime: true)
+        let calls = Task19Counter()
+        timing.installLiveWakeHandler { calls.add() }
+        defer { timing.stopWaiting(); clock.timer.releaseHandler() }
+        timing.consumeSignal()
+        timing.signal() // store capacity changed after graph inspected its state.
+        timing.scheduleLiveWake(until: 500)
+        XCTAssertEqual(clock.timer.deadline, 100,
+            "Installing a later media gate must not discard an already pending capacity wake")
+        XCTAssertEqual(calls.value, 0, "Store-lock signals must never synchronously re-enter graph")
+        let delivery = try XCTUnwrap(clock.timer.captureHandler())
+        delivery()
+        XCTAssertEqual(calls.value, 1)
+        timing.consumeSignal()
+        timing.scheduleLiveWake(until: 500)
+        clock.set(499)
+        delivery()
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertEqual(clock.timer.deadline, 500)
+        clock.set(500)
+        delivery()
+        XCTAssertEqual(calls.value, 2)
+        timing.removeLiveWakeHandler()
+        clock.set(900)
+        delivery()
+        XCTAssertEqual(calls.value, 2, "An old physical delivery cannot revive a retired live handler")
+        XCTAssertNil(clock.timer.deadline)
+    }
+
+    func testLiveClockHandsItsOnlyTimerToNaturalEndAndRejectsLateLiveDelivery() async throws {
+        let clock = Task19HeldPublicationClock()
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let liveCalls = Task19Counter()
+        timing.installLiveWakeHandler { liveCalls.add() }
+        timing.scheduleLiveWake(until: 200)
+        let oldDelivery = try XCTUnwrap(clock.timer.captureHandler())
+        timing.removeLiveWakeHandler()
+        timing.consumeSignal()
+        let task = Task { try await timing.wait(until: 300) }
+        defer { task.cancel(); timing.stopWaiting(); clock.timer.releaseHandler() }
+        await assertNaturalEndEventually { clock.timer.deadline == 300 }
+        clock.set(200)
+        oldDelivery()
+        XCTAssertEqual(liveCalls.value, 0)
+        XCTAssertEqual(clock.timer.deadline, 300)
+        clock.set(300)
+        oldDelivery()
+        try await task.value
+        XCTAssertEqual(liveCalls.value, 0)
+        timing.stopWaiting()
+        oldDelivery()
+        XCTAssertEqual(liveCalls.value, 0)
+        XCTAssertNil(clock.timer.deadline)
+    }
+
+    func testLiveCapacityReleaseUsesPublicationClockInsteadOfHTTPStoreUptime() async throws {
+        let clock = ManualPlaybackClock(100)
+        let timing = try HLSNaturalEndPublicationClock.make(clock: clock)
+        let h = try await Task19Harness(audioCount: 3, publicationClock: timing)
+        defer { h.publisher.close() }
+        try await h.initial()
+        let pinned = try (1...4).map {
+            try XCTUnwrap(h.store.acquireSnapshot(participantID: UInt64($0), now: 0))
+        }
+        try await h.offerBoth(count: 1)
+        clock.set(100 + UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+        try await h.offerBoth(count: 1, now: Task19.second)
+        clock.set(100 + 2 * UInt64(Task19.second))
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 2 * Task19.second), .waiting)
+        XCTAssertEqual(h.store.capacityWaiterCount, 1)
+        // Production HTTP releases use host uptime. A capacity wake must re-read
+        // the injected publication clock rather than expire its still-valid ticket
+        // against an unrelated store timestamp.
+        for lease in pinned {
+            h.store.release(lease, completedAt: nil, now: 4_000_000_000_000)
+        }
+        await assertNaturalEndEventually { h.publisher.visible?.publicationSequence == 3 }
+        XCTAssertEqual(h.publisher.visible?.publicationSequence, 3,
+            "Ordinary live capacity release must publish a valid pending segment without another callback")
+        XCTAssertEqual(h.publisher.ticket.previousPublishInstant, 2 * Task19.second)
+        XCTAssertEqual(h.store.capacityWaiterCount, 0)
+        XCTAssertFalse(h.publisher.visible!.media.values.contains { $0.text.contains("#EXT-X-ENDLIST") })
     }
 
     func testNaturalEndCapacityWakeUsesOneSlotAndCommitAnchorIncludesOrdinaryWake() async throws {
@@ -676,6 +867,13 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(audio.ranges.first?.start, Task19.time(96_256, 48_000))
         XCTAssertEqual(audio.ranges.last?.end, Task19.time(384_000, 48_000))
         try Task19FormalBoundaryChecks.checkAccumulatingDrift()
+        for track in h.tracks.values {
+            let usage = track.sink.formalWriterProbe.snapshot
+            XCTAssertEqual(usage.nativeWriterCount, 1)
+            XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+            XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+            XCTAssertTrue(usage.isComplete)
+        }
     }
 
     func testReviewI5AudioCandidatesUseUniqueItemBundlesAndRejectTicketReplay() async throws {
@@ -755,37 +953,98 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(h.tracks[2]?.relay.usage.unpublishedLogicalSegmentCount, 0)
     }
 
-    func testInitialThreeSecondWindowPublishesBeforeSixSegmentSteadyState() async throws {
-        let h = try await Task19Harness(initialWindowMinimumSeconds: 3)
-        try await h.offer(participant: 1, count: 3)
-        XCTAssertNil(h.publisher.visible)
-
-        try await h.offer(participant: 2, count: 3)
-
-        let visible = try XCTUnwrap(h.publisher.visible)
-        XCTAssertEqual(
-            visible.media.mapValues(\.logicalSequences),
-            [1: Array(0...2), 2: Array(0...2)]
-        )
-        XCTAssertEqual(visible.coverage.logicalSequences, Array(0...2))
-        XCTAssertFalse(visible.coverage.isSixSegmentWindowEligible)
+    func testConfiguredThreeOrFourSecondsCannotShortenALiveSixSegmentWindow() async throws {
+        for preference in [3, 4] {
+            let h = try await Task19Harness(initialWindowMinimumSeconds: preference)
+            defer { h.publisher.close() }
+            try await h.offerBoth(count: 5)
+            XCTAssertNil(h.publisher.visible, "A buffer preference is not finite-source evidence")
+            try await h.offer(participant: 1, count: 1)
+            XCTAssertNil(h.publisher.visible, "Every participant must supply the common six segments")
+            try await h.offer(participant: 2, count: 1)
+            let first = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(first.media.mapValues(\.logicalSequences), [1: Array(0...5), 2: Array(0...5)])
+            XCTAssertTrue(first.coverage.isSixSegmentWindowEligible)
+            XCTAssertTrue(first.media.values.allSatisfy { !$0.isFinal && !$0.text.contains("#EXT-X-ENDLIST") })
+        }
     }
 
-    func testInitialFourSecondWindowRequiresEachTrackWithoutWaitingForSix() async throws {
-        let h = try await Task19Harness(initialWindowMinimumSeconds: 4)
-        try await h.offerBoth(count: 3)
-        XCTAssertNil(h.publisher.visible, "Three seconds must not satisfy the four-second mode")
-        try await h.offer(participant: 1, count: 1)
-        XCTAssertNil(h.publisher.visible, "Every participant must independently cover four seconds")
-        try await h.offer(participant: 2, count: 1)
-        let first = try XCTUnwrap(h.publisher.visible)
-        XCTAssertEqual(first.media.mapValues(\.logicalSequences), [1: Array(0...3), 2: Array(0...3)])
-        XCTAssertEqual(first.coverage.logicalSequences, Array(0...3))
-        XCTAssertFalse(first.coverage.isSixSegmentWindowEligible)
+    func testShortConfiguredPrefixRequiresAuthenticatedEOFAndPublishesOnlyFinalPlaylist() async throws {
+        for count in [3, 4, 5] {
+            let preference = count == 3 ? 3 : 4
+            let h = try await Task19Harness(initialWindowMinimumSeconds: preference,
+                terminalLogicalSequence: UInt64(count - 1))
+            defer { h.publisher.close() }
+            try await h.offerBoth(count: count)
+            XCTAssertNil(h.publisher.visible, "Even a terminal writer needs the explicit common EOF transaction")
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: 0, naturalEnd: true), .published)
+            let final = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(final.media.mapValues(\.logicalSequences),
+                [1: Array(0..<UInt64(count)), 2: Array(0..<UInt64(count))])
+            XCTAssertTrue(final.media.values.allSatisfy { $0.isFinal && $0.text.contains("#EXT-X-ENDLIST") })
+            XCTAssertFalse(final.coverage.isSixSegmentWindowEligible)
+        }
+        let unfinished = try await Task19Harness(initialWindowMinimumSeconds: 3)
+        defer { unfinished.publisher.close() }
+        try await unfinished.offerBoth(count: 3)
+        XCTAssertThrowsError(try unfinished.publisher.publish(ticket: unfinished.publisher.ticket, now: 0, naturalEnd: true))
+        XCTAssertNil(unfinished.publisher.visible, "A caller boolean cannot replace terminal writer authority")
+    }
+
+    func testSixSecondGOPRetainsSixSegmentsAndBoundedReadinessAsWindowSlides() async throws {
+        let durations = Array(repeating: Task19.time(6), count: 18)
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 12 * Task19.second,
+            initialWindowMinimumSeconds: 3, plannedSegmentDurations: durations)
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 5)
+        XCTAssertNil(h.publisher.visible, "Thirty seconds in five segments does not satisfy the live six-segment contract")
         try await h.offerBoth(count: 1)
-        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
-        XCTAssertEqual(h.publisher.visible?.media.mapValues(\.logicalSequences),
-                       [1: Array(0...4), 2: Array(0...4)])
+        XCTAssertEqual(h.publisher.visible?.coverage.participants.first?.ranges.last?.end, Task19.time(36))
+        for index in 1...12 {
+            let now = Int64(index * 6) * Task19.second
+            try await h.offerBoth(count: 1, now: now - 6 * Task19.second)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: now), .published)
+            let visible = try XCTUnwrap(h.publisher.visible)
+            XCTAssertEqual(visible.media.mapValues(\.logicalSequences),
+                [1: Array(UInt64(index)...UInt64(index + 5)), 2: Array(UInt64(index)...UInt64(index + 5))])
+            for playlist in visible.media.values {
+                let target = try XCTUnwrap(playlist.text.split(separator: "\n").first { $0.hasPrefix("#EXT-X-TARGETDURATION:") })
+                let targetSeconds = try XCTUnwrap(Int(target.split(separator: ":")[1]))
+                let total = playlist.text.split(separator: "\n").filter { $0.hasPrefix("#EXTINF:") }
+                    .compactMap { Double($0.dropFirst(8).dropLast()) }.reduce(0, +)
+                XCTAssertGreaterThanOrEqual(total, Double(3 * targetSeconds))
+            }
+            h.store.sweep(now: now)
+            XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14)
+            XCTAssertLessThanOrEqual(h.store.usage.segmentCount, 96)
+            XCTAssertLessThanOrEqual(h.store.usage.residentBytes + h.store.usage.reservedBytes, 688 * 1_048_576)
+        }
+    }
+
+    func testSeventhSegmentSatisfiesActualAudioTargetDurationWithoutExpandingWindowCap() async throws {
+        let h = try await Task19Harness(plannedSegmentDurations: [1, 1, 1, 1, 1, 2, 2].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        XCTAssertNil(h.publisher.visible,
+            "The physical AAC segment slightly over two seconds advertises target3 and needs nine seconds")
+        try await h.offerBoth(count: 1)
+        let visible = try XCTUnwrap(h.publisher.visible)
+        XCTAssertEqual(visible.media.mapValues(\.logicalSequences), [1: Array(0...6), 2: Array(0...6)])
+        XCTAssertTrue(try XCTUnwrap(visible.media[2]).text.contains("#EXT-X-TARGETDURATION:3\n"))
+        XCTAssertTrue(visible.media.values.allSatisfy { !$0.isFinal })
+        XCTAssertEqual(h.publisher.retainedReadinessCount, 14)
+    }
+
+    func testLongGOPTargetFloorFailsBeforeAnyEighthWindowSegmentIsNeeded() async throws {
+        let h = try await Task19Harness(publicationDeadlineNanoseconds: 12 * Task19.second,
+            plannedSegmentDurations: [1, 1, 1, 1, 1, 6, 1].map { Task19.time(Int64($0)) })
+        defer { h.publisher.close() }
+        try await h.offerBoth(count: 6)
+        XCTAssertNil(h.publisher.visible, "Six records with eleven seconds cannot cover three six-second targets")
+        await assertTask19ThrowsError(try await h.offerBoth(count: 1))
+        XCTAssertNil(h.publisher.visible)
+        XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 14,
+            "An incompatible variable-duration window must fail inside the existing seven-record bound")
     }
 
     func testInitialWindowBoundsTrackSkewInsteadOfAbsoluteVideoSequence() async throws {
@@ -1141,6 +1400,17 @@ final class HLSPublisherTests: XCTestCase {
             XCTAssertLessThanOrEqual(h.store.usage.tombstoneCount, 192)
             XCTAssertLessThanOrEqual(h.store.usage.snapshotCount, 9)
             XCTAssertLessThanOrEqual(h.publisher.retainedReadinessCount, 28)
+            for track in h.tracks.values {
+                let usage = track.sink.formalWriterProbe.snapshot
+                XCTAssertEqual(usage.nativeWriterCount, 1, "long publication uses one actual native writer per rendition")
+                XCTAssertEqual(usage.hardInputCount, track.mediaType == .video ? 1_024 : 640)
+                XCTAssertLessThanOrEqual(usage.liveInputCount, usage.hardInputCount)
+                XCTAssertLessThanOrEqual(usage.liveInputBytes, usage.hardInputBytes)
+                XCTAssertLessThanOrEqual(usage.evidenceCount, usage.hardEvidenceCount)
+                XCTAssertLessThanOrEqual(usage.pendingCallbacks, usage.hardCallbackCount)
+                XCTAssertEqual(usage.acceptedInputCount - usage.releasedInputCount, UInt64(usage.liveInputCount))
+                XCTAssertTrue(usage.isComplete)
+            }
         }
         let coverage = try XCTUnwrap(h.publisher.visible?.coverage)
         XCTAssertEqual(coverage.logicalSequences, Array(96...101))
@@ -1318,6 +1588,7 @@ final class Task19Track: @unchecked Sendable {
     let epochStart: ExactMediaTime
     let plannedDurations: [ExactMediaTime]?
     let formatVariant: Task19.FormatVariant
+    private let videoFrameRate: Int32
     private var firstMedia: SealedMediaObject?
     private var formalWriter: SegmentedFMP4Writer?
     private let terminalLogicalSequence: UInt64?
@@ -1342,7 +1613,7 @@ final class Task19Track: @unchecked Sendable {
          offsets: [Int64]? = nil, plannedDurations: [ExactMediaTime]? = nil,
          bindingOverride: FMP4WriterBinding? = nil, terminalSegment: Bool = false,
          terminalLogicalSequence: UInt64? = nil,
-         formatVariant: Task19.FormatVariant = .baseline) async throws {
+         formatVariant: Task19.FormatVariant = .baseline, videoFrameRate: Int32 = 24) async throws {
         binding = try bindingOverride ?? Task19.binding(id: id, epoch: epoch,
             writer: PlaybackIdentityAllocator.shared.next(in: .nonce), item: item)
         self.mediaType = mediaType
@@ -1354,6 +1625,7 @@ final class Task19Track: @unchecked Sendable {
         epochStart = start
         self.plannedDurations = plannedDurations
         self.formatVariant = formatVariant
+        self.videoFrameRate = videoFrameRate
         self.terminalLogicalSequence = terminalSegment ? sequence : terminalLogicalSequence
         format = try XCTUnwrap(CMSampleBufferGetFormatDescription(Task19.sample(mediaType: mediaType,
             start: start.cmTime, duration: duration.cmTime, channels: channels, formatVariant: formatVariant)))
@@ -1372,7 +1644,7 @@ final class Task19Track: @unchecked Sendable {
             formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: sequence, start: start, duration: firstDuration,
                 boundary: boundary, format: format, continuing: nil,
                 terminalSegment: self.terminalLogicalSequence == sequence,
-                formatVariant: formatVariant)
+                formatVariant: formatVariant, videoFrameRate: videoFrameRate)
         } else { try await sink.produce(mediaType: mediaType, sequence: sequence, start: start, duration: duration) }
         initialization = try XCTUnwrap(sink.take(.initialization))
         firstMedia = try XCTUnwrap(sink.take(.media))
@@ -1397,7 +1669,7 @@ final class Task19Track: @unchecked Sendable {
                 formalWriter = try await sink.produceFormal(mediaType: mediaType, sequence: nextSequence, start: nextStart,
                     duration: actualDuration, boundary: boundary, format: format, continuing: formalWriter,
                     terminalSegment: terminalLogicalSequence == nextSequence,
-                    formatVariant: formatVariant)
+                    formatVariant: formatVariant, videoFrameRate: videoFrameRate)
             } else { try await sink.produce(mediaType: mediaType, sequence: nextSequence, start: nextStart, duration: duration) }
             if let extraInit = sink.take(.initialization) { XCTAssertTrue(relay.releaseForControl(extraInit)) }
             object = try XCTUnwrap(sink.take(.media))
@@ -1426,6 +1698,7 @@ final class Task19Track: @unchecked Sendable {
 }
 
 final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendable {
+    let formalWriterProbe = HLSWriterAcceptanceProbe()
     let binding: FMP4WriterBinding
     weak var relay: SegmentReportRelay?
     private let lock = NSCondition()
@@ -1456,6 +1729,11 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
             throw SegmentedFMP4WriterFailure.aacEndpointMismatch
         }
         let buffers = inputs.flatMap(\.buffers)
+        let outputTimings = inputs.flatMap { epoch in
+            epoch.outputTimings.isEmpty
+                ? Array(repeating: WriterInputOutputTiming.calculated, count: epoch.buffers.count)
+                : epoch.outputTimings
+        }
         let payloadBytes = buffers.reduce(0) {
             $0 + (CMSampleBufferGetDataBuffer($1).map(CMBlockBufferGetDataLength) ?? 0)
         }
@@ -1473,7 +1751,8 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
                 accessUnitCount: inputs.reduce(0) { $0 + $1.bandwidth.accessUnitCount },
                 requiresWriterBodyAccounting: true),
             packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+            formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+            outputTimings: outputTimings)
     }
     func releaseEndpointInputs() { lock.withLock { endpointInputs.removeAll() } }
     func collect(_ object: SealedMediaObject) {
@@ -1545,22 +1824,23 @@ final class Task19SystemSink: SegmentedFMP4SystemCallbackSink, @unchecked Sendab
     func produceFormal(mediaType: FinalFMP4MediaType, sequence: UInt64, start: ExactMediaTime,
                        duration: ExactMediaTime, boundary: SegmentBoundaryCoordinator, format: CMFormatDescription,
                        continuing previous: SegmentedFMP4Writer?, terminalSegment: Bool = false,
-                       formatVariant: Task19.FormatVariant = .baseline) async throws -> SegmentedFMP4Writer {
+                       formatVariant: Task19.FormatVariant = .baseline, videoFrameRate: Int32 = 24) async throws -> SegmentedFMP4Writer {
         let relay = try XCTUnwrap(relay)
-        // 本层长播放测试冻结为最多128个逻辑段；不在每段偷偷重建同身份实例。
-        // Task17 的 rollover 算法另由小容量最小回归覆盖；生产标准256/384保持不变。
+        // Use the genuine persistent per-kind live-input policy. The real native
+        // writer controls backing release across flush; this fixture neither raises
+        // cumulative caps nor substitutes callbacks for final native alias release.
         let writer = try previous ?? SegmentedFMP4Writer(binding: binding, trackKind: mediaType == .video ? .video : .aac,
             sourceFormatHint: format, boundarySession: boundary.session, compressedFormatConfiguration: nil,
-            ownershipLimits: .init(rolloverThreshold: 6_144, hardCapacity: 6_145),
-            relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
+            relay: relay, systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: formalWriterProbe),
+            acceptanceProbe: formalWriterProbe)
         if previous == nil { try writer.start(at: start.cmTime) }
         if mediaType == .video {
-            let count = Int(CMTimeConvertScale(duration.cmTime, timescale: 24, method: .default).value)
-            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(count), timescale: 24), duration.cmTime), 0)
+            let count = Int(CMTimeConvertScale(duration.cmTime, timescale: videoFrameRate, method: .default).value)
+            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(count), timescale: videoFrameRate), duration.cmTime), 0)
             for index in (previous == nil ? 0 : 1)...(terminalSegment ? count - 1 : count) {
                 let sample = try Task19.sample(mediaType: .video,
-                    start: CMTimeAdd(start.cmTime, CMTime(value: Int64(index), timescale: 24)),
-                    duration: CMTime(value: 1, timescale: 24), isSync: index == 0 || index == count,
+                    start: CMTimeAdd(start.cmTime, CMTime(value: Int64(index), timescale: videoFrameRate)),
+                    duration: CMTime(value: 1, timescale: videoFrameRate), isSync: index == 0 || index == count,
                     formatVariant: formatVariant)
                 let output = Task19.videoOutput(sample, sequence: sequence * 100 + UInt64(index))
                 try await writer.appendVideoAwaitingReadiness(output, ticket: boundary.issueVideoAppend(for: output, writerBinding: binding))
@@ -1956,31 +2236,52 @@ final class Task19Harness: @unchecked Sendable {
          initialWindowMinimumSeconds: Int = 6,
          terminalLogicalSequence: UInt64? = nil,
          publicationClock: HLSNaturalEndPublicationClock? = nil,
-         initialFormatVariants: [UInt64: Task19.FormatVariant] = [:]) async throws {
+         plannedSegmentDurations: [ExactMediaTime]? = nil,
+         initialFormatVariants: [UInt64: Task19.FormatVariant] = [:], videoFrameRate: Int32 = 24) async throws {
         let sessionToken = loopbackSession?.value ?? token
         store = loopbackSession.map { SealedMediaStore(loopbackSession: $0, itemGeneration: 19) }
             ?? SealedMediaStore(token: sessionToken, itemGeneration: 19)
         self.audioOnly = audioOnly
-        boundary = try SegmentBoundaryCoordinator(mode: audioOnly ? .audioOnly(epochStart: .zero) : .audioVideo(epochStart: .zero, videoMode: .passthrough))
+        // The default passthrough contract permits at most two seconds. A
+        // planned 3/4-second synthetic GOP must declare its real legal bound;
+        // the variable-duration regression still asserts every original gate.
+        let maximumPlannedVideoDuration = plannedSegmentDurations?.max {
+            CMTimeCompare($0.cmTime, $1.cmTime) < 0
+        }?.cmTime
+        boundary = try SegmentBoundaryCoordinator(mode: audioOnly ? .audioOnly(epochStart: .zero)
+            : .audioVideo(epochStart: .zero, videoMode: .passthrough,
+                maximumPassthroughInterval: maximumPlannedVideoDuration))
         let specialAudio: [ExactMediaTime]? = audioBoundaryOffsets == nil ? nil
             : [Task19.time(49_152, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(47_104, 48_000)]
         let specialVideo: [ExactMediaTime]? = audioBoundaryOffsets == nil ? nil
             : [Task19.time(48_256, 48_000)] + Array(repeating: Task19.time(48_128, 48_000), count: 5) + [Task19.time(1)]
+        var plannedAudioDurations: [ExactMediaTime]?
+        if let plannedSegmentDurations {
+            var mediaEnd = Task19.time(0)
+            var physicalEnd: Int64 = 0
+            plannedAudioDurations = try plannedSegmentDurations.map { duration in
+                mediaEnd = try mediaEnd.adding(duration)
+                let target = CMTimeConvertScale(mediaEnd.cmTime, timescale: 48_000, method: .default).value
+                let nextEnd = ((target + 1_023) / 1_024) * 1_024
+                defer { physicalEnd = nextEnd }
+                return Task19.time(nextEnd - physicalEnd, 48_000)
+            }
+        }
         if !audioOnly { tracks[1] = try await Task19Track(id: 1, mediaType: .video, duration: videoDuration,
-            boundary: boundary, plannedDurations: specialVideo,
+            boundary: boundary, plannedDurations: plannedSegmentDurations ?? specialVideo,
             terminalLogicalSequence: terminalLogicalSequence,
-            formatVariant: initialFormatVariants[1] ?? .baseline) }
+            formatVariant: initialFormatVariants[1] ?? .baseline, videoFrameRate: videoFrameRate) }
         for index in 0..<audioCount { tracks[UInt64(index + 2)] = try await Task19Track(id: UInt64(index + 2), mediaType: .audio,
             duration: audioDuration, start: audioStart, item: audioOnly ? UInt64(20 + index) : 19,
             boundary: boundary, channels: [2, 6, 8][index], offsets: audioBoundaryOffsets,
-            plannedDurations: specialAudio, terminalLogicalSequence: terminalLogicalSequence) }
+            plannedDurations: plannedAudioDurations ?? specialAudio, terminalLogicalSequence: terminalLogicalSequence) }
         var declaration = try Task19.declaration(audioOnly: audioOnly, audioCount: audioCount)
         declaration.token = sessionToken
         if let track = tracks[1] {
             declaration.video!.width = Int(CMVideoFormatDescriptionGetDimensions(track.format).width)
             declaration.video!.height = Int(CMVideoFormatDescriptionGetDimensions(track.format).height)
             declaration.video!.codec = try XCTUnwrap(track.initialization.publicationEvidence).format.codec
-            declaration.video!.frameRateMilli = 24_000
+            declaration.video!.frameRateMilli = UInt64(videoFrameRate) * 1_000
         }
         for index in declaration.audio.indices {
             declaration.audio[index].codec = .aac

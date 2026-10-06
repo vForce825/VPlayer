@@ -9,6 +9,15 @@ import Foundation
 import VideoToolbox
 @testable import VPlayerPlayback
 
+/// Keeps a stable test probe without extending the observed object's lifetime.
+final class TestWeakReference<Object: AnyObject> {
+    private(set) weak var value: Object?
+
+    init(_ value: Object?) {
+        self.value = value
+    }
+}
+
 /// 仅替换底层系统 SDK；配置、稳定 route、completion 与资源权限均走同一真实 Registry。
 func makeRoutedPlaybackController(
     factory: any PlaybackPipelineFactory,

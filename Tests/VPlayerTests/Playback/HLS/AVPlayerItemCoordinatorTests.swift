@@ -108,6 +108,600 @@ private final class Task21PausedTimePlayer: AVPlayer, @unchecked Sendable {
 
 @MainActor
 final class AVPlayerItemCoordinatorTests: XCTestCase {
+    func testCanceledHeldPrefixCannotInstallAndJoinsProducerRetirement() async throws {
+        let forwarding = Task27HLSBackendForwarder()
+        let graph = try OutputGraphFixture(backendObject: forwarding)
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: graph.lifecycle, audioOnly: true)
+        let transport = Task21LogTransportOwner(fixture: fixture)
+        addTeardownBlock { try await transport.retire() }
+        let driver = Task21FakeDriver()
+        let coordinator = try AVPlayerItemCoordinator(driver: driver, evidenceSource: fixture.source,
+            backendPublicationReplacementAuthoritySlot: forwarding.backendPublicationReplacementAuthoritySlot)
+        let gate = Task21RetirementCompletionGate()
+        defer { gate.release() }
+        let builder = Task21HeldPrefixBundleBuilder(replacement: .init(
+            request: fixture.request, evidenceSource: fixture.source), gate: gate,
+            retireProducer: {
+                do { try await transport.retire(); return true }
+                catch { XCTFail("Held prefix transport did not retire: \(error)"); return false }
+            })
+        let backend = HLSAVPlayerPlaybackBackend(identity: graph.lifecycle.backendIdentity,
+            coordinator: coordinator, bundleBuilder: builder,
+            replacementSlot: forwarding.backendPublicationReplacementAuthoritySlot)
+        forwarding.attach(backend)
+        let source = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(graph.registry.startOutputPrepareOperation(source))
+        let deadline = ContinuousClock.now + .seconds(2)
+        while !gate.isWaiting, ContinuousClock.now < deadline { await Task.yield() }
+        XCTAssertTrue(gate.isWaiting, "Hold the original cancellation-insensitive prefix return")
+        XCTAssertEqual(driver.installCount, 0)
+        let context = try XCTUnwrap(graph.registry.outputResourceContextSnapshot())
+        let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
+            reason: .stop, at: graph.registry.clock.nowNanoseconds, teardown: true))
+        let receiver = Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+        XCTAssertTrue(graph.registry.startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+            terminalState: .stopped))
+        gate.release()
+        _ = await graph.registry.joinOutputBackendOperation(source)
+        await graph.registry.joinOwnedTerminalCleanup(session: context.sessionIdentity)
+        try receiver.result()
+        XCTAssertEqual(driver.installCount, 0, "A revoked prepare must never install its late prefix")
+        XCTAssertEqual(driver.playCallCount, 0)
+        XCTAssertNil(driver.currentItemIdentity)
+        XCTAssertNil(graph.registry.ownedResourceSnapshot(), "Join actual retirement, not a cancellation marker")
+    }
+
+    func testControllerRateAdmissionWithoutGeneratedMediaClockAdvanceKeepsOriginalStartupDeadline() async throws {
+        try await withWatchdogController { controller, registry, clock, factory, _ in
+            let parent = try XCTUnwrap(registry.outputResourceContextSnapshot()?.parentDeadline)
+            let budget: PlaybackProgressBudgetTicket
+            switch parent { case .coldStart(let value), .outputRecovery(let value): budget = value }
+            XCTAssertNotNil(registry.playbackOperationDeadlineArmSnapshot(), "Rate admission cannot mint media progress")
+            let remaining = try budget.remainingNanoseconds(at: clock.nowNanoseconds)
+            XCTAssertGreaterThan(remaining, 0)
+            clock.advance(nanoseconds: remaining - 1)
+            registry.executor.sync {}
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.parentDeadline, parent)
+            XCTAssertEqual(factory.builder?.buildCount, 1)
+            clock.advance(nanoseconds: 1)
+            try await waitForWatchdogCondition {
+                let state = await controller.currentStateForTesting
+                if case .failed = state { return true }
+                return false
+            }
+            await registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(registry.ownedResourceSnapshot())
+            XCTAssertEqual(factory.builder?.buildCount, 1, "A never-progressing item must terminate its original deadline")
+        }
+    }
+
+    func testRepeatedGeneratedUnexpectedPauseExhaustsOriginalRequestRecoveryBudget() async throws {
+        try await withWatchdogController { controller, registry, _, factory, _ in
+            let builder = try XCTUnwrap(factory.builder)
+            let session = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sessionIdentity)
+            for attempt in 0..<3 {
+                let driver = try XCTUnwrap(factory.driver)
+                let oldPrepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.prepareTicket)
+                let oldActivation = try XCTUnwrap(registry.outputResourceContextSnapshot()?.activation)
+                driver.emitTimeControlStatus(.playing)
+                driver.emitTimeControlStatus(.paused)
+                if attempt < 2 {
+                    try await waitForWatchdogCondition {
+                        guard let context = registry.outputResourceContextSnapshot(), let task = context.sourceTask else { return false }
+                        return context.prepared && context.owner == nil && context.prepareTicket != oldPrepare &&
+                            context.activation != oldActivation && registry.phase(of: task) == .terminal(.completed) &&
+                            driver.playCallCount == attempt + 2
+                    }
+                    XCTAssertEqual(builder.buildCount, attempt + 2)
+                    XCTAssertEqual(builder.retirementCount, attempt + 1)
+                    XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, session)
+                    XCTAssertNotNil(registry.playbackOperationDeadlineArmSnapshot())
+                } else {
+                    try await waitForWatchdogCondition {
+                        let state = await controller.currentStateForTesting
+                        if case .failed(let failure) = state {
+                            return failure.code == "hls.watchdog.recovery-exhausted"
+                        }
+                        return false
+                    }
+                    await registry.joinOwnedTerminalCleanup()
+                    XCTAssertEqual(builder.buildCount, 3, "Late live EOF must not build a fourth producer")
+                    XCTAssertEqual(builder.retirementCount, 3)
+                    XCTAssertNil(registry.ownedResourceSnapshot())
+                }
+            }
+        }
+    }
+
+    func testObservedStallsReprepareRealHLSBackendAndExhaustRequestBudget() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        try await withWatchdogController { controller, registry, clock, factory, _ in
+            let initialSession = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sessionIdentity)
+            let builder = try XCTUnwrap(factory.builder)
+            for attempt in 0..<3 {
+                let driver = try XCTUnwrap(factory.driver)
+                let oldPrepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.prepareTicket)
+                let oldActivation = try XCTUnwrap(registry.outputResourceContextSnapshot()?.activation)
+                let oldProgressInvocation = try XCTUnwrap(driver.lastPositiveRateInvocation)
+                let reads = driver.playbackTimeReadCount
+                driver.observedPlaybackTime = Task21Fixtures.time(1)
+                clock.advance(nanoseconds: 250_000_000)
+                try await waitForWatchdogCondition {
+                    driver.playbackTimeReadCount > reads
+                }
+                if attempt > 0 {
+                    XCTAssertNil(registry.playbackOperationDeadlineArmSnapshot(),
+                        "Real progress on the recovered item must settle its original recovery deadline")
+                }
+                if attempt == 1 {
+                    for sample in 1...140 {
+                        let priorReads = driver.playbackTimeReadCount
+                        driver.observedPlaybackTime = Task21Fixtures.time(1 + Double(sample) / 2)
+                        clock.advance(nanoseconds: 500_000_000)
+                        try await waitForWatchdogCondition { driver.playbackTimeReadCount > priorReads }
+                        XCTAssertEqual(builder.buildCount, 2)
+                    }
+                }
+                clock.advance(nanoseconds: 3_000_000_000)
+                if attempt < 2 {
+                    try await waitForWatchdogCondition {
+                        guard let context = registry.outputResourceContextSnapshot() else { return false }
+                        guard let activationTask = context.sourceTask,
+                              registry.phase(of: activationTask) == .terminal(.completed),
+                              factory.coordinator?.progressObservationIdentity != nil else { return false }
+                        return context.prepared && context.owner == nil && context.prepareTicket != oldPrepare
+                            && context.activation != oldActivation && driver.playCallCount == attempt + 2
+                    }
+                    XCTAssertEqual(builder.buildCount, attempt + 2)
+                    XCTAssertEqual(builder.retirementCount, attempt + 1)
+                    XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, initialSession)
+                    XCTAssertEqual(factory.drivers.count, 1, "The real backend/coordinator is retained")
+                    let successorDeadline = try XCTUnwrap(registry.playbackOperationDeadlineArmSnapshot())
+                    let successorBudget = try XCTUnwrap(registry.outputResourceContextSnapshot()?.parentDeadline)
+                    XCTAssertFalse(oldProgressInvocation.completeObservedMediaProgress(),
+                        "An old activation cannot complete its successor's recovery progress budget")
+                    XCTAssertEqual(registry.playbackOperationDeadlineArmSnapshot(), successorDeadline,
+                        "Rejected stale progress must leave the exact successor deadline unchanged")
+                    XCTAssertEqual(registry.outputResourceContextSnapshot()?.parentDeadline, successorBudget,
+                        "Rejected stale progress cannot reset or extend the successor's remaining budget")
+                } else {
+                    try await waitForWatchdogCondition {
+                        if case .failed(let failure) = await controller.currentStateForTesting {
+                            return failure.code == "hls.watchdog.recovery-exhausted"
+                        }
+                        return false
+                    }
+                    await registry.joinOwnedTerminalCleanup()
+                    XCTAssertNil(registry.ownedResourceSnapshot())
+                    XCTAssertEqual(builder.buildCount, 3, "A third stall must never create a fourth producer")
+                    XCTAssertEqual(builder.retirementCount, 3)
+                }
+            }
+            XCTAssertEqual(factory.maximumAudibleOutputs, 1)
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    func testOriginalQueuedProgressDeliveryCannotAdoptActualRouteReplacement() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        try await withWatchdogController { controller, registry, clock, factory, sdk in
+            let oldCoordinator = try XCTUnwrap(factory.coordinator)
+            let oldDriver = try XCTUnwrap(factory.driver)
+            let oldIdentity = try XCTUnwrap(oldCoordinator.progressObservationIdentity)
+            let originalSession = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sessionIdentity)
+            // This is the exact original callback identity copied before the
+            // route transition, delivered only after both backend handoffs.
+            let lateDelivery = { oldCoordinator.hlsProgressDeadlineFired(identity: oldIdentity) }
+            for kind in [PlaybackBackendKind.sampleBuffer, .hlsAVPlayer] {
+                sdk.lock.withLock { sdk.initialPorts = kind == .hlsAVPlayer ? .airPlay : .hdmi }
+                let handoff = Task { await controller.requestRouteHandoff(to: kind) }
+                try await waitForWatchdogCondition(registry: registry, clock: clock) {
+                    guard let context = registry.outputResourceContextSnapshot() else { return false }
+                    return context.desiredBackendKind == kind && context.prepared && context.owner == nil
+                        && context.activation != nil
+                }
+                await handoff.value
+            }
+            let currentDriver = try XCTUnwrap(factory.driver)
+            XCTAssertFalse(currentDriver === oldDriver)
+            let currentPrepare = registry.outputResourceContextSnapshot()?.prepareTicket
+            let reads = currentDriver.playbackTimeReadCount
+            let before = oldCoordinator.stopTaskCount
+            lateDelivery()
+            for _ in 0..<8 { await Task.yield() }
+            XCTAssertEqual(currentDriver.playbackTimeReadCount, reads)
+            XCTAssertEqual(oldCoordinator.stopTaskCount, before)
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.prepareTicket, currentPrepare)
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.sessionIdentity, originalSession)
+            XCTAssertEqual(factory.maximumAudibleOutputs, 1)
+        }
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, baseline)
+    }
+
+    private func withWatchdogController(factory: WatchdogPlaybackFactory = WatchdogPlaybackFactory(), _ body: @MainActor (
+        PlaybackController, ControlTaskRegistry, ManualPlaybackClock, WatchdogPlaybackFactory,
+        FakeAudioSessionSDK
+    ) async throws -> Void) async throws {
+        let clock = ManualPlaybackClock(100)
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator(), clock: clock)
+        let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
+        let audio = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        let controller = makeRoutedPlaybackController(backendFactory: factory, audioSessionOwner: audio)
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "watchdog-e2e",
+            streamURL: URL(string: "http://localhost/watchdog-fixture")!, title: "Watchdog fixture")
+        let play = Task { await controller.play(request) }
+        do {
+            try await waitForWatchdogCondition(registry: registry, clock: clock) {
+                await controller.currentStateForTesting == .playing(request)
+            }
+            await play.value
+            try await body(controller, registry, clock, factory, sdk)
+        } catch {
+            print("WATCHDOG_E2E_FAILURE state=\(await controller.currentStateForTesting) "
+                + "context=\(String(describing: registry.outputResourceContextSnapshot())) "
+                + "builds=\(factory.builder?.buildCount ?? 0) "
+                + "history=\(PlaybackDiagnosticTracker.shared.recentHistory)")
+            play.cancel()
+            await controller.stop()
+            await play.value
+            await registry.joinOwnedTerminalCleanup()
+            factory.releaseObservations()
+            throw error
+        }
+        await controller.stop()
+        await registry.joinOwnedTerminalCleanup()
+        factory.releaseObservations()
+    }
+
+    private func waitForWatchdogCondition(registry: ControlTaskRegistry? = nil,
+        clock: ManualPlaybackClock? = nil, _ condition: @MainActor () async -> Bool) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(15))
+        while !(await condition()) {
+            guard ContinuousClock.now < deadline else {
+                throw NSError(domain: "HLS.WatchdogEndToEndTimeout", code: 1)
+            }
+            if let registry, let clock,
+               case .pending(let pending) = registry.outputRouteObservationSnapshot(),
+               let observation = pending.ticket,
+               let stability = try registry.armOutputRouteStability(observation: observation) {
+                clock.set(max(clock.nowNanoseconds, stability.deadlineInstant))
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+    }
+
+    func testInitiallyInvalidCurrentItemClockKeepsPollingUntilProgressThenStall() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2), progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        XCTAssertNotNil(scheduler.hlsProgressIdentitySnapshot())
+        let initialReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 4_000_000_000)
+        try await awaitWatchdogSample(live, after: initialReads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        for sample in [0.0, 1.0] {
+            live.driver.observedPlaybackTime = Task21Fixtures.time(sample)
+            let reads = live.driver.playbackTimeReadCount
+            clock.advance(nanoseconds: 250_000_000)
+            try await awaitWatchdogSample(live, after: reads)
+        }
+        let reads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 3_000_000_000)
+        try await awaitWatchdogSample(live, after: reads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 1)
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        let retiring = await live.backend.waitForRetirementCall(timeout: .seconds(2))
+        XCTAssertTrue(retiring)
+    }
+
+    func testInvalidCurrentItemClockAfterProgressTriggersOnceWithoutTimerSpin() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2), progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        live.driver.observedPlaybackTime = Task21Fixtures.time(1)
+        let firstReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 250_000_000)
+        try await awaitWatchdogSample(live, after: firstReads)
+        live.driver.observedPlaybackTime = nil
+        let reads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 3_000_000_000)
+        try await awaitWatchdogSample(live, after: reads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 1)
+        XCTAssertNil(live.progressScheduler?.hlsProgressIdentitySnapshot())
+        let retired = await live.backend.waitForRetirementCall(timeout: .seconds(2))
+        XCTAssertTrue(retired)
+        let settledReads = live.driver.playbackTimeReadCount
+        for _ in 0..<10 { clock.advance(nanoseconds: 1); await Task.yield() }
+        XCTAssertEqual(live.driver.playbackTimeReadCount, settledReads)
+        XCTAssertEqual(live.backend.retireCallCount, 1)
+    }
+
+    func testForeignPhysicalItemCancelsProgressWithoutAdoptingReplacementClock() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2), progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        live.driver.observedPlaybackTime = Task21Fixtures.time(1)
+        let firstReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 250_000_000)
+        try await awaitWatchdogSample(live, after: firstReads)
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        let identity = try XCTUnwrap(scheduler.hlsProgressIdentitySnapshot())
+        live.driver.foreignPhysicalPlaybackItem = true
+        let reads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 3_000_000_000)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while scheduler.hlsProgressIdentitySnapshot() != nil, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        live.driver.observedPlaybackTime = Task21Fixtures.time(500)
+        live.coordinator.hlsProgressDeadlineFired(identity: identity)
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertEqual(live.driver.playbackTimeReadCount, reads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        XCTAssertEqual(live.backend.retireCallCount, 0)
+    }
+
+    func testSystemPlaybackClockReadRejectsForeignPhysicalItemBeforeReadingTime() throws {
+        let player = Task21PausedTimePlayer()
+        let driver = try SystemAVPlayerDriver.make(player: player)
+        let item = AVPlayerItemInstanceIdentity(
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_103),
+            itemGeneration: 1)
+        try driver.install(url: URL(fileURLWithPath: "/tmp/VPlayer-progress-observation.m3u8"), identity: item)
+        defer { driver.replaceCurrentItemWithNil(item: item) }
+        let chargedBytes = PlaybackResourceContextLedger.shared.chargedBytes
+        let callbacks = AVPlayerSDKCallbackLease.occupiedCount
+        player.observedPausedTime = CMTime(value: 336_001, timescale: 48_000)
+        XCTAssertEqual(driver.playbackTime(item: item), ExactMediaTime(value: 336_001, timescale: 48_000))
+        player.observedPausedTime = .indefinite
+        XCTAssertNil(driver.playbackTime(item: item))
+        XCTAssertEqual(driver.playbackClockObservation(item: item), .currentItem(nil))
+        let reads = player.pausedTimeReadCount
+        XCTAssertNil(driver.playbackTime(item: Task21Fixtures.staleGenerationItem(from: item)))
+        player.replaceCurrentItem(with: AVPlayerItem(url: URL(fileURLWithPath: "/tmp/new-progress-item.m3u8")))
+        XCTAssertNil(driver.playbackTime(item: item))
+        XCTAssertEqual(driver.playbackClockObservation(item: item), .staleItem)
+        XCTAssertEqual(player.pausedTimeReadCount, reads)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, chargedBytes)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbacks,
+            "Direct progress reads must not allocate an SDK periodic observer")
+        XCTAssertEqual(driver.fixedTimerCount, 0)
+    }
+
+    func testRegistryProgressPollingSurvivesSeventySecondsAndCancelsOnOwnedPause() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2),
+            progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        _ = live.graph.registry.completeSampleBufferReadiness(live.lifecycle.backendIdentity)
+        live.driver.emitTimeControlStatus(.playing)
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        let handlerCount = clock.deadlineTimerHandlerInstallationCount
+        for sample in 1...140 {
+            live.driver.observedPlaybackTime = Task21Fixtures.time(Double(sample) / 2)
+            let reads = live.driver.playbackTimeReadCount
+            clock.advance(nanoseconds: 500_000_000)
+            try await awaitWatchdogSample(live, after: reads)
+            XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        }
+        let queuedIdentity = try XCTUnwrap(scheduler.hlsProgressIdentitySnapshot())
+        _ = try await live.stop()
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        let readsAfterPause = live.driver.playbackTimeReadCount
+        live.coordinator.hlsProgressDeadlineFired(identity: queuedIdentity)
+        clock.advance(nanoseconds: 10_000_000_000)
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertEqual(live.driver.playbackTimeReadCount, readsAfterPause)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 1, "Only the explicit owned pause may stop output")
+        XCTAssertEqual(clock.deadlineTimerHandlerInstallationCount, handlerCount)
+        XCTAssertEqual(live.driver.fixedTimerCount, 0)
+    }
+
+    func testRegistryDeadlineDetectsWaitingOnlyAfterActualMediaClockAdvance() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2),
+            progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        let originalIdentity = try XCTUnwrap(scheduler.hlsProgressIdentitySnapshot())
+        let handlerCount = clock.deadlineTimerHandlerInstallationCount
+        // Initial waiting is not proof that the player ever advanced.
+        live.driver.emitTimeControlStatus(.waitingToPlayAtSpecifiedRate)
+        clock.advance(nanoseconds: 4_000_000_000)
+        try await awaitWatchdogSample(live, after: live.driver.playbackTimeReadCount)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        XCTAssertNotEqual(scheduler.hlsProgressIdentitySnapshot(), originalIdentity)
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0.25)
+        let reads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 250_000_000)
+        try await awaitWatchdogSample(live, after: reads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        let beforeDeadline = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 2_999_999_999)
+        try await awaitWatchdogSample(live, after: beforeDeadline)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        // The next scoped poll observes a genuinely stalled waiting player.
+        let stalledReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 1)
+        try await awaitWatchdogSample(live, after: stalledReads)
+        XCTAssertEqual(live.coordinator.stopTaskCount, 1)
+        XCTAssertNotNil(live.graph.registry.outputResourceContextSnapshot()?.suspend)
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        XCTAssertEqual(clock.deadlineTimerHandlerInstallationCount, handlerCount,
+            "All progress polls reuse the Registry's single existing timer handler")
+        XCTAssertEqual(live.driver.fixedTimerCount, 0)
+        let retired = await live.backend.waitForRetirementCall(timeout: .seconds(2))
+        XCTAssertTrue(retired)
+        XCTAssertEqual(live.backend.retireCallCount, 1)
+    }
+
+    func testQueuedProgressDeadlineCannotRecoverCanceledActivation() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2),
+            progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        live.driver.observedPlaybackTime = Task21Fixtures.time(1)
+        let firstReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 250_000_000)
+        try await awaitWatchdogSample(live, after: firstReads)
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        let queuedIdentity = try XCTUnwrap(scheduler.hlsProgressIdentitySnapshot())
+        clock.advance(nanoseconds: 3_000_000_000)
+        // Advance has enqueued the real deadline callback; revoke synchronously
+        // before MainActor can consume that exact activation's delivery.
+        let task = try XCTUnwrap(live.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(live.graph.registry.requestCancel(task))
+        live.coordinator.hlsProgressDeadlineFired(identity: queuedIdentity)
+        await MainActor.run {}
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0)
+        XCTAssertEqual(live.backend.retireCallCount, 0)
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+    }
+
+    func testPendingNaturalEndCancelsProgressPollingWithoutReplacement() async throws {
+        let baseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let live = try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2),
+            progressClock: clock)
+        let owner = Task21OwnedTestHarness(live, resourceBaseline: baseline)
+        addTeardownBlock { try await owner.tearDown() }
+        live.driver.observedPlaybackTime = Task21Fixtures.time(0)
+        _ = try await live.prepare()
+        _ = try await live.activate()
+        live.driver.observedPlaybackTime = Task21Fixtures.time(1)
+        let firstReads = live.driver.playbackTimeReadCount
+        clock.advance(nanoseconds: 250_000_000)
+        try await awaitWatchdogSample(live, after: firstReads)
+        live.driver.pendingNaturalEndVerification = true
+        live.driver.emitTimeControlStatus(.paused)
+        let scheduler = try XCTUnwrap(live.progressScheduler)
+        let identity = try XCTUnwrap(scheduler.hlsProgressIdentitySnapshot())
+        live.coordinator.hlsProgressDeadlineFired(identity: identity)
+        for _ in 0..<8 { await Task.yield() }
+        XCTAssertEqual(live.coordinator.stopTaskCount, 0,
+            "Native endpoint verification owns completion; it must not become a stall replacement")
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+    }
+
+    private func awaitWatchdogSample(_ live: Task21Harness, after reads: Int) async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while live.driver.playbackTimeReadCount <= reads, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        guard live.driver.playbackTimeReadCount > reads else {
+            XCTFail("The real Registry-owned deadline must read the driver's current media time")
+            throw NSError(domain: "HLS.WatchdogSampleTimeout", code: 1)
+        }
+    }
+
+    func testRealAACSeedWriterInputPreservesCoalescedPacketTimingAndTrimMetadata() async throws {
+        // Exercise the exact cached-and-rebuilt input used by coordinator fixtures,
+        // before AVAssetWriter can obscure a header-copy failure behind batch cleanup.
+        // A wrapper that reconstructs different timing, trims or packet metadata must
+        // fail here even when the encoded bytes and nominal audio format still match.
+        let layouts: [[RenditionChannelLabel]] = [[.l, .r], [.c, .l, .r, .ls, .rs, .lfe]]
+        for labels in layouts {
+            let input = try await Task21RealAACSeed.makeEncodedInput(layoutLabels: labels)
+            XCTAssertGreaterThan(input.buffers.count, 1)
+            XCTAssertEqual(input.outputTimings.count, input.buffers.count)
+            for (index, source) in input.buffers.enumerated() {
+                let context = "channels=\(labels.count) bucket=\(index)"
+                let wrapped = try SampleBufferBuilder.makeWriterInputSample(
+                    source, lifetime: WriterInputLifetime(),
+                    outputTiming: input.outputTimings[index])
+                XCTAssertFalse(ObjectIdentifier(wrapped) == ObjectIdentifier(source), "\(context) independent header")
+                XCTAssertTrue(CMSampleBufferGetFormatDescription(wrapped).map(ObjectIdentifier.init)
+                    == CMSampleBufferGetFormatDescription(source).map(ObjectIdentifier.init), "\(context) format identity")
+                let count = CMSampleBufferGetNumSamples(source)
+                XCTAssertGreaterThan(count, 1, context)
+                XCTAssertEqual(CMSampleBufferGetNumSamples(wrapped), count, context)
+
+                func assertTime(_ actual: CMTime, _ expected: CMTime, _ field: String) {
+                    XCTAssertEqual(actual.value, expected.value, "\(context) \(field) value")
+                    XCTAssertEqual(actual.timescale, expected.timescale, "\(context) \(field) timescale")
+                    XCTAssertEqual(actual.flags, expected.flags, "\(context) \(field) flags")
+                    XCTAssertEqual(actual.epoch, expected.epoch, "\(context) \(field) epoch")
+                }
+                assertTime(CMSampleBufferGetDuration(wrapped), CMSampleBufferGetDuration(source), "duration")
+                assertTime(CMSampleBufferGetPresentationTimeStamp(wrapped),
+                    CMSampleBufferGetPresentationTimeStamp(source), "pts")
+                assertTime(CMSampleBufferGetDecodeTimeStamp(wrapped),
+                    CMSampleBufferGetDecodeTimeStamp(source), "dts")
+                assertTime(CMSampleBufferGetOutputPresentationTimeStamp(wrapped),
+                    CMSampleBufferGetOutputPresentationTimeStamp(source), "output-pts")
+                assertTime(CMSampleBufferGetOutputDuration(wrapped),
+                    CMSampleBufferGetOutputDuration(source), "output-duration")
+                for packet in 0..<count {
+                    var expected = CMSampleTimingInfo()
+                    var actual = CMSampleTimingInfo()
+                    XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(source, at: packet,
+                        timingInfoOut: &expected), noErr, context)
+                    XCTAssertEqual(CMSampleBufferGetSampleTimingInfo(wrapped, at: packet,
+                        timingInfoOut: &actual), noErr, context)
+                    assertTime(actual.duration, expected.duration, "packet[\(packet)].duration")
+                    assertTime(actual.presentationTimeStamp, expected.presentationTimeStamp, "packet[\(packet)].pts")
+                    assertTime(actual.decodeTimeStamp, expected.decodeTimeStamp, "packet[\(packet)].dts")
+                    XCTAssertEqual(CMSampleBufferGetSampleSize(wrapped, at: packet),
+                        CMSampleBufferGetSampleSize(source, at: packet), context)
+                }
+                for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+                    XCTAssertTrue(CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                        target: wrapped, attachmentMode: mode).map { $0 as NSDictionary }
+                        == CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                            target: source, attachmentMode: mode).map { $0 as NSDictionary },
+                        "\(context) attachmentMode=\(mode) attachments differ")
+                }
+                for key in [kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                            kCMSampleBufferAttachmentKey_TrimDurationAtEnd] {
+                    let expected = Task21RealAACSeed.trimTime(source, key: key)
+                    let actual = Task21RealAACSeed.trimTime(wrapped, key: key)
+                    XCTAssertEqual(actual == nil, expected == nil, context)
+                    if let actual, let expected { assertTime(actual, expected, key as String) }
+                }
+                XCTAssertTrue(CMSampleBufferGetSampleAttachmentsArray(wrapped,
+                    createIfNecessary: false).map { $0 as NSArray }
+                    == CMSampleBufferGetSampleAttachmentsArray(source,
+                        createIfNecessary: false).map { $0 as NSArray }, "\(context) sample attachments differ")
+                XCTAssertTrue(try nativeSamplePayloadDigest(XCTUnwrap(CMSampleBufferGetDataBuffer(wrapped)))
+                    == nativeSamplePayloadDigest(XCTUnwrap(CMSampleBufferGetDataBuffer(source))),
+                    "\(context) payload digests differ")
+            }
+        }
+    }
+
     func testRealAVSeedRetimingPreservesAccessUnitCadenceAtCommonBoundaries() async throws {
         let encoded = try await Task21RealAACSeed.makeEncodedInput()
         XCTAssertGreaterThanOrEqual(encoded.buffers.count, 7)
@@ -1361,6 +1955,134 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         XCTAssertTrue(delivered.contains(second))
     }
 
+    func testQueuedStatusAfterOwnedPauseRevocationCannotInvalidateResumableItem() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            let activation = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.activation)
+            let context = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(harness.graph.coordinator.begin(contextNonce: context.contextNonce,
+                reason: .pause, at: harness.graph.registry.clock.nowNanoseconds))
+            let revoked = try XCTUnwrap(harness.backend.lastActivationInvocation)
+            let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertEqual(harness.graph.registry.phase(of: suspend.task), .queued)
+            // These are original KVO deliveries selected before revocation,
+            // arriving before the owned physical stop can enter MainActor.
+            let queuedStatuses: [AVPlayer.TimeControlStatus] = [.waitingToPlayAtSpecifiedRate, .playing, .paused]
+            for status in queuedStatuses {
+                harness.coordinator.observeTimeControlStatus(status,
+                    item: harness.item, activation: activation)
+            }
+            XCTAssertEqual(harness.coordinator.phase, .stopping)
+            XCTAssertEqual(harness.coordinator.publishedPlayingCount, 0)
+            XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+            XCTAssertEqual(harness.driver.pauseCallCount, 0,
+                "The relay fences state; only the original registered stop may pause")
+            XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.owner, owner)
+            XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, suspend)
+            XCTAssertEqual(harness.graph.registry.phase(of: suspend.task), .queued,
+                "Queued native status must not dispatch an existing pause owner's runner")
+            harness.driver.holdAudioConnectionCompletion = true
+            defer {
+                harness.driver.holdAudioConnectionCompletion = false
+                harness.driver.releaseAudioConnection()
+            }
+            XCTAssertTrue(harness.graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "The original pause owner must retain its first-start admission")
+            let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+            XCTAssertTrue(disconnectHeld)
+            guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertFalse(harness.graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "First-start admission must remain single-flight once the original runner starts")
+            XCTAssertTrue(revoked.requestAutomaticSuspend(item: harness.item),
+                "A duplicate status may recognize the exact in-flight owner without restarting it")
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval,
+                "A held physical disconnect cannot manufacture quiescence")
+            XCTAssertEqual(harness.backend.suspendCallCount, 1)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            guard case .succeeded = await harness.graph.registry.joinOutputBackendOperation(suspend.task) else {
+                throw harness.backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+            XCTAssertEqual(receipt.suspendTicket, suspend)
+            XCTAssertTrue(harness.coordinator.accept(receipt))
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time,
+                prepared.identity.playerItemTime)
+            XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+            XCTAssertEqual(harness.driver.rate, 0)
+            XCTAssertEqual(harness.driver.pauseCallCount, 1)
+            XCTAssertTrue(harness.graph.registry.finishOutputPause(owner: owner))
+            let resumed = try await harness.resumeThroughRegistry()
+            XCTAssertNotEqual(resumed, .rejected)
+            let successor = harness.graph.registry.outputResourceContextSnapshot()?.activation
+            XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.item),
+                "The old activation cannot acquire cleanup authority over its resumed successor")
+            XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.activation, successor)
+            XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+            XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+            XCTAssertEqual(harness.driver.installCount, 1)
+        }
+    }
+
+    func testPauseIntentRevocationBeforeOwnerAdmissionJoinsAutomaticRunner() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2))
+        } body: { harness in
+            let prepared = try await harness.prepare()
+            harness.driver.observedPausedTime = prepared.identity.playerItemTime.cmTime
+            _ = try await harness.activate()
+            let registry = harness.graph.registry
+            let invocation = try XCTUnwrap(harness.backend.lastActivationInvocation)
+            XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .pause)),
+                .acceptedWaiting)
+            XCTAssertFalse(invocation.revalidateCurrentAuthority())
+            XCTAssertNil(registry.outputResourceContextSnapshot()?.owner,
+                "User intent revokes rate before the separate pause-owner transaction")
+            harness.driver.holdAudioConnectionCompletion = true
+            defer {
+                harness.driver.holdAudioConnectionCompletion = false
+                harness.driver.releaseAudioConnection()
+            }
+            XCTAssertTrue(invocation.requestAutomaticSuspend(item: harness.item))
+            let automatic = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let stop = try XCTUnwrap(automatic.suspend)
+            let owner = try XCTUnwrap(harness.graph.coordinator.begin(
+                contextNonce: automatic.contextNonce, reason: .pause, at: registry.clock.nowNanoseconds))
+            XCTAssertEqual(owner, automatic.owner)
+            XCTAssertFalse(registry.startOutputSuspendOperation(stop.task, owner: owner),
+                "The callback won admission, so the explicit caller must join the exact started runner")
+            let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+            XCTAssertTrue(disconnectHeld)
+            guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+            XCTAssertEqual(harness.backend.suspendCallCount, 1)
+            XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+            XCTAssertNotNil(registry.outputResourceContextSnapshot()?.interval)
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            guard case .succeeded = await registry.joinOutputBackendOperation(stop.task) else {
+                throw harness.backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
+            }
+            let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+            XCTAssertEqual(receipt.suspendTicket, stop)
+            XCTAssertTrue(harness.coordinator.accept(receipt))
+            XCTAssertEqual(harness.coordinator.capturedPausedCursor(for: receipt)?.time,
+                prepared.identity.playerItemTime)
+            XCTAssertEqual(harness.driver.pauseCallCount, 1)
+            XCTAssertTrue(registry.finishOutputPause(owner: owner))
+            XCTAssertEqual(registry.performOutputUserControl(try userControlRequest(registry, kind: .resume)),
+                .acceptedWaiting)
+            let resumed = try await harness.resumeThroughRegistry()
+            XCTAssertNotEqual(resumed, .rejected)
+            XCTAssertEqual(harness.driver.installCount, 1)
+            XCTAssertEqual(harness.driver.playCallCount, 2)
+        }
+    }
+
     func testTVOS27NativePrepareActivateSuspendResumeSuspendPreservesItem() async throws {
         try await withFinalEOSFixture { fixture in
             try await fixture.verifyNativePauseResumeConnections()
@@ -2603,6 +3325,61 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         }
     }
 
+    func testGenuineSourceAACCoordinatorNearEOFPauseUsesCurrentHTTPRootAndRejectsRetirement() async throws {
+        for retireBeforeResume in [false, true] {
+            let factory = WatchdogPlaybackFactory(sourceAAC: true)
+            try await withWatchdogController(factory: factory) { controller, registry, _, factory, _ in
+                let driver = try XCTUnwrap(factory.driver)
+                let source = try XCTUnwrap(factory.sourceAACBuilder?.fixture)
+                let timeline = try XCTUnwrap(driver.observedPlayheads.last?.timelineMappingAuthority)
+                XCTAssertTrue(timeline.sourceAACBinding === source.root)
+                XCTAssertNil(timeline.aacEndpointReceipt)
+                XCTAssertNil(timeline.aacPrefixReceipt)
+                let final = try XCTUnwrap(source.root.finalSeal)
+                XCTAssertEqual(timeline.sourceAACFinalEndpoint, final.writtenEnd)
+                let endpoint = try timeline.playerItemTime(for: final.writtenEnd)
+                XCTAssertEqual(driver.constrainedPlaybackEnd, endpoint)
+                let remaining = ExactMediaTime(value: 1, timescale: 4)
+                let cursor = try endpoint.subtracting(remaining)
+                driver.observedPausedTime = cursor.cmTime
+                await controller.setPaused(true)
+                try await waitForWatchdogCondition { driver.systemAudioDisconnected && registry.outputResourceContextSnapshot()?.interval == nil }
+                XCTAssertEqual(driver.playCallCount, 1)
+                if retireBeforeResume {
+                    source.timeline.retireCompressedGeneration()
+                    XCTAssertNil(timeline.sourceAACFinalEndpoint)
+                }
+                let range = try FMP4PresentationRange(start: cursor, duration: remaining)
+                driver.loadedRangesOverride = [range]
+                driver.applySeekToObservedPausedTime = true
+                driver.reconnectedPausedTime = try cursor.adding(ExactMediaTime(value: 1, timescale: 1_000_000)).cmTime
+                await controller.setPaused(false)
+                if retireBeforeResume {
+                    XCTAssertFalse(source.root.isCurrent)
+                    XCTAssertEqual(driver.playCallCount, 1, "Retired source callback authority cannot resume near EOF")
+                } else {
+                    try await waitForWatchdogCondition { driver.playCallCount == 2 }
+                    XCTAssertEqual(driver.requestedSeekTime, cursor)
+                    XCTAssertEqual(driver.lastPlayedPausedTime, cursor)
+                    XCTAssertEqual(driver.lastRequestedLoadedRange, ExactMediaInterval(range))
+                    XCTAssertEqual(driver.lastRequestedLoadedRange?.end, endpoint)
+                    XCTAssertTrue(driver.observedPlayheads.allSatisfy { $0.timelineMappingAuthority === timeline })
+                    XCTAssertEqual(driver.installCount, 1)
+                }
+            }
+        }
+    }
+
+    func testSourceAACDeclarationCannotBorrowEncodedAACTerminalProof() async throws {
+        try await withOwnedSelectionHarness {
+            try await Task21Harness(directAudioOnlyRendition: .init(rawValue: 2), declaredSourceAACWithEncodedBinding: true)
+        } body: { harness in
+            await XCTAssertThrowsErrorAsync(try await harness.prepare())
+            XCTAssertEqual(harness.driver.playCallCount, 0)
+            XCTAssertEqual(harness.driver.prerollCallCount, 0, "Missing authentic source binding must fail before SDK media waits")
+        }
+    }
+
     func testDirectPublicationAdoptionRequiresExactOwnerBindingsAndRemainsFrozen() async throws {
         let fixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 24_131),
@@ -3167,11 +3944,20 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testStaleKVOStopReceiptAndCancelCannotAffectReplacementItem() async throws {
         let harness = try await Task21Harness()
-        _ = try await harness.prepare(); let old = try await harness.stop()
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        let revoked = try XCTUnwrap(harness.backend.lastActivationInvocation)
+        let old = try await harness.stop()
         try harness.reinstall()
         harness.coordinator.observeTimeControlStatus(.playing, item: harness.oldItem,
                                                      activation: harness.activation)
         XCTAssertFalse(harness.coordinator.accept(old))
+        let replacementPhase = harness.coordinator.phase
+        XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.oldItem))
+        XCTAssertFalse(revoked.requestAutomaticSuspend(item: harness.item),
+                       "A retired activation cannot retarget cleanup to a replacement item")
+        XCTAssertEqual(harness.coordinator.phase, replacementPhase)
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
         harness.coordinator.cancel(item: harness.oldItem)
         XCTAssertEqual(harness.coordinator.currentItemIdentity, harness.item)
         XCTAssertEqual(harness.driver.pauseCallCount, 1)
@@ -4987,16 +5773,139 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         _ = try await harness.activate()
         let source = try XCTUnwrap(
             harness.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        let invocation = try XCTUnwrap(harness.backend.lastActivationInvocation)
         XCTAssertTrue(harness.graph.registry.requestCancel(source))
+        XCTAssertFalse(invocation.revalidateCurrentAuthority())
+        let priorSuspend = harness.graph.registry.outputResourceContextSnapshot()?.suspend
+        XCTAssertFalse(invocation.requestAutomaticSuspend(
+            item: Task21Fixtures.staleGenerationItem(from: harness.item)),
+            "A mismatched item cannot use the retained activation's cleanup authority")
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, priorSuspend)
+        harness.driver.holdAudioConnectionCompletion = true
+        defer {
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+        }
 
         harness.driver.emitTimeControlStatus(.playing)
-        for _ in 0..<8 { await Task.yield() }
 
+        // The callback is synchronous. No scheduler yield can stand in for
+        // the immediate fence, or for joining the separate physical stop.
         XCTAssertEqual(harness.coordinator.publishedPlayingCount, 0)
         XCTAssertEqual(harness.coordinator.phase, .stopping,
                        "playing relay 发现权威已撤销后必须失败闭合")
-        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend,
+        XCTAssertEqual(harness.driver.pauseCallCount, 0,
+                       "The relay must not perform an unowned physical pause")
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend,
                         "撤权后的 playing 不得仅静默丢弃，必须进入共享单飞 stop")
+        let stopOwner = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.owner)
+        XCTAssertEqual(stopOwner.reason, .pause)
+        XCTAssertEqual(suspend.priorActivation, invocation.activation)
+        harness.driver.emitTimeControlStatus(.playing)
+        XCTAssertTrue(invocation.requestAutomaticSuspend(item: harness.item))
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.owner, stopOwner)
+        XCTAssertEqual(harness.graph.registry.outputResourceContextSnapshot()?.suspend, suspend)
+        let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+        XCTAssertTrue(disconnectHeld, "The original registered stop must reach physical disconnect")
+        guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        XCTAssertEqual(harness.driver.pauseCallCount, 1)
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt,
+                     "A pending disconnect cannot produce a quiescence receipt")
+        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.interval)
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        let stopped = await harness.graph.registry.joinOutputBackendOperation(suspend.task)
+        guard case .succeeded = stopped else {
+            XCTFail("The original revoked-activation stop did not complete: \(stopped)")
+            return
+        }
+        let receipt = try XCTUnwrap(harness.backend.quiescenceReceipt)
+        XCTAssertEqual(receipt.suspendTicket, suspend)
+        XCTAssertTrue(harness.coordinator.accept(receipt))
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot()?.interval)
+        XCTAssertEqual(harness.driver.rate, 0)
+        XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+        XCTAssertEqual(harness.coordinator.invalidationCount, 0)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+        XCTAssertEqual(harness.driver.installCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 0,
+                       "Revoked playing must not start publication replacement")
+    }
+
+    func testRevokedPlayingArmsOwnedSuspendDeadlineBeforeHeldDisconnectCompletes() async throws {
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let clock = ManualPlaybackClock(100)
+        let harness = try await Task21Harness(progressClock: clock, ownsProgressTerminalCleanup: true)
+        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+        addTeardownBlock { try await owner.tearDown() }
+        _ = try await harness.prepare()
+        _ = try await harness.activate()
+        let scheduler = try XCTUnwrap(harness.progressScheduler)
+        XCTAssertNotNil(scheduler.hlsProgressIdentitySnapshot())
+        let handlerCount = clock.deadlineTimerHandlerInstallationCount
+        let source = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.sourceTask)
+        XCTAssertTrue(harness.graph.registry.requestCancel(source))
+        harness.driver.holdAudioConnectionCompletion = true
+        defer {
+            harness.driver.holdAudioConnectionCompletion = false
+            harness.driver.releaseAudioConnection()
+            harness.backend.allowRetirementCompletion()
+        }
+
+        harness.driver.emitTimeControlStatus(.playing)
+
+        let suspend = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot()?.suspend)
+        let deadline = suspend.anchorInstant + 1_000_000_000
+        XCTAssertEqual(harness.coordinator.phase, .stopping)
+        XCTAssertNil(scheduler.hlsProgressIdentitySnapshot())
+        XCTAssertEqual(scheduler.suspendTicketSnapshot(), suspend,
+                       "The exact stop deadline must be armed before its async runner can return")
+        XCTAssertEqual(scheduler.suspendNotAfterInstantSnapshot(), deadline)
+        XCTAssertFalse(harness.graph.registry.executor.safetyIngress.snapshot.outputPermitPresent)
+        XCTAssertFalse(harness.graph.registry.executor.safetyIngress.snapshot.readinessOpen)
+        XCTAssertEqual(clock.deadlineTimerHandlerInstallationCount, handlerCount)
+        let disconnectHeld = await harness.driver.waitForHeldAudioConnection()
+        XCTAssertTrue(disconnectHeld)
+        guard disconnectHeld else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+
+        clock.set(nowNanoseconds: deadline - 1)
+        harness.graph.registry.executor.sync {}
+        XCTAssertFalse(harness.graph.registry.outputResourceContextSnapshot()?.suspendTimedOut == true)
+        clock.advance(nanoseconds: 1)
+        harness.graph.registry.executor.sync {}
+        let timedOut = try XCTUnwrap(harness.graph.registry.outputResourceContextSnapshot())
+        XCTAssertTrue(timedOut.suspendTimedOut,
+                      "Timeout must execute while the original physical disconnect is still held")
+        XCTAssertTrue(timedOut.poisoned)
+        XCTAssertEqual(timedOut.suspend, suspend)
+        XCTAssertNotNil(timedOut.interval,
+                        "Timeout cannot manufacture physical quiescence or close the original interval")
+        XCTAssertNil(harness.coordinator.lastQuiescenceReceipt)
+        XCTAssertEqual(harness.driver.pauseCallCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 0)
+        XCTAssertNil(scheduler.suspendTicketSnapshot())
+        let firstFailure = harness.graph.registry.playbackStateSnapshot()
+        guard case .failed = firstFailure else {
+            XCTFail("The original suspend deadline must publish its terminal failure")
+            return
+        }
+
+        harness.driver.holdAudioConnectionCompletion = false
+        harness.driver.releaseAudioConnection()
+        harness.backend.allowRetirementCompletion()
+        try await harness.joinProgressTerminalCleanup()
+        XCTAssertEqual(harness.graph.registry.playbackStateSnapshot(), firstFailure)
+        XCTAssertNil(harness.graph.registry.outputResourceContextSnapshot())
+        XCTAssertNil(harness.driver.currentItemIdentity)
+        XCTAssertTrue(harness.driver.disconnectedFromSystemAudio)
+        XCTAssertEqual(harness.driver.playCallCount, 1)
+        XCTAssertEqual(harness.backend.suspendCallCount, 1)
+        XCTAssertEqual(harness.backend.retireCallCount, 1)
     }
 
     func testReview3BackendQuiescenceReceiptRequiresExactPrivateIssuerIdentityAndSingleConsumption()
@@ -5809,50 +6718,86 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testReview3CapacityChargesRetainedGraphAndFifthDeadlineFailsClosed() async throws {
-        let player = AVPlayer()
-        let driver = try SystemAVPlayerDriver.make(player: player)
+        try await withInstalledReview3Driver(outputNonce: 23_300) { driver, item in
+            let player = driver.player
+            player.play()
+            try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
+            for _ in 0..<4 {
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
+                                                object: player.currentItem)
+            }
+            for _ in 0..<8 { await Task.yield() }
+            let fifth = Task { try await driver.waitUntilPaused(item: item) }
+            for _ in 0..<8 { await Task.yield() }
+
+            XCTAssertEqual(driver.fixedTimerCount, 0)
+            XCTAssertEqual(driver.activeWaiterCount, 0,
+                           "deadline 第五项必须在返回伪 UUID 前显式 capacityExceeded")
+            let failedClosed = await withTaskGroup(of: Bool.self) { group in
+                group.addTask {
+                    do { try await fifth.value; return false }
+                    catch { return error as? AVPlayerItemCoordinatorFailure == .directPauseNotConfirmed }
+                }
+                group.addTask {
+                    try? await Task.sleep(for: .milliseconds(200))
+                    return false
+                }
+                let first = await group.next() ?? false
+                fifth.cancel()
+                group.cancelAll()
+                return first
+            }
+            XCTAssertTrue(failedClosed, "容量耗尽必须同步返回准确错误，不能留下永久 waiter")
+            _ = try? await fifth.value
+
+            let authorityHarness = try await Task21Harness()
+            let coordinator = try AVPlayerItemCoordinator(
+                driver: Task21FakeDriver(), evidenceSource: authorityHarness.evidence)
+            let graphBytes = malloc_size(Unmanaged.passUnretained(coordinator).toOpaque())
+            XCTAssertLessThanOrEqual(graphBytes, 2_048,
+                                     "完整 retained graph 与所有 backing 必须统一计费")
+            try await authorityHarness.shutdown()
+        }
+    }
+
+    func testReview3DriverFixtureJoinsObserverTailBeforeRethrowingBodyFailure() async throws {
+        enum Expected: Error { case bodyFailure }
+        let original = WeakSystemAVPlayerDriverProbe(nil)
+        do {
+            try await withInstalledReview3Driver(outputNonce: 23_301) { driver, item in
+                original.value = driver
+                try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
+                throw Expected.bodyFailure
+            }
+            XCTFail("The fixture must preserve its body failure")
+        } catch Expected.bodyFailure {}
+        XCTAssertNil(original.value)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0,
+            "A throwing fixture must remove its original endpoint observer and join the callback tail")
+        let successor = try SystemAVPlayerDriver.make()
+        withExtendedLifetime(successor) {}
+    }
+
+    private func withInstalledReview3Driver(outputNonce: UInt64,
+        _ body: @MainActor (SystemAVPlayerDriver, AVPlayerItemInstanceIdentity) async throws -> Void) async throws {
+        let driver = try SystemAVPlayerDriver.make()
         let item = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 23_300),
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce),
             itemGeneration: 1)
-        try driver.install(url: URL(string: "http://127.0.0.1:1/review3-capacity.m3u8")!,
-                           identity: item)
-        player.play()
-        try driver.constrainPlaybackEnd(to: Task21Fixtures.time(1), item: item)
-        for _ in 0..<4 {
-            NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification,
-                                            object: player.currentItem)
-        }
-        for _ in 0..<8 { await Task.yield() }
-        let fifth = Task { try await driver.waitUntilPaused(item: item) }
-        for _ in 0..<8 { await Task.yield() }
-
-        XCTAssertEqual(driver.fixedTimerCount, 0)
-        XCTAssertEqual(driver.activeWaiterCount, 0,
-                       "deadline 第五项必须在返回伪 UUID 前显式 capacityExceeded")
-        let failedClosed = await withTaskGroup(of: Bool.self) { group in
-            group.addTask {
-                do { try await fifth.value; return false }
-                catch { return error as? AVPlayerItemCoordinatorFailure == .directPauseNotConfirmed }
-            }
-            group.addTask {
-                try? await Task.sleep(for: .milliseconds(200))
-                return false
-            }
-            let first = await group.next() ?? false
-            fifth.cancel()
-            group.cancelAll()
-            return first
-        }
-        XCTAssertTrue(failedClosed, "容量耗尽必须同步返回准确错误，不能留下永久 waiter")
-        _ = try? await fifth.value
-
-        let authorityHarness = try await Task21Harness()
-        let coordinator = try AVPlayerItemCoordinator(
-            driver: Task21FakeDriver(), evidenceSource: authorityHarness.evidence)
-        let graphBytes = malloc_size(Unmanaged.passUnretained(coordinator).toOpaque())
-        XCTAssertLessThanOrEqual(graphBytes, 2_048,
-                                 "完整 retained graph 与所有 backing 必须统一计费")
+        var failure: (any Error)?
+        do {
+            try driver.install(url: URL(string: "http://127.0.0.1:1/review3-capacity.m3u8")!, identity: item)
+            try await body(driver, item)
+        } catch { failure = error }
+        // NotificationCenter owns the endpoint callback independently of the
+        // driver. A later throwing harness must not leave that original SDK
+        // credit alive and block every subsequent single-driver admission.
+        driver.pause(item: item)
+        driver.removeObservers(item: item)
         driver.replaceCurrentItemWithNil(item: item)
+        await driver.joinNativeCallbackTails()
+        XCTAssertNil(driver.currentItemIdentity)
+        if let failure { throw failure }
     }
 
     func testRelaySourceReplacementKeepsPhysicalWakeAndRejectsOldUUID() {
@@ -6654,6 +7599,19 @@ private enum Task21ResumeAwaitFence: CaseIterable, Equatable {
 
 @MainActor
 private final class Task21FakeDriver: AVPlayerDriving {
+    var observedPlaybackTime: ExactMediaTime?
+    private(set) var playbackTimeReadCount = 0
+    var pendingNaturalEndVerification = false
+    var foreignPhysicalPlaybackItem = false
+    func playbackClockObservation(item: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation {
+        guard currentItemIdentity == item, !foreignPhysicalPlaybackItem else { return .staleItem }
+        playbackTimeReadCount += 1
+        return .currentItem(observedPlaybackTime)
+    }
+    func hasPendingNaturalEndVerification(item: AVPlayerItemInstanceIdentity,
+                                          activation: ActivationEpoch) -> Bool {
+        currentItemIdentity == item && timeControlActivation == activation && pendingNaturalEndVerification
+    }
     var failAccessLogObservation = false
     var ignoreDisconnectStateChange = false
     var disconnectFailure: AVPlayerItemCoordinatorFailure?
@@ -6727,6 +7685,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     var conflictHandler: (() -> Void)?
     var operations: [Task21DriverOperation] = []
     var observedPlayheads: [PreparedPlayheadIdentity] = []
+    private(set) var installCount = 0
     var playCallCount = 0
     var pauseCallCount = 0
     var prerollCallCount = 0
@@ -6770,6 +7729,7 @@ private final class Task21FakeDriver: AVPlayerDriving {
     private var pausedStatusContinuation: CheckedContinuation<Void, Error>?
 
     func install(url: URL, identity: AVPlayerItemInstanceIdentity) throws {
+        installCount += 1
         currentItemIdentity = identity
         rate = 0
         timeControlStatus = .paused
@@ -7777,6 +8737,7 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
 
     static func make(lifecycle: OutputLifecycleEpoch,
                      audioOnly: Bool,
+                     itemGeneration: UInt64 = 19,
                      completeMediaBodies: Bool = true,
                      startupPrefix: Bool = false,
                      advanceBeforeInitialHTTP: Bool = false,
@@ -7784,7 +8745,7 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
                      diagnosticPhases: Bool = false) async throws -> Task21HarnessAuthorityFixture {
         task21FixturePhase("aac.seed.begin", enabled: diagnosticPhases)
         let seed = try await Task21RealAACSeed.make(
-            outputLifecycleEpoch: lifecycle,
+            itemGeneration: itemGeneration, outputLifecycleEpoch: lifecycle,
             retainRenditionBinding: startupPrefix && audioOnly)
         task21FixturePhase("aac.seed.ready", enabled: diagnosticPhases)
         let avSeed = audioOnly ? nil : try await Task21RealAVSeed.make(
@@ -7793,12 +8754,13 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         let box = FinalLockedValue<Task21RealHLSHarness>()
         task21FixturePhase("listener.begin", enabled: diagnosticPhases)
         let server = try await LoopbackHTTPSessionFactory().start(
-            itemGeneration: 19, now: { 0 }, logger: { _ in },
+            itemGeneration: itemGeneration, now: { 0 }, logger: { _ in },
             responseFailure: { _, _ in }
         ) { token in
             let publication = try Task21RealHLSHarness(
                 token: token, seed: seed, avSeed: avSeed,
-                endList: audioOnly && !startupPrefix, startupPrefix: startupPrefix)
+                endList: audioOnly && !startupPrefix, startupPrefix: startupPrefix,
+                itemGeneration: itemGeneration)
             box.value = publication
             return LoopbackPreparedPublication(
                 store: publication.store,
@@ -7809,7 +8771,7 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         let publication = try XCTUnwrap(box.value)
         let source = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
         let item = AVPlayerItemInstanceIdentity(
-            outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+            outputLifecycleEpoch: lifecycle, itemGeneration: itemGeneration)
         let bundle = try LoopbackAVPlayerPreparationBundle(
             evidenceSource: source, item: item)
         if advanceBeforeInitialHTTP {
@@ -7858,18 +8820,19 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
         if completeMediaBodies {
             let deadline = ContinuousClock.now.advanced(by: .seconds(2))
             while server.currentAudioSelectionCapability(
-                itemGeneration: 19,
+                itemGeneration: itemGeneration,
                 publicationSequence: snapshot.publicationSequence
             ) == nil, ContinuousClock.now < deadline {
                 try await Task.sleep(for: .milliseconds(10))
             }
             guard server.currentAudioSelectionCapability(
-                itemGeneration: 19,
+                itemGeneration: itemGeneration,
                 publicationSequence: snapshot.publicationSequence
             ) != nil else {
                 // Read-only failure facts distinguish missing HTTP evidence from
                 // admission pressure. These separate snapshots do not reserve or
                 // consume publication/selection authority.
+                print("TASK21_MEMBERSHIP_FAILURE \(server.preparationSelectionDiagnostics(publicationSequence: snapshot.publicationSequence))")
                 let requests = server.acceptedGETSnapshot()
                 let history = server.preparationHistoryFactCounts
                 let usage = server.usage
@@ -7890,7 +8853,7 @@ private final class Task21HarnessAuthorityFixture: @unchecked Sendable {
             task21FixturePhase("selection.ready", enabled: diagnosticPhases)
         } else {
             XCTAssertNil(server.currentAudioSelectionCapability(
-                itemGeneration: 19,
+                itemGeneration: itemGeneration,
                 publicationSequence: snapshot.publicationSequence),
                 "Playlist and initialization bodies cannot select an audio rendition")
         }
@@ -8156,8 +9119,191 @@ private final class Task21OwnedTestHarness {
     }
 }
 
+/// Production backend/controller assembly with genuine loopback publication and
+/// retirement, substituting only the native player's observable clock/status.
+@MainActor
+private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
+    private(set) var drivers: [Task21FakeDriver] = []
+    private(set) weak var coordinator: AVPlayerItemCoordinator?
+    private(set) var builder: WatchdogPlaybackBundleBuilder?
+    private(set) var sourceAACBuilder: SourceAACCoordinatorBundleBuilder?
+    private let usesSourceAAC: Bool
+    init(sourceAAC: Bool = false) { usesSourceAAC = sourceAAC }
+    private(set) var maximumAudibleOutputs = 0
+    var driver: Task21FakeDriver? { drivers.last }
+
+    nonisolated func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
+        tuning: PlaybackTuning, channelID: String, url: URL,
+        eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
+        try await build(kind: kind, identity: identity, eventSink: eventSink)
+    }
+
+    private func build(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity,
+        eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) throws -> any PlaybackBackend {
+        guard kind == .hlsAVPlayer else {
+            return TrackingPlaybackBackend(identity: identity, kind: kind, harness: nil)
+        }
+        let driver = Task21FakeDriver()
+        driver.observedPlaybackTime = Task21Fixtures.time(0)
+        driver.beforePositiveRateSideEffect = { [weak self, weak driver] _ in
+            guard let self, let driver else { return }
+            let others = self.drivers.filter { $0 !== driver && $0.rate > 0 }.count
+            self.maximumAudibleOutputs = max(self.maximumAudibleOutputs, others + 1)
+        }
+        drivers.append(driver)
+        let builder: any HLSOutputItemBundleBuilding
+        if usesSourceAAC {
+            let source = SourceAACCoordinatorBundleBuilder()
+            sourceAACBuilder = source; builder = source
+        } else {
+            let ordinary = WatchdogPlaybackBundleBuilder(eventSink: eventSink, resetClock: {
+                await MainActor.run { driver.observedPlaybackTime = Task21Fixtures.time(0) }
+            }, releaseHistory: {
+                await MainActor.run { driver.observedPlayheads.removeAll() }
+            })
+            self.builder = ordinary; builder = ordinary
+        }
+        let slot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
+        return HLSAVPlayerPlaybackBackend(identity: identity, bundleBuilder: builder,
+            presentationContext: AVPlayerPresentationContext(player: AVPlayer()),
+            coordinatorFactory: { [weak self] replacement in
+                try await MainActor.run {
+                    let coordinator = try AVPlayerItemCoordinator(driver: driver,
+                        evidenceSource: replacement.evidenceSource,
+                        backendPublicationReplacementAuthoritySlot: slot)
+                    self?.coordinator = coordinator
+                    return coordinator
+                }
+            }, replacementSlot: slot)
+    }
+
+    func releaseObservations() {
+        drivers.forEach { $0.observedPlayheads.removeAll() }
+        drivers.removeAll()
+        builder = nil; sourceAACBuilder = nil
+    }
+}
+
+private final class SourceAACCoordinatorBundleBuilder: HLSOutputItemBundleBuilding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: SourceAACCoordinatorBundleOwner?
+    var fixture: SourceAACPublicationFixture? { lock.withLock { current?.fixture } }
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
+        let owner = SourceAACCoordinatorBundleOwner(lifecycle: invocation.outputLifecycleEpoch)
+        lock.withLock { current = owner }
+        return HLSOutputItemBundle(startProducer: { try await owner.start() }, retireProducer: { await owner.retire() })
+    }
+}
+private final class SourceAACCoordinatorBundleOwner: @unchecked Sendable {
+    private let lock = NSLock()
+    private let lifecycle: OutputLifecycleEpoch
+    private var fixtureValue: SourceAACPublicationFixture?
+    private var serverValue: LoopbackHTTPServer?
+    private var evidenceValue: LoopbackAVPlayerPreparationEvidenceSource?
+    var fixture: SourceAACPublicationFixture? { lock.withLock { fixtureValue } }
+    init(lifecycle: OutputLifecycleEpoch) { self.lifecycle = lifecycle }
+    func start() async throws -> AVPlayerItemReplacementBundle {
+        let original = Task19.binding(id: 2, writer: 989_123)
+        let binding = FMP4WriterBinding(outputLifecycleEpoch: lifecycle, itemGeneration: original.itemGeneration,
+            mediaEpoch: original.mediaEpoch, publicationParticipantID: original.publicationParticipantID,
+            renditionIdentity: original.renditionIdentity, writerIdentity: original.writerIdentity)
+        let source = try await SourceAACPublicationFixture.make(binding: binding)
+        lock.withLock { fixtureValue = source }
+        let snapshot = try XCTUnwrap(source.publisher.visible)
+        let server = try await LoopbackHTTPServer.start(store: source.store, declaration: source.declaration,
+            publishedSnapshot: snapshot, sessionCapability: source.session, now: { 1_000_000_000 }, logger: { _ in })
+        lock.withLock { serverValue = server }
+        let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
+        lock.withLock { evidenceValue = evidence }
+        let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch: lifecycle, itemGeneration: 19)
+        let request = try server.makeAVPlayerPreparationRequest(item: item, publicationSequence: snapshot.publicationSequence)
+        let playlist = try XCTUnwrap(snapshot.media[2])
+        let resources = playlist.initializationResources + playlist.resources
+        let urls = [request.itemURL] + (try resources.map {
+            try XCTUnwrap(URL(string: server.path(for: $0), relativeTo: server.baseURL)?.absoluteURL)
+        })
+        let client = URLSession(configuration: .ephemeral)
+        defer { client.invalidateAndCancel() }
+        for url in urls {
+            var get = URLRequest(url: url); get.setValue("close", forHTTPHeaderField: "Connection")
+            let response = try await client.data(for: get)
+            guard (response.1 as? HTTPURLResponse)?.statusCode == 200, !response.0.isEmpty else { throw HLSSourceError.network }
+        }
+        let completionDeadline = ContinuousClock.now + .seconds(2)
+        while !resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }),
+              ContinuousClock.now < completionDeadline { try await Task.sleep(for: .milliseconds(5)) }
+        guard resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }) else { throw HLSSourceError.incompleteEvidence }
+        return .init(request: request, evidenceSource: evidence)
+    }
+    func retire() async -> Bool {
+        let held = lock.withLock { (fixtureValue, serverValue, evidenceValue) }
+        held.2?.retirePreparation()
+        if let server = held.1 {
+            let ticket = server.closeAdmission()
+            let deadline = ContinuousClock.now + .seconds(2)
+            while (server.usage.connections != 0 || server.usage.activeResponses != 0 || FrozenPreparationOwner.activeHistoryServer === server),
+                  ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
+            do { try server.drain(cleanupTicket: ticket); try server.retire(cleanupTicket: ticket) }
+            catch { return false }
+        }
+        held.0?.close()
+        if let writer = held.0?.writer { _ = await writer.cancelAwaitingCompletion() }
+        lock.withLock { fixtureValue = nil; serverValue = nil; evidenceValue = nil }
+        return true
+    }
+}
+
+private final class WatchdogPlaybackBundleBuilder: HLSOutputItemBundleBuilding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var builds = 0
+    private var retirements = 0
+    private let eventSink: @Sendable (PlaybackPipelineEvent) -> Void
+    private let resetClock: @Sendable () async -> Void
+    private let releaseHistory: @Sendable () async -> Void
+    var buildCount: Int { lock.withLock { builds } }
+    var retirementCount: Int { lock.withLock { retirements } }
+
+    init(eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void,
+         resetClock: @escaping @Sendable () async -> Void,
+         releaseHistory: @escaping @Sendable () async -> Void) {
+        self.eventSink = eventSink
+        self.resetClock = resetClock
+        self.releaseHistory = releaseHistory
+    }
+
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
+        lock.withLock { builds += 1 }
+        let generation = invocation.outputLifecycleEpoch.outputNonce
+        let fixture = try await Task21HarnessAuthorityFixture.make(
+            lifecycle: invocation.outputLifecycleEpoch, audioOnly: true, itemGeneration: generation)
+        let replacement = AVPlayerItemReplacementBundle(request: fixture.request, evidenceSource: fixture.source)
+        let metadata = try HLSRuntimeFailureMetadataOwner.reserve(in: .shared)
+        let scope = PlaybackBackendPrepareFailureScope(ticket: invocation.ticket)
+        let sink = eventSink
+        let relay = try HLSRuntimeFailureRelay(metadataOwner: metadata) { diagnostic, owner in
+            sink(.backendFailed(diagnostic, prepareScope: scope, metadataOwner: owner))
+        }
+        await resetClock()
+        return HLSOutputItemBundle(replacement: replacement, startProducer: { replacement },
+            retireProducer: { [self] in
+                await releaseHistory()
+                do { try await fixture.retireTransportAwaitingCompletion() }
+                catch { XCTFail("Watchdog production-bundle retirement failed: \(error)"); return false }
+                lock.withLock { retirements += 1 }
+                return true
+            }, runtimeFailure: relay)
+    }
+}
+
+private final class Task21ProgressCleanupReceiver: PlaybackOwnedCleanupReceiving, Sendable {
+    func performOwnedTerminalCleanup(owner: OutputTransitionOwnerTicket,
+        task: ControlTaskTicket, terminalState: PlaybackState) async {}
+}
+
 @MainActor
 private final class Task21Harness {
+    let progressScheduler: PlaybackDeadlineScheduler?
+    private let progressReceiver: (any PlaybackOwnedCleanupReceiving)?
     let driver: Task21FakeDriver
     let evidence: Task21FakeEvidenceSource
     private let authorityEvents = Task21AuthorityEventSink()
@@ -8186,13 +9332,16 @@ private final class Task21Harness {
          forgedDirectAudioOnlyRendition: AudioRenditionIdentity? = nil,
          prepareMutation: Task21PrepareMutation = .none,
          requiresAACEndpointAuthority: Bool = false,
+         declaredSourceAACWithEncodedBinding: Bool = false,
          additionalUnboundAACRendition: AudioRenditionIdentity? = nil,
          completeMediaBodies: Bool = true,
          startupPrefix: Bool = false,
          advanceBeforeInitialHTTP: Bool = false,
          omitInitialInitializationBodies: Bool = false,
          diagnosticPhases: Bool = false,
-         coordinatorAllocator: PlaybackIdentityAllocator = .shared) async throws {
+         coordinatorAllocator: PlaybackIdentityAllocator = .shared,
+         progressClock: ManualPlaybackClock? = nil,
+         ownsProgressTerminalCleanup: Bool = false) async throws {
         self.liveEdge = Task21Fixtures.time(liveEdge)
         self.boundaries = boundaries.map(Task21Fixtures.time)
         self.directAudioOnlyRendition = directAudioOnlyRendition
@@ -8202,7 +9351,19 @@ private final class Task21Harness {
         driver.prepareMutation = prepareMutation
         driver.diagnosticPhases = diagnosticPhases
         backend = Task21RegistryBackend()
-        graph = try OutputGraphFixture(backendObject: backend)
+        graph = try OutputGraphFixture(clock: progressClock ?? .init(100), backendObject: backend)
+        if progressClock != nil {
+            let scheduler = PlaybackDeadlineScheduler(registry: graph.registry)
+            let receiver: any PlaybackOwnedCleanupReceiving = ownsProgressTerminalCleanup
+                ? Task21FinalEOSCleanupReceiver(registry: graph.registry, audioLane: graph.lane)
+                : Task21ProgressCleanupReceiver()
+            graph.registry.bindPlaybackRuntime(scheduler: scheduler, receiver: receiver)
+            progressScheduler = scheduler
+            progressReceiver = receiver
+        } else {
+            progressScheduler = nil
+            progressReceiver = nil
+        }
         lifecycle = graph.lifecycle
         authorityFixture = try await Task21HarnessAuthorityFixture.make(
             lifecycle: lifecycle, audioOnly: directAudioOnlyRendition != nil,
@@ -8248,6 +9409,14 @@ private final class Task21Harness {
                 publicationSequence: preparation.publicationSequence,
                 audioParticipants: preparation.audioParticipants.map {
                     .init(renditionIdentity: $0.renditionIdentity, codec: .aac)
+                }, directAudioOnlyRendition: preparation.directAudioOnlyRendition)
+        }
+        if declaredSourceAACWithEncodedBinding {
+            preparation = .init(itemURL: preparation.itemURL, item: preparation.item,
+                publicationSequence: preparation.publicationSequence,
+                audioParticipants: preparation.audioParticipants.map {
+                    .init(renditionIdentity: $0.renditionIdentity, codec: .sourceAAC,
+                        terminalBinding: $0.terminalBinding, renditionBinding: $0.renditionBinding)
                 }, directAudioOnlyRendition: preparation.directAudioOnlyRendition)
         }
         if let additionalUnboundAACRendition {
@@ -8432,6 +9601,13 @@ private final class Task21Harness {
         }
         latestReceipt = receipt
         return receipt
+    }
+
+    func joinProgressTerminalCleanup() async throws {
+        let receiver = try XCTUnwrap(progressReceiver as? Task21FinalEOSCleanupReceiver)
+        await graph.registry.joinOwnedTerminalCleanup(session: lifecycle.backendIdentity.sessionIdentity)
+        try receiver.result()
+        authorityFixture.shutdown()
     }
 
     func shutdown() async throws {
@@ -8747,6 +9923,8 @@ private final class Task21RetirementCompletionGate: @unchecked Sendable {
     private let lock = NSLock()
     private var released = false
     private var waiter: CheckedContinuation<Void, Never>?
+
+    var isWaiting: Bool { lock.withLock { waiter != nil } }
 
     func wait() async {
         if lock.withLock({ released }) { return }
@@ -9562,9 +10740,10 @@ private final class Task21RealIntegrationFixture {
             let owner = try XCTUnwrap(graph.coordinator.begin(contextNonce: context.contextNonce,
                 reason: .pause, at: graph.registry.clock.nowNanoseconds))
             let joined = await graph.registry.joinOutputBackendOperations(owner: owner)
-            XCTAssertTrue(joined)
+            XCTAssertTrue(joined, "Native pause cycle \(cycle) must join its original activation")
             let suspend = try XCTUnwrap(graph.registry.outputResourceContextSnapshot()?.suspend)
-            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner))
+            XCTAssertTrue(graph.registry.startOutputSuspendOperation(suspend.task, owner: owner),
+                "Native pause cycle \(cycle) must retain the original owner's first-start admission")
             guard case .succeeded = await graph.registry.joinOutputBackendOperation(suspend.task) else {
                 throw backend.lastError ?? AVPlayerItemCoordinatorFailure.operationInFlight
             }
@@ -10257,9 +11436,16 @@ private final class Task21RealIntegrationFixture {
             ), let participant = evidence.participants.first(where: {
                    $0.participantID
                     == publication.seed.endpoint.binding.publicationParticipantID.rawValue
-               }), Set(participant.completedMedia.map(\.key)).isSuperset(of: expectedMediaKeys) {
-                completed = evidence
-                break
+               }) {
+                // This is deliberately still a live (unfrozen) completion view.
+                // map may size an Array from count before another response adds
+                // a completed resource, invalidating that allocation assumption.
+                var observedKeys = Set<HLSResourceKey>()
+                for resource in participant.completedMedia { observedKeys.insert(resource.key) }
+                if observedKeys.isSuperset(of: expectedMediaKeys) {
+                    completed = evidence
+                    break
+                }
             }
             try await Task.sleep(for: .milliseconds(10))
         }
@@ -10547,15 +11733,19 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
     private let startupPrefix: Bool
 
     init(token: LoopbackSessionToken, seed: Task21RealAACSeed,
-         avSeed: Task21RealAVSeed?, endList: Bool, startupPrefix: Bool = false) throws {
+         avSeed: Task21RealAVSeed?, endList: Bool, startupPrefix: Bool = false,
+         itemGeneration: UInt64 = 19) throws {
         self.seed = seed
         self.avSeed = avSeed
         self.startupPrefix = startupPrefix
         finitePublicationClock = startupPrefix || (avSeed != nil && endList)
             ? try HLSNaturalEndPublicationClock.make() : nil
-        store = SealedMediaStore(loopbackSession: token, itemGeneration: 19)
+        store = SealedMediaStore(loopbackSession: token, itemGeneration: itemGeneration)
         var declared = try Task19.declaration(audioOnly: avSeed == nil)
         declared.token = token.value
+        declared.itemGeneration = itemGeneration
+        XCTAssertEqual(seed.initialization.binding.itemGeneration.rawValue, itemGeneration,
+            "The real replacement fixture must share its Registry-signed generation")
         if let avSeed {
             declared.video?.width = Int(avSeed.videoDimensions.width)
             declared.video?.height = Int(avSeed.videoDimensions.height)
@@ -10611,7 +11801,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
             ? audioPackets.prefix(while: { $0.object.logicalSequence < terminalSequence }).count
             : max(audioPackets.count, videoPackets.count)
         if startupPrefix {
-            guard packetCount >= 3, packetCount <= 7,
+            // Eight encoded audio seconds and the seven-block A/V seed already
+            // supply six/seven genuine nonterminal segments. Never include the
+            // terminal tail or synthesize EOF just to satisfy live startup.
+            guard packetCount >= 6, packetCount <= 7,
                   avSeed == nil || (videoPackets.count >= packetCount
                     && (0..<packetCount).allSatisfy({
                         videoPackets[$0].object.logicalSequence == audioPackets[$0].object.logicalSequence
@@ -10675,8 +11868,10 @@ private final class Task21RealHLSHarness: @unchecked Sendable {
         XCTAssertTrue(snapshot.aacRenditionBindings[participant] === binding, file: file, line: line)
         XCTAssertNil(binding.endpointAuthority, file: file, line: line)
         XCTAssertNil(binding.sealedHTTPReceipt, file: file, line: line)
+        XCTAssertTrue(snapshot.coverage.isSixSegmentWindowEligible, file: file, line: line)
         XCTAssertTrue(snapshot.media.values.allSatisfy {
-            !$0.text.contains("#EXT-X-ENDLIST")
+            (6...7).contains($0.logicalSequences.count)
+                && !$0.text.contains("#EXT-X-ENDLIST")
         }, file: file, line: line)
         let endpoint = (avSeed?.endpointAuthority ?? seed.endpointAuthority).receipt
         XCTAssertFalse(snapshot.media[participant]?.resources.contains(endpoint.terminalMedia.key) == true,
@@ -10920,7 +12115,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
         let buffers = try template.buffers.map {
             try makeEncodedBuffer(from: $0, format: template.format)
         }
-        return Task21AACEncodedInput(buffers: buffers, summary: template.streamSummary)
+        return Task21AACEncodedInput(buffers: buffers.map { $0.buffer },
+            outputTimings: buffers.map { $0.outputTiming }, summary: template.streamSummary)
     }
 
     fileprivate static func makePending(
@@ -10946,7 +12142,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
             actualTrailingPrimeFrames: summary.actualTrailingPrimeFrames,
             bandwidth: summary.bandwidth,
             packetLease: try workspace.acquire(.aacPackets, bytes: payloadBytes),
-            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192))
+            formatLease: try workspace.acquire(.nonPayload, bytes: 8_192),
+            outputTimings: input.outputTimings)
         guard epoch.buffers.count <= 8,
               let first = epoch.buffers.first,
               let format = CMSampleBufferGetFormatDescription(first) else {
@@ -11154,7 +12351,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
     private static func makeEncodedBuffer(
         from template: Task21AACEncodedBufferTemplate,
         format: CMAudioFormatDescription
-    ) throws -> CMSampleBuffer {
+    ) throws -> (buffer: CMSampleBuffer, outputTiming: WriterInputOutputTiming) {
         var block: CMBlockBuffer?
         try AACRenditionEncoder.check(CMBlockBufferCreateWithMemoryBlock(
             allocator: kCFAllocatorDefault,
@@ -11189,9 +12386,8 @@ final class Task21RealAACSeed: @unchecked Sendable {
             sampleBufferOut: &result
         ))
         let buffer = try XCTUnwrap(result)
-        try AACRenditionEncoder.check(CMSampleBufferSetOutputPresentationTimeStamp(
-            buffer, newValue: template.outputPresentationTimeStamp
-        ))
+        let outputTiming = try WriterInputOutputTiming.settingExplicit(
+            template.outputPresentationTimeStamp, on: buffer)
         if let leadingTrim = template.leadingTrim {
             CMSetAttachment(buffer,
                 key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
@@ -11206,7 +12402,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
                     allocator: kCFAllocatorDefault)!,
                 attachmentMode: kCMAttachmentMode_ShouldPropagate)
         }
-        return buffer
+        return (buffer, outputTiming)
     }
 
     fileprivate static func trimTime(_ buffer: CMSampleBuffer,
@@ -11225,6 +12421,7 @@ final class Task21RealAACSeed: @unchecked Sendable {
 /// Fresh buffers rebuilt from the immutable encoding template for one fixture owner.
 private struct Task21AACEncodedInput: @unchecked Sendable {
     let buffers: [CMSampleBuffer]
+    let outputTimings: [WriterInputOutputTiming]
     let summary: AACStreamSummary
 }
 
@@ -11837,8 +13034,9 @@ final class Task21RealAVSeed: @unchecked Sendable {
         // 编码块：系统 writer 的最终 flush 段因此仍落在 HLS 最多 7 段的
         // 可见窗口内，两个 terminal media key 都能由同一 snapshot 广告。
         let inputBufferCount = additionalAudioSeed == nil ? 7 : 6
-        let retimedAudio = try retimedAudioAccessUnits(
+        let retimedInput = try retimedAudioInput(
             Array(audio.encodedBuffers.prefix(inputBufferCount)))
+        let retimedAudio = retimedInput.buffers
         guard retimedAudio.count >= 6,
               let firstAudio = retimedAudio.first,
               let audioFormat = CMSampleBufferGetFormatDescription(firstAudio) else {
@@ -11849,11 +13047,12 @@ final class Task21RealAVSeed: @unchecked Sendable {
         guard (additionalAudioSeed == nil) == (additionalAudioParticipantID == nil) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
-        let additionalRetimedAudio = try additionalAudioSeed.map { seed in
-            try retimedAudioAccessUnits(
+        let additionalRetimedInput = try additionalAudioSeed.map { seed in
+            try retimedAudioInput(
                 Array(seed.encodedBuffers.prefix(inputBufferCount)),
                 startingAt: sourceStart)
         }
+        let additionalRetimedAudio = additionalRetimedInput?.buffers
         let additionalAudioFormat = additionalRetimedAudio?.first.flatMap {
             CMSampleBufferGetFormatDescription($0)
         }
@@ -11987,9 +13186,10 @@ final class Task21RealAVSeed: @unchecked Sendable {
         var accumulatedAudioEpoch: AACEncodedEpoch?
         var accumulatedAdditionalAudioEpoch: AACEncodedEpoch?
         if let additionalAudioWriter, let additionalAudioSeed,
-           let additionalRetimedAudio {
+           let additionalRetimedInput {
             func makeCompleteEpoch(
                 _ buffers: [CMSampleBuffer],
+                outputTimings: [WriterInputOutputTiming],
                 seed: Task21RealAACSeed
             ) throws -> AACEncodedEpoch {
                 let counts = try aacEpochCounts(buffers)
@@ -12008,13 +13208,15 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualTrailingPrimeFrames: UInt32(counts.trailing),
                     bandwidth: seed.streamSummary.bandwidth,
                     packetLease: try workspace.acquire(.aacPackets, bytes: bytes),
-                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+                    outputTimings: outputTimings)
             }
             func appendAccessUnit(
-                _ buffer: CMSampleBuffer,
+                at index: Int,
                 from completeEpoch: AACEncodedEpoch,
                 to writer: SegmentedFMP4Writer
             ) async throws {
+                let buffer = completeEpoch.buffers[index]
                 let counts = try aacEpochCounts([buffer])
                 let chunk = AACEncodedEpoch(
                     identity: completeEpoch.identity,
@@ -12026,12 +13228,16 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualTrailingPrimeFrames: UInt32(counts.trailing),
                     bandwidth: completeEpoch.bandwidth,
                     packetLease: completeEpoch.packetLease,
-                    formatLease: completeEpoch.formatLease)
+                    formatLease: completeEpoch.formatLease,
+                    outputTimings: completeEpoch.outputTimings.isEmpty
+                        ? [] : [completeEpoch.outputTimings[index]])
                 try await writer.appendAACEncodedEpochAwaitingReadiness(chunk, coordinator: boundary)
             }
-            let audioEpoch = try makeCompleteEpoch(retimedAudio, seed: audio)
+            let audioEpoch = try makeCompleteEpoch(retimedAudio,
+                outputTimings: retimedInput.outputTimings, seed: audio)
             let additionalEpoch = try makeCompleteEpoch(
-                additionalRetimedAudio,
+                additionalRetimedInput.buffers,
+                outputTimings: additionalRetimedInput.outputTimings,
                 seed: additionalAudioSeed)
             accumulatedAudioEpoch = audioEpoch
             accumulatedAdditionalAudioEpoch = additionalEpoch
@@ -12070,19 +13276,18 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     videoIndex += 1
                 } else if audioIndex < audioEpoch.buffers.count,
                           CMTimeCompare(audioEnd, additionalEnd) <= 0 {
-                    try await appendAccessUnit(audioEpoch.buffers[audioIndex],
+                    try await appendAccessUnit(at: audioIndex,
                         from: audioEpoch, to: audioWriter)
                     audioIndex += 1
                 } else {
-                    let buffer = additionalEpoch.buffers[additionalAudioIndex]
-                    try await appendAccessUnit(buffer, from: additionalEpoch,
-                                         to: additionalAudioWriter)
+                    try await appendAccessUnit(at: additionalAudioIndex,
+                        from: additionalEpoch, to: additionalAudioWriter)
                     additionalAudioIndex += 1
                 }
             }
         } else {
             let workspace = AACCalibrationWorkspace()
-            for buffer in retimedAudio {
+            for (index, buffer) in retimedAudio.enumerated() {
                 let bufferEnd = CMTimeAdd(
                     CMSampleBufferGetOutputPresentationTimeStamp(buffer),
                     CMSampleBufferGetDuration(buffer)
@@ -12109,7 +13314,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     actualLeadingPrimeFrames: 0, actualTrailingPrimeFrames: 0,
                     bandwidth: audio.streamSummary.bandwidth,
                     packetLease: try workspace.acquire(.aacPackets, bytes: bytes),
-                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024))
+                    formatLease: try workspace.acquire(.nonPayload, bytes: 1_024),
+                    outputTimings: [retimedInput.outputTimings[index]])
                 try await audioWriter.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
             }
             while videoIndex < videoOutputs.count {
@@ -12223,7 +13429,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                 bandwidth: audio.streamSummary.bandwidth,
                 packetLease: try endpointWorkspace.acquire(.aacPackets,
                                                             bytes: endpointByteCount),
-                formatLease: try endpointWorkspace.acquire(.nonPayload, bytes: 1_024))
+                formatLease: try endpointWorkspace.acquire(.nonPayload, bytes: 1_024),
+                outputTimings: retimedInput.outputTimings)
         }
         let endpointAuthority = try audioWriter.makeAACEffectiveEndpointAuthority(
             epoch: endpointEpoch, initializationObject: audioInitialization,
@@ -12277,6 +13484,12 @@ final class Task21RealAVSeed: @unchecked Sendable {
     fileprivate static func retimedAudioAccessUnits(
         _ buffers: [CMSampleBuffer], startingAt requestedStart: CMTime? = nil
     ) throws -> [CMSampleBuffer] {
+        try retimedAudioInput(buffers, startingAt: requestedStart).buffers
+    }
+
+    private static func retimedAudioInput(
+        _ buffers: [CMSampleBuffer], startingAt requestedStart: CMTime? = nil
+    ) throws -> (buffers: [CMSampleBuffer], outputTimings: [WriterInputOutputTiming]) {
         // Removing the leading trim keeps its packets: the original first second
         // can become 49 * 1024 / 48000 = 1.045333 seconds. Submit individual AUs so
         // the next common cut is encountered within the strict 1024/48000 window.
@@ -12341,8 +13554,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
     /// 均来自系统编码结果，trim 只允许留在完整 epoch 的首尾。
     private static func splitAACAccessUnits(
         _ buffers: [CMSampleBuffer]
-    ) throws -> [CMSampleBuffer] {
-        guard let first = buffers.first, let last = buffers.last else { return [] }
+    ) throws -> (buffers: [CMSampleBuffer], outputTimings: [WriterInputOutputTiming]) {
+        guard let first = buffers.first, let last = buffers.last else { return ([], []) }
         let leadingTrim = Task21RealAACSeed.trimTime(first,
             key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
         let trailingTrim = Task21RealAACSeed.trimTime(last,
@@ -12352,6 +13565,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                 .map(CMBlockBufferGetDataLength) ?? 0)
         }
         var accessUnits: [CMSampleBuffer] = []
+        var outputTimings: [WriterInputOutputTiming] = []
         accessUnits.reserveCapacity(buffers.reduce(0) {
             $0 + CMSampleBufferGetNumSamples($1)
         })
@@ -12397,9 +13611,8 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     sampleBufferOut: &retimed
                 ))
                 let accessUnit = try XCTUnwrap(retimed)
-                try AACRenditionEncoder.check(
-                    CMSampleBufferSetOutputPresentationTimeStamp(
-                        accessUnit, newValue: outputStart))
+                let outputTiming = try WriterInputOutputTiming.settingExplicit(
+                    outputStart, on: accessUnit)
                 CMRemoveAttachment(accessUnit,
                     key: kCMSampleBufferAttachmentKey_TrimDurationAtStart)
                 CMRemoveAttachment(accessUnit,
@@ -12419,6 +13632,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
                     throw AACRenditionFailure.invalidInput
                 }
                 accessUnits.append(accessUnit)
+                outputTimings.append(outputTiming)
             }
         }
         if let leadingTrim, let firstAccessUnit = accessUnits.first {
@@ -12444,7 +13658,7 @@ final class Task21RealAVSeed: @unchecked Sendable {
               actualPayloadBytes == expectedPayloadBytes else {
             throw AACRenditionFailure.capacityExceeded
         }
-        return accessUnits
+        return (accessUnits, outputTimings)
     }
 
     private static func aacEpochCounts(
@@ -12924,6 +14138,19 @@ private final class Task21LogFailureBundleBuilder: HLSOutputItemBundleBuilding, 
                 return await retireProducer()
             },
             runtimeFailure: relay)
+    }
+}
+
+private struct Task21HeldPrefixBundleBuilder: HLSOutputItemBundleBuilding {
+    let replacement: AVPlayerItemReplacementBundle
+    let gate: Task21RetirementCompletionGate
+    let retireProducer: HLSOutputItemBundle.ProducerRetirement
+
+    func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
+        HLSOutputItemBundle(replacement: replacement, startProducer: {
+            await gate.wait()
+            return replacement
+        }, retireProducer: retireProducer)
     }
 }
 

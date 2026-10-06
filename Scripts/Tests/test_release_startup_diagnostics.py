@@ -5,8 +5,10 @@
 """Exercise the real startup script's exit path without an Apple SDK."""
 from pathlib import Path
 import os
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +16,124 @@ SCRIPT = ROOT / 'Scripts/test-release-startup.sh'
 
 
 class ReleaseStartupDiagnosticsTests(unittest.TestCase):
+    def run_build(self, command, *, cancel=False, broken_tee=False, existing_product=False):
+        # Exercise the actual build invocation, stopping before SDK-dependent
+        # artifact inspection. Only the unavailable Apple commands are replaced.
+        source = SCRIPT.read_text().split('\napp="$derived_data/')[0]
+        boundary = "printf '证据目录：%s\\n构建日志：%s/build.log\\n'"
+        self.assertEqual(source.count(boundary), 1)
+        initialization, build = source.split(boundary)
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            runner = fixture / 'runner.sh'
+            runner.write_text(initialization + r'''
+xcrun() {
+    printf '%s\n' '{"devices":{"com.apple.CoreSimulator.SimRuntime.tvOS-27-0":[{"udid":"build-test-udid","name":"Apple TV 4K (3rd generation)","isAvailable":true,"state":"Booted","dataPath":"/unused-simulator"}]}}'
+}
+xcodebuild() {
+    printf 'selected build stdout\n'
+    printf 'selected build stderr\n' >&2
+''' + command + '\n}\n' +
+                ('tee() { command tee "$@"; return 19; }\n' if broken_tee else '') +
+                boundary + build + "\nprintf 'BUILD_STAGE_COMPLETE\\n'\n")
+            env = {**os.environ, 'TMPDIR': temporary,
+                   'TVOS_SIMULATOR_UDID': 'build-test-udid'}
+            if existing_product:
+                derived = fixture / 'ReleaseStartup'
+                app = derived / 'Build/Products/Release-appletvsimulator/VPlayer.app'
+                app.mkdir(parents=True)
+                (app / 'Info.plist').write_text('existing product is not build approval')
+                env['VPLAYER_STARTUP_DERIVED_DATA'] = str(derived)
+            output = fixture / 'ci.log'
+            with output.open('w') as stdout:
+                process = subprocess.Popen(['bash', str(runner)], env=env,
+                                           stdout=stdout, stderr=subprocess.PIPE,
+                                           text=True, start_new_session=True)
+                try:
+                    if cancel:
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            logs = list(fixture.glob('vplayer-release-startup.*/build.log'))
+                            if ('selected build stderr' in output.read_text() and
+                                    len(logs) == 1 and
+                                    'selected build stderr' in logs[0].read_text()):
+                                break
+                            if process.poll() is not None:
+                                break
+                            time.sleep(0.01)
+                        # Assert the compiler output reached CI while the build
+                        # was still running, rather than only after an exit trap.
+                        self.assertIsNone(process.poll())
+                        self.assertIn('selected build stderr', output.read_text())
+                        self.assertEqual(len(logs), 1)
+                        self.assertIn('selected build stderr', logs[0].read_text())
+                        os.killpg(process.pid, signal.SIGTERM)
+                    _, stderr = process.communicate(timeout=5)
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.communicate(timeout=5)
+            build_logs = list(fixture.glob('vplayer-release-startup.*/build.log'))
+            self.assertEqual(len(build_logs), 1)
+            return process.returncode, output.read_text(), stderr, build_logs[0].read_text()
+
+    def test_build_forwards_both_streams_and_keeps_complete_local_log(self):
+        status, output, stderr, saved = self.run_build('return 0')
+        self.assertEqual(status, 0, stderr)
+        self.assertIn('BUILD_STAGE_COMPLETE', output)
+        for text in ('selected build stdout', 'selected build stderr'):
+            self.assertIn(text, output)
+            self.assertIn(text, saved)
+
+    def test_existing_product_still_requires_exact_cold_build_and_its_success(self):
+        status, output, stderr, _ = self.run_build(
+            r'''printf 'BUILD_ARG=%s\n' "$@"; return 65''', existing_product=True)
+        self.assertEqual(status, 1)
+        self.assertIn('模拟器构建失败', stderr)
+        self.assertNotIn('BUILD_STAGE_COMPLETE', output)
+        args = [line.removeprefix('BUILD_ARG=') for line in output.splitlines()
+                if line.startswith('BUILD_ARG=')]
+        self.assertEqual(args[:2], ['build', '-project'])
+        self.assertTrue(args[2].endswith('/VPlayer.xcodeproj'))
+        self.assertEqual(args[3:12], [
+            '-scheme', 'VPlayer', '-configuration', 'Release', '-sdk', 'appletvsimulator',
+            '-destination', 'platform=tvOS Simulator,id=build-test-udid', '-derivedDataPath'])
+        self.assertTrue(args[12].endswith('/ReleaseStartup'))
+        self.assertEqual(args[13:], ['CLANG_ENABLE_CODE_COVERAGE=NO', 'CODE_SIGNING_ALLOWED=NO'])
+
+    def test_build_failure_is_not_masked_by_successful_log_forwarding(self):
+        status, output, stderr, saved = self.run_build('return 65')
+        self.assertEqual(status, 1)
+        self.assertIn('模拟器构建失败', stderr)
+        self.assertNotIn('BUILD_STAGE_COMPLETE', output)
+        self.assertIn('selected build stderr', output)
+        self.assertIn('selected build stderr', saved)
+
+    def test_cancelled_build_has_already_forwarded_its_diagnostics(self):
+        status, output, _, saved = self.run_build('sleep 30', cancel=True)
+        self.assertEqual(status, 143)
+        self.assertNotIn('BUILD_STAGE_COMPLETE', output)
+        self.assertIn('selected build stderr', saved)
+
+    def test_log_write_failure_does_not_allow_trials_to_continue(self):
+        status, output, stderr, _ = self.run_build('return 0', broken_tee=True)
+        self.assertEqual(status, 1)
+        self.assertIn('模拟器构建失败', stderr)
+        self.assertNotIn('BUILD_STAGE_COMPLETE', output)
+
+    def test_live_startup_establishes_add_focus_before_selecting(self):
+        source = (ROOT / 'Tests/VPlayerUITests/LiveStartupUITests.swift').read_text()
+        activation = source.split('let add = app.buttons["source.add"]', 1)[1]
+        before_select, after_select = activation.split('XCUIRemote.shared.press(.select)', 1)
+        self.assertIn('for _ in 0..<4 where !add.hasFocus', before_select)
+        self.assertIn('XCUIRemote.shared.press(.down)', before_select)
+        self.assertIn(r'guard add.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {',
+                      before_select)
+        self.assertIn('XCTFail(', before_select)
+        self.assertIn('return', before_select)
+        for identifier in ('name', 'm3u', 'epg', 'save'):
+            self.assertIn(f'source.editor.{identifier}', after_select)
+
     def run_exit(self, command, *, selected=True, broken_copy=False):
         # Load the actual initialization, functions and traps, stopping immediately
         # before the first SDK operation. No production test mode is required.

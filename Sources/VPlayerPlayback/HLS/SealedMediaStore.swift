@@ -123,7 +123,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     private let reservation: PlaybackResourceContextReservation
     let mapCount: Int
     let sampleCount: Int
-    private let ordinals: UnsafeMutablePointer<UInt8>
+    private let ordinals: UnsafeMutablePointer<UInt16>
     private let cursors: UnsafeMutablePointer<MapCursor>
     private let heap: UnsafeMutablePointer<UInt8>
     private var heapCount = 0
@@ -132,11 +132,11 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
 
     static func allocationLimits(mapCount: Int, sampleCount: Int) throws -> AllocationLimits {
         guard (1...128).contains(mapCount), sampleCount >= mapCount,
-              sampleCount <= mapCount * 256 else {
+              sampleCount <= mapCount * 384 else {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         return .init(root: malloc_good_size(class_getInstanceSize(Self.self)),
-            ordinals: malloc_good_size(sampleCount * MemoryLayout<UInt8>.stride),
+            ordinals: malloc_good_size(sampleCount * MemoryLayout<UInt16>.stride),
             cursors: malloc_good_size(mapCount * MemoryLayout<MapCursor>.stride),
             heap: malloc_good_size(mapCount * MemoryLayout<UInt8>.stride),
             context: malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self)),
@@ -188,7 +188,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             guard let map = store.pausedWorkspaceMap(slot: slot, owner: owner) else { continue }
             maps += 1
             samples = try HLSChecked.add(samples, map.samples.count)
-            guard maps <= 128, samples <= 32_768 else {
+            guard maps <= 128, samples <= 49_152 else {
                 throw CompletedMediaEvidenceError.capacityExceeded
             }
         }
@@ -258,7 +258,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
         guard index == mapCount else { throw CompletedMediaEvidenceError.identityMismatch }
     }
 
-    private func order(at index: Int) -> UnsafeBufferPointer<UInt8> {
+    private func order(at index: Int) -> UnsafeBufferPointer<UInt16> {
         .init(start: ordinals + Int(cursors[index].offset), count: Int(cursors[index].count))
     }
 
@@ -353,6 +353,7 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             guard let input = view.input(at: Int(cursors[index].slot)),
                   input.media.renditionIdentity == rendition,
                   let clipped = try intersection(input.map, at: index, requested: requested, presentationOffset: presentationOffset) else { continue }
+            guard input.map.sourceAACProof?.isCurrent ?? true else { return nil }
             cursors[index].input = input
             let eligibility = try PausedDecodeCoverageOrder.eligibility(map: input.map, evidence: input.media)
             cursors[index].eligibility = eligibility
@@ -424,11 +425,15 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             appendUUID(dependency.mediaEvidenceIdentity)
             appendDigest(input.initialization.sealedDigest)
             appendDigest(input.media.sealedDigest)
+            append(UInt64(input.map.maximumSampleCount))
             append(range.start.value)
             append(UInt64(range.start.timescale))
             append(range.end.value)
             append(UInt64(range.end.timescale))
         }
+        guard (0..<Int(indices.count)).allSatisfy({
+            cursors[Int(indices[$0])].input?.map.sourceAACProof?.isCurrent ?? true
+        }) else { return nil }
         return .init(authority: authority, renditionIdentity: rendition, itemGeneration: itemGeneration,
             canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested, presentationOffset: presentationOffset, dependencies: view)
     }
@@ -453,7 +458,7 @@ struct SealedMediaReservation: Sendable, Hashable {
     fileprivate let kind: SealedMediaObjectKind
     fileprivate let bytes: Int
     fileprivate var reservationOverheadBytes: Int {
-        kind == .initialization ? LoopbackStorageLayout.current.initEvidenceAllocationBytes : 32 * 1_024
+        kind == .initialization ? LoopbackStorageLayout.current.initEvidenceAllocationBytes : LoopbackStorageLayout.current.mediaMapReservationBytes
     }
 }
 struct HLSSnapshotBatchReservation: Sendable, Hashable {
@@ -500,7 +505,7 @@ enum SealedMediaStoreCapacityProjection {
             guard charge.existingMapBytes >= 0,
                   charge.replacementMapBytes >= charge.existingMapBytes,
                   try HLSChecked.add(charge.replacementMapBytes, mediaEvidenceBytes)
-                    <= 32 * 1_024 else { throw HLSPublicationFailure.capacityExceeded }
+                    <= LoopbackStorageLayout.current.mediaMapReservationBytes else { throw HLSPublicationFailure.capacityExceeded }
             return try HLSChecked.add(partial,
                                       charge.replacementMapBytes - charge.existingMapBytes)
         }
@@ -782,9 +787,15 @@ final class SealedMediaStore: @unchecked Sendable {
     private var retiredParticipants: Set<UInt64> = []
     /// 每个 participant 仅保留当前后继 writer 到 canonical init 的一条兼容边；
     /// 已封存 media map 自带完整身份，不依赖历史 alias 常驻。
+    private var sourceAACTerminalBindings: [UInt64: SourceAACWriterTerminalBinding] = [:]
     private var aacWriterInitializationAliases: [UInt64: AACWriterInitializationAlias] = [:]
     private var writerInitializationAliases: [UInt64: WriterInitializationAlias] = [:]
     private var instant: Int64 = 0
+    private let publicationClock: HLSNaturalEndPublicationClock?
+
+    var monotonicNowNanoseconds: Int64 {
+        publicationClock?.residencyNowNanoseconds ?? SystemHLSLoopbackClock.nowNanoseconds()
+    }
     private var preparationHistorySequences:
         (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64) = (0,0,0,0,0,0,0,0,0)
 
@@ -902,7 +913,9 @@ final class SealedMediaStore: @unchecked Sendable {
     }
 
     init(token: String, itemGeneration: UInt64, domain: HLSLinearizationDomain = HLSLinearizationDomain(),
-         capacityLimits: SealedMediaStoreCapacityLimits = .standard) {
+         capacityLimits: SealedMediaStoreCapacityLimits = .standard,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) {
+        self.publicationClock = publicationClock
         self.token = token
         self.itemGeneration = itemGeneration
         self.domain = domain
@@ -912,7 +925,9 @@ final class SealedMediaStore: @unchecked Sendable {
 
     init(loopbackSession: LoopbackSessionToken, itemGeneration: UInt64,
          domain: HLSLinearizationDomain = HLSLinearizationDomain(),
-         capacityLimits: SealedMediaStoreCapacityLimits = .standard) {
+         capacityLimits: SealedMediaStoreCapacityLimits = .standard,
+         publicationClock: HLSNaturalEndPublicationClock? = nil) {
+        self.publicationClock = publicationClock
         token = loopbackSession.value
         self.itemGeneration = itemGeneration
         self.domain = domain
@@ -1160,6 +1175,47 @@ final class SealedMediaStore: @unchecked Sendable {
             effectivePlaybackHorizon: horizon, initializationKey: initializationKey,
             initialization: initialization.object, terminalKey: terminalKey,
             terminal: terminal.object)
+    }
+
+    func sourceAACProof(for key: HLSResourceKey) -> SourceAACSealedMediaProof? {
+        domain.sync {
+            guard !closed, let resource = resources[key],
+                  let proof = resource.decodeMap?.sourceAACProof, proof.isCurrent,
+                  proof.callback.matches(resource.object) else { return nil }
+            return proof
+        }
+    }
+
+    /// Only an owner-pinned, fully sent media/init pair can issue a source timeline.
+    func sourceAACProof(preparationSlot: Int, ownerSlot: UInt8) -> SourceAACSealedMediaProof? {
+        domain.sync {
+            guard ownerSlot == 1 || ownerSlot == 2,
+                  let resource = resources.values.first(where: {
+                      Int($0.preparationSlot) == preparationSlot && ($0.preparationPins & ownerSlot) != 0
+                  }), resource.evidence.isComplete,
+                  let key = resource.initializationKey, let initialization = resources[key],
+                  initialization.evidence.isComplete,
+                  let proof = resource.decodeMap?.sourceAACProof, proof.isCurrent,
+                  proof.callback.matches(resource.object) else { return nil }
+            return proof
+        }
+    }
+
+    func validatesSourceAACFinal(_ final: HLSCurrentFinalPublication,
+                                binding: SourceAACWriterTerminalBinding) -> Bool {
+        domain.sync {
+            guard binding.isCurrent, let seal = binding.finalSeal,
+                  seal.authorityIdentity == binding.configuration.authority.identity,
+                  seal.terminal.binding == final.binding,
+                  validatesCurrentFinalPublication(final),
+                  let proof = sourceAACProof(for: final.terminalKey), proof.binding === binding,
+                  proof.callback.logicalSequence == seal.lastLogicalSequence,
+                  proof.callback.writtenRange?.end == seal.writtenEnd,
+                  proof.callback.sampleEntryDigest == seal.sampleEntryDigest,
+                  final.isAudioOnly ? final.effectivePlaybackHorizon == seal.writtenEnd
+                    : CMTimeCompare(final.effectivePlaybackHorizon.cmTime, seal.writtenEnd.cmTime) <= 0 else { return false }
+            return true
+        }
     }
 
     func aacPublicationAdmission(for key: HLSResourceKey)
@@ -1461,6 +1517,7 @@ final class SealedMediaStore: @unchecked Sendable {
             for ordinal in dependencies.indices {
                 guard let input = dependencies.input(atOrdinal: ordinal),
                       let range = try input.map.intersection(with: requested) else { continue }
+                guard input.map.sourceAACProof?.isCurrent ?? true else { return nil }
                 if try HLSChecked.compare(range.start, cursor) <= 0,
                    try HLSChecked.compare(range.end, next) > 0 { next = range.end }
             }
@@ -1496,11 +1553,15 @@ final class SealedMediaStore: @unchecked Sendable {
             appendUUID(dependency.mediaEvidenceIdentity)
             appendDigest(input.initialization.sealedDigest)
             appendDigest(input.media.sealedDigest)
+            append(UInt64(input.map.maximumSampleCount))
             append(range.start.value)
             append(UInt64(range.start.timescale))
             append(range.end.value)
             append(UInt64(range.end.timescale))
         }
+        guard dependencies.indices.allSatisfy({
+            dependencies.input(atOrdinal: $0)?.map.sourceAACProof?.isCurrent ?? true
+        }) else { return nil }
         return .init(authority: coverageAuthority,
             renditionIdentity: rendition, itemGeneration: itemGeneration,
             canonicalCoverageDigest: .init(hash.finalize()), presentationRange: requested,
@@ -1616,6 +1677,7 @@ final class SealedMediaStore: @unchecked Sendable {
                          adding requested: FMP4PresentationRange) throws
         -> ServedRenditionCoverageReceipt? { try domain.sync {
         guard !closed,
+              context.preparedPlayheadIdentity.timelineMappingAuthority.sourceAACBinding?.isCurrent ?? true,
               context.preparedPlayheadIdentity.itemGeneration == itemGeneration,
               context.observedRenditionSetReceipt.preparedPlayheadIdentity
                 == context.preparedPlayheadIdentity,
@@ -1674,6 +1736,7 @@ final class SealedMediaStore: @unchecked Sendable {
             }
         }
         guard let receipt,
+              context.preparedPlayheadIdentity.timelineMappingAuthority.sourceAACBinding?.isCurrent ?? true,
               try HLSChecked.compare(receipt.presentationRange.start, requested.start) <= 0,
               try HLSChecked.compare(receipt.presentationRange.end, requested.end) >= 0 else {
             return nil
@@ -1776,7 +1839,7 @@ final class SealedMediaStore: @unchecked Sendable {
             }
             let chargedResident = resources.values.reduce(0) { $0 + $1.applicationChargeableBytes }
             let chargedReserved = reservations.values.reduce(0) { $0 + $1.bytes + $1.reservationOverheadBytes }
-            let overhead = kind == .initialization ? LoopbackStorageLayout.current.initEvidenceAllocationBytes : 32 * 1_024
+            let overhead = kind == .initialization ? LoopbackStorageLayout.current.initEvidenceAllocationBytes : LoopbackStorageLayout.current.mediaMapReservationBytes
             let total = try HLSChecked.add(HLSChecked.add(chargedResident, chargedReserved),
                                            HLSChecked.add(bodyBytes, overhead))
             guard total <= capacityLimits.hardApplicationBytes else {
@@ -1841,7 +1904,6 @@ final class SealedMediaStore: @unchecked Sendable {
                 }
             } catch {
                 if let resource { releaseApplicationCharges(resource) }
-                for retrofit in retrofits.values { releaseMapApplicationCharge(retrofit) }
                 throw error
             }
             return key
@@ -1989,6 +2051,7 @@ final class SealedMediaStore: @unchecked Sendable {
                 try SegmentReportRelay.transferBatchToStore(inputs.map { ($0.relay, $0.initialization) }) {
                     for (index, input) in inputs.enumerated() {
                         resources[keys[index]] = chargedPrepared[keys[index]]
+                        sourceAACTerminalBindings[keys[index].participantID] = input.sourceAACTerminalBinding
                         reservations.removeValue(forKey: batch[index].identity)
                         if let candidate = input.candidate { candidates[keys[index].participantID] = candidate }
                     }
@@ -1999,7 +2062,6 @@ final class SealedMediaStore: @unchecked Sendable {
                 }
             } catch {
                 for resource in chargedPrepared.values { releaseApplicationCharges(resource) }
-                for resource in chargedRetrofits.values { releaseMapApplicationCharge(resource) }
                 throw error
             }
             return keys
@@ -2024,13 +2086,35 @@ final class SealedMediaStore: @unchecked Sendable {
             renditionIdentity: rendition, mediaEpoch: object.binding.mediaEpoch.rawValue,
             resourceIdentity: object.backing.identity, sealedDigest: object.digest,
             sealedBodyLength: object.bytes.count)
+        if object.publicationEvidence?.sourceAAC != nil {
+            let id = object.binding.publicationParticipantID.rawValue
+            guard let root = sourceAACTerminalBindings[id], root.isCurrent else {
+                throw HLSPublicationFailure.identityMismatch
+            }
+            let alias = writerInitializationAliases[id]
+            let initialization = resources.values.first(where: {
+                $0.object.kind == .initialization && $0.proof == proof
+            }) ?? alias.flatMap { resources[$0.canonicalKey] }
+            guard let initialization,
+                  let initEvidence = initialization.evidence as? CompletedInitBodyEvidenceState else {
+                throw HLSPublicationFailure.identityMismatch
+            }
+            let map = try SealedDecodeCoverageMap.sealSourceAAC(media: object, proof: proof,
+                receipt: receipt, initialization: initialization.object,
+                initializationProof: initialization.proof, compatibility: alias?.compatibility,
+                binding: root, evidence: evidence, initializationEvidence: initEvidence)
+            guard map.applicationChargeableBytes + 4_096 <= LoopbackStorageLayout.current.mediaMapReservationBytes else {
+                throw HLSPublicationFailure.capacityExceeded
+            }
+            return Resource(object: object, proof: proof, receipt: receipt, evidence: evidence, decodeMap: map)
+        }
         if let initialization = resources.values.first(where: {
             $0.object.kind == .initialization && $0.proof == proof
         }), let initEvidence = initialization.evidence as? CompletedInitBodyEvidenceState {
             let map = try SealedDecodeCoverageMap.seal(media: object, proof: proof, receipt: receipt,
                 initialization: initialization.object, evidence: evidence,
                 initializationEvidence: initEvidence)
-            guard map.applicationChargeableBytes + 4_096 <= 32 * 1_024 else {
+            guard map.applicationChargeableBytes + 4_096 <= LoopbackStorageLayout.current.mediaMapReservationBytes else {
                 throw HLSPublicationFailure.capacityExceeded
             }
             return Resource(object: object, proof: proof, receipt: receipt,
@@ -2047,7 +2131,7 @@ final class SealedMediaStore: @unchecked Sendable {
                 canonicalProof: initialization.proof,
                 compatibility: alias.compatibility,
                 evidence: evidence, initializationEvidence: initEvidence)
-            guard map.applicationChargeableBytes + 4_096 <= 32 * 1_024 else {
+            guard map.applicationChargeableBytes + 4_096 <= LoopbackStorageLayout.current.mediaMapReservationBytes else {
                 throw HLSPublicationFailure.capacityExceeded
             }
             return Resource(object: object, proof: proof, receipt: receipt,
@@ -2068,7 +2152,7 @@ final class SealedMediaStore: @unchecked Sendable {
             canonicalProof: initialization.proof,
             compatibility: alias.compatibility,
             evidence: evidence, initializationEvidence: initEvidence)
-        guard map.applicationChargeableBytes + 4_096 <= 32 * 1_024 else {
+        guard map.applicationChargeableBytes + 4_096 <= LoopbackStorageLayout.current.mediaMapReservationBytes else {
             throw HLSPublicationFailure.capacityExceeded
         }
         return Resource(object: object, proof: proof, receipt: receipt,
@@ -2076,7 +2160,7 @@ final class SealedMediaStore: @unchecked Sendable {
     }
 
     /// 单对象 admit 与 initialization batch 共用同一封闭准备阶段：先 seal 全部 map，
-    /// 再逐对象复验 32 KiB，最后按完整 batch delta 复验 688 MiB（或注入的测试 hard limit）。
+    /// 再逐对象复验 paid per-map envelope，最后按完整 batch delta 复验 688 MiB（或注入的测试 hard limit）。
     private func prepareRetrofits(
         initializations: [HLSResourceKey: Resource]
     ) throws -> [HLSResourceKey: Resource] {
@@ -2136,8 +2220,7 @@ final class SealedMediaStore: @unchecked Sendable {
                 bytes: resource.object.kind == .initialization
                     ? LoopbackStorageLayout.current.initEvidenceAllocationBytes : 4_096)
             if let map = resource.decodeMap {
-                resource.mapApplicationReservation = try reserveApplicationCharge(
-                    allocationIdentity: UUID(), bytes: map.applicationChargeableBytes)
+                resource.mapApplicationReservation = try map.claimPrepaidAllocationForStore()
             }
             return resource
         } catch {
@@ -2150,27 +2233,15 @@ final class SealedMediaStore: @unchecked Sendable {
         _ uncharged: [HLSResourceKey: Resource]
     ) throws -> [HLSResourceKey: Resource] {
         var charged: [HLSResourceKey: Resource] = [:]
-        do {
-            for (key, value) in uncharged {
-                var resource = value
-                guard let map = resource.decodeMap else {
-                    throw HLSPublicationFailure.identityMismatch
-                }
-                resource.mapApplicationReservation = try reserveApplicationCharge(
-                    allocationIdentity: UUID(), bytes: map.applicationChargeableBytes)
-                charged[key] = resource
+        for (key, value) in uncharged {
+            var resource = value
+            guard let map = resource.decodeMap else {
+                throw HLSPublicationFailure.identityMismatch
             }
-            return charged
-        } catch {
-            for resource in charged.values { releaseMapApplicationCharge(resource) }
-            throw error
+            resource.mapApplicationReservation = try map.claimPrepaidAllocationForStore()
+            charged[key] = resource
         }
-    }
-
-    private func releaseMapApplicationCharge(_ resource: Resource) {
-        if let reservation = resource.mapApplicationReservation {
-            HLSDeliveryApplicationChargeLedger.shared.release(reservation)
-        }
+        return charged
     }
 
     private func reserveApplicationCharge(allocationIdentity: UUID, bytes: Int) throws
@@ -2187,9 +2258,9 @@ final class SealedMediaStore: @unchecked Sendable {
     }
 
     private func releaseApplicationCharges(_ resource: Resource) {
-        if let reservation = resource.mapApplicationReservation {
-            HLSDeliveryApplicationChargeLedger.shared.release(reservation)
-        }
+        // The map's shared backing owner releases its charge after the final
+        // map, sample collection or span collection alias. Store retirement only
+        // drops its references; it cannot release somebody else's retained bytes.
         if let reservation = resource.evidenceApplicationReservation {
             HLSDeliveryApplicationChargeLedger.shared.release(reservation)
         }
@@ -2316,8 +2387,9 @@ final class SealedMediaStore: @unchecked Sendable {
             waiter.publicationClock?.signal()
             return
         }
-        // EOF 的票使用 publisher logical clock，HTTP release 的 store uptime
-        // 只用于 residency，不能拿它误判 publication deadline。
+        // Both ordinary and EOF tickets use their publisher's injected clock.
+        // A caller-supplied HTTP release timestamp cannot expire another domain's
+        // valid ticket or manufacture publication time.
         let publicationInstant: Int64
         do { publicationInstant = try waiter.publicationClock?.now().logical ?? instant }
         catch {
@@ -2428,6 +2500,7 @@ final class SealedMediaStore: @unchecked Sendable {
     func retireParticipants(_ ids: Set<UInt64>) { domain.sync {
         retiredParticipants.formUnion(ids)
         for id in ids {
+            sourceAACTerminalBindings.removeValue(forKey: id)
             aacWriterInitializationAliases.removeValue(forKey: id)
             writerInitializationAliases.removeValue(forKey: id)
         }
@@ -2454,6 +2527,7 @@ final class SealedMediaStore: @unchecked Sendable {
         capacityWaiter = nil
         pendingSnapshotGeneration.removeAll(keepingCapacity: true)
         expectedTicket = nil
+        sourceAACTerminalBindings.removeAll(keepingCapacity: true)
         aacWriterInitializationAliases.removeAll(keepingCapacity: true)
         writerInitializationAliases.removeAll(keepingCapacity: true)
         for reservation in coverageReservations.values {

@@ -1056,12 +1056,7 @@ final class AppModel {
         switch StreamProtocolPolicy.evaluate(currentChannel.streamURL) {
         case .allowed:
             alertMessage = nil
-            presentedPlaybackRequest = PlaybackRequest(
-                sourceProfileID: currentChannel.sourceProfileID,
-                channelID: currentChannel.id,
-                streamURL: currentChannel.streamURL,
-                title: currentChannel.displayName
-            )
+            presentedPlaybackRequest = PlaybackRequest(channel: currentChannel)
         case let .rejected(rejection):
             presentedPlaybackRequest = nil
             alertKind = .playback

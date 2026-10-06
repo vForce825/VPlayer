@@ -151,67 +151,153 @@ final class AACCalibrationWorkspace: @unchecked Sendable {
     final class Lease: @unchecked Sendable {
         private let lock = NSLock()
         private var owner: AACCalibrationWorkspace?
+        private var packetPool: ReusablePacketReservation?
         private let kind: Kind
+        private var ownedBytes: Int
+        private var writerAccepted = false
         let bytes: Int
-        init(owner: AACCalibrationWorkspace, kind: Kind, bytes: Int) { self.owner = owner; self.kind = kind; self.bytes = bytes }
+        init(owner: AACCalibrationWorkspace, kind: Kind, bytes: Int) {
+            self.owner = owner; self.kind = kind; self.bytes = bytes; ownedBytes = bytes
+        }
+        fileprivate init(pool: ReusablePacketReservation, bytes: Int) {
+            packetPool = pool; kind = .aacPackets; self.bytes = bytes; ownedBytes = bytes
+        }
+        func markWriterAccepted() {
+            lock.withLock {
+                guard let packetPool, !writerAccepted, ownedBytes > 0 else { return }
+                packetPool.markWriterAccepted(ownedBytes)
+                writerAccepted = true
+            }
+        }
+        fileprivate func returnUnusedPoolCharge(_ count: Int) {
+            let owner = lock.withLock { () -> AACCalibrationWorkspace? in
+                precondition(packetPool == nil && count >= 0 && count <= ownedBytes)
+                ownedBytes -= count
+                return self.owner
+            }
+            owner?.release(kind, bytes: count)
+        }
         func release() {
-            let original = lock.withLock { let result = owner; owner = nil; return result }
-            original?.release(kind, bytes: bytes)
+            let value = lock.withLock { () -> (AACCalibrationWorkspace?, ReusablePacketReservation?, Int, Bool) in
+                defer { owner = nil; packetPool = nil; ownedBytes = 0 }
+                return (owner, packetPool, ownedBytes, writerAccepted)
+            }
+            value.0?.release(kind, bytes: value.2)
+            value.1?.returnBytes(value.2, writerAccepted: value.3)
         }
         deinit { release() }
     }
     final class Reservation: @unchecked Sendable {
         private let lock = NSLock()
         private var owner: AACCalibrationWorkspace?
+        private var packetPool: ReusablePacketReservation?
         private let kind: Kind
         private var remaining: Int
         let reservedBytes: Int
-
         fileprivate init(owner: AACCalibrationWorkspace, kind: Kind, bytes: Int) {
-            self.owner = owner
-            self.kind = kind
-            remaining = bytes
-            reservedBytes = bytes
+            self.owner = owner; self.kind = kind; remaining = bytes; reservedBytes = bytes
         }
-
+        fileprivate init(pool: ReusablePacketReservation, bytes: Int) {
+            packetPool = pool; kind = .aacPackets; remaining = bytes; reservedBytes = bytes
+        }
         var unclaimedBytes: Int { lock.withLock { remaining } }
-
         func claim(bytes: Int) throws -> Lease {
             try lock.withLock {
-                guard let owner, bytes >= 0, bytes <= remaining else {
-                    throw AACRenditionFailure.capacityExceeded
+                guard bytes >= 0, bytes <= remaining else { throw AACRenditionFailure.capacityExceeded }
+                if let packetPool {
+                    remaining -= bytes
+                    return Lease(pool: packetPool, bytes: bytes)
                 }
+                guard let owner else { throw AACRenditionFailure.capacityExceeded }
                 remaining -= bytes
                 return Lease(owner: owner, kind: kind, bytes: bytes)
             }
         }
-
-        /// Return unused escrow once the producer can prove no further Fill is
-        /// possible, retaining the exact budget for its final pending emissions.
         func reduceUnclaimed(to bytes: Int) throws {
-            let release = try lock.withLock { () throws -> (AACCalibrationWorkspace, Int) in
-                guard let owner, bytes >= 0, bytes <= remaining else {
+            let value = try lock.withLock { () throws -> (AACCalibrationWorkspace?, ReusablePacketReservation?, Int) in
+                guard owner != nil || packetPool != nil, bytes >= 0, bytes <= remaining else {
                     throw AACRenditionFailure.capacityExceeded
                 }
-                let released = remaining - bytes
-                remaining = bytes
-                return (owner, released)
+                let unused = remaining - bytes; remaining = bytes
+                return (owner, packetPool, unused)
             }
-            release.0.release(kind, bytes: release.1)
+            value.0?.release(kind, bytes: value.2)
+            value.1?.returnBytes(value.2)
         }
-
         func releaseUnclaimed() {
-            let release = lock.withLock { () -> (AACCalibrationWorkspace, Int)? in
-                guard let owner else { return nil }
-                let bytes = remaining
-                remaining = 0
-                self.owner = nil
-                return (owner, bytes)
+            let value = lock.withLock { () -> (AACCalibrationWorkspace?, ReusablePacketReservation?, Int) in
+                defer { owner = nil; packetPool = nil; remaining = 0 }
+                return (owner, packetPool, remaining)
             }
-            if let release { release.0.release(kind, bytes: release.1) }
+            value.0?.release(kind, bytes: value.2)
+            value.1?.returnBytes(value.2)
         }
-
         deinit { releaseUnclaimed() }
+    }
+
+    final class ReusablePacketReservation: @unchecked Sendable {
+        private let lock = NSLock()
+        private let escrow: Lease
+        private let applicationAdmission: HLSDataPlaneAdmission
+        private let applicationLease: HLSDataPlaneAdmission.Lease
+        private var available: Int
+        private var capacityStorage: Int
+        private var acceptedBytes = 0
+        private var draining = false
+        var capacity: Int { lock.withLock { capacityStorage } }
+        var isDraining: Bool { lock.withLock { draining } }
+        var availableBytes: Int { lock.withLock { available } }
+        var nextBoundaryCapacity: Int { lock.withLock { capacityStorage - acceptedBytes } }
+        fileprivate init(escrow: Lease, applicationLedger: HLSDeliveryApplicationChargeLedger) throws {
+            self.escrow = escrow
+            available = escrow.bytes; capacityStorage = escrow.bytes
+            applicationAdmission = HLSDataPlaneAdmission(capacity: 1, maximumBytes: escrow.bytes,
+                applicationLedger: applicationLedger)
+            guard let lease = applicationAdmission.acquire(bytes: escrow.bytes) else { throw AACRenditionFailure.capacityExceeded }
+            applicationLease = lease
+        }
+        fileprivate func markWriterAccepted(_ bytes: Int) {
+            lock.withLock {
+                precondition(bytes >= 0 && acceptedBytes <= capacityStorage - available - bytes)
+                acceptedBytes += bytes
+            }
+        }
+        func reserveAvailable(preferredBytes: Int, minimumBytes: Int) throws -> Reservation {
+            let bytes = try lock.withLock { () throws -> Int in
+                guard !draining, preferredBytes >= minimumBytes, minimumBytes > 0,
+                      available >= minimumBytes else { throw AACRenditionFailure.capacityExceeded }
+                let count = min(preferredBytes, available)
+                available -= count
+                return count
+            }
+            return Reservation(pool: self, bytes: bytes)
+        }
+        func retireUnusedCapacity() {
+            let unused = lock.withLock { () -> Int in
+                guard !draining else { return 0 }
+                draining = true
+                let unused = available
+                available = 0; capacityStorage -= unused
+                return unused
+            }
+            escrow.returnUnusedPoolCharge(unused)
+        }
+        fileprivate func returnBytes(_ bytes: Int, writerAccepted: Bool = false) {
+            let releaseWorkspace = lock.withLock { () -> Bool in
+                precondition(bytes >= 0 && available <= capacityStorage - bytes)
+                if writerAccepted { precondition(acceptedBytes >= bytes); acceptedBytes -= bytes }
+                if draining { capacityStorage -= bytes } else { available += bytes }
+                return draining
+            }
+            if releaseWorkspace { escrow.returnUnusedPoolCharge(bytes) }
+        }
+    }
+
+    func reserveReusablePackets(bytes: Int,
+        applicationLedger: HLSDeliveryApplicationChargeLedger = .shared) throws -> ReusablePacketReservation {
+        guard bytes > 0 else { throw AACRenditionFailure.capacityExceeded }
+        let escrow = try acquire(.aacPackets, bytes: bytes)
+        return try ReusablePacketReservation(escrow: escrow, applicationLedger: applicationLedger)
     }
     private let lock = NSLock()
     private var totals = [Int](repeating: 0, count: 6)

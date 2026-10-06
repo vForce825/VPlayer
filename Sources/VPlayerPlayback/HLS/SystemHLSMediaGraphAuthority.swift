@@ -8,6 +8,63 @@ import Foundation
 import Metal
 import VPlayerCore
 
+/// Reconciliation only; the existing per-AU remux/encoder admission remains the
+/// authority. Unknown source scan must never inherit the legacy progressive default.
+enum HLSGeneratedVideoPlanPolicy {
+    static func accepts(plan: HLSPlaybackPlan.Video, source: HLSScanEvidence,
+                        actual: VideoScanClassificationEvidence) -> Bool {
+        switch (plan, source, actual) {
+        case (.remux, .progressive, .progressive),
+             (.deinterlaceAndEncode, .interlaced, .interlaced): true
+        default: false
+        }
+    }
+
+    static func configurationFingerprint(format: CMVideoFormatDescription, codec: VideoCodec,
+                                         copyOwnership: HLSAudioCopyOwnership) throws -> Data {
+        guard let lease = copyOwnership.compressedInput.acquire(
+            bytes: HLSVideoConfigurationFingerprint.maximumBytes + 8_192) else {
+            throw HLSSourceError.capacity
+        }
+        return try withExtendedLifetime((HLSAudioCopyTail(lease), format)) {
+            var count = 0
+            var firstPointer: UnsafePointer<UInt8>?
+            var firstSize = 0
+            func read(_ index: Int, pointer: inout UnsafePointer<UInt8>?, size: inout Int,
+                      count: inout Int) -> OSStatus {
+                if codec == .h264 {
+                    return CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format, parameterSetIndex: index,
+                        parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
+                        parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+                }
+                return CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(format, parameterSetIndex: index,
+                    parameterSetPointerOut: &pointer, parameterSetSizeOut: &size,
+                    parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
+            }
+            guard read(0, pointer: &firstPointer, size: &firstSize, count: &count) == noErr,
+                  count > 0, count <= HLSVideoConfigurationFingerprint.maximumParameterSets else {
+                throw HLSSourceError.incompleteEvidence
+            }
+            var parameterSets: [Data] = []
+            parameterSets.reserveCapacity(count)
+            var total = 0
+            for index in 0..<count {
+                var pointer: UnsafePointer<UInt8>?
+                var size = 0, actualCount = 0
+                guard read(index, pointer: &pointer, size: &size, count: &actualCount) == noErr,
+                      actualCount == count, let pointer, size > 0,
+                      size <= HLSVideoConfigurationFingerprint.maximumBytes - total else {
+                    throw HLSSourceError.incompleteEvidence
+                }
+                parameterSets.append(Data(bytes: pointer, count: size))
+                total += size
+            }
+            return try HLSVideoConfigurationFingerprint.make(codec: codec, parameterSets: parameterSets)
+        }
+    }
+
+}
+
 /// 渐进视频即将推进共同边界前，必须先让已排队音频追到上一视频时刻。
 /// 隔行分支的安全终点由转码输出的 `writtenThrough` 单独证明，不能复用输入 PTS。
 enum HLSMediaGraphAudioDrainPolicy {
@@ -374,6 +431,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             error: Error
         ) {
             dispatchPrecondition(condition: .onQueue(writerQueue))
+            if let typed = error as? SegmentedFMP4WriterFailure,
+               typed == .newGenerationRequired || typed == .compressedAudioCompatibilityRequired {
+                authority?.fail(typed)
+                completeCurrentEnvelope()
+                return
+            }
             envelope.withBorrowedOutput { output in
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
@@ -391,6 +454,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             _ envelope: HLSVideoEncodedOutputEnvelope,
             error: Error
         ) {
+            if let typed = error as? SegmentedFMP4WriterFailure,
+               typed == .newGenerationRequired || typed == .compressedAudioCompatibilityRequired {
+                authority?.fail(typed)
+                return
+            }
             envelope.withBorrowedOutput { output in
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
@@ -445,6 +513,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             initial: Bool, startTime: CMTime
         ) throws -> SegmentedFMP4Writer {
             let currentBinding = binding
+            let acceptanceProbe = authority?.acceptanceProbe
             let created = try publication.makeRelay(
                 binding: currentBinding, mediaType: .video, limits: .video,
                 initial: initial
@@ -454,8 +523,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     boundarySession: boundary.session,
                     compressedFormatConfiguration: nil,
                     videoCadencePolicy: .strict, relay: relay,
-                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(),
-                    writerWindowContinuation: continuation)
+                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
+                    writerWindowContinuation: continuation, acceptanceProbe: acceptanceProbe)
             }
             try created.start(at: startTime)
             writer = created
@@ -591,7 +660,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
 
     }
-    private enum State { case reading, playable, finishing, retiring, retired, failed }
+    private enum State { case reading, playable, finishing, failing, retiring, retired, failed }
 
     private let condition = NSCondition()
     private let lifecycle: OutputLifecycleEpoch
@@ -600,7 +669,11 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private let publicationDeadlineNanoseconds: Int64
     private let publicationWaitInterval: TimeInterval
     private let runtimeFailureSink: @Sendable (ErrorDiagnosticSnapshot) -> Void
-    private let timeline = HLSTimelineCoordinator()
+    private let generatedSource: (any HLSGeneratedSourceContext)?
+    private let sourceCopyOwnership: HLSAudioCopyOwnership?
+    private let failureDispatchGroup: DispatchGroup?
+    private var failureDispatchInFlight = false
+    private let timeline: HLSTimelineCoordinator
     private let stream: AsyncStream<AdmittedDemuxEvent>
     private let streamContinuation: AsyncStream<AdmittedDemuxEvent>.Continuation
     private var worker: Task<Void, Never>!
@@ -611,6 +684,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var loopbackServer: LoopbackHTTPServer?
     private var prefixPreparationInFlight = false
     private var prefixRetirementWaiter: CheckedContinuation<Void, Never>?
+    /// Written from inspected video facts, read under condition only when the
+    /// real all-track prefix has proved that the selected output branch works.
+    private var mediaInformation: PlaybackMediaInformation?
 
     // 以下只由 worker 访问，retire 在 worker 终止后才释放。
     private var tracks: DemuxTrackSet?
@@ -633,11 +709,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var videoEligibility: VideoRemuxEligibility?
     private var videoBuilder: HLSVideoRemuxSubmissionBuilder?
     private var videoFrameRateConfigured = false
+    private var generatedVideoParameterSetIdentity: VideoAccessUnitSHA256?
     private var audioConfiguration: CompressedAudioRenderConfiguration?
     private var audioCalibration: AACCalibrationReceipt?
+    private var audioCalibrationAttemptCount = 0
     private var audioBridge: SystemHLSAudioPCMBridge?
     private var audioConverter: AudioRenditionConverter?
     private var audioBranch: AudioRenditionBranch?
+    private var sourceAACBranch: SourceAACRenditionBranch?
+    private var dolbyBranch: DolbyCompressedAudioRenditionBranch?
+    private var dolbyProducer: DolbyAudioSourceProducer?
+    private var selectedCompressedAudio: AudioCodec?
+    private var compressedAudioBinding: FMP4WriterBinding?
+    private var selectedAudioFacts: HLSSourceAudioFacts?
+    private let sourceApplicationLedger: HLSDeliveryApplicationChargeLedger
+    private var audioCanAcceptInput: Bool {
+        audioBranch != nil || sourceAACBranch != nil || dolbyBranch != nil
+            || (selectedCompressedAudio != nil && boundary != nil)
+    }
+    private let acceptanceProbe: HLSWriterAcceptanceProbe?
+    private let sharedControlExecutor: PlaybackControlExecutor?
     private var pendingAudio: [HLSTimedAudioAccessUnit] = []
     private var maxVideoPTS: CMTime?
     private var encoderPCMIndex: Int64 = 0
@@ -653,13 +744,38 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     init(
         lifecycle: OutputLifecycleEpoch,
         publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
-        initialWindowMinimumSeconds: Int = 3,
-        failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in }
+        acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
+        initialWindowMinimumSeconds: Int = 6,
+        publicationClock: (any PlaybackMonotonicClock)? = nil,
+        failureSink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void = { _ in },
+        generatedSource: (any HLSGeneratedSourceContext)? = nil,
+        sourceCopyApplicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
+        sharedControlExecutor: PlaybackControlExecutor? = nil
     ) throws {
         guard publicationDeadlineNanoseconds > 0 else {
             throw HLSPublicationFailure.invalidDuration
         }
         self.lifecycle = lifecycle
+        self.acceptanceProbe = acceptanceProbe
+        self.sharedControlExecutor = sharedControlExecutor
+        sourceApplicationLedger = sourceCopyApplicationLedger
+        self.generatedSource = generatedSource
+        if let generatedSource {
+            try Self.validateGeneratedSource(generatedSource, lifecycle: lifecycle)
+            let charge = try HLSCompressedAudioApplicationReservation.reserve(bytes: 16_384,
+                ledger: sourceCopyApplicationLedger)
+            let ownership = HLSAudioCopyOwnership(maximumCompressedBytes: 8 * 1_024 * 1_024,
+                maximumPCMBytes: 8 * 1_024 * 1_024, capacity: 2_048,
+                applicationLedger: sourceCopyApplicationLedger, fixedApplicationCharge: charge)
+            sourceCopyOwnership = ownership
+            timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: ownership,
+                sharedControlExecutor: sharedControlExecutor)
+            failureDispatchGroup = DispatchGroup()
+        } else {
+            sourceCopyOwnership = nil
+            timeline = HLSTimelineCoordinator()
+            failureDispatchGroup = nil
+        }
         runtimeFailureSink = failureSink
         itemGeneration = lifecycle.outputNonce
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
@@ -668,7 +784,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         publication = try SystemHLSPublicationGraph(
             itemGeneration: lifecycle.outputNonce,
             publicationDeadlineNanoseconds: publicationDeadlineNanoseconds,
-            initialWindowMinimumSeconds: initialWindowMinimumSeconds)
+            initialWindowMinimumSeconds: initialWindowMinimumSeconds,
+            clock: publicationClock)
         let pair = AsyncStream<AdmittedDemuxEvent>.makeStream()
         stream = pair.stream
         streamContinuation = pair.continuation
@@ -696,15 +813,37 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         #endif
         do {
             for await admitted in stream {
+                if let generatedSource, !generatedSource.isCurrent { throw HLSSourceError.staleResolution }
                 try Task.checkCancellation()
-                guard condition.withLock({ state != .failed && state != .retiring && state != .retired }) else { return }
+                guard condition.withLock({ state != .failed && state != .failing && state != .retiring && state != .retired }) else { return }
                 var borrowed: DemuxEvent?
                 admitted.withBorrowedEvent { borrowed = $0 }
                 guard let borrowed else { continue }
                 switch borrowed {
-                case .tracks(let value), .discontinuity(let value, _):
+                case .discontinuity:
+                    // This graph owns one epoch. Rebinding a live producer would
+                    // revoke queued proofs and retain the previous audio branch.
+                    // The original source owner joins this graph and performs the
+                    // bounded item-generation replacement instead.
+                    throw SegmentedFMP4WriterFailure.newGenerationRequired
+                case .tracks(let value):
+                    if let generatedSource {
+                        let selected = try selectedMediaFacts(generatedSource)
+                        guard (selected.video == nil) == (value.video == nil),
+                              selected.audio.isEmpty == (value.audio == nil) else {
+                            throw HLSSourceError.incompleteEvidence
+                        }
+                        if let video = value.video, let expected = selected.video {
+                            guard expected.codec == video.codec,
+                                  expected.width == 0 || expected.width == video.width,
+                                  expected.height == 0 || expected.height == video.height else {
+                                throw HLSSourceError.incompleteEvidence
+                            }
+                        }
+                    }
                     tracks = value
                     retainedTrackOwner = admitted
+                    try prepareAudioSelection(value)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.set("g_got_tracks")
                     #endif
@@ -713,6 +852,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 }
                 for event in try timeline.consume(borrowed) {
                     try await consume(event)
+                }
+                if case .tracks = borrowed, selectedCompressedAudio == nil {
+                    try timeline.useCompatibleAudioBeforeSourceAppend()
                 }
             }
         } catch {
@@ -726,12 +868,22 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     private func consume(_ event: HLSTimelineEvent) async throws {
         switch event {
+        case .audioSample, .videoSample:
+            try await publication.waitForProducerCapacity()
+        default:
+            break
+        }
+        guard condition.withLock({ state != .failing && state != .failed && state != .retiring && state != .retired }) else {
+            throw CancellationError()
+        }
+        if let generatedSource, !generatedSource.isCurrent { throw HLSSourceError.staleResolution }
+        switch event {
         case .originEstablished(let origin):
             setDiagnosticStage("timeline.origin")
             if tracks?.video == nil, boundary == nil {
                 try publication.configureAudioOnly()
                 boundary = try SegmentBoundaryCoordinator(mode: .audioOnly(epochStart: origin.effectiveStart.cmTime))
-                mediaEpoch = .init(rawValue: try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch))
+                if mediaEpoch == nil { mediaEpoch = .init(rawValue: try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch)) }
                 try installAudioWriterIfReady()
             }
         case .audioFormat(let configuration):
@@ -749,7 +901,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             let isAheadOfVideo = maxVideoPTS.map {
                 CMTimeCompare(timed.timing.presentationTimeStamp.cmTime, $0) > 0
             } ?? true
-            if audioBranch == nil || interlacedVideoBranch != nil || !pendingAudio.isEmpty || isAheadOfVideo {
+            if !audioCanAcceptInput || interlacedVideoBranch != nil || !pendingAudio.isEmpty || isAheadOfVideo {
                 guard pendingAudio.count < 2048 else {
                     PlaybackDiagnosticTracker.shared.set("cap_pending_audio_\(pendingAudio.count)")
                     throw HLSPublicationFailure.capacityExceeded
@@ -766,7 +918,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             setDiagnosticStage("video.append")
             if let drainThrough = HLSMediaGraphAudioDrainPolicy.drainBeforeVideo(
                 pendingAudioCount: pendingAudio.count,
-                hasAudioBranch: audioBranch != nil,
+                hasAudioBranch: audioCanAcceptInput,
                 hasInterlacedVideoBranch: interlacedVideoBranch != nil,
                 previousVideoPTS: maxVideoPTS
             ) {
@@ -783,15 +935,15 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 maxVideoPTS = currentPTS
             }
             try await appendVideo(timed)
-            if audioBranch == nil {
+            if !audioCanAcceptInput {
                 setDiagnosticStage("audio.installWriter")
                 try installAudioWriterIfReady()
             }
             // TS 交错顺序允许首批视频早于 audio format。writer 尚未具备完整格式证明时，
             // 保留已经 admission 的音频，不能清空后调用一个尚不存在的 branch。
-            if audioBranch != nil, interlacedVideoOutput != nil {
+            if audioCanAcceptInput, interlacedVideoOutput != nil {
                 try await flushInterlacedAudioIfSafe(trigger: .videoSampleSubmitted)
-            } else if audioBranch != nil {
+            } else if audioCanAcceptInput {
                 if !pendingAudio.isEmpty, let effectiveVideoPTS = maxVideoPTS {
                     setDiagnosticStage("audio.flushPending")
                     PlaybackDiagnosticTracker.shared.set("fpa_cnt\(pendingAudio.count)_v\(effectiveVideoPTS.value / Int64(effectiveVideoPTS.timescale))")
@@ -815,7 +967,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private func flushInterlacedAudioIfSafe(
         trigger: HLSMediaGraphAudioDrainPolicy.InterlacedTrigger
     ) async throws {
-        guard audioBranch != nil, let interlacedVideoOutput else { return }
+        guard audioCanAcceptInput, let interlacedVideoOutput else { return }
         setDiagnosticStage("audio.flushBehindVideo")
         let safeAudioEnd = HLSMediaGraphAudioDrainPolicy.drainBehindInterlacedVideo(
             pendingAudioCount: pendingAudio.count,
@@ -835,6 +987,138 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
     }
 
+    private func prepareAudioSelection(_ tracks: DemuxTrackSet) throws {
+        guard let generatedSource, case let .passthrough(codec) = generatedSource.plan.audio,
+              let track = tracks.audio else { return }
+        let media = try selectedMediaFacts(generatedSource)
+        guard media.audio.count == 1, let facts = media.audio.first,
+              facts.codec == track.codec, facts.codec == codec,
+              facts.sampleRate == track.sampleRate, facts.channelCount == track.channelLayout.channelCount else {
+            throw HLSSourceError.incompleteEvidence
+        }
+        guard let nativeMask = track.channelLayout.nativeMask else { return }
+        guard facts.channelMask == nativeMask else { throw HLSSourceError.incompleteEvidence }
+        let capabilities = HLSOutputCapabilities(compressedAudioCodecs: [codec],
+            verifiedCompressedAudioConfigurations: generatedSource.plan.compressedAudioConfiguration.map { [$0] } ?? [],
+            compressedAudioAdmissionCandidates: generatedSource.plan.compressedAudioAdmissionCandidate.map { [$0] } ?? [])
+        guard HLSAudioProcessingPolicy.select(source: facts, capabilities: capabilities,
+            hasVideo: tracks.video != nil) == .passthrough(codec), let sourceCopyOwnership else { return }
+        selectedAudioFacts = facts
+        if mediaEpoch == nil { mediaEpoch = .init(rawValue: try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch)) }
+        guard let mediaEpoch else { throw HLSSourceError.incompleteEvidence }
+        let binding = try makeBinding(mediaEpoch: mediaEpoch)
+        if codec == .ac3 || codec == .eac3 {
+            guard facts.decoderConfiguration == track.extradata else { throw HLSSourceError.incompleteEvidence }
+            guard let sharedControlExecutor else { return }
+            let producer = try DolbyAudioSourceProducer(tracks: tracks, binding: binding,
+                sharedControlExecutor: sharedControlExecutor, copyOwnership: sourceCopyOwnership,
+                applicationLedger: sourceApplicationLedger)
+            try timeline.installDolbyProducer(producer)
+            dolbyProducer = producer
+        }
+        compressedAudioBinding = binding
+        selectedCompressedAudio = codec
+    }
+
+    private func fallBackBeforeCompressedAppend() async throws {
+        guard sourceAACBranch == nil, dolbyBranch == nil, let saved = audioConfiguration else {
+            throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+        }
+        try timeline.useCompatibleAudioBeforeSourceAppend()
+        dolbyProducer?.invalidateSourceInput(); dolbyProducer = nil
+        selectedCompressedAudio = nil; compressedAudioBinding = nil
+        audioConfiguration = nil
+        try await configureAudio(saved)
+        try installAudioWriterIfReady()
+    }
+
+    private static func successorAudioBinding(_ previous: FMP4WriterBinding) throws -> FMP4WriterBinding {
+        .init(outputLifecycleEpoch: previous.outputLifecycleEpoch, itemGeneration: previous.itemGeneration,
+            mediaEpoch: previous.mediaEpoch, publicationParticipantID: previous.publicationParticipantID,
+            renditionIdentity: previous.renditionIdentity,
+            writerIdentity: .init(rawValue: try PlaybackIdentityAllocator.shared.next(in: .nonce)))
+    }
+
+    private func appendCompressedAudio(_ timed: HLSTimedAudioAccessUnit) async throws {
+        guard let codec = selectedCompressedAudio, let facts = selectedAudioFacts,
+              let binding = compressedAudioBinding, let boundary else { throw AACRenditionFailure.invalidInput }
+        if sourceAACBranch == nil, dolbyBranch == nil,
+           (timed.boundaryDecision != .unchanged || timed.sourceOriginReceipt?.effectiveStart != timed.timing.presentationTimeStamp) {
+            try await fallBackBeforeCompressedAppend()
+            try await appendAudio(timed)
+            return
+        }
+        let graph = publication
+        let holder = BoundaryHolder(boundary)
+        let probe = acceptanceProbe
+        let ledger = sourceApplicationLedger
+        if codec == .aac {
+            if sourceAACBranch == nil {
+                let configuration: SourceAACWriterConfiguration
+                do {
+                    configuration = try .init(first: timed, source: facts, binding: binding, applicationLedger: ledger)
+                } catch let error as SourceAACFailure where error == .unsupportedSource || error == .timelineMismatch || error == .sourceMismatch {
+                    try await fallBackBeforeCompressedAppend()
+                    try await appendAudio(timed)
+                    return
+                }
+                do {
+                    let branch = try SourceAACRenditionBranch(configuration: configuration, boundary: boundary) { configuration, continuation in
+                        let current = try continuation.map { try Self.successorAudioBinding($0.predecessorTerminal.binding) } ?? binding
+                        return try graph.makeRelay(binding: current, mediaType: .audio, limits: .audio,
+                            initial: continuation == nil) { relay in
+                            try SegmentedFMP4Writer(binding: current, trackKind: .aac,
+                                sourceFormatHint: configuration.sourceFormatHint, boundarySession: holder.value.session,
+                                compressedFormatConfiguration: nil, relay: relay,
+                                systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: probe),
+                                writerWindowContinuation: continuation, applicationLedger: ledger,
+                                acceptanceProbe: probe, sourceAACConfiguration: configuration)
+                        }
+                    }
+                    condition.withLock { sourceAACBranch = branch }
+                } catch SegmentedFMP4WriterFailure.unsupportedCompressedAudioFormat {
+                    throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+                }
+            }
+            try await sourceAACBranch!.append(timed)
+        } else {
+            guard let producer = dolbyProducer else { throw DolbyAudioSourceFailure.missingOutputAuthority }
+            if dolbyBranch == nil {
+                guard let plan = timeline.makeCompressedAudioCandidatePlan(for: timed),
+                      let authorization = producer.coordinator.authorizeCompressedCandidate(plan) else {
+                    try await fallBackBeforeCompressedAppend()
+                    try await appendAudio(timed)
+                    return
+                }
+                let layout = producer.source.channelLayout
+                let branch = try DolbyCompressedAudioRenditionBranch(producer: producer,
+                    authorization: authorization, boundary: boundary,
+                    initialFormatAdmission: { configuration, format, sourceLayout in
+                        let profile: UInt8 = switch configuration { case let .ac3(value): value.bsid; case let .eac3(value): value.bsid }
+                        return configuration.codec == facts.codec && Int32(profile) == facts.profile
+                            && format.sampleRate == facts.sampleRate && format.channelCount == facts.channelCount
+                            && sourceLayout.nativeMask == facts.channelMask
+                    }, writerFactory: { configuration, format, continuation in
+                        let current = try continuation.map { try Self.successorAudioBinding($0.predecessorTerminal.binding) } ?? binding
+                        return try graph.makeRelay(binding: current, mediaType: .audio, limits: .audio,
+                            initial: continuation == nil) { relay in
+                            try SegmentedFMP4Writer(binding: current, trackKind: codec == .ac3 ? .ac3 : .eac3,
+                                sourceFormatHint: format, boundarySession: holder.value.session,
+                                compressedFormatConfiguration: configuration, relay: relay,
+                                systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: probe),
+                                writerWindowContinuation: continuation, applicationLedger: ledger,
+                                acceptanceProbe: probe, compressedSourceLayout: layout)
+                        }
+                    })
+                condition.withLock { dolbyBranch = branch }
+            }
+            do { try await dolbyBranch!.append(timed) }
+            catch DolbyCompressedAudioRenditionFailure.initialWriterUnsupported {
+                throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
+            }
+        }
+    }
+
     private func configureAudio(_ configuration: CompressedAudioRenderConfiguration) async throws {
         if let existing = audioConfiguration {
             guard existing.fingerprint == configuration.fingerprint else {
@@ -843,6 +1127,10 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             return
         }
         guard let track = tracks?.audio else { throw AACRenditionFailure.invalidInput }
+        if selectedCompressedAudio != nil {
+            audioConfiguration = configuration
+            return
+        }
         // Audio-only publishes one same-layout AAC rendition. Keep mono/multichannel
         // fidelity; the A/V compatibility policy remains the existing stereo rendition.
         let layout = try tracks?.video == nil
@@ -850,6 +1138,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             : RenditionAudioLayout(labels: [.l, .r])
         let request = try AACRenditionRequest(
             layout: layout, capabilityVersion: "system-hls-task22-v1")
+        condition.withLock { audioCalibrationAttemptCount += 1 }
         let receipt = try await AACPrimingCalibrator().calibrate(
             plan: AACCalibrationPlan.build([request]))
         guard receipt.encoders.count == 1 else { throw AACRenditionFailure.calibrationMismatch }
@@ -878,7 +1167,10 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 generation: timed.source.generation, codec: track.codec)
             videoEligibility = try VideoRemuxEligibility(
                 generation: timed.source.generation, track: track,
-                sampleEntry: track.codec == .h264 ? .avc3 : .hev1)
+                // Canonical native codec identifiers match the declared avc1/hvc1
+                // packaging. Every AU is inspected before only matching configuration
+                // NALs are stripped; VCL, SEI and all other NAL bytes stay unchanged.
+                sampleEntry: track.codec == .h264 ? .avc1 : .hvc1)
         }
         let sourcePTS = try ExactMediaTime(
             CMSampleBufferGetPresentationTimeStamp(timed.source.sampleBuffer))
@@ -903,6 +1195,32 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             decodeTimeStamp: resolvedDTS,
             duration: try ExactMediaTime(CMSampleBufferGetDuration(timed.source.sampleBuffer)),
             expectedFormat: track))
+        if let generatedSource {
+            let selected = try selectedMediaFacts(generatedSource)
+            guard let expected = selected.video,
+                  HLSGeneratedVideoPlanPolicy.accepts(plan: generatedSource.plan.video,
+                    source: expected.scan, actual: proof.scanClassification),
+                  expected.codec == proof.codec,
+                  expected.profile < 0 || expected.profile == Int32(proof.format.profileIDC),
+                  expected.width == 0 || expected.width == proof.format.width,
+                  expected.height == 0 || expected.height == proof.format.height else {
+                throw HLSSourceError.incompleteEvidence
+            }
+            if generatedSource.plan.video == .remux, !expected.parameterSetsValidated {
+                throw HLSSourceError.incompleteEvidence
+            }
+            if let frozen = generatedVideoParameterSetIdentity {
+                guard frozen == proof.parameterSets.combinedSHA256 else { throw HLSSourceError.incompleteEvidence }
+            } else {
+                guard !expected.configurationFingerprint.isEmpty, let sourceCopyOwnership,
+                      let format = CMSampleBufferGetFormatDescription(timed.source.sampleBuffer),
+                      try HLSGeneratedVideoPlanPolicy.configurationFingerprint(format: format,
+                        codec: proof.codec, copyOwnership: sourceCopyOwnership) == expected.configurationFingerprint else {
+                    throw HLSSourceError.incompleteEvidence
+                }
+                generatedVideoParameterSetIdentity = proof.parameterSets.combinedSHA256
+            }
+        }
         #if DEBUG
         if proof.randomAccessKind == .h264IDR || proof.randomAccessKind == .hevcIDR {
             if let previous = previousRandomAccessDiagnostic,
@@ -934,6 +1252,16 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: track.frameRate)
+            condition.withLock {
+                mediaInformation = PlaybackMediaInformation(
+                    width: proof.format.width, height: proof.format.height,
+                    scanMode: .progressive,
+                    sourceFrameRate: track.frameRate ?? proof.format.frameRate,
+                    outputFrameRate: (track.frameRate ?? proof.format.frameRate).map {
+                        Double($0.num) / Double($0.den)
+                    },
+                    isSmoothMotionEnhanced: false)
+            }
             videoFrameRateConfigured = true
         }
         if boundary == nil {
@@ -942,8 +1270,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 videoMode: .passthrough,
                 minimumPassthroughInterval: CMTime(value: 90, timescale: 100),
                 maximumPassthroughInterval: CMTime(value: 6, timescale: 1)))
-            mediaEpoch = .init(rawValue:
-                try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch))
+            if mediaEpoch == nil { mediaEpoch = .init(rawValue:
+                try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch)) }
         }
         if videoWriter == nil {
             guard let boundary, let mediaEpoch else {
@@ -959,7 +1287,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     sourceFormatHint: builder.formatDescription,
                     boundarySession: boundary.session,
                     compressedFormatConfiguration: nil, relay: relay,
-                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
+                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
+                    acceptanceProbe: acceptanceProbe)
             }
             try writer.start(at: timed.timing.presentationTimeStamp.cmTime)
             videoBinding = binding
@@ -994,8 +1323,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     sourceFormatHint: builder.formatDescription,
                     boundarySession: boundary.session,
                     compressedFormatConfiguration: nil, relay: relay,
-                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(),
-                    writerWindowContinuation: continuation)
+                    systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
+                    writerWindowContinuation: continuation, acceptanceProbe: acceptanceProbe)
             }
             do {
                 let admission = try requireVideoWindowAdmission(nextWriter)
@@ -1028,6 +1357,13 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: outputFrameRate)
+            condition.withLock {
+                mediaInformation = PlaybackMediaInformation(
+                    width: inspection.format.width, height: inspection.format.height,
+                    scanMode: .interlaced, sourceFrameRate: sourceFrameRate,
+                    outputFrameRate: Double(outputFrameRate.num) / Double(outputFrameRate.den),
+                    isSmoothMotionEnhanced: true)
+            }
             videoFrameRateConfigured = true
         }
         if interlacedVideoBranch == nil {
@@ -1062,8 +1398,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 epochStart: start,
                 videoMode: .passthrough,
                 minimumPassthroughInterval: CMTime(value: 90, timescale: 100)))
-            let mediaEpoch = AudioMediaEpochIdentity(rawValue:
-                try PlaybackIdentityAllocator.shared.next(in: .mediaEpoch))
+            let mediaEpoch = try self.mediaEpoch ?? AudioMediaEpochIdentity(rawValue:
+                PlaybackIdentityAllocator.shared.next(in: .mediaEpoch))
             let binding = try makeBinding(mediaEpoch: mediaEpoch)
             let input = try videoInputSignature(inspection.format)
             let bitrate = try VTVideoBitratePolicy.freeze(
@@ -1498,7 +1834,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     private func installAudioWriterIfReady() throws {
-        guard audioBranch == nil, let configuration = audioConfiguration,
+        guard selectedCompressedAudio == nil, audioBranch == nil, let configuration = audioConfiguration,
               let encoder = audioCalibration?.encoders.first,
               let track = tracks?.audio, let boundary, let mediaEpoch else { return }
         let converter = try Self.makeAudioConverter(
@@ -1521,6 +1857,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         let initialBinding = binding
         let graph = publication
         let boundaryHolder = BoundaryHolder(boundary)
+        let acceptanceProbe = self.acceptanceProbe
         let branch = AudioRenditionBranch(
             encoder: encoder, writer: writer, coordinator: boundary,
             writerWindowFactory: { [weak graph, boundaryHolder, format] continuation in
@@ -1536,7 +1873,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 return try Self.makeAACWriter(
                     publication: graph, binding: next, format: format,
                     boundary: boundaryHolder.value,
-                    continuation: continuation, initial: false)
+                    continuation: continuation, initial: false, acceptanceProbe: acceptanceProbe)
             })
         audioConverter = converter
         audioBridge = bridge
@@ -1549,13 +1886,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         throws -> SegmentedFMP4Writer {
         try Self.makeAACWriter(
             publication: publication, binding: binding, format: format,
-            boundary: boundary, continuation: continuation, initial: initial)
+            boundary: boundary, continuation: continuation, initial: initial, acceptanceProbe: acceptanceProbe)
     }
 
     private static func makeAACWriter(
         publication: SystemHLSPublicationGraph, binding: FMP4WriterBinding,
         format: CMFormatDescription, boundary: SegmentBoundaryCoordinator,
-        continuation: AACWriterWindowContinuation?, initial: Bool
+        continuation: AACWriterWindowContinuation?, initial: Bool,
+        acceptanceProbe: HLSWriterAcceptanceProbe?
     ) throws -> SegmentedFMP4Writer {
         try publication.makeRelay(
             binding: binding, mediaType: .audio, limits: .audio, initial: initial) { relay in
@@ -1563,12 +1901,16 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 binding: binding, trackKind: .aac, sourceFormatHint: format,
                 boundarySession: boundary.session,
                 compressedFormatConfiguration: nil, relay: relay,
-                systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(),
-                aacContinuation: continuation)
+                systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
+                aacContinuation: continuation, acceptanceProbe: acceptanceProbe)
         }
     }
 
     private func appendAudio(_ timed: HLSTimedAudioAccessUnit) async throws {
+        if selectedCompressedAudio != nil {
+            try await appendCompressedAudio(timed)
+            return
+        }
         guard let bridge = audioBridge, let converter = audioConverter,
               let branch = audioBranch else {
             throw AACRenditionFailure.invalidInput
@@ -1593,7 +1935,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private func flushPendingAudio(
         through videoPTS: CMTime?, maximumCount: Int? = nil
     ) async throws {
-        guard audioBranch != nil else { return }
+        guard audioCanAcceptInput else { return }
         var consumedCount = 0
         while let first = pendingAudio.first {
             if let maximumCount, consumedCount >= maximumCount { return }
@@ -1691,7 +2033,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
 
     private func finishNaturalEOFIsolated() async throws {
         let canFinish = condition.withLock { () -> Bool in
-            guard state != .failed, state != .retiring, state != .retired else { return false }
+            guard state != .failed, state != .failing, state != .retiring, state != .retired else { return false }
             state = .finishing
             return true
         }
@@ -1723,20 +2065,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             finishedInterlacedVideo = false
             try await flushPendingAudio(through: nil)
         }
-        setDiagnosticStage("naturalEOF.audioDrain")
-        guard let bridge = audioBridge, let converter = audioConverter,
-              let branch = audioBranch else { throw AACRenditionFailure.invalidInput }
-        for decoded in try bridge.drainForNaturalEOF() {
-            try await appendDecodedAudio(decoded, converter: converter, branch: branch)
+        if let sourceAACBranch {
+            _ = try await sourceAACBranch.finish()
+        } else if let dolbyBranch {
+            _ = try await dolbyBranch.finish()
+        } else {
+            setDiagnosticStage("naturalEOF.audioDrain")
+            guard let bridge = audioBridge, let converter = audioConverter,
+                  let branch = audioBranch else { throw AACRenditionFailure.invalidInput }
+            for decoded in try bridge.drainForNaturalEOF() {
+                try await appendDecodedAudio(decoded, converter: converter, branch: branch)
+            }
+            let tail = try converter.drain()
+            if !tail.samples.isEmpty { try await pump(tail, into: branch) }
+            setDiagnosticStage("naturalEOF.audioEncoder")
+            let terminal = try await settleAudioPump(
+                try await branch.pumpAwaitingWriter(.endOfStream), branch: branch)
+            guard terminal.finalReceipt != nil else { throw AACRenditionFailure.invalidInput }
+            setDiagnosticStage("naturalEOF.audioWriter")
+            _ = try await branch.finishRendition()
         }
-        let tail = try converter.drain()
-        if !tail.samples.isEmpty { try await pump(tail, into: branch) }
-        setDiagnosticStage("naturalEOF.audioEncoder")
-        let terminal = try await settleAudioPump(
-            try await branch.pumpAwaitingWriter(.endOfStream), branch: branch)
-        guard terminal.finalReceipt != nil else { throw AACRenditionFailure.invalidInput }
-        setDiagnosticStage("naturalEOF.audioWriter")
-        _ = try await branch.finishRendition()
         if !finishedInterlacedVideo, tracks?.video != nil {
             setDiagnosticStage("naturalEOF.video")
             guard let videoWriter else {
@@ -1747,7 +2095,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         let publicationResult = try await publication.finishNaturalEnd()
         setDiagnosticStage("naturalEOF.complete")
         condition.withLock {
-            guard state != .failed, state != .retiring, state != .retired else { return }
+            guard state != .failed, state != .failing, state != .retiring, state != .retired else { return }
             terminalResult = publicationResult == .endListPublished
             condition.broadcast()
         }
@@ -1768,6 +2116,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         guard mayPrepare else { return nil }
         defer {
             let waiter = condition.withLock { () -> CheckedContinuation<Void, Never>? in
+                // Even a publication deadline/catch must not expose prepare failure
+                // while its owned compatibility classification is still pending.
+                while failureDispatchInFlight && state != .retiring && state != .retired { condition.wait() }
                 prefixPreparationInFlight = false
                 defer { prefixRetirementWaiter = nil }
                 return prefixRetirementWaiter
@@ -1799,15 +2150,17 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_loopback_ready")
             #endif
-            let mayCommit = condition.withLock { () -> Bool in
+            return condition.withLock {
                 // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
-                guard state != .failed, state != .retiring, state != .retired else { return false }
+                while failureDispatchInFlight && state != .retiring && state != .retired { condition.wait() }
+                guard state != .failed, state != .retiring, state != .retired else { return nil }
                 state = .playable
-                return true
+                return AVPlayerItemReplacementBundle(
+                    request: prepared.replacement.request,
+                    evidenceSource: prepared.replacement.evidenceSource,
+                    mediaInformation: mediaInformation)
             }
-            guard mayCommit else { return nil }
-            return prepared.replacement
         } catch {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_fail")
@@ -1827,8 +2180,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         // 可播前缀只覆盖开头三秒，剩余媒体仍在离线生成；真机硬件编码和
         // 多个 writer window 的自然收尾不能被一个短于剩余节目时长的上限截断。
         let deadline = Date().addingTimeInterval(publicationWaitInterval)
-        while terminalResult == nil && condition.wait(until: deadline) {}
-        return terminalResult == true
+        while (terminalResult == nil || failureDispatchInFlight) && condition.wait(until: deadline) {}
+        return !failureDispatchInFlight && terminalResult == true
     }
 
     var publicationDeadlineNanosecondsForDiagnostics: Int64 {
@@ -1848,6 +2201,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             if state == .retired { return false }
             guard state != .retiring else { return false }
             state = .retiring
+            condition.broadcast()
             return true
         }
         if !shouldRetire { return condition.withLock { state == .retired } }
@@ -1857,6 +2211,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             publication.recordFailure(CancellationError())
         }
         streamContinuation.finish()
+        publication.cancelLivePublication()
         worker.cancel()
         let targets = condition.withLock {
             (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup)
@@ -1865,8 +2220,15 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         targets.1?.cancel()
         targets.2?.requestCancellation()
         targets.3?.signal()
+        condition.withLock { sourceAACBranch }?.cancel()
+        condition.withLock { dolbyBranch }?.cancel()
         interlacedOutputSemaphore.signal()
         _ = await worker.value
+        if let failureDispatchGroup {
+            await withCheckedContinuation { continuation in
+                failureDispatchGroup.notify(queue: .global(qos: .userInitiated)) { continuation.resume() }
+            }
+        }
         if hasPendingPrefix {
             await withCheckedContinuation { continuation in
                 let completed = condition.withLock { () -> Bool in
@@ -1879,6 +2241,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             }
         }
         if let branch = condition.withLock({ audioBranch }) { await branch.cancelAndAwait() }
+        if let branch = condition.withLock({ sourceAACBranch }) { await branch.cancelAndAwait() }
+        if let branch = condition.withLock({ dolbyBranch }) { await branch.cancelAndAwait() }
+        dolbyProducer?.invalidateSourceInput()
         audioBridge?.destroy()
         let interlacedRetired: Bool
         if let interlacedVideoBranch {
@@ -1891,6 +2256,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         await interlacedVideoOutput?.cancelAndAwait()
         if let videoWriter { _ = await videoWriter.cancelAwaitingCompletion() }
         publication.close()
+        timeline.retireCompressedGeneration()
+        sourceCopyOwnership?.cancel()
+        pendingAudio.removeAll(keepingCapacity: false)
         if let server = condition.withLock({ loopbackServer }) {
             let ticket = server.closeAdmission()
             do {
@@ -1938,23 +2306,77 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     private func fail(_ error: Error) {
-        let first = condition.withLock { () -> ErrorDiagnosticSnapshot? in
-            guard state != .retiring, state != .retired,
-                  firstFailureDiagnostic == nil else { return nil }
-            let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
-            state = .failed
+        let ownsFailure = condition.withLock { () -> Bool in
+            guard state != .retiring, state != .retired, state != .failing,
+                  firstFailureDiagnostic == nil else { return false }
+            failureDispatchGroup?.enter()
+            failureDispatchInFlight = true
+            state = .failing
+            return true
+        }
+        guard ownsFailure else { return }
+        defer { failureDispatchGroup?.leave() }
+        // Classification is synchronous but runs outside the graph condition.
+        // It must precede every visible failure diagnostic and prepare wakeup.
+        let acceptedRecovery: Bool
+        if let generatedSource, generatedSource.isCurrent {
+            if error is CompressedAudioInitializationRejection
+                || (error as? SegmentedFMP4WriterFailure) == .compressedAudioCompatibilityRequired {
+                acceptedRecovery = generatedSource.requestCompatibleAudioGeneration()
+            } else if (error as? SegmentedFMP4WriterFailure) == .newGenerationRequired {
+                acceptedRecovery = generatedSource.requestNewGeneration()
+            } else { acceptedRecovery = false }
+        } else { acceptedRecovery = false }
+        let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
+        let deliverRuntime = condition.withLock { () -> Bool in
             firstFailureDiagnostic = diagnostic
             terminalResult = false
+            failureDispatchInFlight = false
+            let active = state != .retiring && state != .retired
+            if active { state = .failed }
             condition.broadcast()
-            return diagnostic
+            return active && !acceptedRecovery
         }
-        guard let first else { return }
-        #if DEBUG
-        PlaybackDiagnosticTracker.shared.set("fail_\(diagnosticStage)_\(type(of: error)).\(error)")
-        #endif
         streamContinuation.finish()
-        publication.recordFailure(first)
-        runtimeFailureSink(first)
+        publication.recordFailure(diagnostic)
+        if deliverRuntime { runtimeFailureSink(diagnostic) }
+    }
+
+    private func selectedMediaFacts(_ source: any HLSGeneratedSourceContext) throws -> HLSMediaFacts {
+        guard source.isCurrent, let selectedURL = source.plan.selectedServiceURL,
+              let facts = source.facts.media.first(where: { $0.url == selectedURL }) else {
+            throw HLSSourceError.staleResolution
+        }
+        return facts
+    }
+
+    private static func validateGeneratedSource(_ source: any HLSGeneratedSourceContext,
+                                                lifecycle: OutputLifecycleEpoch) throws {
+        guard source.isCurrent, source.plan.transport == .generated,
+              source.plan.owner.backendIdentity == lifecycle.backendIdentity,
+              source.plan.owner.outputLifecycleNonce == lifecycle.outputNonce,
+              source.facts.complete, source.facts.owner == source.plan.owner,
+              source.facts.resolutionGeneration == source.plan.resolutionGeneration,
+              source.facts.formatFingerprint == source.plan.formatFingerprint,
+              source.plan.video != .unsupported,
+              let selectedURL = source.plan.selectedServiceURL else { throw HLSSourceError.incompleteEvidence }
+        var selected: HLSMediaFacts?
+        for media in source.facts.media where media.url == selectedURL {
+            guard selected == nil else { throw HLSSourceError.incompleteEvidence }
+            selected = media
+        }
+        guard let selected, !selected.hasUnsupportedTracks, selected.audio.count <= 1 else {
+            throw HLSSourceError.incompleteEvidence
+        }
+        if source.plan.video == .source {
+            guard selected.video == nil else { throw HLSSourceError.incompleteEvidence }
+        }
+        if source.plan.video == .remux {
+            guard selected.video?.scan == .progressive else { throw HLSSourceError.incompleteEvidence }
+        }
+        if source.plan.video == .deinterlaceAndEncode {
+            guard selected.video?.scan == .interlaced else { throw HLSSourceError.incompleteEvidence }
+        }
     }
 
     var failureDescriptionForDiagnostics: String? {
@@ -1968,6 +2390,10 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     #if DEBUG
     // 只读测试接点：测试必须继续使用同一真实 publication 图和系统 callback。
     var publicationForTesting: SystemHLSPublicationGraph { publication }
+    var prefixPreparationInFlightForTesting: Bool { condition.withLock { prefixPreparationInFlight } }
+    var sourceCopyOwnershipForTesting: HLSAudioCopyOwnership? { sourceCopyOwnership }
+    var audioCalibrationAttemptsForTesting: Int { condition.withLock { audioCalibrationAttemptCount } }
+    func recordFailureForTesting(_ error: Error) { fail(error) }
     #endif
 
     private func setDiagnosticStage(_ value: String) {

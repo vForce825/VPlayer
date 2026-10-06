@@ -116,6 +116,32 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var outputLifecycleEpoch: OutputLifecycleEpoch {
             replacementAuthority.lifecycle
         }
+
+        var sharedControlExecutor: PlaybackControlExecutor? { replacementAuthority.registry?.executor }
+
+        /// Registry -> source -> session is the only installation lock order.
+        /// The operation must contain just the synchronous SDK installation/CAS;
+        /// observer removal, callbacks and asynchronous work stay outside it.
+        func performCurrentPreparationMutation(_ operation: () throws -> Void) throws -> Bool {
+            try replacementAuthority.performPreparationMutation(ticket: ticket, operation)
+        }
+
+        func currentPreparationRoute() -> PlaybackRouteSemanticIdentity? {
+            replacementAuthority.preparationRoute(ticket: ticket)
+        }
+
+        func deliverNativeMediaInformation(activation: ActivationEpoch?, invalidated: Bool) async {
+            guard let registry = replacementAuthority.registry,
+                  registry.nativeMetadataScopeIsCurrent(lifecycle: outputLifecycleEpoch, activation: activation, invalidated: invalidated) else { return }
+            await registry.mediaInformationReceiver()?.updateNativeMediaInformation(
+                for: outputLifecycleEpoch, activation: activation, invalidated: invalidated)
+        }
+
+        /// Preparation may continue while paused, but never after its original
+        /// work command has been revoked, replaced or handed to cleanup.
+        func revalidateCurrentPreparation() -> Bool {
+            replacementAuthority.revalidatePreparation(ticket: ticket)
+        }
     }
 
     /// prepare 时由 Registry 签发、与当前 backend lifecycle 精确绑定的单次替换能力。
@@ -146,6 +172,74 @@ final class ControlTaskRegistry: @unchecked Sendable {
             registry?.requestBackendPublicationReplacement(self) == true
         }
 
+        func requestWatchdogRecovery(activation: ActivationEpoch) -> Bool {
+            registry?.requestBackendPublicationReplacement(self, watchdogActivation: activation) == true
+        }
+
+        fileprivate func revalidatePreparation(ticket: PrepareTicket) -> Bool {
+            guard let registry else { return false }
+            // A native wait can return before the queued safety drain runs. Fold
+            // synchronous ingress under the same Cell before trusting this command.
+            return (try? registry.transaction(operationDescriptor: .prepareAdmission) { _ in
+                guard !self.consumed,
+                      case .installed(let context, let backend) = registry.authority.resourceState,
+                      backend.lifecycle == self.lifecycle, backend.identity == ticket.backendIdentity,
+                      context.prepareTicket == ticket, context.owner == nil,
+                      !context.poisoned, !context.teardownRequested,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      let record = registry.authority.commands.first(where: {
+                          $0?.controlTaskTicket.nonce == self.sourceTaskNonce
+                      }) ?? nil else { return false }
+                return record.slot == .prepare && record.phase == .running
+                    && !record.resultInvalidated
+                    && registry.authority.matches(record.safetySnapshot)
+                    && record.groupTicket == context.reservation.workGroup
+            }) == true
+        }
+
+        fileprivate func performPreparationMutation(ticket: PrepareTicket, _ operation: () throws -> Void) throws -> Bool {
+            guard let registry else { return false }
+            return try registry.transaction(operationDescriptor: .prepareAdmission) { _ in
+                guard !self.consumed,
+                      case .installed(let context, let backend) = registry.authority.resourceState,
+                      backend.lifecycle == self.lifecycle, backend.identity == ticket.backendIdentity,
+                      context.prepareTicket == ticket, context.owner == nil,
+                      !context.poisoned, !context.teardownRequested,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      let record = registry.authority.commands.first(where: {
+                          $0?.controlTaskTicket.nonce == self.sourceTaskNonce
+                      }) ?? nil, record.slot == .prepare, record.phase == .running,
+                      !record.resultInvalidated, registry.authority.matches(record.safetySnapshot),
+                      record.groupTicket == context.reservation.workGroup else { return false }
+                try operation()
+                return true
+            }
+        }
+
+        fileprivate func preparationRoute(ticket: PrepareTicket) -> PlaybackRouteSemanticIdentity? {
+            var route: PlaybackRouteSemanticIdentity?
+            _ = try? performPreparationMutation(ticket: ticket) {
+                guard let registry, let stable = registry.authority.stableRouteCommit,
+                      stable.epoch == ticket.stableRouteCommitEpoch,
+                      stable.authority.semanticIdentity?.backend == .hlsAVPlayer else { return }
+                route = stable.authority.semanticIdentity
+            }
+            return route
+        }
+
+        func ownsRetainedReplacementRetirement(_ epoch: OutputLifecycleEpoch) -> Bool {
+            guard lifecycle == epoch, let registry else { return false }
+            return registry.projection {
+                guard self.consumed, let context = registry.authority.outputContext,
+                      context.owner?.reason == .recovery, !context.teardownRequested,
+                      !context.poisoned, context.pendingReset == nil,
+                      context.disposition == .retainForSession(context.sessionIdentity),
+                      context.suspend?.lifecycle == epoch,
+                      registry.authority.ownedBackendResources?.lifecycle == epoch else { return false }
+                return true
+            }
+        }
+
         func matches(lifecycle: OutputLifecycleEpoch,
                      ticket: PrepareTicket) -> Bool {
             guard self.lifecycle == lifecycle, let registry else { return false }
@@ -174,6 +268,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
 
         func requestReplacement() -> Bool {
             withLock { authority }?.requestReplacement() == true
+        }
+
+        func requestWatchdogRecovery(activation: ActivationEpoch) -> Bool {
+            withLock { authority }?.requestWatchdogRecovery(activation: activation) == true
         }
 
         func currentAuthority() -> BackendPublicationReplacementAuthority? {
@@ -282,9 +380,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         /// 当前播放观察发现权威失效时，仍由原 Registry 建立唯一 pause/suspend record。
-        func requestAutomaticSuspend() -> Bool {
+        func requestAutomaticSuspend(item: AVPlayerItemInstanceIdentity) -> Bool {
             capability.requestAutomaticSuspend(sourceTaskNonce: sourceTaskNonce,
-                                                activation: frozenActivation)
+                                                activation: frozenActivation, item: item)
         }
 
         func scheduleNaturalEnd(item: AVPlayerItemInstanceIdentity, identity: UUID,
@@ -294,6 +392,21 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         func retireNaturalEnd(identity: UUID) { capability.retireNaturalEnd(identity: identity) }
+
+        var observationInstant: UInt64? { capability.observationInstant }
+
+        func scheduleHLSProgress(item: AVPlayerItemInstanceIdentity, identity: UUID,
+                                 receiver: any PlaybackHLSProgressDeadlineReceiving,
+                                 delayNanoseconds: UInt64 = 250_000_000) -> Bool {
+            capability.scheduleHLSProgress(invocation: self, item: item,
+                identity: identity, receiver: receiver, delayNanoseconds: delayNanoseconds)
+        }
+
+        func retireHLSProgress(identity: UUID) { capability.retireHLSProgress(identity: identity) }
+
+        func completeObservedMediaProgress() -> Bool {
+            capability.completeObservedMediaProgress(activation: frozenActivation)
+        }
 
         static func == (lhs: Self, rhs: Self) -> Bool {
             lhs.sourceTaskNonce == rhs.sourceTaskNonce
@@ -316,6 +429,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         func retireNaturalEnd(identity: UUID) { registry?.deadlineScheduler?.cancelNaturalEnd(identity) }
+
+        var observationInstant: UInt64? { registry?.clock.nowNanoseconds }
+
+        func scheduleHLSProgress(invocation: BackendPositiveRateInvocation,
+                                 item: AVPlayerItemInstanceIdentity, identity: UUID,
+                                 receiver: any PlaybackHLSProgressDeadlineReceiving,
+                                 delayNanoseconds: UInt64) -> Bool {
+            registry?.deadlineScheduler?.armHLSProgress(invocation: invocation,
+                item: item, identity: identity, receiver: receiver,
+                delayNanoseconds: delayNanoseconds) == true
+        }
+
+        func retireHLSProgress(identity: UUID) { registry?.deadlineScheduler?.cancelHLSProgress(identity) }
+
+        func completeObservedMediaProgress(activation: ActivationEpoch) -> Bool {
+            registry?.completeSampleBufferReadiness(activation.outputLifecycleEpoch.backendIdentity,
+                requiringActivation: activation) == true
+        }
 
         func snapshot(sourceTaskNonce: UInt64,
                       activation: ActivationEpoch) -> BackendPositiveRateInvocation.CurrentSnapshot? {
@@ -349,10 +480,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         func requestAutomaticSuspend(sourceTaskNonce: UInt64,
-                                     activation: ActivationEpoch) -> Bool {
+                                     activation: ActivationEpoch,
+                                     item: AVPlayerItemInstanceIdentity) -> Bool {
             registry?.requestAutomaticSuspend(
                 sourceTaskNonce: sourceTaskNonce,
-                activation: activation) == true
+                activation: activation, item: item) == true
         }
 
         fileprivate func consumeWhileSafetyCellLocked() -> Bool {
@@ -686,6 +818,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
         var outputConfigurationIncarnation: OutputConfigurationIncarnation?
         var cleanupReservation: CleanupReservation?
         var resourceState: OutputResourceState?
+        // This budget belongs to the user's request, never a replaceable item,
+        // activation, backend or work cycle. Fresh media progress cannot refill it.
+        var watchdogRecoverySession: PlaybackSessionIdentity?
+        var watchdogRecoveryCount: UInt8 = 0
         // 固定单槽只保存最新请求的原始身份/预算；前驱资源仍保留在resourceState直到原owner排空。
         var playbackRequestAdmission: CurrentPlaybackOperationDeadlineTicket?
         var stateSubscription: PlaybackStateSubscription?
@@ -1861,6 +1997,18 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         private func installSuspendTimeout(_ context: OutputResourceContext, owner: PreparedCommand) {
+            var context = context
+            if let index = commands.firstIndex(where: { $0?.controlTaskTicket == context.suspend?.task }),
+               let record = commands[index], record.phase == .queued, record.payload == nil {
+                // Cleanup can spend the suspend deadline joining a canceled
+                // prepare. This exact stop never claimed an SDK call or Task;
+                // cancel it before handing physical stopping to retirement.
+                // Queued owned runners and in-flight calls still owe their own
+                // result and must never be settled by this timeout alone.
+                cancel(index)
+                context.suspendRequiresRetirement = true
+                context.suspendPreparedPreserved = false
+            }
             outputContext = context
             snapshot.output.revokeForSafety()
             installPreparedCommand(owner)
@@ -4016,6 +4164,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
         publicationReplacement: BackendPublicationReplacementTransition?
     ) async {
         defer { notifyPlaybackProgress() }
+        if let publicationReplacement,
+           isCurrentBackendPublicationReplacement(publicationReplacement, ticket: ticket, runner: runner) {
+            // The old work-cycle event relay is already closed. Use the existing
+            // owned runner and weak receiver, before any suspension/retirement.
+            await mediaInformationReceiver()?.invalidatePreparedMediaInformation(
+                for: publicationReplacement.retiredLifecycle)
+        }
         if case .suspend = runner.operation {
             // 固定扫描原owner work图，只join正向backend调用，不join自己或另一cleanup。
             for index in 0..<32 {
@@ -4053,7 +4208,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     let channelName = input.request.title.isEmpty ? input.request.channelID : input.request.title
                     let backend = try await input.factory.makeBackend(kind: input.kind, identity: input.identity,
                         tuning: input.tuning, channelID: channelName, url: input.request.streamURL,
-                        eventSink: { [relay = input.relay] event in relay.send(event) })
+                        sourceContext: try input.request.sourceContext, eventSink: { [relay = input.relay] event in relay.send(event) })
                     result = try completeOutputFactory(ticket, candidate: backend) ? .succeeded : .canceled
                 case .prepare:
                     let candidate: (any PlaybackBackend)? = try transaction { _ in
@@ -4104,6 +4259,12 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         PlaybackDiagnosticTracker.shared.set("registry_prepare_backend_returned")
                         #endif
                         result = completeOutputPrepare(ticket) ? .succeeded : .canceled
+                        if backend is HLSAVPlayerPlaybackBackend {
+                            // Completion's Bool includes rejected results. The
+                            // receiver must pull an exact, still-prepared scope.
+                            await mediaInformationReceiver()?.refreshPreparedMediaInformation(
+                                for: prepare.outputLifecycleEpoch)
+                        }
                     } else {
                         #if DEBUG
                         PlaybackDiagnosticTracker.shared.set("registry_prepare_invocation_nil")
@@ -4240,21 +4401,34 @@ final class ControlTaskRegistry: @unchecked Sendable {
             return
         }
         do {
-            guard let retirement = try advanceOutputCleanup(owner: pending.owner),
-                  retirement != suspendTicket,
-                  let cleanup = claimOutputBackendCleanup(retirement, owner: pending.owner),
-                  cleanup.lifecycle == pending.retiredLifecycle,
-                  cleanup.backend.identity == pending.backendIdentity else {
-                finishFailedBackendPublicationReplacement(
-                    ticket: suspendTicket, runner: suspendRunner)
-                return
+            let context = outputResourceContextSnapshot()
+            let alreadyRetired = context?.owner == pending.owner
+                && context?.suspend == pending.suspend
+                && context?.retirementConfirmed == true
+                && context?.retiredLifecycle == pending.retiredLifecycle
+            // A requiresRetirement suspend is physically retired by the owned
+            // suspend runner above. Reuse only that exact confirmed receipt; a
+            // quiescent suspend still requires its one retirement call here.
+            if !alreadyRetired {
+                guard let retirement = try advanceOutputCleanup(owner: pending.owner),
+                      retirement != suspendTicket,
+                      let cleanup = claimOutputBackendCleanup(retirement, owner: pending.owner),
+                      cleanup.lifecycle == pending.retiredLifecycle,
+                      cleanup.backend.identity == pending.backendIdentity else {
+                    finishFailedBackendPublicationReplacement(
+                        ticket: suspendTicket, runner: suspendRunner)
+                    return
+                }
+                let retirementResult = await cleanup.backend.retireOutput(
+                    epoch: pending.retiredLifecycle)
+                guard retirementResult == .confirmedLocalOutputStopped,
+                      completeOutputRetirement(retirement, lifecycle: pending.retiredLifecycle) else {
+                    finishFailedBackendPublicationReplacement(
+                        ticket: suspendTicket, runner: suspendRunner)
+                    return
+                }
             }
-            let retirementResult = await cleanup.backend.retireOutput(
-                epoch: pending.retiredLifecycle)
-            guard retirementResult == .confirmedLocalOutputStopped,
-                  completeOutputRetirement(
-                    retirement, lifecycle: pending.retiredLifecycle),
-                  let handoff = try handoffBackendPublicationReplacementToReprepare(
+            guard let handoff = try handoffBackendPublicationReplacementToReprepare(
                     pending: pending,
                     suspendTicket: suspendTicket,
                     suspendRunner: suspendRunner) else {
@@ -4388,6 +4562,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 return nil
             }
 
+            // This path installs a fresh lifecycle just like ordinary reprepare.
+            // A supported backend must not retain the old lifecycle's stop issuer.
+            installSampleBufferQuiescenceIssuerIfSupported(
+                resources.object, identity: resources.identity, lifecycle: lifecycle)
+
             // 从这里开始均为固定槽写入，不再分配、不再调用外部实现。
             for index in authority.commands.indices
                 where retiringMask & (1 << index) != 0 {
@@ -4450,6 +4629,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     invocation: handoff.invocation)
                 result = completeOutputPrepare(handoff.ticket)
                     ? .succeeded : .canceled
+                if handoff.backend is HLSAVPlayerPlaybackBackend {
+                    await mediaInformationReceiver()?.refreshPreparedMediaInformation(
+                        for: handoff.invocation.outputLifecycleEpoch)
+                }
             } catch is CancellationError {
                 result = .canceled
             } catch {
@@ -4473,6 +4656,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 authority.commands[index]?.phase = .terminal(.canceled)
             }
         }
+        if case .failed(let error) = result {
+            startFailedBackendPublicationReprepareCleanup(handoff, error: error)
+            return
+        }
         guard case .succeeded = result, handoff.shouldReactivate,
               let context = outputResourceContextSnapshot(), context.prepared,
               let activation = try? beginOutputActivation(
@@ -4483,6 +4670,35 @@ final class ControlTaskRegistry: @unchecked Sendable {
         // 用户播放意图。Registry 在新 lifecycle 上重新签发正式 activation；backend
         // 不能绕过该权威直接调用 AVPlayer.play()。
         _ = await joinOutputBackendOperation(activation)
+    }
+
+    /// The replacement runner has no controller awaiting its prepare result.
+    /// Transfer a real failure to terminal cleanup on this exact installed
+    /// lifecycle, then return so that cleanup can join the runner's physical tail.
+    private func startFailedBackendPublicationReprepareCleanup(
+        _ handoff: BackendPublicationReprepareHandoff, error: PlaybackCoreError
+    ) {
+        let failure = PlaybackController.failure(for: error)
+        executor.sync {
+            guard let receiver = terminalReceiver else { return }
+            let owner: OutputTransitionOwnerTicket? = try? transaction(operationDescriptor: .resourceOwnership) { output in
+                guard case .installed(let context, let backend) = authority.resourceState,
+                      context.owner == nil, context.sourceTask == handoff.ticket,
+                      context.prepareTicket == handoff.invocation.ticket,
+                      backend.object === handoff.backend,
+                      backend.lifecycle == handoff.invocation.outputLifecycleEpoch,
+                      let record = authority.commands.first(where: {
+                        $0?.controlTaskTicket == handoff.ticket
+                      }) ?? nil,
+                      record.backendOperation === handoff.runner else { return nil }
+                return try beginOutputTransitionLocked(contextNonce: context.contextNonce,
+                    reason: .terminal, anchorInstant: monotonicClock.nowNanoseconds,
+                    teardown: true, sourceActivation: nil, output: &output)
+            }
+            guard let owner else { return }
+            _ = startOwnedTerminalCleanup(owner: owner, receiver: receiver,
+                terminalState: .failed(failure))
+        }
     }
 
     private func finishFailedBackendPublicationReplacement(
@@ -5049,6 +5265,36 @@ final class ControlTaskRegistry: @unchecked Sendable {
         )
     }
 
+    private func mediaInformationReceiver() -> (any PlaybackBackendMediaInformationReceiving)? {
+        executor.sync { terminalReceiver as? any PlaybackBackendMediaInformationReceiving }
+    }
+
+    func nativeMetadataScopeIsCurrent(lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) -> Bool {
+        (try? transaction { _ in
+            guard let context = authority.outputContext, let backend = authority.ownedBackendResources,
+                  backend.lifecycle == lifecycle, backend.identity == lifecycle.backendIdentity,
+                  context.candidateBackendIdentity == lifecycle.backendIdentity else { return false }
+            if let activation {
+                return context.activation == activation && (context.interval?.activation == activation ||
+                    (invalidated && context.suspend?.priorActivation == activation))
+            }
+            return context.interval == nil && (context.activation == nil ||
+                (invalidated && context.suspend?.lifecycle == lifecycle))
+        }) == true
+    }
+
+    /// A nil result means stale/unsafe, while a scoped nil information value is
+    /// a genuinely prepared audio-only graph. No sink is called under these locks.
+    func preparedHLSMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
+        try? transaction { output in
+            guard let candidate = currentMountablePresentationLocked(output: output),
+                  candidate.lifecycle == lifecycle,
+                  let backend = authority.ownedBackendResources?.object as? HLSAVPlayerPlaybackBackend,
+                  backend.identity == candidate.backendIdentity else { return nil }
+            return backend.preparedMediaInformation(for: lifecycle)
+        }
+    }
+
     /// 最终route/safety fence与Relay固定状态提交属于同一个权威事务；continuation副作用锁外执行。
     func commitInstalledPresentation(
         to relay: PlaybackPresentationRelay
@@ -5249,6 +5495,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
                   current === runner, current.joining else { return false }
             authority.commands[index]?.phase = .terminal(.canceled)
             authority.commands[index]?.payload = nil
+            if case .pipeline = current.relay,
+               let context = authority.outputContext, context.teardownRequested,
+               case .backend(let retiringBackend) = ticket.group.resourceIdentity,
+               context.candidateBackendIdentity == retiringBackend,
+               let groupIndex = authority.groups.firstIndex(where: {
+                   $0?.ticket == ticket.group && $0?.parent == context.reservation.ownerGroup
+               }),
+               authority.groups[groupIndex]?.sealed == true,
+               authority.commands.indices.allSatisfy({ other in
+                   other == index || authority.commands[other]?.groupTicket != ticket.group
+               }),
+               !authority.groups.contains(where: { $0?.parent == ticket.group }) {
+                // The exact relay has been closed and its original runner
+                // physically joined. A backend being destroyed cannot leave
+                // owner-group siblings behind across repeated route/reset cycles.
+                authority.commands[index] = nil
+                authority.groups[groupIndex] = nil
+            }
             return true
         }) == true
     }
@@ -5277,6 +5541,17 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         continue
                     }
                     if pipelineOnly, case .audio = runner.relay { continue }
+                    if pipelineOnly, case .pipeline = runner.relay,
+                       context.owner?.reason == .recovery, !context.teardownRequested,
+                       context.pendingReset == nil, !context.poisoned,
+                       context.disposition == .retainForSession(context.sessionIdentity),
+                       context.desiredBackendKind == .hlsAVPlayer,
+                       record.groupTicket.resourceIdentity == context.candidateBackendIdentity.map(ControlResourceIdentity.backend),
+                       !authority.isDescendant(record.groupTicket, of: context.reservation.workGroup) {
+                        // The retained HLS backend keeps its single event sink.
+                        // Its exact owner-group child survives renewable work.
+                        continue
+                    }
                     // ownerGroup还要承接reserved cleanup；只封同组relay record，不封其cleanup入口。
                     if record.groupTicket != cleanup.groupTicket { authority.groups[groupIndex]?.sealed = true }
                     authority.cancel(index)
@@ -7819,7 +8094,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
         return executor.performPlaybackBudget(.mediaProgress(receipt)) == .budget(.progressCompleted)
     }
 
-    func completeSampleBufferReadiness(_ backend: PlaybackBackendIdentity) -> Bool {
+    func completeSampleBufferReadiness(_ backend: PlaybackBackendIdentity,
+                                      requiringActivation: ActivationEpoch? = nil) -> Bool {
         defer { notifyPlaybackProgress() }
         var accepted = false
         executor.sync {
@@ -7837,6 +8113,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 }
                 guard !context.poisoned else { return nil }
                 guard context.owner == nil else { return nil }
+                if let requiringActivation, context.activation != requiringActivation { return nil }
                 guard context.disposition != .releaseAfterTeardown else { return nil }
                 guard context.desiredBackendKind == .sampleBuffer || context.desiredBackendKind == .hlsAVPlayer else { return nil }
                 guard owned.identity == backend else { return nil }
@@ -8485,6 +8762,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
             context.desiredBackendKind = kind
             context.sourceTask = prepared.ticket
             context.prepareTicket = prepare
+            // The retained lease carries the predecessor's context, not its
+            // readiness. Only this new backend's prepare may reopen activation.
+            context.prepared = false
             context.retainedRebase = nil
             authority.resourceState = .pendingCreation(context, lease)
             return installPreparedCommand(prepared)
@@ -8928,30 +9208,77 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }) ?? false
     }
 
-    /// KVO/HTTP 观察失败闭合时复用当前 lifecycle 的既有 Registry 单飞 stop。
+    /// Cleanup authority survives positive-rate revocation only for the exact
+    /// original source/interval/item. It cannot admit playback or replacement.
     private func requestAutomaticSuspend(
         sourceTaskNonce: UInt64,
-        activation: ActivationEpoch
+        activation: ActivationEpoch,
+        item: AVPlayerItemInstanceIdentity
     ) -> Bool {
-        guard let (sourceTask, interval) = positiveRateInvocationSnapshot(
-            sourceTaskNonce: sourceTaskNonce, activation: activation),
-              let context = outputResourceContextSnapshot(),
-              context.activation == interval.activation,
-              context.interval == interval,
-              context.sourceTask == sourceTask else { return false }
-        let owner: OutputTransitionOwnerTicket
-        do {
-            guard let value = try beginOutputTransition(
-                contextNonce: context.contextNonce,
-                reason: .pause,
-                anchorInstant: monotonicClock.nowNanoseconds,
-                teardown: false,
-                sourceActivation: interval.activation
-            ) else { return false }
-            owner = value
-        } catch { return false }
-        guard let stop = outputResourceContextSnapshot()?.suspend else { return false }
-        return startOutputSuspendOperation(stop.task, owner: owner)
+        // Match the public transition boundary: arm the original suspend budget
+        // after the Cell unlocks, before any held SDK completion can return.
+        defer { notifyPlaybackProgress() }
+        return executor.sync {
+            func admitSuspend(reason: OutputTransitionReason, output: inout PlaybackOutputSafetyState)
+                throws -> (owner: OutputTransitionOwnerTicket, startsRunner: Bool)? {
+                guard case .installed(var context, let backend) = authority.resourceState,
+                      let sourceTask = context.sourceTask, sourceTask.nonce == sourceTaskNonce,
+                      let interval = context.interval, interval.activation == activation,
+                      context.activation == activation,
+                      interval.outputLifecycle == item.outputLifecycleEpoch,
+                      interval.itemGeneration == item.itemGeneration,
+                      backend.identity == interval.backendIdentity,
+                      backend.lifecycle == interval.outputLifecycle,
+                      let record = authority.commands.first(where: {
+                          $0?.controlTaskTicket == sourceTask
+                      }) ?? nil, record.slot == .activation,
+                      record.groupTicket == context.reservation.workGroup else { return nil }
+                if let owner = context.owner {
+                    guard let stop = context.suspend,
+                          stop.lifecycle == interval.outputLifecycle,
+                          stop.priorActivation == activation,
+                          context.closeClaim?.suspendTicket == stop,
+                          context.closeClaim?.intervalKey == interval else { return nil }
+                    // Preserve both the existing owner and its dispatch. Native
+                    // status can arrive after explicit pause admission but before
+                    // that caller starts its original single-flight runner.
+                    return (owner, false)
+                }
+                guard let owner = try beginOutputTransitionLocked(context: &context, reason: reason,
+                    anchorInstant: monotonicClock.nowNanoseconds, teardown: reason.releasesLease,
+                    sourceActivation: activation, output: &output) else { return nil }
+                return (owner, true)
+            }
+            // Ordinary admission must commit revoked output/readiness bits.
+            // Cleanup-only barriers restore those bits; use that path only after
+            // the Cell has already folded a safety failure and closed them.
+            let admission = try? transaction(operationDescriptor: .resourceOwnership,
+                safetyFailureFallback: { output in
+                    try admitSuspend(reason: .terminal, output: &output)
+                }) { output in
+                    try admitSuspend(reason: .pause, output: &output)
+                }
+            guard let admission, let context = outputResourceContextSnapshot(),
+                  context.owner == admission.owner, let stop = context.suspend else { return false }
+            let owner = admission.owner
+            // Only this call's new automatic owner needs dispatch. An existing
+            // pause owner must still succeed at its own first-start gate; already
+            // started automatic owners retain their exact runner and physical join.
+            guard admission.startsRunner else { return true }
+            // Recovery/terminal owners already own their execution path. Never
+            // replace their task or consume a new publication-replacement capability.
+            if owner.reason != .pause { return true }
+            if startOutputSuspendOperation(stop.task, owner: owner) { return true }
+            // A duplicate observation joins the exact registered runner; it
+            // must not interpret an already-started stop as a failed admission.
+            return projection {
+                authority.outputContext?.owner == owner
+                    && authority.outputContext?.suspend == stop
+                    && authority.commands.contains {
+                        $0?.controlTaskTicket == stop.task && $0?.backendOperation != nil
+                    }
+            }
+        }
     }
 
     /// publication 失败与正 rate authority 独立：能力仍需精确命中签发时的
@@ -8959,9 +9286,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
     /// owner 与 registered suspend runner，后继 retirement/reprepare 继续由同一
     /// output cleanup 状态机推进。
     private func requestBackendPublicationReplacement(
-        _ capability: BackendPublicationReplacementAuthority
+        _ capability: BackendPublicationReplacementAuthority,
+        watchdogActivation: ActivationEpoch? = nil
     ) -> Bool {
         var started = false
+        var exhaustedOwner: OutputTransitionOwnerTicket?
         executor.sync {
             let runner = OwnedPlaybackBackendOperation(operation: .suspend)
             let prepared: BackendPublicationReplacementTransition? = try? transaction(
@@ -8983,8 +9312,24 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         prepareRecord.phase == .terminal(.completed),
                       context.suspend == nil, context.owner == nil,
                       context.disposition == .retainForSession(context.sessionIdentity),
-                      !context.poisoned,
-                      let owner = try beginOutputTransitionLocked(
+                      !context.poisoned else { return nil }
+                if let watchdogActivation {
+                    guard context.activation == watchdogActivation,
+                          context.interval?.activation == watchdogActivation,
+                          output.outputPermitPresent, output.routeObservationGateOpen,
+                          !authority.snapshot.userPaused, !authority.snapshot.interruptionVeto else { return nil }
+                    if authority.watchdogRecoverySession != context.sessionIdentity {
+                        authority.watchdogRecoverySession = context.sessionIdentity
+                        authority.watchdogRecoveryCount = 0
+                    }
+                    if authority.watchdogRecoveryCount >= 2 {
+                        exhaustedOwner = try beginOutputTransitionLocked(context: &context,
+                            reason: .terminal, anchorInstant: monotonicClock.nowNanoseconds,
+                            teardown: true, sourceActivation: watchdogActivation, output: &output)
+                        return nil
+                    }
+                }
+                guard let owner = try beginOutputTransitionLocked(
                         context: &context, reason: .recovery,
                         anchorInstant: monotonicClock.nowNanoseconds,
                         // publication replacement 只退休旧 item；backend/lease 由
@@ -9013,6 +9358,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     originalContextNonce: context.contextNonce,
                     shouldReactivate: suspend.priorActivation != nil)
                 capability.consumed = true
+                if watchdogActivation != nil { authority.watchdogRecoveryCount += 1 }
                 return transition
             }
             guard let prepared else { return }
@@ -9020,7 +9366,31 @@ final class ControlTaskRegistry: @unchecked Sendable {
                 prepared.suspend.task, runner: runner,
                 publicationReplacement: prepared)
         }
+        if let exhaustedOwner, let receiver = executor.sync({ terminalReceiver }) {
+            return startOwnedTerminalCleanup(owner: exhaustedOwner, receiver: receiver,
+                terminalState: .failed(.init(code: "hls.watchdog.recovery-exhausted",
+                    userMessage: "播放持续停滞，已停止自动重试。请重试或切换频道。")))
+        }
         return started
+    }
+
+    /// Legacy controller requests share the exact same scoped owner and budget
+    /// as native progress callbacks; they never start an independent handoff.
+    func requestCurrentHLSWatchdogRecovery() async -> Bool {
+        let candidate: (BackendPublicationReplacementAuthoritySlot, ActivationEpoch,
+                        HLSAVPlayerPlaybackBackend?)? = projection {
+            guard let context = authority.outputContext, context.owner == nil,
+                  context.desiredBackendKind == .hlsAVPlayer, let activation = context.activation,
+                  let backend = authority.ownedBackendResources?.object
+                    as? any BackendPublicationReplacementAuthorityInstalling else { return nil }
+            return (backend.backendPublicationReplacementAuthoritySlot, activation,
+                authority.ownedBackendResources?.object as? HLSAVPlayerPlaybackBackend)
+        }
+        guard let candidate else { return false }
+        if let backend = candidate.2 {
+            return await backend.requestWatchdogRecovery(activation: candidate.1)
+        }
+        return candidate.0.requestWatchdogRecovery(activation: candidate.1)
     }
 
     func finishOutputPause(owner: OutputTransitionOwnerTicket) -> Bool {

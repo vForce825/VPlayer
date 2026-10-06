@@ -1,0 +1,15 @@
+SPDX-FileCopyrightText: 2026 VPlayer contributors
+SPDX-License-Identifier: GPL-3.0-only
+SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
+
+homepod-live-h264-aac-80s.ts is generated only from FFmpeg lavfi color and anullsrc.
+No broadcast samples, external stream URLs, credentials or signatures are included.
+Generator: Scripts/generate-homepod-live-fixture.sh
+Generation environment: Debian FFmpeg 7.1.5-0+deb13u1, libx264, single encoder thread.
+Video: H.264 High@4.0, 320x180 progressive, 30 fps, 80 seconds, GOP 150, no B frames.
+Audio: AAC-LC, 44.1 kHz, stereo, 96 kb/s.
+SHA-256: 2d2e32582cb6cfd4128de72b3af546dba69a8b42ce7141d1c5bfd70e622cedbd
+
+The finite bytes are served by regression tests as an open live source. The tests
+must withhold EOF and must not synthesize EXT-X-ENDLIST; otherwise natural-end
+publication draining can hide the live scheduling regression.

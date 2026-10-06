@@ -13,6 +13,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
     static let maximumEmissionsPerPump = 32
 
     private let encoder: AACRenditionEncoder
+    private let writerHeadroomConfigured: Bool
     typealias WriterWindowFactory = @Sendable (
         AACWriterWindowContinuation
     ) throws -> SegmentedFMP4Writer
@@ -42,14 +43,14 @@ final class AudioRenditionBranch: @unchecked Sendable {
     }
 
     private final class PendingBatch {
-        let emissions: [AACIncrementalEmission]
+        var emissions: [AACIncrementalEmission?]
         let result: AACStreamPumpResult
         let lease: HLSDataPlaneAdmission.Lease
         var nextIndex = 0
 
         init(emissions: [AACIncrementalEmission], result: AACStreamPumpResult,
              lease: HLSDataPlaneAdmission.Lease) {
-            self.emissions = emissions
+            self.emissions = emissions.map(Optional.some)
             self.result = result
             self.lease = lease
         }
@@ -65,11 +66,15 @@ final class AudioRenditionBranch: @unchecked Sendable {
             maximumBytes: AudioRenditionBranch.maximumPumpOutputBytes)
     ) {
         self.encoder = encoder
+        writerHeadroomConfigured = encoder.configureWriterBoundary(maximumDuration: coordinator.session.maximumBoundaryDuration)
         self.writer = writer
         self.writerWindowFactory = writerWindowFactory
         self.coordinator = coordinator
         self.admission = admission
     }
+
+    var writerAdmissionSnapshot: AACWriterAdmissionSnapshot? { encoder.writerAdmissionSnapshot }
+    var writerUsage: SegmentedFMP4WriterUsage { lock.withLock { writer }.usage }
 
     var writerReceipt: AACIncrementalWriterReceipt? {
         lock.withLock { storedWriterReceipt }
@@ -91,7 +96,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
     var pendingEmissionIdentity: AACIncrementalEmissionIdentity? {
         lock.withLock {
             guard let pending, pending.nextIndex < pending.emissions.count else { return nil }
-            return AACIncrementalEmissionIdentity(pending.emissions[pending.nextIndex])
+            return pending.emissions[pending.nextIndex].map(AACIncrementalEmissionIdentity.init)
         }
     }
 
@@ -109,7 +114,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
             return PendingMemoryUsage(
                 reservedBytes: pending.lease.bytes,
                 actualFrozenAndMaterializedBytes:
-                    pending.emissions.reduce(0) { $0 + $1.accountedFrozenBytes })
+                    pending.emissions.reduce(0) { $0 + ($1?.accountedFrozenBytes ?? 0) })
         }
     }
 
@@ -124,6 +129,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
     }
 
     private func collectPumpIsolated(_ input: AACStreamPumpInput) throws {
+        guard writerHeadroomConfigured else { throw AACRenditionFailure.capacityExceeded }
         guard lock.withLock({ !ended }) else {
             throw AACRenditionFailure.invalidInput
         }
@@ -310,7 +316,9 @@ final class AudioRenditionBranch: @unchecked Sendable {
         }
         do {
             while batch.nextIndex < batch.emissions.count {
-                let emission = batch.emissions[batch.nextIndex]
+                guard let emission = lock.withLock({ batch.emissions[batch.nextIndex] }) else {
+                    throw AACRenditionFailure.invalidInput
+                }
                 switch try writer.appendAACIncremental(
                     emission, coordinator: coordinator) {
                 case .retryLater:
@@ -320,8 +328,11 @@ final class AudioRenditionBranch: @unchecked Sendable {
                         finalReceipt: nil,
                         waitingForWriter: true)
                 case .appended:
-                    batch.nextIndex += 1
                     lock.withLock {
+                        // Drop only the consumed frozen owner. Native block aliases
+                        // retain their own lease, and the pump lease covers the suffix.
+                        batch.emissions[batch.nextIndex] = nil
+                        batch.nextIndex += 1
                         let identity = AACIncrementalEmissionIdentity(emission)
                         if storedFirstCommittedEmissionIdentity == nil {
                             storedFirstCommittedEmissionIdentity = identity
@@ -370,7 +381,10 @@ final class AudioRenditionBranch: @unchecked Sendable {
                 let next = try lock.withLock { () throws -> (SegmentedFMP4Writer, AACIncrementalEmission)? in
                     guard !ended, pending === batch else { throw AACRenditionFailure.cancelled }
                     guard batch.nextIndex < batch.emissions.count else { return nil }
-                    return (writer, batch.emissions[batch.nextIndex])
+                    guard let emission = batch.emissions[batch.nextIndex] else {
+                        throw AACRenditionFailure.invalidInput
+                    }
+                    return (writer, emission)
                 }
                 guard let (currentWriter, emission) = next else { break }
                 let result = try await currentWriter.appendAACIncrementalAwaitingReadiness(
@@ -378,6 +392,7 @@ final class AudioRenditionBranch: @unchecked Sendable {
                 guard result == .appended else { throw AACRenditionFailure.busy }
                 try lock.withLock {
                     guard !ended, pending === batch else { throw AACRenditionFailure.cancelled }
+                    batch.emissions[batch.nextIndex] = nil
                     batch.nextIndex += 1
                     let identity = AACIncrementalEmissionIdentity(emission)
                     if storedFirstCommittedEmissionIdentity == nil { storedFirstCommittedEmissionIdentity = identity }

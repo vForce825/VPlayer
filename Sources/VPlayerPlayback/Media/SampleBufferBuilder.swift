@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AudioToolbox
 import CoreFoundation
 import CoreMedia
 import Foundation
@@ -349,9 +350,12 @@ private final class HLSOwnedBlockContext {
     private let lock = NSLock()
     private var refConAvailable = true
     var lease: HLSDataPlaneAdmission.Lease?
-    init(_ admission: HLSOwnedBlockAdmission, _ lease: HLSDataPlaneAdmission.Lease) {
+    private let inputLifetime: WriterInputLifetime?
+    init(_ admission: HLSOwnedBlockAdmission, _ lease: HLSDataPlaneAdmission.Lease,
+         inputLifetime: WriterInputLifetime? = nil) {
         self.admission = admission
         self.lease = lease
+        self.inputLifetime = inputLifetime
     }
     func claimRefCon() -> Bool {
         lock.withLock {
@@ -362,10 +366,49 @@ private final class HLSOwnedBlockContext {
     }
     func release() {
         lease = nil
+        inputLifetime?.releaseBacking()
         #if DEBUG
         admission.released()
         #endif
     }
+}
+
+/// An independently admitted physical allocation, or a zero-copy reference to an
+/// already-owned block. Its final native FreeBlock callback never captures a writer.
+private final class HLSPrepaidBlockContext {
+    let lifetime: WriterInputLifetime
+    let original: CMBlockBuffer?
+    #if DEBUG
+    var failAllocation = false
+    #endif
+    private let lock = NSLock()
+    private var available = true
+    init(lifetime: WriterInputLifetime, original: CMBlockBuffer? = nil) {
+        self.lifetime = lifetime
+        self.original = original
+    }
+    func claim() -> Bool {
+        lock.withLock {
+            guard available else { return false }
+            available = false
+            return true
+        }
+    }
+}
+private func hlsPrepaidAllocate(_ refCon: UnsafeMutableRawPointer?, _ bytes: Int) -> UnsafeMutableRawPointer? {
+    #if DEBUG
+    if let refCon, Unmanaged<HLSPrepaidBlockContext>.fromOpaque(refCon).takeUnretainedValue().failAllocation { return nil }
+    #endif
+    return malloc(bytes)
+}
+private func hlsPrepaidFree(_ refCon: UnsafeMutableRawPointer?, _ memory: UnsafeMutableRawPointer, _: Int) {
+    guard let refCon else { return }
+    let borrowed = Unmanaged<HLSPrepaidBlockContext>.fromOpaque(refCon).takeUnretainedValue()
+    guard borrowed.claim() else { return }
+    let context = Unmanaged<HLSPrepaidBlockContext>.fromOpaque(refCon).takeRetainedValue()
+    if context.original == nil { free(memory) }
+    context.lifetime.releaseBacking()
+    withExtendedLifetime(context.original) {}
 }
 private func hlsOwnedAllocate(_ refCon: UnsafeMutableRawPointer?, _ size: Int) -> UnsafeMutableRawPointer? {
     guard let refCon else { return nil }
@@ -386,6 +429,36 @@ private func hlsOwnedFree(_ refCon: UnsafeMutableRawPointer?, _ block: UnsafeMut
     #endif
     free(block)
     context.release()
+}
+
+/// Creation-time intent, never inferred from a sample's calculated output getter.
+/// Invalid represents the calculated mode; explicit values occupy one CMTime.
+struct WriterInputOutputTiming: Sendable {
+    private let value: CMTime
+    static let calculated = Self(value: .invalid)
+
+    static func settingExplicit(_ value: CMTime, on sample: CMSampleBuffer) throws -> Self {
+        guard value.isNumeric else { throw PlaybackCoreError.videoDecode(SampleBufferBuilder.invalidDataErrorCode) }
+        let intent = Self(value: value)
+        try intent.restore(on: sample)
+        guard intent.matchesSource(sample) else {
+            throw PlaybackCoreError.videoDecode(SampleBufferBuilder.invalidDataErrorCode)
+        }
+        return intent
+    }
+
+    func matchesSource(_ sample: CMSampleBuffer) -> Bool {
+        guard value.isValid else { return true }
+        let actual = CMSampleBufferGetOutputPresentationTimeStamp(sample)
+        return actual.value == value.value && actual.timescale == value.timescale
+            && actual.flags == value.flags && actual.epoch == value.epoch
+    }
+
+    func restore(on sample: CMSampleBuffer) throws {
+        guard value.isValid else { return }
+        let status = CMSampleBufferSetOutputPresentationTimeStamp(sample, newValue: value)
+        guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+    }
 }
 
 enum SampleBufferBuilder {
@@ -769,17 +842,245 @@ enum SampleBufferBuilder {
     }
 
     /// 仅为 HLS 复制接管提供的同步借用入口；Span 的地址不会离开本调用。
+    /// The caller has already paid the physical allocation and all owner metadata.
+    /// The token's deinit is rollback if no block ever takes ownership.
+    static func makeHLSPrepaidBlockBuffer(length: Int, lifetime: WriterInputLifetime) throws -> CMBlockBuffer {
+        try makePrepaidBlock(length: length, pointer: nil, original: nil, lifetime: lifetime)
+    }
+
+    #if DEBUG
+    static func makeHLSPrepaidBlockBuffer(length: Int, lifetime: WriterInputLifetime,
+        constructionMode: HLSOwnedBlockAdmission.ConstructionMode) throws -> CMBlockBuffer {
+        let failure: Int
+        switch constructionMode {
+        case .normal: failure = 0
+        case .failBeforeAllocation: failure = 1
+        case .failAllocation: failure = 2
+        case .failAfterAllocation: failure = 3
+        case .failAfterAllocationFreeBeforeReturn: failure = 4
+        case .failAfterAllocationFreeDuringFailureCleanup: failure = 5
+        }
+        return try makePrepaidBlock(length: length, pointer: nil, original: nil, lifetime: lifetime, failureMode: failure)
+    }
+    #endif
+
+    static func makeHLSPrepaidBlockBuffer(copying data: Data, lifetime: WriterInputLifetime) throws -> CMBlockBuffer {
+        let block = try makeHLSPrepaidBlockBuffer(length: data.count, lifetime: lifetime)
+        let status = data.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
+                offsetIntoDestination: 0, dataLength: data.count)
+        }
+        guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+        return block
+    }
+
+    private static func makePrepaidBlock(length: Int, pointer: UnsafeMutableRawPointer?,
+                                         original: CMBlockBuffer?, lifetime: WriterInputLifetime,
+                                         failureMode: Int = 0) throws -> CMBlockBuffer {
+        guard length > 0 else {
+            lifetime.releaseBacking()
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+        let context = HLSPrepaidBlockContext(lifetime: lifetime, original: original)
+        #if DEBUG
+        context.failAllocation = failureMode == 2
+        let actualLength = failureMode == 1 ? 0 : length
+        #else
+        let actualLength = length
+        #endif
+        let refCon = Unmanaged.passRetained(context).toOpaque()
+        var source = CMBlockBufferCustomBlockSource(version: kCMBlockBufferCustomBlockSourceVersion,
+            AllocateBlock: hlsPrepaidAllocate, FreeBlock: hlsPrepaidFree, refCon: refCon)
+        var result: CMBlockBuffer?
+        let status = CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault,
+            memoryBlock: pointer, blockLength: actualLength, blockAllocator: nil, customBlockSource: &source,
+            offsetToData: 0, dataLength: actualLength, flags: kCMBlockBufferAssureMemoryNowFlag,
+            blockBufferOut: &result)
+        var createStatus = status
+        #if DEBUG
+        if failureMode == 1 { createStatus = kCMBlockBufferBadPointerParameterErr }
+        if status == noErr, failureMode == 4 { result = nil; createStatus = kCMBlockBufferBadPointerParameterErr }
+        if status == noErr, failureMode == 5 { createStatus = kCMBlockBufferBadPointerParameterErr }
+        #endif
+        guard createStatus == noErr, let block = result else {
+            result = nil
+            if context.claim() {
+                let owner = Unmanaged<HLSPrepaidBlockContext>.fromOpaque(refCon).takeRetainedValue()
+                owner.lifetime.releaseBacking()
+            }
+            throw PlaybackCoreError.videoDecode(createStatus)
+        }
+        #if DEBUG
+        if failureMode == 3 { throw PlaybackCoreError.videoDecode(kCMBlockBufferBadPointerParameterErr) }
+        #endif
+        return block
+    }
+
+    /// A paid header/custom block reference; payload stays in its original owner.
+    /// No sample, encoded epoch/output or writer may be placed in the FreeBlock context.
+    static func makeWriterInputSample(_ sample: CMSampleBuffer, lifetime: WriterInputLifetime,
+                                      outputTiming: WriterInputOutputTiming = .calculated) throws -> CMSampleBuffer {
+        var transferred = false
+        defer { if !transferred { lifetime.releaseBacking() } }
+        guard outputTiming.matchesSource(sample) else {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+        let count = CMSampleBufferGetNumSamples(sample)
+        guard (1...64).contains(count), let original = CMSampleBufferGetDataBuffer(sample) else {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+        let length = CMBlockBufferGetDataLength(original)
+        guard length > 0, CMBlockBufferIsRangeContiguous(original, atOffset: 0, length: length),
+              CMBlockBufferAssureBlockMemory(original) == noErr else {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+        var pointer: UnsafeMutablePointer<Int8>?
+        var contiguous = 0, total = 0
+        guard CMBlockBufferGetDataPointer(original, atOffset: 0, lengthAtOffsetOut: &contiguous,
+            totalLengthOut: &total, dataPointerOut: &pointer) == noErr,
+            let pointer, contiguous == length, total == length else {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+        var attachmentBudget = 2_048 + (count - 1) * 128
+        for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+            if let values = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                target: sample, attachmentMode: mode) {
+                try validateWriterAttachment(values as NSDictionary, remaining: &attachmentBudget)
+            }
+        }
+        if let values = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) {
+            try validateWriterAttachment(values as NSArray, remaining: &attachmentBudget)
+        }
+        let times = try writerInputTiming(sample, sampleCount: count)
+        let block = try makePrepaidBlock(length: length, pointer: UnsafeMutableRawPointer(pointer),
+            original: original, lifetime: lifetime)
+        transferred = true
+        var result: CMSampleBuffer?
+        let format = CMSampleBufferGetFormatDescription(sample)
+        var packets: UnsafePointer<AudioStreamPacketDescription>?
+        var packetBytes = 0
+        let packetStatus = CMSampleBufferGetAudioStreamPacketDescriptionsPtr(sample,
+            packetDescriptionsPointerOut: &packets, sizeOut: &packetBytes)
+        if packetStatus == noErr, let packets, let format,
+           packetBytes == count * MemoryLayout<AudioStreamPacketDescription>.stride {
+            result = try makeWriterPacketSample(block: block, format: format, sampleCount: count,
+                presentationTimeStamp: CMSampleBufferGetPresentationTimeStamp(sample),
+                packets: packets, times: times)
+        } else {
+            let sizes = (0..<count).map { CMSampleBufferGetSampleSize(sample, at: $0) }
+            let status = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: block,
+                formatDescription: format, sampleCount: count, sampleTimingEntryCount: times.count,
+                sampleTimingArray: times, sampleSizeEntryCount: count, sampleSizeArray: sizes,
+                sampleBufferOut: &result)
+            guard status == noErr else { throw PlaybackCoreError.videoDecode(status) }
+        }
+        guard let result else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+        for mode in [kCMAttachmentMode_ShouldPropagate, kCMAttachmentMode_ShouldNotPropagate] {
+            if let values = CMCopyDictionaryOfAttachments(allocator: kCFAllocatorDefault,
+                target: sample, attachmentMode: mode) {
+                CMSetAttachments(result, attachments: values, attachmentMode: mode)
+            }
+        }
+        if let source = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: false) as? [NSDictionary] {
+            guard let target = CMSampleBufferGetSampleAttachmentsArray(result, createIfNecessary: true) as? [NSMutableDictionary],
+                  source.count == target.count else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+            for index in source.indices {
+                target[index].removeAllObjects()
+                target[index].addEntries(from: source[index] as! [AnyHashable: Any])
+            }
+        }
+        // Retiming drops an explicit output PTS. Restore only creation-time intent,
+        // after source trim/reverse attachments, matching the encoder's setter order.
+        // Never promote a calculated getter value into a new explicit override.
+        try outputTiming.restore(on: result)
+        return result
+    }
+
+    private static func writerInputTiming(_ sample: CMSampleBuffer,
+                                           sampleCount: Int) throws -> [CMSampleTimingInfo] {
+        var count = 0
+        var status = CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: 0,
+            arrayToFill: nil, entriesNeededOut: &count)
+        guard status == noErr, count == 1 || count == sampleCount else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        // Preserve the original array shape as well as every CMTime field; expanding
+        // a uniform entry through per-sample getters can perform timestamp arithmetic.
+        var times = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(), count: count)
+        var written = 0
+        status = CMSampleBufferGetSampleTimingInfoArray(sample, entryCount: count,
+            arrayToFill: &times, entriesNeededOut: &written)
+        guard status == noErr, written == count else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        return times
+    }
+
+    private static func makeWriterPacketSample(block: CMBlockBuffer, format: CMFormatDescription,
+                                               sampleCount: Int, presentationTimeStamp: CMTime,
+                                               packets: UnsafePointer<AudioStreamPacketDescription>,
+                                               times: [CMSampleTimingInfo]) throws -> CMSampleBuffer {
+        var packetSample: CMSampleBuffer?
+        let packetStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(allocator: kCFAllocatorDefault,
+            dataBuffer: block, formatDescription: format, sampleCount: sampleCount,
+            presentationTimeStamp: presentationTimeStamp, packetDescriptions: packets,
+            sampleBufferOut: &packetSample)
+        guard packetStatus == noErr, let packetSample else {
+            throw PlaybackCoreError.videoDecode(packetStatus == noErr ? invalidDataErrorCode : packetStatus)
+        }
+        // The packet constructor derives timing from the format (e.g. 1024/48000),
+        // which need not match the source's exact representation (e.g. 8/375).
+        // Copy the packet-bearing header with the original, bounded timing array.
+        // Both headers share the prepaid block and are covered by input admission.
+        var result: CMSampleBuffer?
+        let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+            sampleBuffer: packetSample, sampleTimingEntryCount: times.count,
+            sampleTimingArray: times, sampleBufferOut: &result)
+        guard status == noErr, let result else {
+            throw PlaybackCoreError.videoDecode(status == noErr ? invalidDataErrorCode : status)
+        }
+        // End the temporary header's scope before copying source attachments. The
+        // timing-copy API drops output-PTS overrides, so attachments must come last.
+        return result
+    }
+
+    private static func validateWriterAttachment(_ value: Any, remaining: inout Int, depth: Int = 0) throws {
+        guard depth < 8, remaining >= 32 else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+        remaining -= 32
+        if let dictionary = value as? NSDictionary {
+            guard dictionary.count <= 16 else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+            for (key, item) in dictionary {
+                try validateWriterAttachment(key, remaining: &remaining, depth: depth + 1)
+                try validateWriterAttachment(item, remaining: &remaining, depth: depth + 1)
+            }
+        } else if let array = value as? NSArray {
+            guard array.count <= 64 else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+            for item in array { try validateWriterAttachment(item, remaining: &remaining, depth: depth + 1) }
+        } else if let data = value as? NSData {
+            guard data.length <= remaining else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+            remaining -= data.length
+        } else if let string = value as? NSString {
+            guard string.length <= remaining / 2 else { throw PlaybackCoreError.videoDecode(invalidDataErrorCode) }
+            remaining -= string.length * 2
+        } else if !(value is NSNumber) {
+            throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
+        }
+    }
+
     static func makeHLSOwnedBlockBuffer(
         copying bytes: borrowing Span<UInt8>,
         admission: HLSOwnedBlockAdmission,
-        applicationMetadataBytes: Int = 0
+        applicationMetadataBytes: Int = 0,
+        inputLifetime: WriterInputLifetime? = nil
     ) throws -> CMBlockBuffer {
+        var transferred = false
+        defer { if !transferred { inputLifetime?.releaseBacking() } }
         guard bytes.count > 0, bytes.count <= admission.maximumPayloadBytes else {
             throw PlaybackCoreError.videoDecode(invalidDataErrorCode)
         }
         let lease = try admission.acquire(bytes: bytes.count,
                                           applicationMetadataBytes: applicationMetadataBytes)
-        let context = HLSOwnedBlockContext(admission, lease)
+        let context = HLSOwnedBlockContext(admission, lease, inputLifetime: inputLifetime)
         let refCon = Unmanaged.passRetained(context).toOpaque()
         var source = CMBlockBufferCustomBlockSource(
             version: kCMBlockBufferCustomBlockSourceVersion,
@@ -835,6 +1136,7 @@ enum SampleBufferBuilder {
         #endif
         let copyStatus: OSStatus = bytes.withUnsafeBytes { raw in CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: block, offsetIntoDestination: offset, dataLength: bytes.count) }
         guard copyStatus == noErr else { throw PlaybackCoreError.videoDecode(copyStatus) }
+        transferred = true
         return block
     }
 
@@ -842,10 +1144,11 @@ enum SampleBufferBuilder {
     static func makeHLSOwnedBlockBuffer(
         copying data: Data,
         admission: HLSOwnedBlockAdmission,
-        applicationMetadataBytes: Int = 0
+        applicationMetadataBytes: Int = 0,
+        inputLifetime: WriterInputLifetime? = nil
     ) throws -> CMBlockBuffer {
         try makeHLSOwnedBlockBuffer(copying: data.span, admission: admission,
-                                    applicationMetadataBytes: applicationMetadataBytes)
+                                    applicationMetadataBytes: applicationMetadataBytes, inputLifetime: inputLifetime)
     }
 
     static func makeAudio(

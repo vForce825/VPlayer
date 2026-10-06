@@ -29,12 +29,43 @@ class NativeSamplePayloadContractTests(unittest.TestCase):
         self.assertNotIn("CMBlockBufferCopyDataBytes", helper)
         self.assertNotIn("Data(count:", helper)
 
+    def test_only_top_level_buffer_dictionaries_canonicalize_absence(self):
+        self.assertTrue("static func freezeBufferDictionary(" in SOURCE,
+                      "buffer dictionary absence needs a scoped, content-preserving representation")
+        helper = SOURCE.split("static func freezeBufferDictionary(", 1)[1].split(
+            "static func freeze(_ value:", 1)[0]
+        self.assertIn("guard let dictionary else { return .dictionary([:]) }", helper)
+        self.assertIn("return try freeze(dictionary as NSDictionary)", helper,
+                      "all present keys and nested values must retain exact facts")
+        freeze = SOURCE.split("static func freeze(_ sample: CMSampleBuffer)", 1)[1].split(
+            "func nativeSamplePayloadDigest(", 1)[0]
+        self.assertIn("try sampleAttachments.map { try NativeAttachmentFacts.freeze($0) }", freeze)
+        self.assertIn("try NativeAttachmentFacts.freezeBufferDictionary(propagating)", freeze)
+        self.assertIn("try NativeAttachmentFacts.freezeBufferDictionary(privateAttachments)", freeze)
+        builder = (ROOT / "Sources/VPlayerPlayback/Media/SampleBufferBuilder.swift").read_text()
+        self.assertIn("CMSetAttachments(result, attachments: values, attachmentMode: mode)", builder)
+        self.assertIn("try outputTiming.restore(on: result)", builder)
+
     def test_validation_checkpoints_are_preserved(self):
-        self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 5)
+        # Five original validation sites plus the two-sided zero-copy wrapper check.
+        self.assertEqual(SOURCE.count("NativeSampleFacts.freeze("), 7)
+        self.assertIn('stage: "input-wrapper"', SOURCE)
         self.assertIn("try validatesSource(facts)", SOURCE)
         self.assertIn("try operation.validatesSource(operation.facts)", SOURCE)
         self.assertIn("try Task.checkCancellation()", SOURCE)
         self.assertIn("awaitingAppend?.identity == operation.identity", SOURCE)
+
+    def test_exact_metadata_failures_identify_the_copy_boundary(self):
+        facts = SOURCE.split("private struct NativeSampleFacts:", 1)[1].split(
+            "func nativeSamplePayloadDigest(", 1)[0]
+        self.assertIn("guard self == other else", facts,
+                      "diagnostics must retain full exact facts equality")
+        self.assertIn("HLS_NATIVE_SAMPLE_MISMATCH", facts)
+        self.assertIn("#if DEBUG", facts)
+        self.assertIn("timing.indices.first", facts,
+                      "print only the first timing difference, not a whole sample history")
+        for stage in ["input-wrapper", "ready-header", "native-return"]:
+            self.assertIn(f'stage: "{stage}"', SOURCE)
 
 
 if __name__ == "__main__":

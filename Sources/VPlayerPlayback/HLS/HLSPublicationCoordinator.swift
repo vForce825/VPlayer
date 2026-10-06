@@ -17,18 +17,21 @@ struct HLSInitialParticipant: @unchecked Sendable {
     let aacRenditionBinding: AACRenditionTerminalBinding?
     let aacWriterWindowAdmission: AACWriterWindowAdmission?
     let writerWindowAdmission: WriterWindowAdmission?
+    let sourceAACTerminalBinding: SourceAACWriterTerminalBinding?
     init(initialization: SealedMediaObject, proof: EpochFormatProof, relay: SegmentReportRelay,
          candidateTicket: AudioCandidateTicket?, candidate: HLSAudioCandidateRegistration? = nil,
          aacTerminalBinding: AACWriterTerminalBinding? = nil,
          aacRenditionBinding: AACRenditionTerminalBinding? = nil,
          aacWriterWindowAdmission: AACWriterWindowAdmission? = nil,
-         writerWindowAdmission: WriterWindowAdmission? = nil) {
+         writerWindowAdmission: WriterWindowAdmission? = nil,
+         sourceAACTerminalBinding: SourceAACWriterTerminalBinding? = nil) {
         self.initialization = initialization; self.proof = proof; self.relay = relay
         self.candidateTicket = candidateTicket; self.candidate = candidate
         self.aacTerminalBinding = aacTerminalBinding
         self.aacRenditionBinding = aacRenditionBinding
         self.aacWriterWindowAdmission = aacWriterWindowAdmission
         self.writerWindowAdmission = writerWindowAdmission
+        self.sourceAACTerminalBinding = sourceAACTerminalBinding
     }
 
     var aacEndpointAuthority: AACEffectiveEndpointAuthority? {
@@ -79,6 +82,7 @@ struct HLSPublishedSnapshot: Sendable {
     /// publication-ready 只读这个快照，不得提前读取 terminal endpoint 槽。
     let aacTimelineMappings: [UInt64: AACWriterTimelineMappingReceipt]
     let aacRenditionBindings: [UInt64: AACRenditionTerminalBinding]
+    let sourceAACTerminalBindings: [UInt64: SourceAACWriterTerminalBinding]
 
     init(publisherIdentity: UUID,
          publicationSequence: UInt64,
@@ -88,7 +92,8 @@ struct HLSPublishedSnapshot: Sendable {
          coverage: PublicationCoverage,
          aacTerminalBindings: [UInt64: AACWriterTerminalBinding],
          aacTimelineMappings: [UInt64: AACWriterTimelineMappingReceipt],
-         aacRenditionBindings: [UInt64: AACRenditionTerminalBinding] = [:]) {
+         aacRenditionBindings: [UInt64: AACRenditionTerminalBinding] = [:],
+         sourceAACTerminalBindings: [UInt64: SourceAACWriterTerminalBinding] = [:]) {
         self.publisherIdentity = publisherIdentity
         self.publicationSequence = publicationSequence
         self.participantVector = participantVector
@@ -98,6 +103,7 @@ struct HLSPublishedSnapshot: Sendable {
         self.aacTerminalBindings = aacTerminalBindings
         self.aacTimelineMappings = aacTimelineMappings
         self.aacRenditionBindings = aacRenditionBindings
+        self.sourceAACTerminalBindings = sourceAACTerminalBindings
     }
 }
 
@@ -110,22 +116,30 @@ final class HLSPendingPublicationAuthority: @unchecked Sendable {
     private let itemGeneration: UInt64
     private let publicationSequence: UInt64
     private let terminalBindings: [UInt64: AACWriterTerminalBinding]
+    private let sourceBindings: [UInt64: SourceAACWriterTerminalBinding]
     private var consumed = false
 
     fileprivate init(publisherIdentity: UUID, itemGeneration: UInt64,
                      publicationSequence: UInt64,
-                     terminalBindings: [UInt64: AACWriterTerminalBinding]) {
+                     terminalBindings: [UInt64: AACWriterTerminalBinding],
+                     sourceBindings: [UInt64: SourceAACWriterTerminalBinding]) {
         self.publisherIdentity = publisherIdentity
         self.itemGeneration = itemGeneration
         self.publicationSequence = publicationSequence
         self.terminalBindings = terminalBindings
+        self.sourceBindings = sourceBindings
     }
 
     func consume(serverPublisherIdentity: UUID, itemGeneration: UInt64,
-                 terminalBindings: [UInt64: AACWriterTerminalBinding]) -> UInt64? {
+                 terminalBindings: [UInt64: AACWriterTerminalBinding],
+                 sourceBindings: [UInt64: SourceAACWriterTerminalBinding] = [:]) -> UInt64? {
         lock.withLock {
             guard !consumed, publisherIdentity == serverPublisherIdentity,
                   self.itemGeneration == itemGeneration,
+                  self.sourceBindings.count == sourceBindings.count,
+                  self.sourceBindings.allSatisfy({ id, binding in
+                      sourceBindings[id] === binding && binding.isCurrent
+                  }),
                   self.terminalBindings.count == terminalBindings.count,
                   self.terminalBindings.allSatisfy({ participantID, binding in
                       terminalBindings[participantID] === binding
@@ -212,10 +226,13 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     private let publicationDeadlineNanoseconds: Int64
     private let initialWindowMinimumSeconds: Int
     private let publicationClock: HLSNaturalEndPublicationClock?
+    private let livePublicationIsScoped: Bool
     private var naturalEndDrainInProgress = false
     private var participants: [UInt64: HLSInitialParticipant] = [:]
     private var initializationKeys: [UInt64: HLSResourceKey] = [:]
     private var records: [UInt64: [HLSValidatedSegment]] = [:]
+    // One immutable scalar per current rendition; committed with its first playlist.
+    private var advertisedTargetDurations: [UInt64: Int64] = [:]
     private struct WriterSlot {
         let source: SegmentedFMP4CallbackContext
         let relay: SegmentReportRelay
@@ -259,6 +276,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
         self.initialWindowMinimumSeconds = initialWindowMinimumSeconds
         self.publicationClock = publicationClock
+        livePublicationIsScoped = publicationClock?.hasLiveWakeHandler == true
         participantGeneration = try PlaybackIdentityAllocator.shared.next(in: .admissionFence)
         owner = try store.claimPublicationOwner()
         do { try store.domain.sync {
@@ -282,6 +300,43 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         sequence > 0 && pendingCount >= 4 || store.usage.shouldBackpressure
             || writerSlots.values.contains { $0.contains { $0.retiring } }
     } }
+    /// Producer suspension is safe only when every participant already owns
+    /// a drainable common prefix. Union backlog alone can strand lagging audio.
+    var shouldBackpressureProducer: Bool { store.domain.sync {
+        guard sequence > 0 else { return false }
+        let common = participants.keys.map { id in
+            records[id]?.filter { $0.receipt.logicalSequence >= nextLogicalSequence }.count ?? 0
+        }.min() ?? 0
+        return common >= 4 || common > 0 && store.usage.shouldBackpressure
+    } }
+
+    /// A normal live publication must be woken even when no new media callback
+    /// arrives. When data/capacity is missing, preserve the ticket's original
+    /// deadline rather than busy-retry or silently renew it.
+    func nextLivePublicationWake(now: Int64) throws -> Int64? { try store.domain.sync {
+        try revalidate(_ticket, now: nil)
+        guard sequence > 0, !ended, !naturalEndDrainInProgress else { return nil }
+        guard let previousInstant, let deadline = _ticket.absoluteDeadline else {
+            throw HLSPublicationFailure.identityMismatch
+        }
+        guard deadline > now else {
+            _ = try self.deadline(ticket: _ticket, now: now)
+            throw HLSPublicationFailure.deadlineExceeded
+        }
+        let ready = participants.keys.allSatisfy { id in
+            records[id]?.contains { $0.receipt.logicalSequence == nextLogicalSequence } == true
+        }
+        guard ready else { return deadline }
+        let duration = declaration.video.flatMap { video in
+            records[video.participantID]?.first {
+                $0.receipt.logicalSequence == nextLogicalSequence
+            }?.commonDuration
+        } ?? HLSChecked.one
+        let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(duration))
+        let earliest = try HLSChecked.add(previousInstant, interval)
+        return earliest > now ? min(earliest, deadline) : deadline
+    } }
+
     private var pendingCount: Int { Set(records.values.flatMap { $0.filter { $0.receipt.logicalSequence >= nextLogicalSequence }.map { $0.receipt.logicalSequence } }).count }
 
     /// 只预约紧邻下一次 publication。若中间发生别的 CAS，真实 completed-response
@@ -297,14 +352,20 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 participants.compactMap { participantID, participant in
                     participant.aacTerminalBinding.map { (participantID, $0) }
                 })
-            guard !bindings.isEmpty, bindings.count <= 4 else {
+            let sourceBindings = Dictionary(uniqueKeysWithValues:
+                participants.compactMap { id, participant in
+                    participant.sourceAACTerminalBinding.map { (id, $0) }
+                })
+            guard !bindings.isEmpty || !sourceBindings.isEmpty,
+                  bindings.count + sourceBindings.count <= 4,
+                  sourceBindings.values.allSatisfy(\.isCurrent) else {
                 throw HLSPublicationFailure.identityMismatch
             }
             return HLSPendingPublicationAuthority(
                 publisherIdentity: publisherIdentity,
                 itemGeneration: declaration.itemGeneration,
                 publicationSequence: next.partialValue,
-                terminalBindings: bindings)
+                terminalBindings: bindings, sourceBindings: sourceBindings)
         }
     }
 
@@ -340,9 +401,12 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                   evidence.session === initializationEvidence.session, evidence.format == initializationEvidence.format,
                   let boundary = evidence.boundary, boundary.binding == object.binding,
                   boundary.logicalSequence == object.logicalSequence else { throw HLSPublicationFailure.identityMismatch }
+            try validateSourceAAC(participant, object: object)
             try validateFormat(evidence, participantID: id, declaration: declarationFor(id), requireFrameRate: true)
             let boundaryStart: ExactMediaTime
-            if let mapping = participant.aacTerminalBinding?.timelineMappingReceipt,
+            if let source = evidence.sourceAAC, let offset = source.timelineOffset {
+                boundaryStart = try receipt.presentationRange.start.subtracting(offset)
+            } else if let mapping = participant.aacTerminalBinding?.timelineMappingReceipt,
                mapping.reportIdentity == object.report.identity,
                mapping.writtenPhysicalBase == receipt.presentationRange.start {
                 // 只有首个真实 report 的起点包含 encoder leading；其物理尾与后续
@@ -466,6 +530,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             if naturalEnd, eofLastSequence == nil {
                 let tails = Set(participants.keys.compactMap { records[$0]?.last?.receipt.logicalSequence })
                 guard tails.count == 1, let tail = tails.first else { throw HLSPublicationFailure.invalidSequence }
+                try validateNaturalEndSourceAACAuthorities()
                 try validateNaturalEndAACAuthorities()
                 try sealAACPublicationMemberships()
                 eofLastSequence = tail
@@ -474,7 +539,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             let chosen: [UInt64: [HLSValidatedSegment]]
             let lastSequence: UInt64
             if sequence == 0 {
-                if initialWindowMinimumSeconds == 6 {
+                // A caller's buffer preference is not evidence that this source is
+                // finite. Only authenticated EOF may expose a short final prefix.
+                let shortFinalPrefix = initialWindowMinimumSeconds != 6
+                    && eofLastSequence.map { $0 < 5 } == true
+                if !shortFinalPrefix {
                     guard participants.keys.allSatisfy({
                         (records[$0]?.count ?? 0) >= 6
                     }) else { return .waiting }
@@ -494,30 +563,13 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                         lastSequence = 6
                     }
                 } else {
-                    let availableCount = participants.keys.map {
-                        records[$0]?.count ?? 0
-                    }.min() ?? 0
-                    guard availableCount >= 3 else { return .waiting }
-                    var initial: [UInt64: [HLSValidatedSegment]]?
-                    for count in 3...min(availableCount, 7) {
-                        let candidate = records.mapValues { Array($0.prefix(count)) }
-                        if try allAtLeastStartupMinimum(candidate) {
-                            initial = candidate
-                            break
-                        }
-                    }
-                    guard let initial else {
-                        if availableCount >= 7 {
-                            throw HLSPublicationFailure.initialWindowInvariant
-                        }
-                        return .waiting
-                    }
-                    chosen = initial
-                    guard let initialLastSequence = initial.values.first?.last?
-                        .receipt.logicalSequence else {
-                        throw HLSPublicationFailure.initialWindowInvariant
-                    }
-                    lastSequence = initialLastSequence
+                    guard let terminal = eofLastSequence else { throw HLSPublicationFailure.initialWindowInvariant }
+                    let finite = records.mapValues { $0.filter { $0.receipt.logicalSequence <= terminal } }
+                    guard try allAtLeastStartupMinimum(finite) else { return .waiting }
+                    // Include the complete authenticated terminal prefix in this
+                    // first snapshot, so it can never appear as a short live list.
+                    chosen = finite
+                    lastSequence = terminal
                 }
             } else {
                 let ready = participants.keys.allSatisfy { records[$0]?.contains(where: { $0.receipt.logicalSequence == nextLogicalSequence }) == true }
@@ -530,38 +582,16 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 // 已验收共同 segment；准确终段才附加唯一 ENDLIST。
                 lastSequence = ready ? nextLogicalSequence : nextLogicalSequence - 1
                 let available = records.mapValues { $0.filter { $0.receipt.logicalSequence <= lastSequence } }
-                if initialWindowMinimumSeconds == 6 {
-                    let six = available.mapValues { Array($0.suffix(6)) }
-                    if try allAtLeastSix(six) {
-                        chosen = six
-                    } else {
-                        let seven = available.mapValues { Array($0.suffix(7)) }
-                        guard seven.values.allSatisfy({ $0.count == 7 }),
-                              try allAtLeastSix(seven) else {
-                            throw HLSPublicationFailure.initialWindowInvariant
-                        }
-                        chosen = seven
-                    }
+                let six = available.mapValues { Array($0.suffix(6)) }
+                if try allAtLeastSix(six) {
+                    chosen = six
                 } else {
-                    let availableCount = available.values.map(\.count).min() ?? 0
-                    guard availableCount >= 3 else { return .waiting }
-                    let preferredCount = min(availableCount, 6)
-                    let preferred = available.mapValues {
-                        Array($0.suffix(preferredCount))
+                    let seven = available.mapValues { Array($0.suffix(7)) }
+                    guard seven.values.allSatisfy({ $0.count == 7 }),
+                          try allAtLeastSix(seven) else {
+                        throw HLSPublicationFailure.initialWindowInvariant
                     }
-                    if try allAtLeastStartupMinimum(preferred) {
-                        chosen = preferred
-                    } else {
-                        let seven = available.mapValues { Array($0.suffix(7)) }
-                        guard seven.values.allSatisfy({ $0.count == 7 }),
-                              try allAtLeastStartupMinimum(seven) else {
-                            if finishing {
-                                throw HLSPublicationFailure.initialWindowInvariant
-                            }
-                            return .waiting
-                        }
-                        chosen = seven
-                    }
+                    chosen = seven
                 }
                 let span = declaration.video.flatMap { chosen[$0.participantID]?.last?.commonDuration } ?? HLSChecked.one
                 let interval = max(Int64(1_000_000_000), try HLSChecked.nanoseconds(span))
@@ -588,10 +618,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             guard let reservation = try store.reserveSnapshotBatch(mediaCount: participants.count, includeMaster: sequence == 0 && declaration.video != nil) else {
                 if ticket.absoluteDeadline.map({ now >= $0 }) == true { _closed = true; throw HLSPublicationFailure.deadlineExceeded }
                 try store.waitForSnapshotCapacity(owner: owner, ticket: ticket,
-                    publicationClock: naturalEndDrainInProgress ? publicationClock : nil) { [weak self] instant in
+                    publicationClock: publicationClock) { [weak self] instant in
                     guard let self else { return }
-                    if self.naturalEndDrainInProgress {
-                        // 同一容量槽只唤醒原 finish runner；它会重读真实 clock 与准确 ticket。
+                    if self.naturalEndDrainInProgress || self.livePublicationIsScoped {
+                        // Live graph/EOF runner re-enter their own failure/lifecycle
+                        // scope and resample the current clock and ticket.
                         self.publicationClock?.signal()
                     } else {
                         do { _ = try self.publish(ticket: ticket, now: instant) }
@@ -614,6 +645,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 let effectivePlaybackHorizons = try frozenEffectivePlaybackHorizons(
                     normalized, writesEndList: writesEndList)
                 var media: [UInt64: HLSPlaylistSnapshot] = [:]
+                var targets: [UInt64: Int64] = [:]
                 var newDiscontinuities = discontinuitySequences
                 for id in participants.keys.sorted() {
                     let segments = normalized[id]!
@@ -621,8 +653,12 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     let removedDiscontinuities = (records[id] ?? []).filter { $0.discontinuity && $0.receipt.logicalSequence < first }.count
                     let discontinuitySequence = try HLSChecked.add(discontinuitySequences[id] ?? 0, UInt64(removedDiscontinuities))
                     newDiscontinuities[id] = discontinuitySequence
+                    let target = try advertisedTargetDurations[id]
+                        ?? HLSPlaylistSerializer.requiredTargetDuration(segments: segments)
+                    targets[id] = target
                     let representation = try HLSPlaylistSerializer.media(segments: segments, declaration: declarationFor(id),
-                        discontinuitySequence: discontinuitySequence, anchor: anchor, endList: writesEndList)
+                        discontinuitySequence: discontinuitySequence, anchor: anchor, endList: writesEndList,
+                        advertisedTargetDuration: target)
                     _serializationCount += 1
                     media[id] = HLSPlaylistSnapshot(identity: UUID(), version: newSequence, representation: representation,
                         logicalSequences: segments.map { $0.receipt.logicalSequence }, resources: segments.map(\.key),
@@ -636,6 +672,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     media: media, master: master, records: normalized, now: now)
                 let clockAnchor = try publicationClock?.prepareCommit(logical: now)
                 try store.commit(authority)
+                advertisedTargetDurations = targets
                 sequence = newSequence
                 nextLogicalSequence = nextSequence
                 previousInstant = now
@@ -678,7 +715,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     coverage: coverage,
                     aacTerminalBindings: aacTerminalBindings,
                     aacTimelineMappings: aacTimelineMappings,
-                    aacRenditionBindings: aacRenditionBindings)
+                    aacRenditionBindings: aacRenditionBindings,
+                    sourceAACTerminalBindings: Dictionary(uniqueKeysWithValues:
+                        participants.compactMap { id, value in
+                            value.sourceAACTerminalBinding.map { (id, $0) }
+                        }))
                 if let clockAnchor { publicationClock?.didCommit(clockAnchor) }
                 return .published
             } catch {
@@ -775,6 +816,56 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                 throw HLSPublicationFailure.deadlineExceeded
             }
             return .wait(try publicationClock.monotonicDeadline(for: wake, from: instant))
+        }
+    }
+
+    private func validateSourceAAC(_ participant: HLSInitialParticipant,
+                                   object: SealedMediaObject) throws {
+        let id = participant.proof.binding.publicationParticipantID.rawValue
+        let codec = (participant.candidate?.declaration ?? declaration).audio
+            .first(where: { $0.participantID == id })?.codec
+        guard codec == .sourceAAC || participant.sourceAACTerminalBinding == nil
+            && object.publicationEvidence?.sourceAAC == nil else {
+            throw HLSPublicationFailure.identityMismatch
+        }
+        guard codec == .sourceAAC else { return }
+        guard participant.proof.mediaType == .audio,
+              participant.aacTerminalBinding == nil, participant.aacRenditionBinding == nil,
+              participant.aacWriterWindowAdmission == nil,
+              let root = participant.sourceAACTerminalBinding, root.isCurrent,
+              let callback = object.publicationEvidence?.sourceAAC,
+              callback.matches(object), root.accepts(callback) else {
+            throw HLSPublicationFailure.identityMismatch
+        }
+        let initial = root.configuration.authority.initialBinding
+        let binding = participant.proof.binding
+        guard initial.outputLifecycleEpoch == binding.outputLifecycleEpoch,
+              initial.itemGeneration == binding.itemGeneration,
+              initial.mediaEpoch == binding.mediaEpoch,
+              initial.publicationParticipantID == binding.publicationParticipantID,
+              initial.renditionIdentity == binding.renditionIdentity else {
+            throw HLSPublicationFailure.identityMismatch
+        }
+    }
+
+    private func validateNaturalEndSourceAACAuthorities() throws {
+        for audio in declaration.audio where audio.codec == .sourceAAC {
+            guard let participant = participants[audio.participantID],
+                  let root = participant.sourceAACTerminalBinding, root.isCurrent,
+                  let final = root.finalSeal, final.inputCount > 0,
+                  final.authorityIdentity == root.configuration.authority.identity,
+                  final.terminal.binding == participant.proof.binding,
+                  final.terminal.terminalReason == .finished,
+                  let last = records[audio.participantID]?.last,
+                  let proof = store.sourceAACProof(for: last.key), proof.binding === root,
+                  proof.callback.logicalSequence == final.lastLogicalSequence,
+                  proof.callback.writtenRange?.end == final.writtenEnd,
+                  final.lastLogicalSequence == last.receipt.logicalSequence,
+                  final.terminal.lastLogicalSequence == final.lastLogicalSequence,
+                  final.terminal.lastCallbackReportIdentity == last.objectIdentity.reportIdentity,
+                  final.writtenEnd == last.receipt.presentationRange.end else {
+                throw HLSPublicationFailure.identityMismatch
+            }
         }
     }
 
@@ -921,6 +1012,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             }
             if let commonHorizon {
                 result[id] = commonHorizon
+            } else if writesEndList, let source = participants[id]?.sourceAACTerminalBinding {
+                guard source.isCurrent, let final = source.finalSeal else {
+                    throw HLSPublicationFailure.identityMismatch
+                }
+                result[id] = final.writtenEnd
             } else if writesEndList,
                       let final = participants[id]?.aacRenditionBinding?.finalWriterReceipt {
                 result[id] = final.lastEffectiveEnd
@@ -928,7 +1024,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                       let authority = participants[id]?.aacTerminalBinding?.endpointAuthority {
                 result[id] = authority.receipt.lastEffectiveEnd
             } else {
-                result[id] = try tail.commonStart.adding(tail.commonDuration)
+                result[id] = try tail.commonStart.adding(tail.commonDuration).adding(
+                    participants[id]?.sourceAACTerminalBinding?.timelineOffset ?? HLSChecked.zero)
             }
         }
         return result
@@ -1051,6 +1148,10 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                   next.relay.releaseForControl(next.initialization) else {
                 throw HLSPublicationFailure.identityMismatch
             }
+            try validateSourceAAC(next, object: next.initialization)
+            guard previous.sourceAACTerminalBinding === next.sourceAACTerminalBinding else {
+                throw HLSPublicationFailure.identityMismatch
+            }
             guard store.advanceWriterWindowInitialization(
                 canonicalKey: canonicalKey,
                 predecessorInitialization: previous.initialization,
@@ -1165,6 +1266,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                   (input.proof.mediaType == .video) == (declaration.video?.participantID == binding.publicationParticipantID.rawValue) else {
                 throw HLSPublicationFailure.identityMismatch
             }
+            try validateSourceAAC(input, object: input.initialization)
             if let terminalBinding = input.aacTerminalBinding {
                 guard input.proof.mediaType == .audio,
                       terminalBinding.binding == binding,
@@ -1253,7 +1355,10 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
     }
     private func revalidate(_ ticket: PlaylistPublishTicket, now: Int64?) throws {
         guard !_closed else { throw HLSPublicationFailure.closed }
-        guard _ticket == ticket else { throw HLSPublicationFailure.staleTicket }
+        guard _ticket == ticket,
+              participants.values.allSatisfy({ $0.sourceAACTerminalBinding?.isCurrent ?? true }) else {
+            throw HLSPublicationFailure.staleTicket
+        }
         try store.validatePublication(ticket, owner: owner)
         if let now, let deadline = ticket.absoluteDeadline, now > deadline {
             _closed = true
@@ -1307,9 +1412,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             outputLifecycleEpoch: lifecycle, participantGeneration: generation ?? participantGeneration, publicationSequence: sequence,
             previousPublishInstant: previousInstant, absoluteDeadline: deadline, participantVector: vector)
     }
-    // The non-six mode retains the original 3...7 segment scan and exact sums.
-    // A four-second preference raises only the verified duration floor; it does
-    // not require six seconds from finite sources or relax any publication cap.
+    // A shorter configured floor applies only to the complete authenticated EOF
+    // prefix. It never authorizes a short live playlist or a partial EOF drain.
     private func allAtLeastStartupMinimum(_ chosen: [UInt64: [HLSValidatedSegment]]) throws -> Bool {
         try chosen.values.allSatisfy { segments in
             guard segments.count >= 3 else { return false }
@@ -1319,12 +1423,17 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
         }
     }
     private func allAtLeastSix(_ chosen: [UInt64: [HLSValidatedSegment]]) throws -> Bool {
-        try chosen.values.allSatisfy { segments in
+        try chosen.allSatisfy { entry in
+            let (id, segments) = entry
             guard segments.count >= 6 else { return false }
             let duration = try segments.reduce(HLSChecked.zero) {
                 try $0.adding($1.receipt.presentationRange.duration)
             }
-            return try HLSChecked.compare(duration, HLSChecked.six) >= 0
+            let minimum = try HLSPlaylistSerializer.requiredTargetDuration(segments: segments)
+            let target = advertisedTargetDurations[id] ?? minimum
+            guard target >= minimum else { throw HLSPublicationFailure.invalidDuration }
+            let required = try HLSChecked.multiply(target, 3)
+            return try HLSChecked.compare(duration, .init(value: required, timescale: 1)) >= 0
         }
     }
     private func samples(_ segments: [HLSValidatedSegment]) -> [HLSBandwidthSample] {
@@ -1363,6 +1472,11 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                       segment.receipt.logicalSequence == common.receipt.logicalSequence,
                       segment.commonStart == common.commonStart else { throw HLSPublicationFailure.identityMismatch }
                 let end = try common.commonStart.adding(video == nil ? HLSChecked.one : common.receipt.presentationRange.duration)
+                if video != nil, participants[segment.key.participantID]?.sourceAACTerminalBinding != nil {
+                    try validateBoundary(segment.receipt.presentationRange.start,
+                        common: common.receipt.presentationRange.start,
+                        unit: segment.boundary.accessUnitDuration, first: false, isVideoWithEvidence: false)
+                }
                 let terminalDurationComparison = try HLSChecked.compare(
                     segment.receipt.presentationRange.end,
                     segment.receipt.presentationRange.start
@@ -1377,7 +1491,9 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                     && terminalDurationComparison > 0
                 if !terminalAudioTail {
                     let isVideo = segment.proof.mediaType == .video
-                    try validateBoundary(segment.receipt.presentationRange.end, common: end,
+                    let boundaryEnd = try segment.receipt.presentationRange.end.subtracting(
+                        participants[segment.key.participantID]?.sourceAACTerminalBinding?.timelineOffset ?? HLSChecked.zero)
+                    try validateBoundary(boundaryEnd, common: end,
                         unit: segment.boundary.accessUnitDuration, first: false,
                         isVideoWithEvidence: isVideo)
                 }
@@ -1395,7 +1511,9 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             let commonEnd = try tail.commonStart.adding(
                 declaration.video == nil ? HLSChecked.one : tail.commonDuration
             )
-            if try HLSChecked.compare(tail.receipt.presentationRange.end, commonEnd) < 0 {
+            let sourceEnd = try tail.receipt.presentationRange.end.subtracting(
+                participants[tail.key.participantID]?.sourceAACTerminalBinding?.timelineOffset ?? HLSChecked.zero)
+            if try HLSChecked.compare(sourceEnd, commonEnd) < 0 {
                 return true
             }
         }

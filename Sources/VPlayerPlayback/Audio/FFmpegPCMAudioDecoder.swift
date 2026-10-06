@@ -6,7 +6,12 @@ import AudioToolbox
 import CoreMedia
 import Foundation
 
+enum HLSAudioCopyAdmissionFailure: Error, Sendable, Equatable {
+    case capacityExceeded
+}
+
 final class HLSAudioCopyOwnership: @unchecked Sendable {
+    private let fixedApplicationCharge: HLSCompressedAudioApplicationReservation?
     enum Phase: Sendable, Equatable { case compressedInput, nativePacket, pcmData, cmBlock, framing }
     struct CopyEvent: Sendable, Equatable { let phase: Phase; let wasChargedBeforeCopy: Bool }
     let compressedInput: HLSDataPlaneAdmission
@@ -22,7 +27,9 @@ final class HLSAudioCopyOwnership: @unchecked Sendable {
     private let observationLock = NSLock()
     private weak var drainObservation: FFmpegDrainCancelOrderingObservation?
     init(maximumCompressedBytes: Int, maximumPCMBytes: Int, capacity: Int,
-         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared) {
+         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
+         fixedApplicationCharge: HLSCompressedAudioApplicationReservation? = nil) {
+        self.fixedApplicationCharge = fixedApplicationCharge
         compressedInput = .init(capacity: capacity, maximumBytes: maximumCompressedBytes, applicationLedger: applicationLedger)
         nativeAllocation = .init(capacity: capacity, maximumBytes: maximumCompressedBytes, applicationLedger: applicationLedger)
         pcmTemporary = .init(capacity: capacity, maximumBytes: maximumPCMBytes, applicationLedger: applicationLedger)
@@ -43,6 +50,28 @@ final class HLSAudioCopyOwnership: @unchecked Sendable {
             if events.count == Self.eventCapacity { events.removeFirst() }
             events.append(.init(phase: phase, wasChargedBeforeCopy: true))
         } }
+        #endif
+        return lease
+    }
+    /// Framing may execute in the shared timeline/service CAS. It must never
+    /// wait for a later boundary or native tail that needs the same control lane.
+    func admitFramingWithoutWaiting(bytes: Int) throws -> HLSDataPlaneAdmission.Lease {
+        try acquireWithoutWaiting(framing, phase: .framing, bytes: bytes)
+    }
+    func admitSourceProofWithoutWaiting(bytes: Int) throws -> HLSDataPlaneAdmission.Lease {
+        try acquireWithoutWaiting(compressedInput, phase: .compressedInput, bytes: bytes)
+    }
+    private func acquireWithoutWaiting(_ domain: HLSDataPlaneAdmission, phase: Phase,
+                                       bytes: Int) throws -> HLSDataPlaneAdmission.Lease {
+        guard let lease = domain.acquire(bytes: bytes) else {
+            if domain.usage.cancelled { throw CancellationError() }
+            throw HLSAudioCopyAdmissionFailure.capacityExceeded
+        }
+        #if DEBUG
+        lock.withLock {
+            if events.count == Self.eventCapacity { events.removeFirst() }
+            events.append(.init(phase: phase, wasChargedBeforeCopy: true))
+        }
         #endif
         return lease
     }

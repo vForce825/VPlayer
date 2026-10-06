@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreGraphics
+import UIKit
 import XCTest
 
 final class VPlayerUITests: XCTestCase {
@@ -310,12 +312,691 @@ final class VPlayerUITests: XCTestCase {
     @MainActor
     private func focusSettingsRow(_ row: XCUIElement, in app: XCUIApplication) {
         let cell = app.cells.containing(.button, identifier: row.identifier).element
+        var presses = 0
         for _ in 0..<5 where !row.hasFocus && !cell.hasFocus {
             XCUIRemote.shared.press(.down)
+            presses += 1
         }
+        // Freeze the original verdict before collecting evidence. A focus
+        // transition during diagnostics must not turn a failed check into a pass.
+        let reachedRow = row.hasFocus || cell.hasFocus
         XCTAssertTrue(
-            row.hasFocus || cell.hasFocus,
+            reachedRow,
             "Expected focus to reach settings row \(row.identifier)"
+                + (reachedRow ? "" : settingsFocusFailureDetails(
+                    row: row, cell: cell, app: app, presses: presses
+                ))
         )
+    }
+
+    @MainActor
+    private func settingsFocusFailureDetails(
+        row: XCUIElement, cell: XCUIElement, app: XCUIApplication, presses: Int
+    ) -> String {
+        // Failure-only evidence for the seeded fixture. Keep the compact state
+        // in assertion text so the bounded CI failure report preserves it even
+        // when the complete UI log or xcresult attachments are unavailable.
+        func frame(_ rect: CGRect) -> String {
+            String(format: "%.0f,%.0f,%.0f,%.0f", rect.minX, rect.minY, rect.width, rect.height)
+        }
+        func describe(_ snapshot: any XCUIElementSnapshot) -> String {
+            "type=\(snapshot.elementType.rawValue),id=\(snapshot.identifier.prefix(64)),"
+                + "focus=\(snapshot.hasFocus),selected=\(snapshot.isSelected),frame=\(frame(snapshot.frame))"
+        }
+
+        let identifier = row.identifier
+        var evidence = " SETTINGS_FOCUS_FAILURE downPresses=\(presses) initialRowOrCellFocus=false"
+        let rowExists = row.exists
+        let cellExists = cell.exists
+        evidence += " lateRowExists=\(rowExists) lateRowHittable=\(rowExists && row.isHittable)"
+            + " lateCellExists=\(cellExists) lateCellHittable=\(cellExists && cell.isHittable)"
+        do {
+            let root = try app.snapshot()
+            var pending: [(node: any XCUIElementSnapshot, ancestors: [String], viewport: CGRect)] = [
+                (root, [], root.frame)
+            ]
+            var visited = 0
+            var target: [String] = []
+            var focused: [String] = []
+            var settings: [String] = []
+            while !pending.isEmpty && visited < 256 {
+                let entry = pending.removeLast()
+                let node = entry.node
+                visited += 1
+                var viewport = entry.viewport
+                if [.scrollView, .collectionView, .table].contains(node.elementType) {
+                    viewport = viewport.intersection(node.frame)
+                }
+                let summary = describe(node)
+                if node.identifier == identifier && target.count < 2 {
+                    target.append("\(summary),viewport=\(frame(viewport)),"
+                        + "intersectsViewport=\(viewport.intersects(node.frame)),"
+                        + "insideViewport=\(viewport.contains(node.frame)),"
+                        + "ancestors=\(entry.ancestors.suffix(5).joined(separator: "/"))")
+                }
+                if node.hasFocus && focused.count < 4 {
+                    focused.append(summary)
+                }
+                if node.elementType == .button && node.identifier.hasPrefix("settings."),
+                   settings.count < 6 {
+                    settings.append(summary)
+                }
+                // Bound both traversal and the ancestry carried by each entry.
+                let ancestor = "\(node.elementType.rawValue):\(node.identifier.prefix(48)):focus=\(node.hasFocus)"
+                let ancestors = Array((entry.ancestors + [ancestor]).suffix(5))
+                let remaining = max(0, 256 - visited - pending.count)
+                pending.append(contentsOf: node.children.prefix(remaining).reversed().map {
+                    ($0, ancestors, viewport)
+                })
+            }
+            evidence += " lateSnapshotScreen=\(frame(root.frame)) visited=\(visited)"
+                + " scanAtLimit=\(visited == 256) target=[\(target.joined(separator: ";"))]"
+                + " focused=[\(focused.joined(separator: ";"))]"
+                + " settings=[\(settings.joined(separator: ";"))]"
+        } catch {
+            evidence += " lateSnapshotError=\(String(describing: error).prefix(256))"
+        }
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "settings-focus-failure-\(identifier)"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        // The report limits each failure string to 4096 characters. Reserve
+        // room for XCTest's prefix and the original assertion message.
+        return String(evidence.prefix(3_700))
+    }
+}
+
+
+/// Diagnostic tests keep the production grid and native CardButtonStyle intact.
+/// Only the synthetic fixture supplies a layout-neutral colored measurement line.
+final class ChannelCardFocusDiagnosticTests: XCTestCase {
+    @MainActor
+    func testFlatPlaylistCardsLoseVisualFocusAfterScrolling() throws {
+        try exerciseFocusAndScroll(grouping: "playlistOrder")
+    }
+
+    @MainActor
+    func testGroupedPlaylistCardsLoseVisualFocusAfterScrolling() throws {
+        try exerciseFocusAndScroll(grouping: "playlistGroups")
+    }
+
+    @MainActor
+    private func exerciseFocusAndScroll(grouping: String) throws {
+        continueAfterFailure = false
+        executionTimeAllowance = 600
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "-ui-fixture", "seeded", "-uiTestResetPlaybackSettings",
+            "-ui-card-focus-diagnostics", "-channels.grouping", grouping,
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryL"
+        ]
+        app.launch()
+        defer { app.terminate() }
+        let first = app.buttons["channel.focus-probe.000"]
+        let second = app.buttons["channel.focus-probe.001"]
+        XCTAssertTrue(first.waitForExistence(timeout: 10))
+        try enterChannelGrid(app: app, first: first)
+
+        // Calibrate on rendered pixels before asserting anything about residual
+        // scale. AX frame widths are logged only, never used as the visual oracle.
+        let initial = try stableSnapshot(app: app)
+        let firstFocused = try initial.observation("channel.focus-probe.000")
+        let secondUnfocused = try initial.observation("channel.focus-probe.001")
+        let baseline = secondUnfocused.visualWidth
+        let focusDelta = firstFocused.visualWidth - baseline
+        guard firstFocused.hasFocus, !secondUnfocused.hasFocus,
+              focusDelta >= 3, focusDelta < baseline * 0.3 else {
+            attach(initial, name: "focus-calibration-unavailable-\(grouping)")
+            throw CardFocusProbeError.unavailable(
+                "Initial rendered focus expansion could not be calibrated: \(initial.summary)"
+            )
+        }
+        print("CARD_FOCUS_CALIBRATION grouping=\(grouping) baseline=\(baseline) "
+            + "focusDelta=\(focusDelta) \(initial.summary)")
+        attach(initial, name: "focus-calibration-initial-\(grouping)")
+
+        XCUIRemote.shared.press(.right)
+        XCTAssertTrue(second.wait(for: \.hasFocus, toEqual: true, timeout: 5))
+        let moved = try stableSnapshot(app: app)
+        let secondFocused = try moved.observation("channel.focus-probe.001")
+        guard secondFocused.visualWidth - baseline >= 3 else {
+            attach(moved, name: "focus-calibration-move-unavailable-\(grouping)")
+            throw CardFocusProbeError.unavailable(
+                "Pixels did not measure expansion on the newly focused card: \(moved.summary)"
+            )
+        }
+        let tolerance = max(2, focusDelta * 0.2)
+        try assertUnfocusedWidths(moved, baseline: baseline, tolerance: tolerance,
+            label: "\(grouping)-initial-right")
+        attach(moved, name: "focus-calibration-moved-\(grouping)")
+        XCUIRemote.shared.press(.left)
+        XCTAssertTrue(first.wait(for: \.hasFocus, toEqual: true, timeout: 5))
+
+        for cycle in 0..<2 {
+            var snapshot = try stableSnapshot(app: app)
+            var reachedBottom = false
+            for step in 0..<30 {
+                if try snapshot.focusedIndex() >= 75 {
+                    reachedBottom = true
+                    break
+                }
+                let index = try snapshot.focusedIndex()
+                if cycle == 1 && index < 60 {
+                    XCUIRemote.shared.press(.down, forDuration: 0.5)
+                } else {
+                    XCUIRemote.shared.press(.down)
+                }
+                snapshot = try stableSnapshot(app: app)
+                try assertUnfocusedWidths(snapshot, baseline: baseline, tolerance: tolerance,
+                    label: "\(grouping)-cycle\(cycle)-down\(step)")
+            }
+            if !reachedBottom { reachedBottom = try snapshot.focusedIndex() >= 75 }
+            XCTAssertTrue(reachedBottom, "Coverage failure: did not reach the last fixture rows")
+            XCTAssertFalse(first.isHittable, "Coverage failure: the first card never left the viewport")
+            attach(snapshot, name: "focus-bottom-\(grouping)-\(cycle)")
+
+            var reachedTop = false
+            for step in 0..<30 {
+                if try snapshot.focusedIndex() == 0 {
+                    reachedTop = true
+                    break
+                }
+                let index = try snapshot.focusedIndex()
+                if cycle == 1 && index > 20 {
+                    XCUIRemote.shared.press(.up, forDuration: 0.5)
+                } else {
+                    XCUIRemote.shared.press(.up)
+                }
+                snapshot = try stableSnapshot(app: app)
+                try assertUnfocusedWidths(snapshot, baseline: baseline, tolerance: tolerance,
+                    label: "\(grouping)-cycle\(cycle)-up\(step)")
+            }
+            if !reachedTop { reachedTop = try snapshot.focusedIndex() == 0 }
+            XCTAssertTrue(reachedTop, "Coverage failure: did not return to the first fixture card")
+            XCTAssertTrue(first.hasFocus)
+            attach(snapshot, name: "focus-returned-\(grouping)-\(cycle)")
+        }
+        print("CARD_FOCUS_RESULT grouping=\(grouping) calibrated=true cycles=2 residualScale=notObserved")
+    }
+
+    @MainActor
+    private func enterChannelGrid(app: XCUIApplication, first: XCUIElement) throws {
+        logEntryFocus(app: app, phase: "launch")
+        if first.hasFocus { return }
+
+        // defaultFocus chooses an item when the grid receives focus; it does not
+        // promise that a freshly launched TabView has entered that region. Use
+        // the same real remote tab-entry flow as the existing application tests.
+        let channelTab = app.tabBars.buttons["频道"]
+        for _ in 0..<8 where !app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) {
+            XCUIRemote.shared.press(.up)
+        }
+        guard app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) else {
+            throw entryFailure(app: app, reason: "Could not acquire the tab bar")
+        }
+        for _ in 0..<3 { XCUIRemote.shared.press(.left) }
+        for _ in 0..<4 where !channelTab.hasFocus { XCUIRemote.shared.press(.right) }
+        guard channelTab.hasFocus else {
+            throw entryFailure(app: app, reason: "Could not focus the channels tab")
+        }
+        XCUIRemote.shared.press(.select)
+        // Some tvOS configurations retain focus on the selected tab until Down.
+        // Never Select a channel here: the experiment must not open playback.
+        for _ in 0..<4 {
+            if first.wait(for: \.hasFocus, toEqual: true, timeout: 2) {
+                logEntryFocus(app: app, phase: "entered-grid")
+                return
+            }
+            XCUIRemote.shared.press(.down)
+        }
+        guard first.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {
+            throw entryFailure(app: app, reason: "Channels tab entry did not focus the first probe card")
+        }
+        logEntryFocus(app: app, phase: "entered-grid")
+    }
+
+    @MainActor
+    private func logEntryFocus(app: XCUIApplication, phase: String) {
+        let tabs = app.tabBars.buttons.allElementsBoundByIndex.map {
+            "\($0.label):focus=\($0.hasFocus)"
+        }.joined(separator: " ")
+        let first = app.buttons["channel.focus-probe.000"]
+        print("CARD_FOCUS_ENTRY phase=\(phase) firstFocus=\(first.hasFocus) tabs=[\(tabs)]")
+    }
+
+    @MainActor
+    private func entryFailure(app: XCUIApplication, reason: String) -> CardFocusProbeError {
+        logEntryFocus(app: app, phase: "failed-entry")
+        print("CARD_FOCUS_ENTRY_HIERARCHY \(app.debugDescription)")
+        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        attachment.name = "focus-entry-unavailable"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        return .unavailable(reason)
+    }
+
+    @MainActor
+    private func stableSnapshot(app: XCUIApplication) throws -> CardFocusSnapshot {
+        let started = Date()
+        let deadline = started.addingTimeInterval(12)
+        var previous: CardFocusSnapshot?
+        var lastScreenshot: XCUIScreenshot?
+        var lastReason = "Rendered focus/scroll state never stabilized"
+        var samples = 0
+        while Date() < deadline {
+            samples += 1
+            // Capture the hierarchy once. Live index-bound XCUIElement proxies
+            // can change identity or disappear as LazyVGrid realizes/removes rows;
+            // querying each attribute also used to cost 10+ seconds per checkpoint.
+            let hierarchy: any XCUIElementSnapshot
+            do {
+                hierarchy = try app.snapshot()
+            } catch {
+                lastReason = "Could not capture the AX hierarchy: \(error)"
+                previous = nil
+                Thread.sleep(forTimeInterval: 0.15)
+                continue
+            }
+            let candidates = probeAttributes(in: hierarchy)
+            let screenshot = XCUIScreen.main.screenshot()
+            lastScreenshot = screenshot
+            let screenFrame = hierarchy.frame
+            guard let image = screenshot.image.cgImage else {
+                throw CardFocusProbeError.unavailable("Screenshot has no CGImage")
+            }
+            let raster = try CardFocusRaster(image: image, screenFrame: screenFrame)
+            var observations: [CardFocusObservation] = []
+            var incompleteReason: String?
+            for candidate in candidates {
+                let frame = candidate.frame
+                // Clip-edge cards have no complete visual oracle. Fully visible
+                // cards must have a marker; silently dropping one could hide a bug.
+                guard frame.width > 0, frame.height > 0,
+                      frame.minX >= screenFrame.minX + 10,
+                      frame.maxX <= screenFrame.maxX - 10,
+                      frame.minY >= screenFrame.minY + 80,
+                      frame.maxY <= screenFrame.maxY - 10 else { continue }
+                guard let width = raster.markerWidth(near: frame) else {
+                    incompleteReason = "No marker for \(candidate.identifier), AX frame=\(frame)"
+                    break
+                }
+                observations.append(CardFocusObservation(
+                    identifier: candidate.identifier, hasFocus: candidate.hasFocus,
+                    visualWidth: width, accessibilityFrame: frame
+                ))
+            }
+            let current = CardFocusSnapshot(
+                observations: observations.sorted { $0.identifier < $1.identifier },
+                screenshot: screenshot
+            )
+            if incompleteReason == nil {
+                do { _ = try current.focusedIndex() }
+                catch { incompleteReason = String(describing: error) }
+            }
+            if let incompleteReason {
+                // Screenshots and AX attributes cannot be captured atomically.
+                // A scroll can move between those reads, so retry the whole sample.
+                lastReason = incompleteReason
+                previous = nil
+            } else {
+                if let previous, current.isStable(comparedTo: previous) {
+                    print("CARD_FOCUS_CAPTURE elapsed=\(Date().timeIntervalSince(started)) "
+                        + "samples=\(samples) candidates=\(candidates.count) visible=\(observations.count)")
+                    return current
+                }
+                lastReason = "Rendered geometry is changing: \(current.summary)"
+                previous = current
+            }
+            // Poll for stable rendered widths and AX positions, rather than
+            // treating a transient screenshot/AX mismatch as a product failure.
+            Thread.sleep(forTimeInterval: 0.15)
+        }
+        if let lastScreenshot {
+            let attachment = XCTAttachment(screenshot: lastScreenshot)
+            attachment.name = "focus-measurement-never-settled"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        throw CardFocusProbeError.unavailable("After 12 seconds: \(lastReason)")
+    }
+
+    @MainActor
+    private func probeAttributes(in hierarchy: any XCUIElementSnapshot) -> [CardFocusAttributes] {
+        var pending: [any XCUIElementSnapshot] = [hierarchy]
+        var result: [CardFocusAttributes] = []
+        while let snapshot = pending.popLast() {
+            if snapshot.elementType == .button,
+               snapshot.identifier.hasPrefix("channel.focus-probe.") {
+                result.append(CardFocusAttributes(
+                    identifier: snapshot.identifier, frame: snapshot.frame,
+                    hasFocus: snapshot.hasFocus
+                ))
+            }
+            pending.append(contentsOf: snapshot.children)
+        }
+        return result
+    }
+
+    @MainActor
+    private func assertUnfocusedWidths(
+        _ snapshot: CardFocusSnapshot, baseline: CGFloat, tolerance: CGFloat, label: String
+    ) throws {
+        _ = try snapshot.focusedIndex()
+        print("CARD_FOCUS_SAMPLE phase=\(label) \(snapshot.summary)")
+        let residual = snapshot.observations.filter {
+            !$0.hasFocus && $0.visualWidth > baseline + tolerance
+        }
+        if !residual.isEmpty {
+            attach(snapshot, name: "residual-focus-scale-\(label)")
+            XCTFail("CARD_FOCUS_RESIDUAL baseline=\(baseline) tolerance=\(tolerance) "
+                + "phase=\(label) \(snapshot.summary)")
+            throw CardFocusProbeError.residualScale
+        }
+        XCTAssertGreaterThanOrEqual(snapshot.observations.filter { !$0.hasFocus }.count, 1,
+            "Coverage failure: no unfocused peer was measured")
+    }
+
+    @MainActor
+    private func attach(_ snapshot: CardFocusSnapshot, name: String) {
+        let attachment = XCTAttachment(screenshot: snapshot.screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+}
+
+private enum CardFocusProbeError: Error, CustomStringConvertible {
+    case unavailable(String)
+    case residualScale
+
+    var description: String {
+        switch self {
+        case let .unavailable(reason): "CARD_FOCUS_MEASUREMENT_UNAVAILABLE: \(reason)"
+        case .residualScale: "CARD_FOCUS_RESIDUAL: a nonfocused card retained measured visual expansion"
+        }
+    }
+}
+
+/// Value-only projection of one immutable AX hierarchy; reading these values
+/// never resolves an element by index or makes another automation round trip.
+private struct CardFocusAttributes {
+    let identifier: String
+    let frame: CGRect
+    let hasFocus: Bool
+}
+
+private struct CardFocusObservation {
+    let identifier: String
+    let hasFocus: Bool
+    let visualWidth: CGFloat
+    let accessibilityFrame: CGRect
+
+    var accessibilityWidth: CGFloat { accessibilityFrame.width }
+}
+
+private struct CardFocusSnapshot {
+    let observations: [CardFocusObservation]
+    let screenshot: XCUIScreenshot
+
+    var summary: String {
+        observations.map {
+            "\($0.identifier):focus=\($0.hasFocus),renderedWidthPoints=\($0.visualWidth),axWidth=\($0.accessibilityWidth)"
+        }.joined(separator: " ")
+    }
+
+    func observation(_ identifier: String) throws -> CardFocusObservation {
+        guard let value = observations.first(where: { $0.identifier == identifier }) else {
+            throw CardFocusProbeError.unavailable("No fully visible observation for \(identifier): \(summary)")
+        }
+        return value
+    }
+
+    func focusedIndex() throws -> Int {
+        let focused = observations.filter(\.hasFocus)
+        guard focused.count == 1,
+              let suffix = focused.first?.identifier.split(separator: ".").last,
+              let index = Int(suffix) else {
+            throw CardFocusProbeError.unavailable("Expected exactly one focused probe card: \(summary)")
+        }
+        return index
+    }
+
+    func isStable(comparedTo previous: Self) -> Bool {
+        guard observations.count >= 2,
+              observations.count == previous.observations.count else { return false }
+        return zip(observations, previous.observations).allSatisfy { lhs, rhs in
+            lhs.identifier == rhs.identifier && lhs.hasFocus == rhs.hasFocus
+                && abs(lhs.visualWidth - rhs.visualWidth) <= 1
+                && abs(lhs.accessibilityFrame.minX - rhs.accessibilityFrame.minX) <= 1
+                && abs(lhs.accessibilityFrame.minY - rhs.accessibilityFrame.minY) <= 1
+        }
+    }
+}
+
+final class ChannelCardFocusRasterTests: XCTestCase {
+    func testPixelMeasurementDetectsScaleEvenWhenAccessibilityFrameDoesNotChange() throws {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        let idle = raster(marker: 60..<220)
+        let enlarged = raster(marker: 50..<230)
+        XCTAssertEqual(try XCTUnwrap(idle.markerWidth(near: frame)), 160, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(enlarged.markerWidth(near: frame)), 180, accuracy: 0.001)
+    }
+
+    func testCGImageDecodingPreservesScreenPixelCoordinates() throws {
+        let source = raster(marker: 60..<220)
+        let provider = try XCTUnwrap(CGDataProvider(data: Data(source.rgba) as CFData))
+        let image = try XCTUnwrap(CGImage(
+            width: source.width, height: source.height,
+            bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: source.width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent
+        ))
+        let decoded = try CardFocusRaster(image: image, screenFrame: source.screenFrame)
+        XCTAssertEqual(try XCTUnwrap(decoded.markerWidth(
+            near: CGRect(x: 40, y: 40, width: 200, height: 100)
+        )), 160, accuracy: 0.001)
+        XCTAssertNil(decoded.markerWidth(
+            near: CGRect(x: 40, y: 140, width: 200, height: 100)
+        ), "Decoding must not mirror the line to the bottom of the screen")
+        let doubled = try CardFocusRaster(image: image,
+            screenFrame: CGRect(x: 0, y: 0, width: 300, height: 100))
+        XCTAssertEqual(try XCTUnwrap(doubled.markerWidth(
+            near: CGRect(x: 20, y: 20, width: 100, height: 50)
+        )), 80, accuracy: 0.001)
+    }
+
+    func testClippedMarkerIsUnavailableRatherThanAnUnderestimatedWidth() {
+        XCTAssertNil(raster(marker: 0..<220).markerWidth(
+            near: CGRect(x: 40, y: 40, width: 200, height: 100)
+        ))
+    }
+
+    func testMissingMarkerIsUnavailableRatherThanZeroWidth() {
+        XCTAssertNil(raster(marker: 0..<0).markerWidth(
+            near: CGRect(x: 40, y: 40, width: 200, height: 100)
+        ))
+    }
+
+    func testAnotherCardsMarkerCannotStandInForTheRequestedCard() {
+        XCTAssertNil(raster(marker: 60..<220).markerWidth(
+            near: CGRect(x: 350, y: 40, width: 200, height: 100)
+        ))
+    }
+
+    func testMarkerSearchIsBoundedByRowsAndIntersectingRuns() throws {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        var inspectedPixelCount = 0
+        XCTAssertEqual(try XCTUnwrap(raster(marker: 60..<220).markerWidth(
+            near: frame, inspectedPixelCount: &inspectedPixelCount
+        )), 160, accuracy: 0.001)
+        // 100 candidate rows plus six 160-pixel marker runs and their edges.
+        // Scanning all 260 columns per row would exceed this by over 20 times.
+        XCTAssertLessThanOrEqual(inspectedPixelCount, 1_100,
+            "Empty rows must use one center-column read, not a full-width scan")
+    }
+
+    func testCenteredMarkerSearchPreservesGeometryRejectionsAndLongestRun() throws {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        for marker in [60..<220, 61..<221, 90..<190] {
+            XCTAssertEqual(try XCTUnwrap(raster(marker: marker).markerWidth(near: frame)),
+                CGFloat(marker.count), accuracy: 0.001)
+        }
+        for marker in [84..<244, 34..<194, 91..<189] {
+            XCTAssertNil(raster(marker: marker).markerWidth(near: frame),
+                "Center tolerance and minimum run length must still reject \(marker)")
+        }
+        let fractionalCenter = CGRect(x: 139.0625, y: 40, width: 1, height: 100)
+        XCTAssertEqual(try XCTUnwrap(raster(marker: 139..<140).markerWidth(
+            near: fractionalCenter
+        )), 1, accuracy: 0.001,
+            "The center column must be floored; rounding would miss this accepted run")
+        XCTAssertNil(raster(marker: 60..<300).markerWidth(near: frame),
+            "A run crossing the right search edge must remain unavailable")
+        let split = raster(markers: [(40..<46, 60..<130), (40..<46, 150..<220)])
+        XCTAssertNil(split.markerWidth(near: frame), "Separated runs must not be joined")
+        let varied = raster(markers: [(40..<42, 60..<220), (42..<46, 50..<230)])
+        XCTAssertEqual(try XCTUnwrap(varied.markerWidth(near: frame)), 180, accuracy: 0.001,
+            "All marker rows must be measured, including a later, wider run")
+    }
+
+    func testInvalidRasterStorageAndNonfiniteBoundsAreUnavailable() {
+        let frame = CGRect(x: 40, y: 40, width: 200, height: 100)
+        let short = CardFocusRaster(width: 600, height: 200,
+            screenFrame: CGRect(x: 0, y: 0, width: 600, height: 200), rgba: [0])
+        XCTAssertNil(short.markerWidth(near: frame))
+        XCTAssertNil(raster(marker: 60..<220).markerWidth(near: .null))
+        let invalidScreen = CardFocusRaster(width: 600, height: 200,
+            screenFrame: CGRect(x: 0, y: 0, width: 0, height: 200),
+            rgba: raster(marker: 60..<220).rgba)
+        XCTAssertNil(invalidScreen.markerWidth(near: frame))
+    }
+
+    private func raster(marker: Range<Int>) -> CardFocusRaster {
+        raster(markers: [(40..<46, marker)])
+    }
+
+    private func raster(markers: [(rows: Range<Int>, columns: Range<Int>)]) -> CardFocusRaster {
+        var pixels = [UInt8](repeating: 0, count: 600 * 200 * 4)
+        for marker in markers {
+            for y in marker.rows {
+                for x in marker.columns {
+                    let offset = (y * 600 + x) * 4
+                    pixels[offset] = 255
+                    pixels[offset + 2] = 255
+                    pixels[offset + 3] = 255
+                }
+            }
+        }
+        return CardFocusRaster(width: 600, height: 200,
+            screenFrame: CGRect(x: 0, y: 0, width: 600, height: 200), rgba: pixels)
+    }
+}
+
+/// Reads a saturated magenta line inside the native button label. The rendered
+/// marker inherits the card's transform, unlike an AX frame or @FocusState flag.
+private struct CardFocusRaster {
+    let width: Int
+    let height: Int
+    let screenFrame: CGRect
+    let rgba: [UInt8]
+
+    init(width: Int, height: Int, screenFrame: CGRect, rgba: [UInt8]) {
+        self.width = width
+        self.height = height
+        self.screenFrame = screenFrame
+        self.rgba = rgba
+    }
+
+    init(image: CGImage, screenFrame: CGRect) throws {
+        let width = image.width
+        let height = image.height
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        let decoded = pixels.withUnsafeMutableBytes { bytes -> Bool in
+            guard let context = CGContext(
+                data: bytes.baseAddress, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue
+                    | CGImageAlphaInfo.premultipliedLast.rawValue
+            ) else { return false }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height)))
+            return true
+        }
+        guard decoded, screenFrame.width > 0, screenFrame.height > 0 else {
+            throw CardFocusProbeError.unavailable("Screenshot RGBA decoding failed")
+        }
+        self.init(width: width, height: height, screenFrame: screenFrame, rgba: pixels)
+    }
+
+    func markerWidth(near frame: CGRect) -> CGFloat? {
+        var inspectedPixelCount = 0
+        return markerWidth(near: frame, inspectedPixelCount: &inspectedPixelCount)
+    }
+
+    func markerWidth(near frame: CGRect, inspectedPixelCount: inout Int) -> CGFloat? {
+        // Validate one contiguous read before scanning the screenshot. Repeated
+        // Array subscripts make this diagnostic unnecessarily slow in Debug;
+        // the pointer stays inside this synchronous, owner-retaining closure.
+        guard width > 0, height > 0, screenFrame.width > 0, screenFrame.height > 0,
+              frame.width > 0, frame.height > 0,
+              [screenFrame.minX, screenFrame.minY, screenFrame.width, screenFrame.height,
+               frame.minX, frame.maxX, frame.minY, frame.width, frame.height].allSatisfy(\.isFinite) else { return nil }
+        let area = width.multipliedReportingOverflow(by: height)
+        let byteCount = area.partialValue.multipliedReportingOverflow(by: 4)
+        guard !area.overflow, !byteCount.overflow, rgba.count == byteCount.partialValue else { return nil }
+        let scaleX = CGFloat(width) / screenFrame.width
+        let scaleY = CGFloat(height) / screenFrame.height
+        let centreX = (frame.midX - screenFrame.minX) * scaleX
+        guard scaleX.isFinite, scaleY.isFinite, scaleX > 0, scaleY > 0, centreX.isFinite else { return nil }
+        // Include native visual scale even on platforms where AX reports only
+        // the untransformed layout rectangle. Do not include adjacent centres.
+        let bounds = [((frame.minX - 30 - screenFrame.minX) * scaleX).rounded(.down),
+                      ((frame.maxX + 30 - screenFrame.minX) * scaleX).rounded(.up),
+                      ((frame.minY - 60 - screenFrame.minY) * scaleY).rounded(.down),
+                      ((frame.minY + 60 - screenFrame.minY) * scaleY).rounded(.up)]
+        guard bounds.allSatisfy(\.isFinite) else { return nil }
+        let x0 = Int(min(CGFloat(width), max(0, bounds[0])))
+        let x1 = Int(min(CGFloat(width), max(0, bounds[1])))
+        let y0 = Int(min(CGFloat(height), max(0, bounds[2])))
+        let y1 = Int(min(CGFloat(height), max(0, bounds[3])))
+        guard x0 < x1, y0 < y1 else { return nil }
+        // Every accepted run spans the center column: its half-length is at
+        // least 25% of the card width while its center offset is below 12%.
+        // Empty rows therefore need only one pixel read. This preserves the
+        // longest complete run, clipping rejection and all geometry thresholds.
+        guard centreX >= CGFloat(x0), centreX < CGFloat(x1) else { return nil }
+        let centerColumn = Int(centreX.rounded(.down))
+        return rgba.withUnsafeBufferPointer { storage in
+            guard let base = storage.baseAddress else { return nil }
+            func isMarker(_ x: Int, row: UnsafePointer<UInt8>) -> Bool {
+                inspectedPixelCount += 1
+                let pixel = row.advanced(by: x * 4)
+                return pixel[0] >= 180 && pixel[1] <= 100 && pixel[2] >= 180
+            }
+            var longest = 0
+            for y in y0..<y1 {
+                let row = base.advanced(by: y * width * 4)
+                guard isMarker(centerColumn, row: row) else { continue }
+                var runStart = centerColumn
+                while runStart > x0, isMarker(runStart - 1, row: row) {
+                    runStart -= 1
+                }
+                var runEnd = centerColumn + 1
+                while runEnd < x1, isMarker(runEnd, row: row) {
+                    runEnd += 1
+                }
+                let length = runEnd - runStart
+                let centre = CGFloat(runStart + runEnd) / 2
+                if runStart > x0, runEnd < x1,
+                   abs(centre - centreX) < frame.width * scaleX * 0.12,
+                   CGFloat(length) >= frame.width * scaleX * 0.5 {
+                    longest = max(longest, length)
+                }
+            }
+            guard longest > 0 else { return nil }
+            let measured = CGFloat(longest) / scaleX
+            return measured.isFinite ? measured : nil
+        }
     }
 }

@@ -17,8 +17,8 @@ protocol HLSNaturalEndPublicationScope: AnyObject, Sendable {
     func withActivePublication<T>(_ operation: () throws -> T) throws -> T
 }
 
-/// 一个 publisher 的 commit 时钟与 EOF 等待槽。store 域可调用这里只取本锁的方法；
-/// 本类型从不反向调用 publisher、store 或 graph，因此不会倒置 graph→store 的锁序。
+/// 同一 publisher 的 live/EOF 时钟与唯一 timer。store 域可调用这里只取本锁的方法；
+/// Store 发信号只操作本锁；仅 timer 在退出本锁后调用 live graph，保持 graph→store 锁序。
 final class HLSNaturalEndPublicationClock: @unchecked Sendable {
     struct CommitAnchor: Sendable {
         let logical: Int64
@@ -37,7 +37,9 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
         return 128 + timerHandler + cancellationHandler + graphScopeStorage +
             64 + 32 + // 唯一 continuation 与 weak side table。
             3 * 512 + // 三层新增串行 async frame 的固定 ABI 余量；没有新增 Task runner。
-            3 * malloc_good_size(pointer) // graph、publisher、唯一 capacity slot 的引用存储。
+            3 * malloc_good_size(pointer) + // graph、publisher、唯一 capacity slot 的引用存储。
+            malloc_good_size(16 + pointer) + 48 + // live wake 的 weak graph capture。
+            64 + 3 * 512 + malloc_good_size(pointer) // 唯一 producer wait 的有界 async frame 余量。
     }
 
     static var reservationBytes: Int {
@@ -62,6 +64,7 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
 
     private let lock = NSLock()
     private let clock: any PlaybackMonotonicClock
+    private let usesAbsoluteMonotonicTime: Bool
     private let ledger: PlaybackResourceContextLedger
     private let reservation: PlaybackResourceContextReservation
     private let timer: any PlaybackDeadlineTimer
@@ -73,22 +76,26 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
     private var pending = false
     private var cancelled = false
     private var stopped = false
+    private var liveWakeHandler: (@Sendable () -> Void)?
 
     static func make(clock: (any PlaybackMonotonicClock)? = nil,
+                     usesAbsoluteMonotonicTime: Bool = false,
                      ledger: PlaybackResourceContextLedger = .shared) throws
         -> HLSNaturalEndPublicationClock {
         let reservation = try ledger.reserve(allocationIdentity: .stable(UUID()),
             bytes: reservationBytes)
         let owner = HLSNaturalEndPublicationClock(
             clock: clock ?? DispatchPlaybackMonotonicClock(),
+            usesAbsoluteMonotonicTime: usesAbsoluteMonotonicTime,
             ledger: ledger, reservation: reservation)
         try ledger.rebind(reservation, to: .object(ObjectIdentifier(owner)))
         return owner
     }
 
-    private init(clock: any PlaybackMonotonicClock, ledger: PlaybackResourceContextLedger,
+    private init(clock: any PlaybackMonotonicClock, usesAbsoluteMonotonicTime: Bool, ledger: PlaybackResourceContextLedger,
                  reservation: PlaybackResourceContextReservation) {
         self.clock = clock
+        self.usesAbsoluteMonotonicTime = usesAbsoluteMonotonicTime
         self.ledger = ledger
         self.reservation = reservation
         timer = clock.makeDeadlineTimer(deliveryQueue: .global(qos: .userInitiated))
@@ -126,6 +133,12 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
     func now() throws -> Instant {
         try lock.withLock {
             let current = try readClockLocked()
+            if usesAbsoluteMonotonicTime {
+                guard let value = Int64(exactly: current) else {
+                    throw HLSPublicationFailure.arithmeticOverflow
+                }
+                return .init(logical: value, monotonic: current)
+            }
             guard let anchor else { return .init(logical: 0, monotonic: current) }
             guard current >= anchor.monotonic,
                   let elapsed = Int64(exactly: current - anchor.monotonic) else {
@@ -156,6 +169,40 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
         return value
     }
 
+    /// HTTP response tails may outlive the publication timer. Residency still
+    /// samples this same monotonic domain after publication admission is closed.
+    var residencyNowNanoseconds: Int64 { Int64(clamping: clock.nowNanoseconds) }
+
+    var hasLiveWakeHandler: Bool { lock.withLock { liveWakeHandler != nil && !stopped } }
+
+    func installLiveWakeHandler(_ handler: @escaping @Sendable () -> Void) {
+        lock.withLock {
+            precondition(liveWakeHandler == nil && continuation == nil && !stopped)
+            liveWakeHandler = handler
+        }
+    }
+
+    func scheduleLiveWake(until instant: UInt64?) {
+        lock.withLock {
+            guard !stopped, liveWakeHandler != nil, continuation == nil else { return }
+            // A capacity signal between state inspection and rearm must win.
+            // It is consumed by the next graph turn, never lost to a later gate.
+            let deadline = pending ? min(instant ?? UInt64.max, clock.nowNanoseconds) : instant
+            scheduledInstant = deadline
+            timer.schedule(notAfterInstant: deadline)
+        }
+    }
+
+    func removeLiveWakeHandler() {
+        lock.withLock {
+            liveWakeHandler = nil
+            if continuation == nil {
+                scheduledInstant = nil
+                timer.schedule(notAfterInstant: nil)
+            }
+        }
+    }
+
     /// 每次读取 publisher 前消费合并信号；读取后到 install wait 之间的通知不能丢失。
     func consumeSignal() { lock.withLock { pending = false } }
 
@@ -163,25 +210,43 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
         let waiter = lock.withLock { () -> CheckedContinuation<Void, Error>? in
             guard !stopped else { return nil }
             pending = true
-            guard let waiter = continuation else { return nil }
-            continuation = nil
-            scheduledInstant = nil
-            timer.schedule(notAfterInstant: nil)
-            return waiter
+            if let waiter = continuation {
+                continuation = nil
+                scheduledInstant = nil
+                timer.schedule(notAfterInstant: nil)
+                return waiter
+            }
+            if liveWakeHandler != nil {
+                // Store callbacks cannot enter graph while holding the store lock.
+                // The same timer coalesces signals and re-enters graph asynchronously.
+                let now = clock.nowNanoseconds
+                scheduledInstant = now
+                timer.schedule(notAfterInstant: now)
+            }
+            return nil
         }
         waiter?.resume()
     }
 
     private func timerFired() {
-        let due = lock.withLock { () -> Bool in
-            guard let scheduledInstant else { return false }
+        let delivery = lock.withLock { () -> (Bool, (@Sendable () -> Void)?) in
+            guard !stopped, let scheduledInstant else { return (false, nil) }
             let now = clock.nowNanoseconds
-            if now >= scheduledInstant || lastObserved.map({ now < $0 }) == true { return true }
-            // 迟到旧回调或测试 early-fire 不能撤销仍有效的新排期。
-            timer.schedule(notAfterInstant: scheduledInstant)
-            return false
+            guard now >= scheduledInstant || lastObserved.map({ now < $0 }) == true else {
+                // An early or stale physical delivery cannot cancel a later schedule.
+                timer.schedule(notAfterInstant: scheduledInstant)
+                return (false, nil)
+            }
+            if let liveWakeHandler {
+                self.scheduledInstant = nil
+                timer.schedule(notAfterInstant: nil)
+                return (true, liveWakeHandler)
+            }
+            return (true, nil)
         }
-        if due { signal() }
+        guard delivery.0 else { return }
+        if let liveWakeHandler = delivery.1 { liveWakeHandler() }
+        else { signal() }
     }
 
     func wait(until instant: UInt64) async throws {
@@ -190,6 +255,7 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
                 let immediate = lock.withLock { () -> Result<Void, Error>? in
                     guard !cancelled, !Task.isCancelled else { return .failure(CancellationError()) }
                     guard !stopped else { return .failure(HLSPublicationFailure.closed) }
+                    guard liveWakeHandler == nil else { return .failure(HLSPublicationFailure.identityMismatch) }
                     guard continuation == nil else { return .failure(HLSPublicationFailure.capacityExceeded) }
                     if pending { pending = false; return .success(()) }
                     continuation = waiter
@@ -215,6 +281,7 @@ final class HLSNaturalEndPublicationClock: @unchecked Sendable {
     func stopWaiting() {
         let waiter = lock.withLock { () -> CheckedContinuation<Void, Error>? in
             stopped = true
+            liveWakeHandler = nil
             defer { continuation = nil; scheduledInstant = nil }
             timer.schedule(notAfterInstant: nil)
             return continuation
@@ -261,6 +328,12 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     private var storedError: ErrorDiagnosticSnapshot?
     private var failureSink: (@Sendable (ErrorDiagnosticSnapshot) -> Void)?
     private var naturalEndPending = false
+    // Removing a timer handler cannot revoke a closure already selected for
+    // delivery. This graph-lock fence remains revoked after EOF completes.
+    private var livePublicationActive = true
+    private var closed = false
+    private var producerWaitCancelled = false
+    private var producerWaiter: CheckedContinuation<Void, Error>?
     private var prefixUnavailableAtNaturalEnd = false
     private var lastLogicalSequence: UInt64 = 0
     private var videoFrameRateMilli: UInt64?
@@ -271,7 +344,23 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     private(set) var publisher: HLSPublicationCoordinator?
     #if DEBUG
     // 测试只控制真实 callback 的到达顺序，不替代 validator、offer 或来源凭据。
+    private var initialStoreCreationCount = 0
+    var initialStoreCreationCountForTesting: Int { condition.withLock { initialStoreCreationCount } }
     private var beforeReceiveForTesting: (@Sendable (SealedMediaObject) -> Void)?
+    private var beforeLiveWakeForTesting: (@Sendable () -> Void)?
+    private var afterLiveWakeForTesting: (@Sendable () -> Void)?
+
+    /// Observes an already-selected live delivery outside the graph lock; tests
+    /// can hold the real timer callback across EOF/retirement without forging it.
+    func installLiveWakeObserverForTesting(
+        before: @escaping @Sendable () -> Void,
+        after: @escaping @Sendable () -> Void
+    ) {
+        condition.withLock {
+            beforeLiveWakeForTesting = before
+            afterLiveWakeForTesting = after
+        }
+    }
 
     func installBeforeReceiveForTesting(
         _ observer: @escaping @Sendable (SealedMediaObject) -> Void
@@ -282,7 +371,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
 
     init(itemGeneration: UInt64,
          publicationDeadlineNanoseconds: Int64 = 120_000_000_000,
-         initialWindowMinimumSeconds: Int = 3) throws {
+         initialWindowMinimumSeconds: Int = 6,
+         clock: (any PlaybackMonotonicClock)? = nil) throws {
         guard publicationDeadlineNanoseconds > 0,
               [3, 4, 6].contains(initialWindowMinimumSeconds) else {
             throw HLSPublicationFailure.invalidDuration
@@ -290,8 +380,10 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
         self.itemGeneration = itemGeneration
         self.initialWindowMinimumSeconds = UInt8(initialWindowMinimumSeconds)
         self.publicationDeadlineNanoseconds = publicationDeadlineNanoseconds
-        publicationClock = try HLSNaturalEndPublicationClock.make()
+        publicationClock = try HLSNaturalEndPublicationClock.make(
+            clock: clock, usesAbsoluteMonotonicTime: true)
         token = try LoopbackSessionToken.generateSystemCapability()
+        publicationClock.installLiveWakeHandler { [weak self] in self?.livePublicationWake() }
     }
 
     func installFailureSink(_ sink: @escaping @Sendable (ErrorDiagnosticSnapshot) -> Void) {
@@ -366,7 +458,7 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
             // authority.fail 会反向 recordFailure；必须先退出本图的 condition。
             if let (diagnostic, sink) = firstFailure { sink(diagnostic) }
         }
-        guard storedError == nil,
+        guard !closed, storedError == nil,
               let window = windows[object.binding.writerIdentity.rawValue],
               window.relay === relay else {
             _ = relay.releaseForControl(object)
@@ -400,6 +492,9 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
             if storedError == nil {
                 let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
                 storedError = diagnostic
+                publicationClock.removeLiveWakeHandler()
+                if let publisher { publisher.cancelCapacityWait(ticket: publisher.ticket) }
+                resumeProducerLocked(throwing: diagnostic)
                 if let failureSink { firstFailure = (diagnostic, failureSink) }
             }
             _ = relay.releaseForControl(object)
@@ -426,16 +521,47 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
         } else {
             videoDeclaration = nil
         }
+        let actualAudioCodec: HLSAudioCodec
+        if audio.writer.sourceAACConfiguration != nil {
+            guard let initialization = audio.initialization,
+                  let evidence = initialization.publicationEvidence?.sourceAAC,
+                  evidence.matches(initialization),
+                  audio.writer.sourceAACTerminalBinding?.isCurrent == true,
+                  audio.writer.sourceAACTerminalBinding?.accepts(evidence) == true else {
+                throw HLSPublicationFailure.identityMismatch
+            }
+            actualAudioCodec = .sourceAAC
+        } else {
+            switch audioFormat.codec {
+            case "mp4a.40.2": actualAudioCodec = .aac
+            case "ac-3":
+                guard audio.initialization?.publicationEvidence?.dolbyInitialization != nil else {
+                    throw HLSPublicationFailure.identityMismatch
+                }
+                actualAudioCodec = .ac3
+            case "ec-3":
+                guard audio.initialization?.publicationEvidence?.dolbyInitialization != nil else {
+                    throw HLSPublicationFailure.identityMismatch
+                }
+                actualAudioCodec = .eac3
+            default: throw HLSPublicationFailure.identityMismatch
+            }
+        }
         let declaration = HLSItemDeclaration(
             itemGeneration: itemGeneration,
             token: token.value,
             video: videoDeclaration,
             audio: [.init(
                 participantID: audio.binding.publicationParticipantID.rawValue,
-                renditionID: "main-aac", codec: .aac,
+                renditionID: "main-\(actualAudioCodec.groupPrefix)", codec: actualAudioCodec,
                 channels: audioFormat.channels, language: nil,
-                score: 100, peakEnvelope: 2_048_000)])
-        let store = SealedMediaStore(loopbackSession: token, itemGeneration: itemGeneration)
+                score: 100, peakEnvelope: SegmentedFMP4Writer.audioPeakEnvelope(
+                    configuration: audio.writer.compressedFormatConfiguration))])
+        #if DEBUG
+        initialStoreCreationCount += 1
+        #endif
+        let store = SealedMediaStore(loopbackSession: token, itemGeneration: itemGeneration,
+                                    publicationClock: publicationClock)
         let candidate: HLSAudioCandidateRegistration?
         if !expectsVideo, let initialization = audio.initialization, let proof = audio.proof {
             candidate = try store.registerAudioCandidate(
@@ -453,7 +579,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
                 aacTerminalBinding: window.mediaType == .audio
                     ? window.writer.aacTerminalBinding : nil,
                 aacRenditionBinding: window.mediaType == .audio
-                    ? window.writer.aacRenditionTerminalBinding : nil)
+                    ? window.writer.aacRenditionTerminalBinding : nil,
+                sourceAACTerminalBinding: window.writer.sourceAACTerminalBinding)
         }
         let publisher = try HLSPublicationCoordinator(
             store: store, participants: participants, declaration: declaration,
@@ -486,7 +613,8 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
               let successorProof = window.proof else {
             throw HLSPublicationFailure.identityMismatch
         }
-        if window.mediaType == .audio {
+        if window.mediaType == .audio, window.writer.sourceAACTerminalBinding == nil,
+           window.writer.compressedFormatConfiguration == nil {
             guard let terminal = window.writer.aacTerminalBinding,
                   let rendition = window.writer.aacRenditionTerminalBinding,
                   let admission = window.writer.aacWriterWindowAdmission else {
@@ -506,8 +634,9 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
             }
             _ = try publisher.advanceWriterWindow(
                 .init(initialization: successorInitialization, proof: successorProof,
-                      relay: window.relay, candidateTicket: nil,
-                      writerWindowAdmission: admission),
+                      relay: window.relay, candidateTicket: audioCandidate?.ticket, candidate: audioCandidate,
+                      writerWindowAdmission: admission,
+                      sourceAACTerminalBinding: window.writer.sourceAACTerminalBinding),
                 admission: admission, ticket: publisher.ticket)
         }
         window.installed = true
@@ -523,15 +652,102 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
         window.timeline = timeline
         let receipt = try timeline.validate(object, using: proof)
         lastLogicalSequence = max(lastLogicalSequence, object.logicalSequence)
-        let result = try publisher.offer(
+        _ = try publisher.offer(
             object, receipt: receipt, relay: window.relay, ticket: publisher.ticket,
-            now: Int64(object.logicalSequence + 1) * 1_000_000_000,
-            naturalEndTail: naturalEndPending)
-        if case .accepted = result {
-            if naturalEndPending { return }
-            _ = try publisher.publish(
-                ticket: publisher.ticket,
-                now: Int64(object.logicalSequence + 1) * 1_000_000_000)
+            now: publicationClock.now().logical, naturalEndTail: naturalEndPending)
+        if !naturalEndPending { try advanceLivePublicationLocked() }
+    }
+
+    /// One timer owns ordinary gates, capacity notifications and the unchanged
+    /// ticket deadline. Every wake revalidates under graph → store lock ordering.
+    private func advanceLivePublicationLocked() throws {
+        guard !closed, livePublicationActive, !naturalEndPending, let publisher else { return }
+        if let storedError { throw storedError }
+        publicationClock.consumeSignal()
+        let instant = try publicationClock.now()
+        _ = try publisher.publish(ticket: publisher.ticket, now: instant.logical)
+        let wake = try publisher.nextLivePublicationWake(now: instant.logical)
+        publicationClock.scheduleLiveWake(until: try wake.map {
+            try publicationClock.monotonicDeadline(for: $0, from: instant)
+        })
+        if !publisher.shouldBackpressureProducer { resumeProducerLocked() }
+        condition.broadcast()
+    }
+
+    private func livePublicationWake() {
+        #if DEBUG
+        let observer = condition.withLock { (beforeLiveWakeForTesting, afterLiveWakeForTesting) }
+        observer.0?()
+        defer { observer.1?() }
+        #endif
+        var failure: (ErrorDiagnosticSnapshot, @Sendable (ErrorDiagnosticSnapshot) -> Void)?
+        condition.withLock {
+            guard !closed, livePublicationActive, !naturalEndPending, storedError == nil else { return }
+            do { try advanceLivePublicationLocked() }
+            catch {
+                let diagnostic = PlaybackErrorDiagnostics.snapshot(error)
+                storedError = diagnostic
+                publicationClock.removeLiveWakeHandler()
+                if let publisher { publisher.cancelCapacityWait(ticket: publisher.ticket) }
+                resumeProducerLocked(throwing: diagnostic)
+                condition.broadcast()
+                if let failureSink { failure = (diagnostic, failureSink) }
+            }
+        }
+        if let (diagnostic, sink) = failure { sink(diagnostic) }
+    }
+
+    /// The sole media worker suspends only when a complete common prefix can
+    /// drain independently. A leading track alone must not prevent its partner
+    /// from reaching the matching boundary. No callback owns a blocking wait.
+    func waitForProducerCapacity() async throws {
+        try Task.checkCancellation()
+        let needsWait = try condition.withLock {
+            if let storedError { throw storedError }
+            guard !closed else { throw HLSPublicationFailure.closed }
+            return !naturalEndPending && publisher?.shouldBackpressureProducer == true
+        }
+        guard needsWait else { return }
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (waiter: CheckedContinuation<Void, Error>) in
+                let immediate = condition.withLock { () -> Result<Void, Error>? in
+                    if Task.isCancelled || producerWaitCancelled { return .failure(CancellationError()) }
+                    if let storedError { return .failure(storedError) }
+                    guard !closed else { return .failure(HLSPublicationFailure.closed) }
+                    guard !naturalEndPending, publisher?.shouldBackpressureProducer == true else {
+                        return .success(())
+                    }
+                    guard producerWaiter == nil else { return .failure(HLSPublicationFailure.capacityExceeded) }
+                    producerWaiter = waiter
+                    return nil
+                }
+                if let immediate { waiter.resume(with: immediate) }
+            }
+        } onCancel: { [self] in
+            condition.withLock {
+                producerWaitCancelled = true
+                resumeProducerLocked(throwing: CancellationError())
+            }
+        }
+    }
+
+    private func resumeProducerLocked(throwing error: (any Error)? = nil) {
+        guard let waiter = producerWaiter else { return }
+        producerWaiter = nil
+        if let error { waiter.resume(throwing: error) }
+        else { waiter.resume() }
+    }
+
+    /// Retirement closes publication admission before joining the media worker.
+    /// The store itself remains alive until writer and HTTP tails have drained.
+    func cancelLivePublication() {
+        condition.withLock {
+            closed = true
+            livePublicationActive = false
+            publicationClock.stopWaiting()
+            if let publisher { publisher.cancelCapacityWait(ticket: publisher.ticket) }
+            resumeProducerLocked(throwing: CancellationError())
+            condition.broadcast()
         }
     }
 
@@ -539,18 +755,25 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     /// 这些片段先进入 publisher records，等所有 writer terminal authority 齐备后再做
     /// 有界 natural-end drain；不能把尾片当普通中段提前发布。
     func beginNaturalEnd() {
-        condition.withLock { naturalEndPending = true }
+        condition.withLock {
+            naturalEndPending = true
+            livePublicationActive = false
+            publicationClock.removeLiveWakeHandler()
+            if let publisher { publisher.cancelCapacityWait(ticket: publisher.ticket) }
+            resumeProducerLocked()
+        }
     }
 
     func waitForVisible(until deadline: Date) throws
         -> (SealedMediaStore, HLSItemDeclaration, HLSPublishedSnapshot)? {
         condition.lock()
         defer { condition.unlock() }
-        while publisher?.visible == nil && storedError == nil
+        while !closed && publisher?.visible == nil && storedError == nil
                 && !prefixUnavailableAtNaturalEnd {
             guard condition.wait(until: deadline) else { return nil }
         }
         if let storedError { throw storedError }
+        guard !closed else { throw HLSPublicationFailure.closed }
         guard let store, let declaration, let snapshot = publisher?.visible else { return nil }
         return (store, declaration, snapshot)
     }
@@ -574,6 +797,7 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     func withActivePublication<T>(_ operation: () throws -> T) throws -> T {
         try condition.withLock {
             if let storedError { throw storedError }
+            guard !closed else { throw HLSPublicationFailure.closed }
             return try operation()
         }
     }
@@ -581,12 +805,16 @@ final class SystemHLSPublicationGraph: HLSNaturalEndPublicationScope, @unchecked
     func recordFailure(_ error: Error) {
         condition.withLock {
             if storedError == nil { storedError = PlaybackErrorDiagnostics.snapshot(error) }
+            publicationClock.removeLiveWakeHandler()
+            if let publisher { publisher.cancelCapacityWait(ticket: publisher.ticket) }
+            resumeProducerLocked(throwing: storedError)
             condition.broadcast()
         }
         publicationClock.signal()
     }
 
     func close() {
+        cancelLivePublication()
         condition.withLock {
             publisher?.close()
             for window in windows.values { window.relay.closePublications() }

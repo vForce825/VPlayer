@@ -17,6 +17,15 @@ final class LiveStartupUITests: XCTestCase {
         selectTab(named: "播放列表", in: app)
         let add = app.buttons["source.add"]
         XCTAssertTrue(add.waitForExistence(timeout: 5))
+        // Selecting a tab can leave focus in the tab bar. Existence alone
+        // does not establish which control the next remote Select activates.
+        for _ in 0..<4 where !add.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        guard add.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {
+            XCTFail("Expected remote focus to reach the Add Playlist button before selecting it")
+            return
+        }
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.textFields["source.editor.name"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.textFields["source.editor.m3u"].exists)

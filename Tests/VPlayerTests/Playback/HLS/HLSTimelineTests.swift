@@ -9,6 +9,24 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class HLSTimelineTests: XCTestCase {
+    func testRetirementDestroysVideoParserWhileTimelineRemainsAlive() throws {
+        let factory = ScriptedFFmpegParserFactory()
+        let subject = HLSTimelineCoordinator(parserFactory: factory)
+        _ = try subject.consume(.tracks(audioVideoTracks()))
+        let parser = try XCTUnwrap(factory.handles.first)
+        XCTAssertEqual(factory.handles.count, 1)
+        XCTAssertEqual(parser.destroyCount, 0)
+
+        subject.retireCompressedGeneration()
+
+        withExtendedLifetime(subject) {
+            XCTAssertEqual(parser.destroyCount, 1,
+                "The video generation provider must not keep its owning assembler alive")
+        }
+        subject.retireCompressedGeneration()
+        XCTAssertEqual(parser.destroyCount, 1)
+    }
+
     func testHEVCEOSSurvivesFormatReplayAndFollowingCRAChanges() throws {
         let factory = ScriptedFFmpegParserFactory { handle, _, bytes, pts, dts, _ in
             try handle.emit(FFmpegParsedFrame(bytes: bytes, pts: pts, dts: dts,

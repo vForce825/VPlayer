@@ -75,9 +75,12 @@ final class HLSRuntimeFailureRelay: @unchecked Sendable {
         // 256B 覆盖两处函数 reabstraction；64B 覆盖 bundle/builder 新引用的分配级差。
         // Coordinator's relay alias is part of its separately measured 12 KiB
         // resource-context root; this metadata bound does not prove that root's capacity.
+        // Three existing graph owners retain the inline media value: authority,
+        // assembler prefix, and output bundle. No additional capture or queue.
+        let mediaSnapshots = 3 * malloc_good_size(MemoryLayout<PlaybackMediaInformation?>.stride)
         return actual(self) + actual(lock) + metadataOwner.knownAllocationBytes +
             ErrorDiagnosticSnapshot.maximumStorageAllocationBytes +
-            bridgeCapture + relayCapture + publicationCapture + 256 + 64
+            bridgeCapture + relayCapture + publicationCapture + 256 + 64 + mediaSnapshots
     }
 
     func record(_ diagnostic: ErrorDiagnosticSnapshot) {
@@ -175,6 +178,14 @@ final class HLSOutputItemBundle: @unchecked Sendable {
     }
     var currentLifecycle: Lifecycle { lock.withLock { lifecycle } }
 
+    func preparedMediaInformation(for epoch: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
+        lock.withLock {
+            guard lifecycle == .producing, let replacement = replacementStorage,
+                  replacement.request.item.outputLifecycleEpoch == epoch else { return nil }
+            return .init(lifecycle: epoch, information: replacement.mediaInformation)
+        }
+    }
+
     /// producer 的 source read 只可启动一次。调用方在成功返回后才可把同一 request
     /// 安装进 coordinator；若启动失败，bundle 立即回到 retired，禁止后续激活半成品。
     func prepareProducer() async throws {
@@ -185,7 +196,9 @@ final class HLSOutputItemBundle: @unchecked Sendable {
         }
         guard mayStart else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
         do {
+            try Task.checkCancellation()
             let replacement = try await startProducer()
+            try Task.checkCancellation()
             let accepted = lock.withLock { () -> Bool in
                 guard lifecycle == .producing else { return false }
                 replacementStorage = replacement
@@ -263,75 +276,62 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
     let sourceURLForDiagnostics: URL
     let demuxerCardinality = 1
     let playablePrefixMinimumSeconds = 6
-    private let graphFactory: GraphFactory
+    private let graphFactory: GraphFactory?
     private let applicationLedger: HLSDeliveryApplicationChargeLedger
     private let runtimeEventSink: RuntimeEventSink
     private let resourceContextLedger: PlaybackResourceContextLedger
+    private let initialWindowMinimumSeconds: Int
+    private let generatedSource: (any HLSGeneratedSourceContext)?
+    private let acceptanceProbe: HLSWriterAcceptanceProbe?
 
     convenience init(sourceURL: URL,
                      startupBufferSeconds: TimeInterval = 3,
-                     runtimeEventSink: @escaping RuntimeEventSink = { _ in }) throws {
-        // Choose noncapturing factories: no uncharged per-builder closure context.
-        let factory: GraphFactory
-        if AVPlayerStartupBufferPolicy.initialPublicationSeconds(configured: startupBufferSeconds) == 4 {
-            factory = { source, invocation, ledger, failureSink in
-                let authority = try SystemHLSMediaGraphAuthority(
-                    lifecycle: invocation.outputLifecycleEpoch,
-                    initialWindowMinimumSeconds: 4, failureSink: failureSink)
-                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
-                    graph: SystemHLSDeliveryGraph(authority: authority))
-            }
-        } else {
-            factory = { source, invocation, ledger, failureSink in
-                let authority = try SystemHLSMediaGraphAuthority(
-                    lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
-                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
-                    graph: SystemHLSDeliveryGraph(authority: authority))
-            }
-        }
+                     runtimeEventSink: @escaping RuntimeEventSink = { _ in },
+                     acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
+                     generatedSource: (any HLSGeneratedSourceContext)? = nil) throws {
+        let minimum = AVPlayerStartupBufferPolicy.initialPublicationSeconds(configured: startupBufferSeconds)
         try self.init(sourceURL: sourceURL, applicationLedger: .shared,
-                      runtimeEventSink: runtimeEventSink, graphFactory: factory)
+            resourceContextLedger: .shared, runtimeEventSink: runtimeEventSink,
+            graphFactory: nil, productionMinimumSeconds: minimum, acceptanceProbe: acceptanceProbe, generatedSource: generatedSource)
     }
 
-    init(validating sourceURL: URL) throws {
-        let scheme = sourceURL.scheme?.lowercased() ?? ""
-        guard scheme == "http" || scheme == "https" else {
-            throw PlaybackCoreError.unsupportedProtocol(scheme)
-        }
-        self.sourceURLForDiagnostics = sourceURL
-        applicationLedger = .shared
-        runtimeEventSink = { _ in }
-        resourceContextLedger = .shared
-        graphFactory = { source, invocation, ledger, failureSink in
-            let authority = try SystemHLSMediaGraphAuthority(
-                lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
-            return HLSMediaGraphAssembler(
-                sourceURL: source,
-                applicationLedger: ledger,
-                graph: SystemHLSDeliveryGraph(authority: authority))
-        }
+    convenience init(validating sourceURL: URL) throws {
+        try self.init(sourceURL: sourceURL)
     }
 
-    init(
+    /// Explicit injected factories retain their existing closure signature. They
+    /// are a test/compatibility path; production consumes the original owner below.
+    convenience init(
         sourceURL: URL,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
         resourceContextLedger: PlaybackResourceContextLedger = .shared,
         runtimeEventSink: @escaping RuntimeEventSink = { _ in },
-        graphFactory: @escaping GraphFactory
+        graphFactory: @escaping GraphFactory,
+        acceptanceProbe: HLSWriterAcceptanceProbe? = nil,
+        generatedSource: (any HLSGeneratedSourceContext)? = nil
     ) throws {
+        try self.init(sourceURL: sourceURL, applicationLedger: applicationLedger,
+            resourceContextLedger: resourceContextLedger, runtimeEventSink: runtimeEventSink,
+            graphFactory: graphFactory, productionMinimumSeconds: 3, acceptanceProbe: acceptanceProbe, generatedSource: generatedSource)
+    }
+
+    private init(sourceURL: URL, applicationLedger: HLSDeliveryApplicationChargeLedger,
+                 resourceContextLedger: PlaybackResourceContextLedger,
+                 runtimeEventSink: @escaping RuntimeEventSink, graphFactory: GraphFactory?,
+                 productionMinimumSeconds: Int, acceptanceProbe: HLSWriterAcceptanceProbe?,
+                 generatedSource: (any HLSGeneratedSourceContext)?) throws {
         let scheme = sourceURL.scheme?.lowercased() ?? ""
         guard scheme == "http" || scheme == "https" else {
             throw PlaybackCoreError.unsupportedProtocol(scheme)
         }
-        self.sourceURLForDiagnostics = sourceURL
-        self.applicationLedger = applicationLedger
-        // production 两者均为 shared；local context ledger 只用于显式测试配对。
         guard resourceContextLedger.usesApplicationLedger(applicationLedger) else {
             throw LoopbackHTTPReservationError.hardCapacityExceeded
         }
-        self.resourceContextLedger = resourceContextLedger
-        self.runtimeEventSink = runtimeEventSink
-        self.graphFactory = graphFactory
+        sourceURLForDiagnostics = sourceURL
+        self.applicationLedger = applicationLedger; self.resourceContextLedger = resourceContextLedger
+        self.runtimeEventSink = runtimeEventSink; self.graphFactory = graphFactory
+        initialWindowMinimumSeconds = productionMinimumSeconds; self.generatedSource = generatedSource
+        self.acceptanceProbe = acceptanceProbe
     }
 
     func makeBundle(
@@ -343,8 +343,21 @@ final class SystemHLSOutputItemBundleBuilder: HLSOutputItemBundleBuilding, @unch
             sink(.backendFailed(diagnostic, prepareScope: .init(ticket: invocation.ticket),
                 metadataOwner: owner))
         }
-        let assembler = try graphFactory(sourceURLForDiagnostics, invocation, applicationLedger,
-                                        { diagnostic in observation.record(diagnostic) })
+        if let generatedSource, !generatedSource.isCurrent { throw HLSSourceError.staleResolution }
+        let assembler: HLSMediaGraphAssembler
+        if let graphFactory {
+            assembler = try graphFactory(sourceURLForDiagnostics, invocation, applicationLedger,
+                { diagnostic in observation.record(diagnostic) })
+        } else {
+            let authority = try SystemHLSMediaGraphAuthority(lifecycle: invocation.outputLifecycleEpoch,
+                acceptanceProbe: acceptanceProbe,
+                initialWindowMinimumSeconds: initialWindowMinimumSeconds,
+                failureSink: { diagnostic in observation.record(diagnostic) },
+                generatedSource: generatedSource, sourceCopyApplicationLedger: applicationLedger,
+                sharedControlExecutor: invocation.sharedControlExecutor)
+            assembler = HLSMediaGraphAssembler(sourceURL: sourceURLForDiagnostics,
+                applicationLedger: applicationLedger, graph: SystemHLSDeliveryGraph(authority: authority))
+        }
         return HLSOutputItemBundle(
             startProducer: { try await assembler.startUntilPlayablePrefix() },
             retireProducer: { await assembler.retireAndAwaitReceipt() },

@@ -16,7 +16,7 @@ final class DefaultAudioSessionCompletionReceiver: PlaybackAudioSessionCompletio
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {}
 }
 
-public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving {
+public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
     private let registry: ControlTaskRegistry
     private let deadlineScheduler: PlaybackDeadlineScheduler
     private let audioSessionOwner: PlaybackAudioSessionOwner
@@ -35,6 +35,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     private var terminalMetricsProvider: (any PlaybackTerminalMetricsProviding)?
     private var mediaGeneration: MediaGeneration?
     private var currentMediaInformation: PlaybackMediaInformation?
+    private var mediaInformationLifecycle: OutputLifecycleEpoch?
     private var interruptionActive = false
     private var systemPauseRequired = false
     private var resumeVetoRequired = false
@@ -322,6 +323,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         } else {
             presentationRelay.finish()
         }
+        clearMediaInformation()
         // 入口时冻结身份与预算；前驱排空、SDK配置及route稳定都不能重置起点。
         let sessionIdentity: PlaybackSessionIdentity
         let parentDeadline: CurrentPlaybackOperationDeadlineTicket
@@ -606,7 +608,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 let relay = PlaybackSessionEventRelay(identity: runIdentity) { [weak self] identity, event in
                     await self?.receivePipelineEvent(event, identity: identity, backendIdentity: candidateID)
                 }
-                let relayGroup = try registry.createGroup(resource: .backend(candidateID), parent: creation.reservation.workGroup)
+                let relayParent = kind == .hlsAVPlayer
+                    ? creation.reservation.ownerGroup : creation.reservation.workGroup
+                let relayGroup = try registry.createGroup(resource: .backend(candidateID), parent: relayParent)
                 let relayDrain = try registry.enqueue(group: relayGroup, slot: .accounting, policy: .routeNeutral)
                 guard registry.bindEventRelay(relay, to: relayDrain) else {
                     diagnosticStage = "bind_factory_relay_failed"
@@ -669,7 +673,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 diagnosticStage = "publishInstalledPresentation_failed"
                 return
             }
-            if systemPauseRequired, !controllerState.userPaused {
+            if controllerState.userPaused {
+                publish(.paused(request))
+            } else if systemPauseRequired {
                 publish(resumeVetoRequired ? .paused(request) : .recovering(request))
             }
             diagnosticStage = "calling_startPreparedSampleBuffer"
@@ -691,14 +697,15 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                     let isHLS = registry.outputResourceContextSnapshot()?.desiredBackendKind == .hlsAVPlayer
                     if rebase.successorClaim == nil || isHLS {
                         if isHLS {
-                            _ = registry.completeSampleBufferReadiness(backendIdentity)
+                            // The original startup/recovery media deadline stays
+                            // live until the coordinator observes clock advance.
                             recoveryCoordinator.resetRecovery.resetFinished()
                         }
                         publish(.playing(request))
                     }
-                    await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
-                        hasObservedProgress: true, session: sessionIdentity,
-                        controlRevision: activationControlRevision)
+                    // HLS observation starts from direct AVPlayer media-clock
+                    // samples under its exact Registry activation. Successful
+                    // rate admission alone must not arm a stall watchdog.
                     guard ownsUserControl(runIdentity, revision: activationControlRevision) else { return }
                     diagnosticStage = isHLS ? "hls_playing" : "activation_succeeded_waiting_for_pipeline"
                 case .failed(let error):
@@ -814,6 +821,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard controllerState.userPaused != paused else { return }
         controllerState.userPaused = paused
         advanceReadinessCycle()
+        // The existing recovery owner may already be draining the old output.
+        // Fold presentation intent now, even when no second pause owner is admitted.
+        if paused { publish(.paused(request)) }
         if context.phase == .pendingLeaseAcquisition {
             // Registry already folded intent and canceled any pending activation.
             // The original acquisition caller still owns physical settlement and
@@ -850,11 +860,22 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             let coordinator = OutputCleanupCoordinator(registry: registry)
             guard let owner = try? coordinator.begin(contextNonce: context.contextNonce,
                 reason: .pause, at: registry.clock.nowNanoseconds), owner.reason == .pause,
-                let original = registry.outputResourceContextSnapshot(), let stop = original.suspend,
-                registry.startOutputSuspendOperation(stop.task, owner: owner) else { return }
+                let original = registry.outputResourceContextSnapshot(), original.owner == owner,
+                original.contextNonce == context.contextNonce,
+                original.sessionIdentity == sessionIdentity,
+                original.candidateBackendIdentity == context.candidateBackendIdentity,
+                let stop = original.suspend else { return }
+            // The MainActor relay can start this exact runner after user-control
+            // ingress revokes rate and before this actor admits the pause owner.
+            // First-start remains strict; losing that race still joins the same
+            // captured ticket, never a newer owner's or successor's suspension.
+            _ = registry.startOutputSuspendOperation(stop.task, owner: owner)
             guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
                   ownsUserControl(controlRun, revision: controlRevision),
                   registry.finishOutputPause(owner: owner) else { return }
+            // A prepare notification can lose to this pause owner. Replay after
+            // the retained pause settles, even when there will be no activation.
+            refreshPreparedMediaInformation(for: stop.lifecycle)
             await watchdog.disarm(session: sessionIdentity, controlRevision: controlRevision)
             guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             registry.updatePreparedSampleBufferPause(contextNonce: original.contextNonce,
@@ -869,9 +890,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             guard ownsUserControl(controlRun, revision: controlRevision) else { return }
             switch outcome {
             case .succeeded:
-                await watchdog.arm(activationEpoch: registry.clock.nowNanoseconds,
-                    hasObservedProgress: true, session: sessionIdentity, controlRevision: controlRevision)
-                guard ownsUserControl(controlRun, revision: controlRevision) else { return }
+                break // The resumed item must establish fresh media-clock progress.
             case .failed(let error):
                 if let context = registry.outputResourceContextSnapshot() {
                     beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
@@ -1141,7 +1160,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     func publishRouteRecovering(request: PlaybackRequest) {
-        publish(.recovering(request))
+        publish(controllerState.userPaused ? .paused(request) : .recovering(request))
     }
 
     func publishRouteUnavailableFailure() {
@@ -1149,11 +1168,15 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     func handleRouteCommit(_ commit: StableRouteCommitIdentity) async {
+        // A queued notification cannot control a newer route or cancel its timer.
+        guard registry.stableRouteCommitSnapshot() == commit else { return }
         recoveryCoordinator.cancelRouteUnavailableTimeout()
         guard let request = controllerState.request, let runIdentity = admittedRun, isCurrent(runIdentity) else {
             return
         }
-        guard let context = registry.outputResourceContextSnapshot(), context.sessionIdentity.requestID == request.id else {
+        guard let context = registry.outputResourceContextSnapshot(),
+              context.sessionIdentity.requestID == request.id,
+              commit.authority.sessionIdentity == context.sessionIdentity else {
             return
         }
         let ports = commit.authority.semanticIdentity?.ports ?? []
@@ -1173,6 +1196,19 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         if targetKind != currentKind {
             await requestRouteHandoff(to: targetKind)
         } else {
+            // The stable-route wake and its notification run independently. A
+            // successor may already own this exact commit while its prepare or
+            // activation is awaiting the SDK and activeRoutePorts still names
+            // the predecessor. Keep that original lifecycle in charge. Derive
+            // ownership from the live prepare, so no separate marker can survive
+            // cancellation, replacement, or teardown; newer commits still act.
+            if context.phase == .installed, let prepare = context.prepareTicket,
+               prepare.backendIdentity == context.candidateBackendIdentity,
+               prepare.backendIdentity.sessionIdentity == context.sessionIdentity,
+               prepare.stableRouteCommitEpoch == commit.epoch,
+               prepare.audioAdmissionFenceRevision == commit.authority.audioAdmissionFenceRevision {
+                return
+            }
             let activePorts = controllerState.activeRoutePorts
             if activePorts == nil {
                 controllerState.activeRoutePorts = ports
@@ -1200,16 +1236,21 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         publishRouteRecovering(request: request)
         controllerState.activeRoutePorts = nil
         guard let context = registry.outputResourceContextSnapshot(),
-              context.owner == nil, context.phase == .installed, context.prepared else {
+              context.owner == nil || context.owner?.reason == .pause,
+              context.phase == .installed, context.prepared else {
             return
         }
         let coordinator = OutputCleanupCoordinator(registry: registry)
         guard let owner = try? coordinator.begin(contextNonce: context.contextNonce,
             reason: .pause, at: registry.clock.nowNanoseconds), owner.reason == .pause,
-            let original = registry.outputResourceContextSnapshot(), let stop = original.suspend,
-            registry.startOutputSuspendOperation(stop.task, owner: owner) else {
+            let original = registry.outputResourceContextSnapshot(), original.owner == owner,
+            original.contextNonce == context.contextNonce,
+            original.sessionIdentity == context.sessionIdentity,
+            original.candidateBackendIdentity == context.candidateBackendIdentity,
+            let stop = original.suspend else {
             return
         }
+        _ = registry.startOutputSuspendOperation(stop.task, owner: owner)
         switch await registry.joinOutputBackendOperation(stop.task) {
         case .succeeded:
             guard registry.finishOutputPause(owner: owner) else { return }
@@ -1227,6 +1268,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
               let context = registry.outputResourceContextSnapshot(),
               context.owner == nil, context.phase == .installed, context.prepared else {
             return
+        }
+        if case .backend(_, let lifecycle?, _, _, _) = registry.ownedResourceSnapshot()?.payload {
+            refreshPreparedMediaInformation(for: lifecycle)
         }
         // Route loss may temporarily publish recovering, but restoring a route
         // must return manual pause to an actionable state without activating it.
@@ -1265,7 +1309,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard controllerState.request != nil, admittedRun != nil else { return }
         switch reason {
         case .playbackStalled, .bufferStarvation, .playbackBacklogExceeded:
-            await requestQuiescentEndpointHandoff()
+            guard !controllerState.userPaused, !systemPauseRequired else { return }
+            _ = await registry.requestCurrentHLSWatchdogRecovery()
         case .prepareBacklogExceeded, .hardCapacityExceeded:
             if let context = registry.outputResourceContextSnapshot() {
                 beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.watchdogHardCapacityFailure))
@@ -1284,7 +1329,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard admission.startsCleanup else { return }
         clearPresentation()
         advanceReadinessCycle()
-        publish(.recovering(request))
+        publishRouteRecovering(request: request)
         guard registry.startOwnedInterruptionCleanup(owner: admission.owner, receiver: self) else { return }
         await registry.joinOwnedTerminalCleanup()
         guard isCurrent(runIdentity),
@@ -1303,7 +1348,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard admission.startsCleanup else { return }
         clearPresentation()
         advanceReadinessCycle()
-        publish(.recovering(request))
+        publishRouteRecovering(request: request)
         guard registry.startOwnedInterruptionCleanup(owner: admission.owner, receiver: self) else { return }
         await registry.joinOwnedTerminalCleanup()
         guard isCurrent(runIdentity),
@@ -1561,7 +1606,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         #endif
         switch event {
         case let .mediaInformation(information, generation: eventGeneration?):
+            guard finishedPresentationSession != backendIdentity.sessionIdentity else { return }
             guard mediaGeneration.map({ eventGeneration >= $0 }) ?? true else { return }
+            mediaInformationLifecycle = nil
             if mediaGeneration != eventGeneration {
                 mediaGeneration = eventGeneration
                 if currentMediaInformation != nil, information != nil {
@@ -1570,6 +1617,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             }
             publishMediaInformation(information)
         case let .mediaInformation(information, generation: nil):
+            guard finishedPresentationSession != backendIdentity.sessionIdentity else { return }
+            mediaInformationLifecycle = nil
             publishMediaInformation(information)
         case let .ready(eventCycle):
             let readinessResult = registry.completeSampleBufferReadiness(backendIdentity)
@@ -1686,6 +1735,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     private func clearPresentation() {
+        clearMediaInformation()
         do {
             try presentationRelay.replace(with: nil)
         } catch PlaybackPresentationRelayError.identitySpaceExhausted {
@@ -1712,9 +1762,37 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         registry.publishMediaInformation(information)
     }
 
+    /// No await: the notifying Registry runner may itself be awaited by play or
+    /// pause. Revalidate its exact scope without joining or changing ownership.
+    func refreshPreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) {
+        guard let run = admittedRun, isCurrent(run),
+              finishedPresentationSession != lifecycle.backendIdentity.sessionIdentity,
+              let snapshot = registry.preparedHLSMediaInformation(for: lifecycle) else { return }
+        if mediaInformationLifecycle != lifecycle { clearMediaInformation() }
+        guard mediaInformationLifecycle != lifecycle || currentMediaInformation != snapshot.information else { return }
+        mediaInformationLifecycle = lifecycle
+        publishMediaInformation(snapshot.information)
+    }
+
+    func updateNativeMediaInformation(for lifecycle: OutputLifecycleEpoch, activation: ActivationEpoch?, invalidated: Bool) {
+        // Recheck after the notifier's actor hop. A queued old activation cannot
+        // republish or clear a successor's current metadata.
+        guard registry.nativeMetadataScopeIsCurrent(lifecycle: lifecycle, activation: activation, invalidated: invalidated) else { return }
+        if invalidated { invalidatePreparedMediaInformation(for: lifecycle) }
+        else { refreshPreparedMediaInformation(for: lifecycle) }
+    }
+
+    func invalidatePreparedMediaInformation(for lifecycle: OutputLifecycleEpoch) {
+        guard mediaInformationLifecycle == lifecycle,
+              let run = admittedRun, isCurrent(run),
+              registry.outputResourceContextSnapshot()?.candidateBackendIdentity == lifecycle.backendIdentity else { return }
+        clearMediaInformation()
+    }
+
     private func clearMediaInformation() {
-        guard currentMediaInformation != nil || mediaGeneration != nil else { return }
+        guard currentMediaInformation != nil || mediaGeneration != nil || mediaInformationLifecycle != nil else { return }
         mediaGeneration = nil
+        mediaInformationLifecycle = nil
         publishMediaInformation(nil)
     }
 

@@ -36,8 +36,7 @@ final class RawAACFramingStrategy: CompressedAudioFramingStrategy {
     }
 
     func push(_ packet: CompressedAudioFramingPacket) throws {
-        let lease = hlsCopyOwnership?.admit(.framing, bytes: packet.data.count)
-        guard hlsCopyOwnership == nil || lease != nil else { throw AudioCodecProfileValidation.error() }
+        let lease = try hlsCopyOwnership?.admitFramingWithoutWaiting(bytes: packet.data.count)
         guard packet.data.count <= AudioCodecProfileValidation.maximumRawAACAccessUnitBytes else {
             throw AudioCodecProfileValidation.error()
         }
@@ -132,10 +131,7 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
             let nextTimestamp = CMTimeAdd(timestamp, CMTime(value: 1_024, timescale: sampleRate))
             guard nextTimestamp.isNumeric else { throw AudioCodecProfileValidation.error() }
             // Data(carry.prefix) 是新的 backing；先为该准确 frame range 收费，再复制。
-            let outputLease = hlsCopyOwnership?.admit(.framing, bytes: frameLength)
-            guard hlsCopyOwnership == nil || outputLease != nil else {
-                throw AudioCodecProfileValidation.error()
-            }
+            let outputLease = try hlsCopyOwnership?.admitFramingWithoutWaiting(bytes: frameLength)
             let payload = Data(carry.prefix(frameLength))
             try receiver(FramedCompressedAudioFrame(
                 payload: payload,
@@ -295,9 +291,7 @@ final class ADTSAudioFramingStrategy: CompressedAudioFramingStrategy {
     private func admitSegments(_ lengths: [Int], ownership: HLSAudioCopyOwnership) throws -> [CarryLeaseSegment] {
         var result: [CarryLeaseSegment] = []
         for length in lengths where length > 0 {
-            guard let lease = ownership.admit(.framing, bytes: length) else {
-                throw AudioCodecProfileValidation.error()
-            }
+            let lease = try ownership.admitFramingWithoutWaiting(bytes: length)
             result.append(CarryLeaseSegment(byteCount: length, lease: lease))
         }
         return result
@@ -358,9 +352,7 @@ final class FFmpegCompressedAudioFramingStrategy: CompressedAudioFramingStrategy
             let tail: HLSAudioCopyTail?
             if let ownership = hlsCopyOwnership {
                 let byteCount = parsed.withBorrowedBytes { $0.count }
-                guard let lease = ownership.admit(.framing, bytes: byteCount) else {
-                    throw AudioCodecProfileValidation.error()
-                }
+                let lease = try ownership.admitFramingWithoutWaiting(bytes: byteCount)
                 payload = parsed.withBorrowedBytes { bytes in
                     bytes.withUnsafeBytes { raw in
                         guard let baseAddress = raw.baseAddress, !raw.isEmpty else { return Data() }

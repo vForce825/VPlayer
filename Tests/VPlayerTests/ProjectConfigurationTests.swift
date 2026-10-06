@@ -117,7 +117,8 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertEqual(VPlayerCore.deploymentTarget, "tvOS 27.0")
         let configuredFloors = projectYAML.split(separator: "\n")
             .filter { $0.contains("deploymentTarget:") && $0.contains("\"") }
-        XCTAssertEqual(configuredFloors.count, 6)
+        // Includes the independently built VPlayerHLSAcceptanceTests target.
+        XCTAssertEqual(configuredFloors.count, 7)
         XCTAssertTrue(configuredFloors.allSatisfy { $0.contains("\"27.0\"") })
         let generatedFloors = generatedProject.split(separator: "\n")
             .filter { $0.contains("TVOS_DEPLOYMENT_TARGET =") }

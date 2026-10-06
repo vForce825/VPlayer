@@ -458,6 +458,7 @@ final class SegmentReportRelay: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private weak var capacityWakeup: WriterCapacityWakeup?
     private let identity = UUID()
     private let limits: FMP4WriterLimits
     private let capacity: Int
@@ -546,7 +547,15 @@ final class SegmentReportRelay: @unchecked Sendable {
         }
     }
     /// 锁内只签发固定一份能力；回调必须在 relay 锁外，避免反向进入 publisher 锁域。
+    func installCapacityWakeup(_ value: WriterCapacityWakeup) throws {
+        try lock.withLock {
+            guard capacityWakeup == nil || capacityWakeup === value else { throw SegmentedFMP4WriterFailure.illegalState }
+            capacityWakeup = value
+        }
+    }
+
     func notifyPublicationDrainIfReady() {
+        lock.withLock { capacityWakeup }?.signal()
         let delivery = lock.withLock { () -> (
             (@Sendable (WriterPublicationDrainReceipt) -> Void)?,
             CheckedContinuation<WriterPublicationDrainReceipt?, Never>?,

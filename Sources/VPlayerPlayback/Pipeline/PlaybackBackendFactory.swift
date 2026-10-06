@@ -13,9 +13,20 @@ protocol PlaybackBackendFactory: Sendable {
         url: URL,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) async throws -> any PlaybackBackend
+
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
+                     channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend
 }
 
 extension PlaybackBackendFactory {
+    /// Existing injected factories keep their explicit legacy contract.
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
+                     channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
+        try await makeBackend(kind: kind, identity: identity, tuning: tuning, channelID: channelID, url: url, eventSink: eventSink)
+    }
+
     func makeBackend(
         kind: PlaybackBackendKind,
         identity: PlaybackBackendIdentity,
@@ -39,13 +50,19 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
     /// 应用启动时注入唯一的 writer/publisher/store/server 装配 authority。没有 authority
     /// 时 AirPlay 仍创建 HLS backend，但 prepare 必须 fail-closed，绝不退回 SampleBuffer。
     private let hlsGraphFactory: SystemHLSOutputItemBundleBuilder.GraphFactory?
+    private let hlsAcceptanceProbe: HLSWriterAcceptanceProbe?
+    private let sourceDependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies
 
     init(
         pipelineFactory: any PlaybackPipelineFactory = SystemPlaybackPipelineFactory(),
-        hlsGraphFactory: SystemHLSOutputItemBundleBuilder.GraphFactory? = nil
+        hlsGraphFactory: SystemHLSOutputItemBundleBuilder.GraphFactory? = nil,
+        hlsAcceptanceProbe: HLSWriterAcceptanceProbe? = nil,
+        sourceDependencies: @escaping @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies = { .init(context: $0) }
     ) {
         self.pipelineFactory = pipelineFactory
         self.hlsGraphFactory = hlsGraphFactory
+        self.hlsAcceptanceProbe = hlsAcceptanceProbe
+        self.sourceDependencies = sourceDependencies
     }
 
     func makeBackend(
@@ -56,6 +73,13 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
         url: URL,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void
     ) async throws -> any PlaybackBackend {
+        try await makeBackend(kind: kind, identity: identity, tuning: tuning, channelID: channelID,
+            url: url, sourceContext: nil, eventSink: eventSink)
+    }
+
+    func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
+                     channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
+                     eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("factory_making_\(kind)")
         #endif
@@ -77,21 +101,22 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
             if let hlsGraphFactory {
                 builder = try SystemHLSOutputItemBundleBuilder(
                     sourceURL: url, runtimeEventSink: eventSink, graphFactory: hlsGraphFactory)
+            } else if sourceContext != nil {
+                // Dormant construction validates the URL only. Source resolution,
+                // planning and all media work begin under admitted preparation.
+                builder = try SystemHLSOutputItemBundleBuilder(validating: url)
             } else {
                 builder = try SystemHLSOutputItemBundleBuilder(sourceURL: url,
                     startupBufferSeconds: tuning.videoBufferSeconds, runtimeEventSink: eventSink)
             }
-            let driver = try await MainActor.run {
-                try SystemAVPlayerDriver.make(
-                    preferredForwardBufferDuration: tuning.videoBufferSeconds
-                )
+            let lease = try await MainActor.run {
+                try HomePodAVPlayerSession(identity: identity.sessionIdentity,
+                    preferredForwardBufferDuration: tuning.videoBufferSeconds).claim(backend: identity)
             }
-            let presentation = await MainActor.run {
-                AVPlayerPresentationContext(player: driver.player)
-            }
+            let presentation = await lease.presentation
             let replacementSlot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
             let metrics = PlaybackMetrics(channelID: channelID)
-            return HLSAVPlayerPlaybackBackend(
+            let backend = HLSAVPlayerPlaybackBackend(
                 identity: identity,
                 bundleBuilder: builder,
                 presentationContext: presentation,
@@ -100,7 +125,7 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
                 coordinatorFactory: { replacement in
                     try await MainActor.run {
                         try AVPlayerItemCoordinator(
-                            driver: driver,
+                            driver: lease.driver,
                             evidenceSource: replacement.evidenceSource,
                             backendPublicationReplacementAuthoritySlot: replacementSlot
                         )
@@ -108,6 +133,15 @@ final class SystemPlaybackBackendFactory: PlaybackBackendFactory, @unchecked Sen
                 },
                 replacementSlot: replacementSlot
             )
+            if let sourceContext, hlsGraphFactory == nil {
+                backend.configureSourceRouting(dependencies: sourceDependencies(sourceContext), sessionLease: lease,
+                    builderFactory: { [probe = hlsAcceptanceProbe] input, owned in
+                        try SystemHLSOutputItemBundleBuilder(sourceURL: input,
+                            startupBufferSeconds: tuning.videoBufferSeconds, runtimeEventSink: eventSink,
+                            acceptanceProbe: probe, generatedSource: owned)
+                    }, eventSink: eventSink)
+            }
+            return backend
         }
     }
 }

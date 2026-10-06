@@ -132,9 +132,9 @@ final class HLSResourceStoreTests: XCTestCase {
     }
 
     func testGlobal560688MiBAndInitialization64KiBBoundariesAreAtomic() throws {
-        // The application budget includes the media reservation's fixed32KiB
+        // The application budget includes the media reservation's bounded paid map
         // evidence precharge, not just its payload. Keep the exact total-byte edges.
-        let mediaEvidenceBytes = 32 * 1_024
+        let mediaEvidenceBytes = LoopbackStorageLayout.current.mediaMapReservationBytes
         XCTAssertFalse(HLSDeliveryApplicationChargeLedger.shared.shouldBackpressure,
             "Global application backpressure must be inactive for this store-local threshold check")
         for totalBytes in [560 * 1024 * 1024 - 1, 560 * 1024 * 1024, 560 * 1024 * 1024 + 1,
@@ -449,10 +449,10 @@ final class HLSResourceStoreTests: XCTestCase {
         XCTAssertEqual(hard.participantBitrates, soft.participantBitrates)
         XCTAssertEqual(soft.initializationBytes, 9 * 1024 * 1024)
         XCTAssertEqual(hard.initializationBytes, 10 * 1024 * 1024)
-        XCTAssertEqual(soft.mapEvidenceBytes, 2_752_512)
-        XCTAssertEqual(hard.mapEvidenceBytes, 3_145_728)
-        XCTAssertEqual(Double(soft.totalBytes) / 1_048_576, 541.670, accuracy: 0.001)
-        XCTAssertEqual(Double(hard.totalBytes) / 1_048_576, 659.708, accuracy: 0.001)
+        XCTAssertEqual(soft.mapEvidenceBytes, 6_881_280)
+        XCTAssertEqual(hard.mapEvidenceBytes, 7_864_320)
+        XCTAssertEqual(Double(soft.totalBytes) / 1_048_576, 545.607, accuracy: 0.001)
+        XCTAssertEqual(Double(hard.totalBytes) / 1_048_576, 664.208, accuracy: 0.001)
         XCTAssertLessThan(soft.totalBytes, 560 * 1024 * 1024)
         XCTAssertLessThan(hard.totalBytes, 688 * 1024 * 1024)
     }

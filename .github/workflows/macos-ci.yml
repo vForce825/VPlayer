@@ -3,8 +3,6 @@ name: Same-head tvOS 27 acceptance
 # Standard GitHub-hosted runners are free for this public repository.
 # No larger runners, uploaded artifacts, persistent caches, retries or releases.
 "on":
-  push:
-    branches: [migration/tvos27]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -13,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: macos-ci-complete-${{ github.sha }}
+  group: macos-ci-complete-${{ github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: false
 
 defaults:
@@ -21,6 +19,7 @@ defaults:
     shell: bash
 
 env:
+  CANDIDATE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
   DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
   TVOS_TEST_DESTINATION: platform=tvOS Simulator,name=Apple TV 4K (3rd generation),OS=27.0
   HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -31,33 +30,38 @@ env:
 jobs:
   complete-tests:
     name: Complete Debug unit and UI tests
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 120
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
         timeout-minutes: 40
         run: |
-          brew install mint jq ripgrep
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
           xcrun simctl list runtimes -j | jq -e '
             .runtimes[] |
             select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
           '
           ./ci_scripts/ci_post_clone.sh
           xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
       - name: State the supported acceptance coverage
@@ -87,33 +91,38 @@ jobs:
 
   release-contracts:
     name: Optimized boundaries, startup and six cold starts
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 100
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
         timeout-minutes: 40
         run: |
-          brew install mint jq ripgrep
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
           xcrun simctl list runtimes -j | jq -e '
             .runtimes[] |
             select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
           '
           ./ci_scripts/ci_post_clone.sh
           xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
       - name: Run all optimized Release boundary tests
@@ -164,38 +173,45 @@ jobs:
             xcrun simctl boot "$TVOS_SIMULATOR_UDID"
           fi
           xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
-          VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseColdStarts" \
+          # Reuse only this job's build data. The script still runs its exact
+          # build command so Xcode validates current inputs and build settings.
+          VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseStartup" \
             ./Scripts/test-release-startup.sh
 
   sanitizer-validation:
     name: Existing physical-storage Address Sanitizer subset
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 90
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
         timeout-minutes: 40
         run: |
-          brew install mint jq ripgrep
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
           xcrun simctl list runtimes -j | jq -e '
             .runtimes[] |
             select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
           '
           ./ci_scripts/ci_post_clone.sh
           xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
       - name: Run all existing Address Sanitizer selectors
@@ -237,33 +253,38 @@ jobs:
 
   artifact-validation:
     name: FFmpeg, deployment and reproducibility contracts
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 100
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
         timeout-minutes: 40
         run: |
-          brew install mint jq ripgrep
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
           xcrun simctl list runtimes -j | jq -e '
             .runtimes[] |
             select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
           '
           ./ci_scripts/ci_post_clone.sh
           xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
       - name: Check deployment floors and precompiled Metal reproducibility
@@ -295,36 +316,51 @@ jobs:
         run: |
           python3 Scripts/Tests/test_xcresult_failure_report.py
           python3 Scripts/Tests/test_release_startup_diagnostics.py
+          python3 Scripts/Tests/test_persistent_hls_acceptance.py
+          python3 Scripts/Tests/test_hls_acceptance_workflows.py
+          python3 Scripts/Tests/test_hls_acceptance_configurator.py
+          python3 Scripts/Tests/test_hls_acceptance_fixture.py
+          python3 Scripts/Tests/test_hls_generation_readback.py
+          python3 Scripts/Tests/test_hls_fixture_provisioning.py
+          python3 Scripts/Tests/test_hls_fixture_preparation.py
+          python3 Scripts/Tests/test_source_fixture_padding.py
+          python3 Scripts/Tests/test_he_aac_fixture_observation.py
+          python3 Scripts/Tests/test_source_fixture_manifest.py
 
   fixture-validation:
     name: Strict HTTP playback and 900-second 4K timeline
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 90
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Prepare pinned application dependencies and build tools
         id: prepare
         timeout-minutes: 40
         run: |
-          brew install mint jq ripgrep ffmpeg
+          brew install mint jq ripgrep pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/verify-hls-fixture-toolchain.sh
           xcrun simctl list runtimes -j | jq -e '
             .runtimes[] |
             select(.identifier == "com.apple.CoreSimulator.SimRuntime.tvOS-27-0" and .isAvailable)
           '
           ./ci_scripts/ci_post_clone.sh
           xcodebuild -downloadComponent MetalToolchain
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           ./Scripts/bootstrap.sh --check
           ./Scripts/verify-licenses.sh
       - name: Check fixture runner, server and generator contracts
@@ -349,6 +385,11 @@ jobs:
           ./Scripts/run-playback-integration-tests.sh \
             --timeline-fixture "$fixture_dir/timeline.ts" \
             --only-testing VPlayerTests/PlaybackFixtureIntegrationTests \
+            --only-testing VPlayerTests/SampleBufferBuilderTests \
+            --only-testing VPlayerTests/HLSManagedDemuxSmokeTests \
+            --only-testing VPlayerTests/HLSProxyBackpressureTests \
+            --only-testing VPlayerTests/NativeHLSMasterSmokeTests \
+            --only-testing VPlayerTests/NativeOwnedDolbyFallbackSmokeTests \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
@@ -360,21 +401,22 @@ jobs:
 
   compiler-controls:
     name: Artifact-local compiler controls (no production allocation proof)
-    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/migration/tvos27' }}
     runs-on: xcode-27
     timeout-minutes: 10
     steps:
       - name: Check out the exact acceptance head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Verify source, Xcode and tvOS SDK
         run: |
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          echo "ACCEPTANCE_HEAD=$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
+          echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           xcodebuild -version
-          test "$(xcodebuild -version | head -n 1)" = "Xcode 27.0"
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = 'Xcode 27.0'
           test "$(xcrun --sdk appletvsimulator --show-sdk-version)" = "27.0"
       - name: Validate exact-toolchain Debug and Release control artifacts
         timeout-minutes: 5

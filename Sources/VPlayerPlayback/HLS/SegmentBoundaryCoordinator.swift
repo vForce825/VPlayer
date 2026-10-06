@@ -155,7 +155,8 @@ enum SegmentBoundarySampleIdentity: Sendable, Hashable {
 /// 正式边界会话的身份只在协调器构造时产生；writer 必须冻结同一实例。
 final class SegmentBoundarySession: @unchecked Sendable {
     fileprivate let identity = UUID()
-    fileprivate init() {}
+    let maximumBoundaryDuration: CMTime
+    fileprivate init(maximumBoundaryDuration: CMTime) { self.maximumBoundaryDuration = maximumBoundaryDuration }
 }
 
 /// 只有成功 append 并提交正式边界事务后可读；inspection 和 caller 时间不能构造它。
@@ -340,7 +341,7 @@ final class SegmentBoundaryCoordinator {
     private static let renditionCapacity = 3
 
     private let lock = NSLock()
-    let session = SegmentBoundarySession()
+    let session: SegmentBoundarySession
     private let epochStart: CMTime
     private let videoMode: SegmentVideoBoundaryMode?
     private let minimumPassthroughInterval: CMTime
@@ -383,6 +384,8 @@ final class SegmentBoundaryCoordinator {
         }
         minimumPassthroughInterval = minInterval
         maximumPassthroughInterval = maxInterval
+        session = SegmentBoundarySession(maximumBoundaryDuration:
+            selectedVideoMode == nil ? CMTime(value: 1, timescale: 1) : maxInterval)
         guard start.isNumeric, start.epoch == 0, start.timescale > 0,
               minInterval.isNumeric, maxInterval.isNumeric,
               CMTimeCompare(minInterval, .zero) > 0,
@@ -640,6 +643,42 @@ final class SegmentBoundaryCoordinator {
         }
     }
 
+    func issueSourceAACAppend(for unit: SourceAACAccessUnit,
+                              writerBinding: FMP4WriterBinding) throws -> SegmentBoundaryAppendTicket {
+        guard unit.binding == writerBinding, unit.validates() else { throw SegmentBoundaryFailure.ticketMismatch }
+        let identity = Self.sourceAACIdentity(unit)
+        return try lock.withLock {
+            let decision = try decideAudio(rendition: writerBinding.renditionIdentity,
+                at: unit.presentationStart.cmTime)
+            return try makeTicket(decision, binding: writerBinding, sampleIdentity: identity)
+        }
+    }
+    static func sourceAACIdentity(_ unit: SourceAACAccessUnit) -> SegmentBoundarySampleIdentity {
+        .aac(sample: unit.inputIdentity, presentationStart: unit.presentationStart,
+            format: ObjectIdentifier(unit.configuration.sourceFormatHint), digest: unit.payloadSHA256)
+    }
+
+    func issueMappedCompressedAudioAppend(_ submission: CompressedAudioWriterSubmission,
+                                         timed: HLSTimedAudioAccessUnit,
+                                         writerBinding: FMP4WriterBinding) throws -> SegmentBoundaryAppendTicket {
+        let identity = try Self.mappedCompressedIdentity(submission, timed: timed)
+        return try lock.withLock {
+            let decision = try decideAudio(rendition: writerBinding.renditionIdentity,
+                at: timed.timing.presentationTimeStamp.cmTime)
+            return try makeTicket(decision, binding: writerBinding, sampleIdentity: identity)
+        }
+    }
+
+    static func mappedCompressedIdentity(_ submission: CompressedAudioWriterSubmission,
+                                         timed: HLSTimedAudioAccessUnit) throws -> SegmentBoundarySampleIdentity {
+        guard timed.validatesCompressedSubmission(submission) else { throw SegmentBoundaryFailure.ticketMismatch }
+        let unit = submission.accessUnit
+        return .compressed(codec: unit.codec, sampleRate: unit.sampleRate, channelCount: unit.channelCount,
+            sampleCount: unit.sampleCount, formatConfiguration: unit.formatConfiguration,
+            admission: unit.admissionIdentity, payload: unit.payloadIdentity, range: unit.payloadRange,
+            digest: unit.payloadDigest, presentationStart: timed.timing.presentationTimeStamp)
+    }
+
     static func videoIdentity(
         _ output: HLSVideoEncodedOutput
     ) throws -> SegmentBoundarySampleIdentity {
@@ -839,6 +878,15 @@ final class SegmentBoundaryCoordinator {
         let facts = state.kind.sampleRateAndCount
         let boundary = try boundary(at: state.nextBoundaryOffset)
         let previousOffset = state.nextBoundaryOffset - 1
+        if boundary.isPositiveInfinity {
+            // The media worker must not wait indefinitely for a cut which only
+            // future input can produce, nor mislabel an AU beyond the promised GOP.
+            let previous = try self.boundary(at: previousOffset)
+            let deadline = CMTimeAdd(previous, session.maximumBoundaryDuration)
+            guard deadline.isNumeric, CMTimeCompare(presentationStart, deadline) < 0 else {
+                throw SegmentBoundaryFailure.audioBoundaryExceeded
+            }
+        }
         if boundary.isPositiveInfinity || CMTimeCompare(presentationStart, boundary) < 0 {
             return Decision(
                 trackKind: state.kind.trackKind,
