@@ -619,10 +619,9 @@ private struct NativeHLSSelectedVideoAppearance {
               HLSVideoCapability.supportsNativeColor(expected),
               let mappedPrimaries = CVColorPrimariesGetStringForIntegerCodePoint(Int32(sourcePrimaries.rawValue)),
               let mappedTransfer = CVTransferFunctionGetStringForIntegerCodePoint(Int32(sourceTransfer.rawValue)),
-              let mappedMatrix = CVYCbCrMatrixGetStringForIntegerCodePoint(Int32(sourceMatrix.rawValue)),
               primaries == mappedPrimaries.takeUnretainedValue() as String,
               transfer == mappedTransfer.takeUnretainedValue() as String,
-              matrix == mappedMatrix.takeUnretainedValue() as String else { return false }
+              matchesMatrix(sourceMatrix) else { return false }
         if let original = expected.sampleEntry {
             // No silent avc3/avc1 or hev1/hvc1 equivalence: normalized subtypes
             // lacking matching original-entry evidence fail this admission.
@@ -631,6 +630,19 @@ private struct NativeHLSSelectedVideoAppearance {
         // TS AVC has no ISO sample entry. Core Media exposes its actual AVC
         // decoding subtype; the full admitted parameter-set digest still matches.
         return container == .mpegTS && expected.codec == .h264 && sampleEntry == "avc1"
+    }
+
+    private func matchesMatrix(_ expected: DemuxColorMatrix) -> Bool {
+        func matchesCode(_ code: DemuxColorMatrix) -> Bool {
+            guard let mapped = CVYCbCrMatrixGetStringForIntegerCodePoint(Int32(code.rawValue)) else { return false }
+            return matrix == mapped.takeUnretainedValue() as String
+        }
+        // H.273 Table 4 defines identical coefficients for codes 5 and 6.
+        // Core Video can preserve two labels rather than canonicalizing them.
+        // This comparison runs only after the native color-family guard;
+        // the original source code and fingerprint remain unchanged.
+        if expected.isRec601 { return matchesCode(.bt470BG) || matchesCode(.smpte170M) }
+        return matchesCode(expected)
     }
 }
 

@@ -33,6 +33,14 @@ final class NativeHLSSelectedVideoFormatTests: XCTestCase {
     }
     func testRec601SelectedAppearanceUsesCoreVideoAliasesAndKeepsSourceCodes() throws {
         let fixture = try NativeColorFixture()
+        // The SDK preserves code 5 as a distinct label (YCbCrMatrix#5 on
+        // tvOS 27), although H.273 defines the same coefficients for 5 and 6.
+        let nativeMatrices: [CFString] = [
+            try XCTUnwrap(CVYCbCrMatrixGetStringForIntegerCodePoint(5)).takeUnretainedValue(),
+            kCVImageBufferYCbCrMatrix_ITU_R_601_4
+        ]
+        XCTAssertEqual(try XCTUnwrap(CVYCbCrMatrixGetStringForIntegerCodePoint(6)).takeUnretainedValue() as String,
+            kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String)
         for primaries: UInt16 in [5, 6] {
             for transfer: UInt16 in [1, 6] {
                 for matrix: UInt16 in [5, 6] {
@@ -42,22 +50,26 @@ final class NativeHLSSelectedVideoFormatTests: XCTestCase {
                     let expected = try fixture.facts(sampleEntry: "avc1", color: color)
                     let nativePrimaries = try XCTUnwrap(CVColorPrimariesGetStringForIntegerCodePoint(Int32(primaries))).takeUnretainedValue()
                     let nativeTransfer = try XCTUnwrap(CVTransferFunctionGetStringForIntegerCodePoint(Int32(transfer))).takeUnretainedValue()
-                    let nativeMatrix = try XCTUnwrap(CVYCbCrMatrixGetStringForIntegerCodePoint(Int32(matrix))).takeUnretainedValue()
                     XCTAssertEqual(nativePrimaries as String, (primaries == 5
                         ? kCVImageBufferColorPrimaries_EBU_3213 : kCVImageBufferColorPrimaries_SMPTE_C) as String)
-                    XCTAssertEqual(nativeMatrix as String, kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String)
-                    let actual = try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
-                        transfer: nativeTransfer, matrix: nativeMatrix), expected: expected)
-                    XCTAssertEqual(actual.colorPrimaries?.rawValue, primaries)
-                    XCTAssertEqual(actual.colorTransfer?.rawValue, transfer)
-                    XCTAssertEqual(actual.colorMatrix?.rawValue, matrix)
-                    let otherPrimaries = primaries == 5 ? kCVImageBufferColorPrimaries_SMPTE_C : kCVImageBufferColorPrimaries_EBU_3213
-                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: otherPrimaries,
-                        transfer: nativeTransfer, matrix: nativeMatrix), expected: expected))
-                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
-                        transfer: nativeTransfer, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2), expected: expected))
-                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
-                        transfer: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, matrix: nativeMatrix), expected: expected))
+                    for nativeMatrix in nativeMatrices {
+                        let actual = try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                            transfer: nativeTransfer, matrix: nativeMatrix), expected: expected)
+                        XCTAssertEqual(actual.colorPrimaries?.rawValue, primaries)
+                        XCTAssertEqual(actual.colorTransfer?.rawValue, transfer)
+                        XCTAssertEqual(actual.colorMatrix?.rawValue, matrix)
+                        let otherPrimaries = primaries == 5 ? kCVImageBufferColorPrimaries_SMPTE_C : kCVImageBufferColorPrimaries_EBU_3213
+                        XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: otherPrimaries,
+                            transfer: nativeTransfer, matrix: nativeMatrix), expected: expected))
+                        XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                            transfer: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, matrix: nativeMatrix), expected: expected))
+                    }
+                    let rejectedMatrices: [CFString] = [kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                        kCVImageBufferYCbCrMatrix_ITU_R_2020, "Unspecified" as CFString]
+                    for rejected in rejectedMatrices {
+                        XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                            transfer: nativeTransfer, matrix: rejected), expected: expected))
+                    }
                 }
             }
         }
