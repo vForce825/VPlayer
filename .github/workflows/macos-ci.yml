@@ -414,6 +414,24 @@ jobs:
             --only-testing VPlayerTests/HLSManifestGraphTests/testSessionDataResourcesAndVariablesRemainUnsupportedWithoutReferences \
             --only-testing VPlayerTests/HLSManifestGraphTests/testSessionDataRejectsMalformedAttributeShapes \
             --only-testing VPlayerTests/HLSManifestGraphTests/testSessionDataValueDoesNotRelaxOtherExtensionRestrictions \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACMatchesCompleteLCConfigurationsWithAbsentSBRExtension \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACIdentityRejectsHEAndIncompleteOrUnsupportedLCConfigurations \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACIdentityHandlesSlicedValidatedLCConfigurations \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACEquivalenceKeepsSourceFormatRateAndExactLayoutGuards \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACEquivalenceKeepsExplicitSDKFrameLengthContradictions \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests/testNativeAACEquivalentSelectionDigestPreservesTransitionIdentityGuards \
+            --only-testing VPlayerTests/HLSCompatibilityProbeTests/testCompleteRec601TransportPreservesSourceEvidence \
+            --only-testing VPlayerTests/HLSCompatibilityProbeTests/testSourceRec601SPSPreservesExactCodePointsWithoutUnlockingGeneratedColor \
+            --only-testing VPlayerTests/HLSCompatibilityProbeTests/testRec601ProjectionKeepsRawCodesAndRejectsConflictingEvidence \
+            --only-testing VPlayerTests/HLSCompatibilityProbeTests/testSourceSPSColorSeparatesKnownUnspecifiedAndExplicitUnsupportedCodes \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testRec601KeepsNativeOrProxyWithoutEnteringGeneratedColorPipeline \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testRec601NativeColorDoesNotWidenMixedGamutsOrHDR \
+            --only-testing VPlayerTests/NativeHLSSelectedVideoFormatTests/testRec601SelectedAppearanceUsesCoreVideoAliasesAndKeepsSourceCodes \
+            --only-testing VPlayerTests/NativeHLSSelectedVideoFormatTests/testSourceRec601MetadataCannotEnterSharedGeneratedFormatBuilder \
+            --only-testing VPlayerTests/VideoAccessUnitInspectorTests/testRec601HEVCSourceFactsKeepCodesWhileGeneratedInspectionRejectsThem \
+            --only-testing VPlayerTests/VideoAccessUnitInspectorTests/testExplicitUnsupportedVUIColorEnumsCannotUseFrozenFallback \
+            --only-testing VPlayerTests/VideoAccessUnitInspectorTests/testHEVCAlternativeTransferSEIRejectsMalformedUnknownAndConflictingValues \
+            --only-testing VPlayerTests/VideoRemuxEligibilityTests/testSourceRec601CannotEnterGeneratedRemuxColorContract \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \

@@ -1073,7 +1073,7 @@ enum HEVCAlternativeTransferReader {
                                         previous: DemuxColorTransfer?) throws -> DemuxColorTransfer {
         guard payloadSize == 1 else { throw VideoAccessUnitInspectionError.invalidHDRMetadata }
         let value = UInt16(try reader.readByte())
-        guard let transfer = DemuxColorTransfer(rawValue: value) else {
+        guard let transfer = DemuxColorTransfer(rawValue: value), !transfer.isRec601 else {
             throw VideoAccessUnitInspectionError.unsupportedColorTransfer(value)
         }
         guard previous == nil || previous == transfer else {
@@ -2200,21 +2200,25 @@ private func parseColorDescription(
     transfer: DemuxColorTransfer?,
     matrix: DemuxColorMatrix?
 ) {
-    // Source facts preserve ISO unspecified (2) as absence. Generated-media
-    // inspection remains strict so this cannot unlock frozen color fallback.
+    // Source facts retain Rec.601 codes and preserve ISO unspecified (2) as absence.
+    // Generated inspection stays within the existing renderer/encoder contract;
+    // admitting these codes there would currently relabel the gamut as BT.709.
     let primariesValue = UInt16(try reader.readBits(8))
     let primaries = DemuxColorPrimaries(rawValue: primariesValue)
-    guard primaries != nil || (colorMode == .sourceFacts && primariesValue == 2) else {
+    guard (primaries != nil && (colorMode == .sourceFacts || primaries?.isRec601 == false))
+            || (colorMode == .sourceFacts && primariesValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorPrimaries(primariesValue)
     }
     let transferValue = UInt16(try reader.readBits(8))
     let transfer = DemuxColorTransfer(rawValue: transferValue)
-    guard transfer != nil || (colorMode == .sourceFacts && transferValue == 2) else {
+    guard (transfer != nil && (colorMode == .sourceFacts || transfer?.isRec601 == false))
+            || (colorMode == .sourceFacts && transferValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorTransfer(transferValue)
     }
     let matrixValue = UInt16(try reader.readBits(8))
     let matrix = DemuxColorMatrix(rawValue: matrixValue)
-    guard matrix != nil || (colorMode == .sourceFacts && matrixValue == 2) else {
+    guard (matrix != nil && (colorMode == .sourceFacts || matrix?.isRec601 == false))
+            || (colorMode == .sourceFacts && matrixValue == 2) else {
         throw VideoAccessUnitInspectionError.unsupportedColorMatrix(matrixValue)
     }
     return (primaries, transfer, matrix)

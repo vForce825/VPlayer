@@ -186,7 +186,7 @@ private final class SourceInspectionState: @unchecked Sendable {
             else { scan = .unknown }
             let profileMatches = track.profile < 0 || (track.profile & 255) == Int32(proof.profileIDC)
             let range: HLSVideoRange?
-            switch transfer { case .bt709: range = .sdr; case .pq: range = .pq; case .hlg: range = .hlg; default: range = nil }
+            switch transfer { case .bt709, .smpte170M: range = .sdr; case .pq: range = .pq; case .hlg: range = .hlg; default: range = nil }
             return HLSVideoFacts(codec: codec, profile: Int32(proof.profileIDC), scan: profileMatches ? scan : .contradictory,
                 parameterSetsValidated: profileMatches && !contradiction,
                 configurationFingerprint: try HLSVideoConfigurationFingerprint.make(codec: codec, parameterSets: units),

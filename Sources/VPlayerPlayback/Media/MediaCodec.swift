@@ -113,20 +113,34 @@ public enum DemuxColorRange: UInt8, Sendable, Hashable {
 
 public enum DemuxColorPrimaries: UInt16, Sendable, Hashable {
     case bt709 = 1
+    case bt470BG = 5
+    case smpte170M = 6
     case bt2020 = 9
+
+    // Preserve the distinct H.273 625/525 code points as source evidence.
+    // The generated video pipeline does not yet carry these gamuts.
+    var isRec601: Bool { self == .bt470BG || self == .smpte170M }
 }
 
 public enum DemuxColorTransfer: UInt16, Sendable, Hashable {
     case bt709 = 1
+    case smpte170M = 6
     case bt2020 = 14
     case bt2020_12 = 15
     case pq = 16
     case hlg = 18
+
+    var isRec601: Bool { self == .smpte170M }
 }
 
 public enum DemuxColorMatrix: UInt16, Sendable, Hashable {
     case bt709 = 1
+    case bt470BG = 5
+    case smpte170M = 6
     case bt2020Nonconstant = 9
+
+    // H.273 matrices 5/6 have identical coefficients, but retain the source code.
+    var isRec601: Bool { self == .bt470BG || self == .smpte170M }
 }
 
 public enum DemuxChromaLocation: UInt8, Sendable, Hashable {

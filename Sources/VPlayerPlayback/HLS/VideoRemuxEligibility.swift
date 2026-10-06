@@ -576,6 +576,8 @@ final class VideoRemuxEligibility {
         _ evidence: any VideoRemuxInspectionEvidence,
         bitDepth: UInt8
     ) throws {
+        guard evidence.remuxColorPrimaries?.isRec601 != true, evidence.remuxColorTransfer?.isRec601 != true,
+              evidence.remuxColorMatrix?.isRec601 != true else { try reject(.inconsistentColorMetadata) }
         let isHDRTransfer = evidence.remuxColorTransfer == .pq
             || evidence.remuxColorTransfer == .hlg
         if isHDRTransfer {

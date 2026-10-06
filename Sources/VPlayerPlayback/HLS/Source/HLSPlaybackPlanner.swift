@@ -36,7 +36,7 @@ public enum HLSPlaybackPlanner {
               media.audio.count == 1, let audio = media.audio.first, audio.codec != nil else { throw HLSSourceError.unsupportedMedia }
         let videoDecision: HLSPlaybackPlan.Video
         if let video = media.video {
-            guard let codec = video.codec, video.parameterSetsValidated,
+            guard let codec = video.codec, video.parameterSetsValidated, !video.requiresNativeRec601Color,
                   capabilities.videoProfiles[codec]?.contains(video.profile) == true else { throw HLSSourceError.unsupportedMedia }
             switch video.scan {
             case .progressive: videoDecision = .remux

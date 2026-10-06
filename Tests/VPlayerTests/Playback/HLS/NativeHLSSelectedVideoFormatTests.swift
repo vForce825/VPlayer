@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import CoreMedia
+import CoreVideo
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
@@ -30,6 +31,47 @@ final class NativeHLSSelectedVideoFormatTests: XCTestCase {
         XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(transfer: "Unspecified" as CFString), expected: admitted))
         XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(alternativeTransfer: true), expected: admitted))
     }
+    func testRec601SelectedAppearanceUsesCoreVideoAliasesAndKeepsSourceCodes() throws {
+        let fixture = try NativeColorFixture()
+        for primaries: UInt16 in [5, 6] {
+            for transfer: UInt16 in [1, 6] {
+                for matrix: UInt16 in [5, 6] {
+                    let color = (try XCTUnwrap(DemuxColorPrimaries(rawValue: primaries)),
+                        try XCTUnwrap(DemuxColorTransfer(rawValue: transfer)),
+                        try XCTUnwrap(DemuxColorMatrix(rawValue: matrix)))
+                    let expected = try fixture.facts(sampleEntry: "avc1", color: color)
+                    let nativePrimaries = try XCTUnwrap(CVColorPrimariesGetStringForIntegerCodePoint(Int32(primaries))).takeUnretainedValue()
+                    let nativeTransfer = try XCTUnwrap(CVTransferFunctionGetStringForIntegerCodePoint(Int32(transfer))).takeUnretainedValue()
+                    let nativeMatrix = try XCTUnwrap(CVYCbCrMatrixGetStringForIntegerCodePoint(Int32(matrix))).takeUnretainedValue()
+                    XCTAssertEqual(nativePrimaries as String, (primaries == 5
+                        ? kCVImageBufferColorPrimaries_EBU_3213 : kCVImageBufferColorPrimaries_SMPTE_C) as String)
+                    XCTAssertEqual(nativeMatrix as String, kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String)
+                    let actual = try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                        transfer: nativeTransfer, matrix: nativeMatrix), expected: expected)
+                    XCTAssertEqual(actual.colorPrimaries?.rawValue, primaries)
+                    XCTAssertEqual(actual.colorTransfer?.rawValue, transfer)
+                    XCTAssertEqual(actual.colorMatrix?.rawValue, matrix)
+                    let otherPrimaries = primaries == 5 ? kCVImageBufferColorPrimaries_SMPTE_C : kCVImageBufferColorPrimaries_EBU_3213
+                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: otherPrimaries,
+                        transfer: nativeTransfer, matrix: nativeMatrix), expected: expected))
+                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                        transfer: nativeTransfer, matrix: kCVImageBufferYCbCrMatrix_ITU_R_709_2), expected: expected))
+                    XCTAssertThrowsError(try SystemNativeHLSAssetInspector.videoFacts(fixture.format(primaries: nativePrimaries,
+                        transfer: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, matrix: nativeMatrix), expected: expected))
+                }
+            }
+        }
+    }
+
+    func testSourceRec601MetadataCannotEnterSharedGeneratedFormatBuilder() throws {
+        let fixture = try NativeColorFixture()
+        for metadata in [DemuxVideoMetadata(primaries: .bt470BG), .init(primaries: .smpte170M),
+                         .init(transfer: .smpte170M), .init(matrix: .bt470BG), .init(matrix: .smpte170M)] {
+            XCTAssertThrowsError(try VideoFormatDescriptionBuilder.make(codec: .h264,
+                parameterSets: fixture.parameters, videoMetadata: metadata))
+        }
+    }
+
     func testNativeSampleEntryDoesNotSilentlyCollapseContainerAliases() throws {
         let fixture = try NativeColorFixture(), format = try fixture.format()
         XCTAssertEqual(CMFormatDescriptionGetMediaSubType(format), kCMVideoCodecType_H264)
@@ -111,7 +153,8 @@ private struct NativeColorFixture {
         guard status == noErr else { throw HLSSourceError.unsupportedMedia }
         return try XCTUnwrap(result)
     }
-    func facts(sampleEntry: String?, container: HLSMediaFacts.Container = .fragmentedMP4) throws -> HLSCompatibilityFacts {
+    func facts(sampleEntry: String?, container: HLSMediaFacts.Container = .fragmentedMP4,
+               color: (DemuxColorPrimaries, DemuxColorTransfer, DemuxColorMatrix) = (.bt709, .bt709, .bt709)) throws -> HLSCompatibilityFacts {
         let context = try sourceContext()
         let source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL, generation: 1, topology: .media(Data()))
         let dimensions = CMVideoFormatDescriptionGetDimensions(base)
@@ -119,7 +162,7 @@ private struct NativeColorFixture {
             configurationFingerprint: try HLSVideoConfigurationFingerprint.make(codec: .h264, parameterSets: parameters),
             width: dimensions.width, height: dimensions.height, chromaFormat: 1, bitDepth: 8, level: 40,
             tier: .main, frameRate: MediaRational(num: 25, den: 1), videoRange: .sdr,
-            colorPrimaries: .bt709, colorTransfer: .bt709, colorMatrix: .bt709, sampleEntry: sampleEntry)
+            colorPrimaries: color.0, colorTransfer: color.1, colorMatrix: color.2, sampleEntry: sampleEntry)
         return .init(source: source, media: [.init(url: context.entryURL, container: container, video: video,
             audio: [], hasUnsupportedTracks: false)], complete: true, inspectedBytes: 32)
     }

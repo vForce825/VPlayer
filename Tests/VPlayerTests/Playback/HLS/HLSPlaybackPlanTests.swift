@@ -18,6 +18,48 @@ final class HLSPlaybackPlanTests: XCTestCase {
         }
     }
 
+    func testRec601KeepsNativeOrProxyWithoutEnteringGeneratedColorPipeline() throws {
+        for primaries: UInt16 in [5, 6] {
+            for transfer: UInt16 in [1, 6] {
+                for matrix: UInt16 in [5, 6] {
+                    let color = (try XCTUnwrap(DemuxColorPrimaries(rawValue: primaries)),
+                        try XCTUnwrap(DemuxColorTransfer(rawValue: transfer)),
+                        try XCTUnwrap(DemuxColorMatrix(rawValue: matrix)))
+                    let format = video(color: color)
+                    for managed in [false, true] {
+                        let source = try source(master: true, managed: managed)
+                        let plan = try HLSPlaybackPlanner.makePlan(source: source,
+                            facts: facts(source, video: format), capabilities: capabilities())
+                        XCTAssertEqual(plan.transport, managed ? .proxy : .native)
+                        XCTAssertEqual(plan.video, .source)
+                    }
+                    let raw = try source(raw: true)
+                    for scan in [HLSScanEvidence.progressive, .interlaced, .unknown, .contradictory] {
+                        XCTAssertThrowsError(try HLSPlaybackPlanner.makePlan(source: raw,
+                            facts: facts(raw, video: video(scan: scan, color: color)), capabilities: capabilities()))
+                    }
+                    let original = try source(master: true)
+                    for scan in [HLSScanEvidence.interlaced, .unknown, .contradictory] {
+                        XCTAssertThrowsError(try HLSPlaybackPlanner.makePlan(source: original,
+                            facts: facts(original, video: video(scan: scan, color: color)), capabilities: capabilities()))
+                    }
+                }
+            }
+        }
+    }
+
+    func testRec601NativeColorDoesNotWidenMixedGamutsOrHDR() throws {
+        for color: (DemuxColorPrimaries, DemuxColorTransfer, DemuxColorMatrix) in [
+            (.bt470BG, .bt709, .bt709), (.bt709, .bt709, .smpte170M),
+            (.smpte170M, .pq, .smpte170M), (.bt470BG, .hlg, .bt470BG),
+            (.bt470BG, .bt2020, .bt470BG), (.smpte170M, .bt2020_12, .smpte170M)
+        ] {
+            let source = try source(master: true)
+            XCTAssertThrowsError(try HLSPlaybackPlanner.makePlan(source: source,
+                facts: facts(source, video: video(color: color)), capabilities: capabilities()))
+        }
+    }
+
     func testDeclaredCodecAndScalarContradictionsNeverCollapseMaster() throws {
         let declarations = ["CODECS=\"avc1.4d4028,mp4a.40.2\"", "CODECS=\"avc1.640029,mp4a.40.2\"",
             "CODECS=\"avc1.640028,mp4a.40.5\"", "CODECS=\"avc1.640028,unknown\"", "CODECS=\"avc1.640028\"",
@@ -152,12 +194,13 @@ final class HLSPlaybackPlanTests: XCTestCase {
         return .init(source: source, media: urls.map { .init(url: $0, container: container, video: video ?? self.video(),
             audio: [audio ?? aac()], hasUnsupportedTracks: false) }, complete: true, inspectedBytes: 100)
     }
-    private func video(codec: VideoCodec = .h264, scan: HLSScanEvidence = .progressive) -> HLSVideoFacts {
+    private func video(codec: VideoCodec = .h264, scan: HLSScanEvidence = .progressive,
+                       color: (DemuxColorPrimaries, DemuxColorTransfer, DemuxColorMatrix) = (.bt709, .bt709, .bt709)) -> HLSVideoFacts {
         .init(codec: codec, profile: codec == .h264 ? 100 : 2, scan: scan, parameterSetsValidated: true,
             configurationFingerprint: Data(repeating: 1, count: 32), width: 1920, height: 1080, chromaFormat: 1,
             bitDepth: codec == .h264 ? 8 : 10, level: codec == .h264 ? 40 : 120, compatibilityFlags: codec == .h264 ? 0 : 0x20000000,
             constraintIndicatorFlags: codec == .h264 ? nil : 0xB00000000000, tier: .main, frameRate: MediaRational(num: 30, den: 1),
-            videoRange: .sdr, colorPrimaries: .bt709, colorTransfer: .bt709, colorMatrix: .bt709, sampleEntry: codec == .h264 ? nil : "hvc1")
+            videoRange: .sdr, colorPrimaries: color.0, colorTransfer: color.1, colorMatrix: color.2, sampleEntry: codec == .h264 ? nil : "hvc1")
     }
     private func aac() -> HLSSourceAudioFacts { .init(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2, channelMask: 3,
         decoderConfiguration: Data([0x11,0x90]), priming: .notSignaledPreserveTimestamps, service: .independentMain, formatValidated: true) }

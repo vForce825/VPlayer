@@ -34,7 +34,7 @@ enum VideoFormatDescriptionBuilder {
                     codec: codec,
                     pointers: stablePointers,
                     sizes: stableSizes,
-                    extensions: colorExtensions(videoMetadata),
+                    extensions: try colorExtensions(videoMetadata),
                     formatDescription: &formatDescription
                 )
             }
@@ -66,7 +66,7 @@ enum VideoFormatDescriptionBuilder {
                 codec: codec,
                 pointers: stablePointers,
                 sizes: sizes,
-                extensions: colorExtensions(videoMetadata),
+                extensions: try colorExtensions(videoMetadata),
                 formatDescription: &formatDescription
             )
         }
@@ -116,19 +116,21 @@ enum VideoFormatDescriptionBuilder {
 
     /// 解复用器会结合 SEI 解析有效传递函数；只从 SPS 重建会把兼容写法的 HLG
     /// 当作 SDR。显式传递已有色彩证据，缺失的字段继续交给 Core Media 解析。
-    private static func colorExtensions(_ metadata: DemuxVideoMetadata) -> CFDictionary? {
+    private static func colorExtensions(_ metadata: DemuxVideoMetadata) throws -> CFDictionary? {
         var result: [String: Any] = [:]
         if let range = metadata.range {
             result[kCMFormatDescriptionExtension_FullRangeVideo as String] = range == .full
         }
         if let primaries = metadata.primaries {
             result[kCMFormatDescriptionExtension_ColorPrimaries as String] = switch primaries {
+            case .bt470BG, .smpte170M: throw PlaybackCoreError.videoFormatDescription(kCMFormatDescriptionError_InvalidParameter)
             case .bt709: kCMFormatDescriptionColorPrimaries_ITU_R_709_2
             case .bt2020: kCMFormatDescriptionColorPrimaries_ITU_R_2020
             }
         }
         if let transfer = metadata.transfer {
             result[kCMFormatDescriptionExtension_TransferFunction as String] = switch transfer {
+            case .smpte170M: throw PlaybackCoreError.videoFormatDescription(kCMFormatDescriptionError_InvalidParameter)
             case .bt709: kCMFormatDescriptionTransferFunction_ITU_R_709_2
             case .bt2020, .bt2020_12: kCMFormatDescriptionTransferFunction_ITU_R_2020
             case .pq: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
@@ -137,6 +139,7 @@ enum VideoFormatDescriptionBuilder {
         }
         if let matrix = metadata.matrix {
             result[kCMFormatDescriptionExtension_YCbCrMatrix as String] = switch matrix {
+            case .bt470BG, .smpte170M: throw PlaybackCoreError.videoFormatDescription(kCMFormatDescriptionError_InvalidParameter)
             case .bt709: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2
             case .bt2020Nonconstant: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020
             }

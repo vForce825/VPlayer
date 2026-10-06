@@ -334,6 +334,18 @@ final class VideoRemuxEligibilityTests: XCTestCase {
         }
     }
 
+    func testSourceRec601CannotEnterGeneratedRemuxColorContract() throws {
+        let cases = [remuxEvidence(primaries: .bt470BG), remuxEvidence(primaries: .smpte170M),
+            remuxEvidence(transfer: .smpte170M), remuxEvidence(matrix: .bt470BG), remuxEvidence(matrix: .smpte170M)]
+        for evidence in cases {
+            let subject = try VideoRemuxEligibility(generation: evidence.remuxGeneration, codec: .h264,
+                sampleEntry: .avc1, requiresDecodeTimestamp: false)
+            XCTAssertThrowsError(try subject.evaluate(evidence)) {
+                XCTAssertEqual($0 as? VideoRemuxEligibilityError, .inconsistentColorMetadata)
+            }
+        }
+    }
+
     func testProfileBitDepthAndHDRColorConsistencyMatrix() throws {
         let transcode = try VideoRemuxEligibility(
             generation: MediaGeneration(rawValue: 7),

@@ -1741,7 +1741,8 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private func videoInputSignature(
         _ format: VideoAccessUnitFormatSummary
     ) throws -> VideoEncodingInputFormatSignature {
-        guard format.bitDepthLuma == format.bitDepthChroma,
+        guard format.primaries?.isRec601 != true, format.transfer?.isRec601 != true, format.matrix?.isRec601 != true,
+              format.bitDepthLuma == format.bitDepthChroma,
               format.bitDepthLuma == 8 || format.bitDepthLuma == 10,
               format.chromaFormatIDC == 1 else {
             throw HLSVideoRemuxSubmissionFailure.formatMismatch

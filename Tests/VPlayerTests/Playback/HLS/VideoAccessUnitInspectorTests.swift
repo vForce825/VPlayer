@@ -155,6 +155,7 @@ final class VideoAccessUnitInspectorTests: XCTestCase {
             [Data([147, 0, 0x80])],
             [Data([147, 2, 18, 18, 0x80])],
             [Data([147, 1, 2, 0x80])],
+            [Data([147, 1, 6, 0x80])],
             [Data([147, 1, 18, 0x80]), Data([147, 1, 16, 0x80])],
         ] {
             let bytes = annexB([hevcVPS(), hevcSPS(colorTransfer: 14), hevcPPS()]
@@ -681,6 +682,11 @@ final class VideoAccessUnitInspectorTests: XCTestCase {
             (h264SPS(colorPrimaries: 2), .unsupportedColorPrimaries(2)),
             (h264SPS(colorTransfer: 2), .unsupportedColorTransfer(2)),
             (h264SPS(colorMatrix: 2), .unsupportedColorMatrix(2)),
+            (h264SPS(colorPrimaries: 5), .unsupportedColorPrimaries(5)),
+            (h264SPS(colorPrimaries: 6), .unsupportedColorPrimaries(6)),
+            (h264SPS(colorTransfer: 6), .unsupportedColorTransfer(6)),
+            (h264SPS(colorMatrix: 5), .unsupportedColorMatrix(5)),
+            (h264SPS(colorMatrix: 6), .unsupportedColorMatrix(6)),
         ]
         for (index, fixture) in h264Cases.enumerated() {
             XCTAssertThrowsError(try h264Session.inspect(inspectionInput(
@@ -708,6 +714,11 @@ final class VideoAccessUnitInspectorTests: XCTestCase {
             (hevcSPS(colorPrimaries: 2), .unsupportedColorPrimaries(2)),
             (hevcSPS(colorTransfer: 2), .unsupportedColorTransfer(2)),
             (hevcSPS(colorMatrix: 2), .unsupportedColorMatrix(2)),
+            (hevcSPS(colorPrimaries: 5), .unsupportedColorPrimaries(5)),
+            (hevcSPS(colorPrimaries: 6), .unsupportedColorPrimaries(6)),
+            (hevcSPS(colorTransfer: 6), .unsupportedColorTransfer(6)),
+            (hevcSPS(colorMatrix: 5), .unsupportedColorMatrix(5)),
+            (hevcSPS(colorMatrix: 6), .unsupportedColorMatrix(6)),
         ]
         for (index, fixture) in hevcCases.enumerated() {
             XCTAssertThrowsError(try hevcSession.inspect(inspectionInput(
@@ -717,6 +728,19 @@ final class VideoAccessUnitInspectorTests: XCTestCase {
                 codec: .hevc
             ))) { error in
                 XCTAssertEqual(error as? VideoAccessUnitInspectionError, fixture.1)
+            }
+        }
+    }
+
+    func testRec601HEVCSourceFactsKeepCodesWhileGeneratedInspectionRejectsThem() throws {
+        for primary: UInt8 in [5, 6] {
+            let sps = hevcSPS(colorPrimaries: primary, colorTransfer: 6, colorMatrix: primary)
+            let format = try VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc)
+            XCTAssertEqual(format.primaries?.rawValue, UInt16(primary))
+            XCTAssertEqual(format.transfer?.rawValue, 6)
+            XCTAssertEqual(format.matrix?.rawValue, UInt16(primary))
+            XCTAssertThrowsError(try VideoSequenceParameterSetInspector.inspectHEVC(Array(sps))) {
+                XCTAssertEqual($0 as? VideoAccessUnitInspectionError, .unsupportedColorPrimaries(UInt16(primary)))
             }
         }
     }

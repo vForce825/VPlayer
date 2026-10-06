@@ -709,12 +709,14 @@ final class HLSVideoRemuxSubmissionBuilder: @unchecked Sendable {
         }
         if let primaries = format.primaries {
             result[kCMFormatDescriptionExtension_ColorPrimaries] = switch primaries {
+            case .bt470BG, .smpte170M: throw HLSVideoRemuxSubmissionFailure.formatMismatch
             case .bt709: kCVImageBufferColorPrimaries_ITU_R_709_2
             case .bt2020: kCVImageBufferColorPrimaries_ITU_R_2020
             }
         }
         if let transfer = format.transfer {
             result[kCMFormatDescriptionExtension_TransferFunction] = switch transfer {
+            case .smpte170M: throw HLSVideoRemuxSubmissionFailure.formatMismatch
             case .bt709: kCVImageBufferTransferFunction_ITU_R_709_2
             case .bt2020, .bt2020_12: kCVImageBufferTransferFunction_ITU_R_2020
             case .pq: kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ
@@ -723,6 +725,7 @@ final class HLSVideoRemuxSubmissionBuilder: @unchecked Sendable {
         }
         if let matrix = format.matrix {
             result[kCMFormatDescriptionExtension_YCbCrMatrix] = switch matrix {
+            case .bt470BG, .smpte170M: throw HLSVideoRemuxSubmissionFailure.formatMismatch
             case .bt709: kCVImageBufferYCbCrMatrix_ITU_R_709_2
             case .bt2020Nonconstant: kCVImageBufferYCbCrMatrix_ITU_R_2020
             }
