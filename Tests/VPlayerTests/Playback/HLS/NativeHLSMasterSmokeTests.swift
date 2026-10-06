@@ -131,16 +131,19 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let physical = try XCTUnwrap(driver.nativeCurrentItem(coordinator.item))
         let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
         let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
+        XCTAssertEqual(quantum.visualSelection, .absent,
+            "The real inspector must positively establish visual absence for this fixture")
         let track = try XCTUnwrap(physical.tracks.first { $0.isEnabled && $0.assetTrack?.mediaType == .video })
         let asset = try XCTUnwrap(track.assetTrack)
         XCTAssertTrue(quantum.hasCurrentIdentity(item: coordinator.item, physical: physical))
         let same = NativeHLSFinalPresentationQuantum.compareBindings(prior: quantum, current: quantum)
-        XCTAssertEqual(same, .init(presence: 3, equalFields: NativeHLSQuantumBindingComparison.allFields))
+        XCTAssertEqual(same, .init(presence: 3, equalFields: NativeHLSQuantumBindingComparison.allFields,
+            visualSelections: quantum.visualSelection.rawValue | (quantum.visualSelection.rawValue << 2)))
         XCTAssertTrue(same.matches)
         let appeared = NativeHLSFinalPresentationQuantum.compareBindings(prior: nil, current: quantum)
         let disappeared = NativeHLSFinalPresentationQuantum.compareBindings(prior: quantum, current: nil)
-        XCTAssertEqual(appeared, .init(presence: 2, equalFields: 0))
-        XCTAssertEqual(disappeared, .init(presence: 1, equalFields: 0))
+        XCTAssertEqual(appeared, .init(presence: 2, equalFields: 0, visualSelections: quantum.visualSelection.rawValue << 2))
+        XCTAssertEqual(disappeared, .init(presence: 1, equalFields: 0, visualSelections: quantum.visualSelection.rawValue))
         XCTAssertFalse(appeared.matches); XCTAssertFalse(disappeared.matches)
         held.track = track; held.asset = asset; held.item = coordinator.item
         held.receipt = quantum; held.alias = quantum; held.weakReceipt = quantum
@@ -431,6 +434,95 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         if let failure { throw failure }
     }
 
+    func testQuantumWrapperRenewalRequiresExactAssetAndPositiveVisualAbsence() {
+        for evidence in NativeHLSVisualSelectionEvidence.allCases {
+            for fields in UInt8(0)...3 {
+                let comparison = NativeHLSQuantumSDKIdentityComparison(equalFields: fields, visualSelection: evidence)
+                XCTAssertEqual(comparison.failure(allowingWrapperRenewal: false) == nil, fields == 3)
+                XCTAssertEqual(comparison.failure(allowingWrapperRenewal: true) == nil,
+                    fields == 3 || (fields == 2 && evidence == .absent))
+                for ready in [false, true] {
+                    for errorFree in [false, true] {
+                        XCTAssertEqual(comparison.permitsPendingPause(isReady: ready, errorFree: errorFree),
+                            fields == 3 || (fields == 2 && evidence == .absent && ready && errorFree))
+                    }
+                }
+                if fields == 0 {
+                    XCTAssertEqual(comparison.failure(allowingWrapperRenewal: true), .videoTrack)
+                    XCTAssertEqual(comparison.equalFields & 2, 0, "Asset inequality survives the first wrapper rejection")
+                }
+                if fields == 1 { XCTAssertEqual(comparison.failure(allowingWrapperRenewal: true), .videoAssetIdentity) }
+            }
+        }
+    }
+
+    func testPendingQuantumRenewalMayChangeOnlyPresentationWrapper() {
+        for presence in UInt8(0)...3 {
+            for prior in NativeHLSVisualSelectionEvidence.allCases {
+                for current in NativeHLSVisualSelectionEvidence.allCases {
+                    let visual = prior.rawValue | (current.rawValue << 2)
+                    let wrapperOnly = NativeHLSQuantumBindingComparison(presence: presence, equalFields: 0x1FB, visualSelections: visual)
+                    XCTAssertEqual(wrapperOnly.matchesPendingWindow,
+                        presence == 0 || (presence == 3 && prior == .absent && current == .absent))
+                }
+            }
+        }
+        for bit in 0..<9 where bit != 2 {
+            let fields = NativeHLSQuantumBindingComparison.allFields ^ (UInt16(1) << bit)
+            for additionalWrapperChange in [UInt16(0), UInt16(1 << 2)] {
+                let changed = NativeHLSQuantumBindingComparison(presence: 3,
+                    equalFields: fields ^ additionalWrapperChange, visualSelections: 5)
+                XCTAssertFalse(changed.matchesPendingWindow, "Actual media/item/source/format/timing changes remain terminal")
+            }
+        }
+    }
+
+    func testWrapperWindowRestrictionSurvivesOriginalWrapperReturnAndMissingEvidence() {
+        var window = NativeHLSQuantumWindow()
+        XCTAssertTrue(window.permits(nil), "Unchanged exact-endpoint-only behavior before any wrapper exception")
+        window.recordWrapperRenewal(false)
+        XCTAssertFalse(window.requiresVisualAbsence)
+        window.recordWrapperRenewal(true)
+        window.recordWrapperRenewal(false) // Original wrapper returns, or a retry has exact identity.
+        XCTAssertTrue(window.requiresVisualAbsence)
+        XCTAssertTrue(window.permits(.absent))
+        XCTAssertFalse(window.permits(nil))
+        for evidence in NativeHLSVisualSelectionEvidence.allCases where evidence != .absent {
+            XCTAssertFalse(window.permits(evidence))
+        }
+        window.reset()
+        XCTAssertFalse(window.requiresVisualAbsence)
+        XCTAssertTrue(window.permits(nil))
+    }
+
+    func testVisualAbsenceRequiresSuccessfulSDKLoadAndNoSourceAlternates() throws {
+        XCTAssertEqual(NativeHLSVisualSelectionEvidence.classify(sourceHasNoAlternates: true,
+            groupLoaded: true, groupPresent: false), .absent)
+        XCTAssertEqual(NativeHLSVisualSelectionEvidence.classify(sourceHasNoAlternates: true,
+            groupLoaded: false, groupPresent: false), .unknown)
+        XCTAssertEqual(NativeHLSVisualSelectionEvidence.classify(sourceHasNoAlternates: true,
+            groupLoaded: true, groupPresent: true), .present)
+        XCTAssertEqual(NativeHLSVisualSelectionEvidence.classify(sourceHasNoAlternates: false,
+            groupLoaded: true, groupPresent: false), .sourceAlternates)
+        let url = URL(string: "https://fixture.invalid/master.m3u8")!
+        XCTAssertFalse(NativeHLSVisualSelectionEvidence.sourceHasNoAlternates(in:
+            HLSManifestGraph(rootURL: url, documents: [:], aliases: [:])))
+        for alternate in ["#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"angles\",NAME=\"main\",URI=\"angle.m3u8\"\n",
+                          "#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID=\"angles\",NAME=\"main\"\n"] {
+            let graph = try HLSManifestGraph.parse(data: Data(("#EXTM3U\n" + alternate +
+                "#EXT-X-STREAM-INF:BANDWIDTH=100000\nmedia.m3u8\n").utf8), responseURL: url)
+            XCTAssertFalse(NativeHLSVisualSelectionEvidence.sourceHasNoAlternates(in: graph))
+        }
+        for reference in ["", ",VIDEO=\"angles\""] {
+            let graph = try HLSManifestGraph.parse(data: Data(("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100000" +
+                reference + "\nmedia.m3u8\n").utf8), responseURL: url)
+            XCTAssertEqual(NativeHLSVisualSelectionEvidence.sourceHasNoAlternates(in: graph), reference.isEmpty)
+            let iframe = try HLSManifestGraph.parse(data: Data(("#EXTM3U\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=100000,URI=\"iframe.m3u8\"" +
+                reference + "\n").utf8), responseURL: url)
+            XCTAssertEqual(NativeHLSVisualSelectionEvidence.sourceHasNoAlternates(in: iframe), reference.isEmpty)
+        }
+    }
+
     func testNativeSmokeFailureReportSurvivesXCResultFieldLimit() {
         let oversized = String(repeating: "x", count: 8_192)
         for managed in [false, true] {
@@ -450,17 +542,23 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         XCTAssertLessThanOrEqual(MemoryLayout<AVPlayerNaturalEndFailureDiagnostic?>.stride, 256)
         let widest = ExactMediaTime(value: .min, timescale: .max)
         let diagnostic = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmQuantum, quantumFailure: .videoAssetIdentity,
+            sdkIdentity: .init(equalFields: 0, visualSelection: .sourceAlternates),
             first: widest, stable: widest, expected: widest, effective: widest, quantum: widest)
         let summary = diagnostic.summary
         XCTAssertLessThanOrEqual(summary.utf8.count, 288)
         XCTAssertTrue(summary.hasSuffix(" q=\(widest.value)/\(widest.timescale)"), "Every clock scalar must fit without truncation")
+        XCTAssertTrue(summary.contains(" i=0/3"), "The original failed wrapper read must retain actual asset inequality too")
         let retained = "stage=naturalEnd.rejected reason=network detail={endpoint-reason=endpointMismatch \(summary)}"
         XCTAssertLessThanOrEqual(retained.utf8.count, 384)
         let message = "original-output=\(UInt64.max) original-activation=\(UInt64.max) original-failure={\(retained)} " + String(repeating: "x", count: 2_048)
         XCTAssertTrue(String(message.prefix(1_024)).contains(retained))
+        let sdkReport = NativeSmokeFailureReport.message(phase: "full-eof-completion", managed: true, reason: "deadline",
+            context: String(repeating: "c", count: 512), detail: message, trace: "")
+        let sdkVisible = String(("failed - " + sdkReport).prefix(1_024))
+        XCTAssertTrue(sdkVisible.contains("predicate=confirm.quantum.videoAssetIdentity i=0/3"))
         let stale = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmQuantum, quantumFailure: .revision,
             revision: .init(expected: .max, current: .max, exhausted: true, reason: .privateEOSRefresh),
-            binding: .init(presence: 3, equalFields: 511),
+            binding: .init(presence: 3, equalFields: 511, visualSelections: 15),
             first: widest, stable: widest, expected: widest, effective: widest, quantum: widest)
         XCTAssertTrue(stale.summary.contains("predicate=confirm.quantum.revision"))
         XCTAssertTrue(stale.summary.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
@@ -474,7 +572,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let visible = String(("failed - " + report).prefix(1_024))
         XCTAssertTrue(visible.contains("predicate=confirm.quantum.revision"))
         XCTAssertTrue(visible.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
-        XCTAssertTrue(visible.contains(" b=3/511"))
+        XCTAssertTrue(visible.contains(" b=3/511/15"))
         let install = AVPlayerNaturalEndFailureDiagnostic(predicate: .refreshQuantum, quantumFailure: .revision,
             revision: .init(expected: .max, current: .max, exhausted: false, reason: .privateEOSRefresh),
             first: widest, stable: nil, expected: widest, effective: widest, quantum: widest)

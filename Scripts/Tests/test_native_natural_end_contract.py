@@ -133,7 +133,7 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('minimum == period', inspector)
         self.assertIn('video.frameRate == rate', inspector)
         self.assertIn('endpointBoundary.containsFinalClock(', driver)
-        self.assertIn('nativeEndQuantum?.validationFailure', driver)
+        self.assertIn('nativeEndQuantum?.validation', driver)
         self.assertIn('compareBindings(prior: nativeEndQuantum, current: quantum)', driver)
         comparison = inspector.split('static func compareBindings(', 1)[1].split('\n}\n', 1)[0]
         for index, field in enumerate(['item', 'physicalItem', 'videoTrack', 'videoAsset', 'source', 'selectionRevision', 'video', 'period', 'duration']):
@@ -164,6 +164,35 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('XCTAssertGreaterThan(result.interruptedBodies, 0,', smoke)
         self.assertIn('testNativeTruncationControlKeepsFirstFailureOwnership', smoke)
         self.assertIn('XCTAssertLessThan(CMTimeCompare(early.cmTime, finalQuantumStart.cmTime), 0)', smoke)
+
+    def test_wrapper_renewal_keeps_strict_install_final_and_original_window(self):
+        inspector = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSAssetInspector.swift').read_text()
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertIn('allowingWrapperRenewal && !requiresFreshness', inspector)
+        self.assertIn('(track === videoTrack ? 1 : 0) | (asset === videoAsset ? 2 : 0)', inspector)
+        self.assertIn('equalFields == 2 && visualSelection == .absent', inspector)
+        self.assertIn('(document.variants + document.iframeVariants)', inspector)
+        self.assertIn('$0.attributes["TYPE"] == "VIDEO"', inspector)
+        self.assertIn('$0.attributes["VIDEO"] == nil', inspector)
+        load = inspector.split('loadMediaSelectionGroup(for: .visual)', 1)[1].split('let selectedAudio', 1)[0]
+        self.assertIn('visualGroupLoaded = true', load)
+        self.assertIn('catch is CancellationError', load)
+        self.assertIn('try validate()', load)
+        install = driver.split('func updateNaturalPlaybackEndQuantum(', 1)[1].split('private func installEndpointObservation(', 1)[0]
+        self.assertNotIn('allowingWrapperRenewal: true', install)
+        for terminal in ['quantum.validation(', 'observedDuration == quantum.duration', 'binding.matchesPendingWindow',
+                         'nativeEndQuantumWindow.permits(quantum?.visualSelection)']:
+            self.assertLess(install.index(terminal), install.index('quantum?.revisionMismatch()'))
+        self.assertLess(install.index('quantum?.revisionMismatch()'), install.index('recordWrapperRenewal(usedWrapperRenewal)'))
+        check = driver.split('private func checkNaturalEndQuantum(', 1)[1].split('private func captureNaturalEndFailureClocks(', 1)[0]
+        self.assertIn('allowingWrapperRenewal: !requiresFreshness', check)
+        self.assertIn('nativeEndQuantumWindow.permits(nativeEndQuantum?.visualSelection)', check)
+        pending = driver.split('private func acceptPendingNaturalEndQuantum(', 1)[1].split('private func completeNaturalEndRead(', 1)[0]
+        self.assertIn('guard case .natural = endpointBoundary else', pending)
+        self.assertIn('comparison.permitsPendingPause(isReady: physical.status == .readyToPlay, errorFree: physical.error == nil)', pending)
+        self.assertLess(pending.index('comparison.permitsPendingPause('), pending.index('recordWrapperRenewal('))
+        cancel = driver.split('private func cancelNaturalEndDeadline()', 1)[1].split('func consumeNaturalEndTerminal(', 1)[0]
+        self.assertIn('nativeEndQuantumWindow.reset()', cancel)
 
     def test_unknown_sdk_timing_needs_selected_fixed_bitstream_evidence(self):
         source = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSAssetInspector.swift').read_text()

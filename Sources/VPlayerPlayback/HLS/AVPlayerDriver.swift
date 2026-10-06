@@ -136,6 +136,7 @@ struct AVPlayerNaturalEndFailureDiagnostic: Sendable {
     let quantumFailure: NativeHLSQuantumValidationFailure?
     var revision: NativeHLSSelectionRevisionMismatch?
     var binding: NativeHLSQuantumBindingComparison?
+    var sdkIdentity: NativeHLSQuantumSDKIdentityComparison?
     var first: ExactMediaTime?
     var stable: ExactMediaTime?
     var expected: ExactMediaTime?
@@ -150,8 +151,9 @@ struct AVPlayerNaturalEndFailureDiagnostic: Sendable {
         let revisionDetail = revision.map {
             " r=\($0.expected)/\($0.current) why=\($0.reason.rawValue)" + ($0.exhausted ? " x=1" : "")
         } ?? ""
-        let bindingDetail = binding.map { " b=\($0.presence)/\($0.equalFields)" } ?? ""
-        let value = "predicate=\(code)\(revisionDetail)\(bindingDetail) f=\(time(first)) s=\(time(stable)) e=\(time(expected)) a=\(time(effective)) q=\(time(quantum))"
+        let bindingDetail = binding.map { " b=\($0.presence)/\($0.equalFields)/\($0.visualSelections)" } ?? ""
+        let sdkDetail = sdkIdentity.map { " i=\($0.equalFields)/\($0.visualSelection.rawValue)" } ?? ""
+        let value = "predicate=\(code)\(revisionDetail)\(bindingDetail)\(sdkDetail) f=\(time(first)) s=\(time(stable)) e=\(time(expected)) a=\(time(effective)) q=\(time(quantum))"
         // Scalar values and enum codes are ASCII. Keep the complete diagnosis
         // inside the original coordinator's 384-byte first-failure record.
         return String(value.prefix(288))
@@ -759,6 +761,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private(set) var naturalEndObservation: AVPlayerNaturalEndObservation?
     private var endpointBoundary = AVPlayerPlaybackEndBoundary.constrained
     private var nativeEndQuantum: NativeHLSFinalPresentationQuantum?
+    private var nativeEndQuantumWindow = NativeHLSQuantumWindow()
     nonisolated let nativeSelectionRevision = NativeHLSSelectionRevision()
     private(set) var naturalEndTerminalResult: AVPlayerNaturalEndTerminalResult?
     #if DEBUG
@@ -1444,9 +1447,10 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         func reject(_ predicate: AVPlayerNaturalEndFailurePredicate,
                     cause: NativeHLSQuantumValidationFailure? = nil,
                     revision: NativeHLSSelectionRevisionMismatch? = nil,
-                    binding: NativeHLSQuantumBindingComparison? = nil) -> AVPlayerItemCoordinatorFailure {
+                    binding: NativeHLSQuantumBindingComparison? = nil,
+                    sdkIdentity: NativeHLSQuantumSDKIdentityComparison? = nil) -> AVPlayerItemCoordinatorFailure {
             #if DEBUG
-            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision, binding: binding,
+            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision, binding: binding, sdkIdentity: sdkIdentity,
                 first: naturalEndObservation?.firstCurrentTime, stable: nil,
                 expected: quantum?.duration ?? nativeEndQuantum?.duration, effective: observedDuration, quantum: quantum?.period)
             #endif
@@ -1456,16 +1460,24 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity, let item, player.currentItem === item else { throw reject(.refreshIdentity) }
         // Establish every terminal condition before classifying a stale revision
         // as retryable. A changed binding cannot hide behind simultaneous staleness.
+        var currentSDKIdentity: NativeHLSQuantumSDKIdentityComparison?
         if let quantum {
-            if let failure = quantum.validationFailure(item: identity, physical: item, requiresFreshness: false) {
-                throw reject(.refreshQuantum, cause: failure.cause)
+            let validation = quantum.validation(item: identity, physical: item, requiresFreshness: false)
+            currentSDKIdentity = validation.sdkIdentity
+            if let failure = validation.rejection {
+                throw reject(.refreshQuantum, cause: failure.cause, sdkIdentity: failure.sdkIdentity)
             }
             observedDuration = try? ExactMediaTime(item.duration)
             guard observedDuration == quantum.duration else { throw reject(.refreshDuration) }
         }
+        var usedWrapperRenewal = false
         if endpointStabilityDeadline != nil {
             let binding = NativeHLSFinalPresentationQuantum.compareBindings(prior: nativeEndQuantum, current: quantum)
-            guard binding.matches else { throw reject(.refreshPendingBinding, binding: binding) }
+            guard binding.matchesPendingWindow else { throw reject(.refreshPendingBinding, binding: binding) }
+            guard nativeEndQuantumWindow.permits(quantum?.visualSelection) else {
+                throw reject(.refreshQuantum, cause: .visualSelection, binding: binding, sdkIdentity: currentSDKIdentity)
+            }
+            usedWrapperRenewal = binding.usesWrapperRenewal
         }
         if let mismatch = quantum?.revisionMismatch() {
             let terminal = reject(.refreshQuantum, cause: .revision, revision: mismatch)
@@ -1473,6 +1485,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             throw NativeHLSQuantumRevisionSuperseded()
         }
         nativeEndQuantum = quantum
+        nativeEndQuantumWindow.recordWrapperRenewal(usedWrapperRenewal)
     }
 
     private func installEndpointObservation(expected time: ExactMediaTime,
@@ -1618,12 +1631,26 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               observation.constrainedEndpoint == observation.expectedEndpoint,
               let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration),
               constraint == observation.expectedEndpoint,
-              nativeEndQuantum?.hasCurrentIdentity(item: identity, physical: item) ?? true,
               naturalEndAuthority?.activation == activation,
-              naturalEndAuthority?.revalidateCurrentAuthority() == true else { return false }
+              naturalEndAuthority?.revalidateCurrentAuthority() == true,
+              acceptPendingNaturalEndQuantum(item: identity, physical: item) else { return false }
         // Only the private matching notification installs the first observation
         // and its original deadline. Completion, cancellation and owned pause
         // clear that deadline; this query creates no grace period or EOS proof.
+        return true
+    }
+
+    private func acceptPendingNaturalEndQuantum(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
+        guard case .natural = endpointBoundary else {
+            return nativeEndQuantum?.hasCurrentIdentity(item: identity, physical: physical) ?? true
+        }
+        let validation = nativeEndQuantum?.validation(item: identity, physical: physical,
+            requiresFreshness: false, allowingWrapperRenewal: true)
+        guard validation?.rejection == nil, nativeEndQuantumWindow.permits(nativeEndQuantum?.visualSelection) else { return false }
+        if let comparison = validation?.sdkIdentity, comparison.usesWrapperRenewal {
+            guard comparison.permitsPendingPause(isReady: physical.status == .readyToPlay, errorFree: physical.error == nil) else { return false }
+        }
+        nativeEndQuantumWindow.recordWrapperRenewal(validation?.sdkIdentity?.usesWrapperRenewal == true)
         return true
     }
 
@@ -1684,15 +1711,22 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     private func checkNaturalEndQuantum(item: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,
                                        requiresFreshness: Bool) -> Bool {
-        let failure = nativeEndQuantum?.validationFailure(item: item, physical: physical, requiresFreshness: requiresFreshness)
+        let validation = nativeEndQuantum?.validation(item: item, physical: physical, requiresFreshness: requiresFreshness,
+            allowingWrapperRenewal: !requiresFreshness)
+        let failure = validation?.rejection ?? (nativeEndQuantumWindow.permits(nativeEndQuantum?.visualSelection) ? nil :
+            NativeHLSQuantumValidationRejection(cause: .visualSelection, sdkIdentity: validation?.sdkIdentity))
         #if DEBUG
         if let failure, naturalEndFailureDiagnosticForTesting == nil {
             naturalEndFailureDiagnosticForTesting = .init(
                 predicate: requiresFreshness ? .confirmQuantum : .ingressQuantum,
-                quantumFailure: failure.cause, revision: failure.revision)
+                quantumFailure: failure.cause, revision: failure.revision, sdkIdentity: failure.sdkIdentity)
         }
         #endif
-        // A missing quantum keeps the exact-endpoint-only policy unchanged.
+        if failure == nil, !requiresFreshness {
+            nativeEndQuantumWindow.recordWrapperRenewal(validation?.sdkIdentity?.usesWrapperRenewal == true)
+        }
+        // A missing quantum keeps exact-endpoint-only behavior only if this
+        // window has never borrowed the presentation-wrapper exception.
         return failure == nil
     }
 
@@ -1717,6 +1751,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             else { naturalEndAuthority?.retireNaturalEnd(identity: endpointStabilityDeadline) }
         }
         endpointStabilityDeadline = nil
+        nativeEndQuantumWindow.reset()
     }
 
     func consumeNaturalEndTerminal(

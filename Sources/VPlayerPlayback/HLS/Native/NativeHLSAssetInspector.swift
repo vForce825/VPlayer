@@ -74,12 +74,61 @@ final class NativeHLSSelectionRevision: @unchecked Sendable {
 }
 
 enum NativeHLSQuantumValidationFailure: String, Sendable {
-    case revision, logicalItem, physicalItem, source, trackCount, videoCount, videoAsset, videoTrack, videoAssetIdentity
+    case revision, logicalItem, physicalItem, source, trackCount, videoCount, videoAsset, videoTrack, videoAssetIdentity, visualSelection
 }
 
 struct NativeHLSQuantumValidationRejection: Sendable {
     let cause: NativeHLSQuantumValidationFailure
     var revision: NativeHLSSelectionRevisionMismatch?
+    var sdkIdentity: NativeHLSQuantumSDKIdentityComparison?
+}
+
+/// Only a successful absent SDK group and an owned graph without alternate
+/// visual declarations permit presentation-wrapper renewal. Failure is unknown.
+enum NativeHLSVisualSelectionEvidence: UInt8, Sendable, CaseIterable {
+    case unknown = 0, absent = 1, present = 2, sourceAlternates = 3
+    static func classify(sourceHasNoAlternates: Bool, groupLoaded: Bool, groupPresent: Bool) -> Self {
+        guard sourceHasNoAlternates else { return .sourceAlternates }
+        guard groupLoaded else { return .unknown }
+        return groupPresent ? .present : .absent
+    }
+    static func sourceHasNoAlternates(in graph: HLSManifestGraph) -> Bool {
+        guard !graph.documents.isEmpty, graph.document(for: graph.rootURL) != nil else { return false }
+        return graph.documents.values.allSatisfy { document in
+            !document.renditions.contains { $0.attributes["TYPE"] == "VIDEO" } &&
+                (document.variants + document.iframeVariants).allSatisfy { $0.attributes["VIDEO"] == nil }
+        }
+    }
+}
+
+/// Both equalities come from the same already-captured SDK objects. Bit zero is
+/// the presentation wrapper; bit one is the exact retained media-track object.
+struct NativeHLSQuantumSDKIdentityComparison: Sendable, Equatable {
+    let equalFields: UInt8
+    let visualSelection: NativeHLSVisualSelectionEvidence
+    var usesWrapperRenewal: Bool { equalFields == 2 && visualSelection == .absent }
+    func failure(allowingWrapperRenewal: Bool) -> NativeHLSQuantumValidationFailure? {
+        guard equalFields & 1 != 0 || (allowingWrapperRenewal && usesWrapperRenewal) else { return .videoTrack }
+        guard equalFields & 2 != 0 else { return .videoAssetIdentity }
+        return nil
+    }
+    func permitsPendingPause(isReady: Bool, errorFree: Bool) -> Bool {
+        failure(allowingWrapperRenewal: true) == nil && (!usesWrapperRenewal || (isReady && errorFree))
+    }
+}
+
+struct NativeHLSQuantumValidationResult: Sendable {
+    let rejection: NativeHLSQuantumValidationRejection?
+    var sdkIdentity: NativeHLSQuantumSDKIdentityComparison?
+}
+
+/// A restriction on one existing private-EOS window, never a completion proof.
+/// Once used, wrapper renewal cannot fall back to an ineligible exact wrapper.
+struct NativeHLSQuantumWindow: Sendable {
+    private(set) var requiresVisualAbsence = false
+    mutating func recordWrapperRenewal(_ used: Bool) { requiresVisualAbsence = requiresVisualAbsence || used }
+    func permits(_ evidence: NativeHLSVisualSelectionEvidence?) -> Bool { !requiresVisualAbsence || evidence == .absent }
+    mutating func reset() { requiresVisualAbsence = false }
 }
 
 /// Only a non-exhausted revision supersession after every terminal installation
@@ -93,7 +142,14 @@ struct NativeHLSQuantumBindingComparison: Sendable, Equatable {
     static let allFields: UInt16 = 0x1FF
     let presence: UInt8
     let equalFields: UInt16
+    /// Two bits each: prior, then current NativeHLSVisualSelectionEvidence.
+    let visualSelections: UInt8
+    init(presence: UInt8, equalFields: UInt16, visualSelections: UInt8 = 0) {
+        self.presence = presence; self.equalFields = equalFields; self.visualSelections = visualSelections
+    }
     var matches: Bool { presence == 0 || (presence == 3 && equalFields == Self.allFields) }
+    var usesWrapperRenewal: Bool { presence == 3 && equalFields == (Self.allFields ^ (1 << 2)) && visualSelections == 5 }
+    var matchesPendingWindow: Bool { matches || usesWrapperRenewal }
 }
 
 /// Selected SDK/configuration timing evidence, not proof that every final sample rendered.
@@ -101,6 +157,7 @@ struct NativeHLSQuantumBindingComparison: Sendable, Equatable {
 final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
     let period: ExactMediaTime
     let duration: ExactMediaTime
+    let visualSelection: NativeHLSVisualSelectionEvidence
     private let item: AVPlayerItemInstanceIdentity
     private let physicalItem: ObjectIdentifier
     // Object identity is valid only while the instance lives. Retain the exact
@@ -116,10 +173,12 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
     fileprivate init(period: ExactMediaTime, duration: ExactMediaTime, item: AVPlayerItemInstanceIdentity,
         physicalItem: ObjectIdentifier, videoTrack: AVPlayerItemTrack, videoAsset: AVAssetTrack,
         source: HLSOwnedSourcePlan, video: HLSVideoFacts, revision: UInt64,
-        selectionRevision: NativeHLSSelectionRevision, retention: HLSApplicationLifetimeCharge) {
+        selectionRevision: NativeHLSSelectionRevision, retention: HLSApplicationLifetimeCharge,
+        visualSelection: NativeHLSVisualSelectionEvidence) {
         self.period = period; self.duration = duration; self.item = item; self.physicalItem = physicalItem
         self.videoTrack = videoTrack; self.videoAsset = videoAsset; self.source = source; self.retention = retention
         self.video = video; self.revision = revision; self.selectionRevision = selectionRevision
+        self.visualSelection = visualSelection
     }
     @MainActor func isCurrent(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
         validationFailure(item: identity, physical: physical, requiresFreshness: true) == nil
@@ -128,31 +187,44 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
         validationFailure(item: identity, physical: physical, requiresFreshness: false) == nil
     }
     func revisionMismatch() -> NativeHLSSelectionRevisionMismatch? { selectionRevision.mismatch(revision) }
-    /// Same short-circuit reads as the Boolean checks. The scalar cause lets the
-    /// original failed read be diagnosed without checking mutable SDK state again.
     @MainActor func validationFailure(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,
                                      requiresFreshness: Bool) -> NativeHLSQuantumValidationRejection? {
-        if requiresFreshness, let mismatch = selectionRevision.mismatch(revision) {
-            return .init(cause: .revision, revision: mismatch)
+        validation(item: identity, physical: physical, requiresFreshness: requiresFreshness).rejection
+    }
+    /// Installation and final confirmation always use exact current SDK objects.
+    /// Only private ingress/pending-pause may defer a wrapper-only difference.
+    @MainActor func validation(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem,
+                              requiresFreshness: Bool, allowingWrapperRenewal: Bool = false) -> NativeHLSQuantumValidationResult {
+        func reject(_ cause: NativeHLSQuantumValidationFailure,
+                    revision: NativeHLSSelectionRevisionMismatch? = nil,
+                    sdkIdentity: NativeHLSQuantumSDKIdentityComparison? = nil) -> NativeHLSQuantumValidationResult {
+            .init(rejection: .init(cause: cause, revision: revision, sdkIdentity: sdkIdentity), sdkIdentity: sdkIdentity)
         }
-        guard identity == item else { return .init(cause: .logicalItem) }
-        guard ObjectIdentifier(physical) == physicalItem else { return .init(cause: .physicalItem) }
-        guard source.sourceIsCurrent else { return .init(cause: .source) }
+        if requiresFreshness, let mismatch = selectionRevision.mismatch(revision) {
+            return reject(.revision, revision: mismatch)
+        }
+        guard identity == item else { return reject(.logicalItem) }
+        guard ObjectIdentifier(physical) == physicalItem else { return reject(.physicalItem) }
+        guard source.sourceIsCurrent else { return reject(.source) }
         let enabled = physical.tracks.filter(\.isEnabled)
-        guard enabled.count <= 16 else { return .init(cause: .trackCount) }
+        guard enabled.count <= 16 else { return reject(.trackCount) }
         let videos = enabled.filter { $0.assetTrack?.mediaType == .video }
-        guard videos.count == 1, let track = videos.first else { return .init(cause: .videoCount) }
-        guard let asset = track.assetTrack else { return .init(cause: .videoAsset) }
-        guard track === videoTrack else { return .init(cause: .videoTrack) }
-        guard asset === videoAsset else { return .init(cause: .videoAssetIdentity) }
-        return nil
+        guard videos.count == 1, let track = videos.first else { return reject(.videoCount) }
+        guard let asset = track.assetTrack else { return reject(.videoAsset) }
+        let sdkIdentity = NativeHLSQuantumSDKIdentityComparison(
+            equalFields: (track === videoTrack ? 1 : 0) | (asset === videoAsset ? 2 : 0), visualSelection: visualSelection)
+        if let cause = sdkIdentity.failure(allowingWrapperRenewal: allowingWrapperRenewal && !requiresFreshness) {
+            return reject(cause, sdkIdentity: sdkIdentity)
+        }
+        return .init(rejection: nil, sdkIdentity: sdkIdentity)
     }
     func hasSameBinding(as other: NativeHLSFinalPresentationQuantum) -> Bool {
         Self.compareBindings(prior: other, current: self).matches
     }
     static func compareBindings(prior: NativeHLSFinalPresentationQuantum?, current: NativeHLSFinalPresentationQuantum?) -> NativeHLSQuantumBindingComparison {
         let presence: UInt8 = (prior == nil ? 0 : 1) | (current == nil ? 0 : 2)
-        guard let prior, let current else { return .init(presence: presence, equalFields: 0) }
+        let visualSelections = (prior?.visualSelection.rawValue ?? 0) | ((current?.visualSelection.rawValue ?? 0) << 2)
+        guard let prior, let current else { return .init(presence: presence, equalFields: 0, visualSelections: visualSelections) }
         var equal: UInt16 = 0
         if current.item == prior.item { equal |= 1 << 0 }
         if current.physicalItem == prior.physicalItem { equal |= 1 << 1 }
@@ -163,7 +235,7 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
         if current.video == prior.video { equal |= 1 << 6 }
         if current.period == prior.period { equal |= 1 << 7 }
         if current.duration == prior.duration { equal |= 1 << 8 }
-        return .init(presence: presence, equalFields: equal)
+        return .init(presence: presence, equalFields: equal, visualSelections: visualSelections)
     }
 }
 
@@ -229,7 +301,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let trackIDs = tracks.map(ObjectIdentifier.init)
         let assets = tracks.map(\.assetTrack)
         let assetIDs = assets.map { $0.map(ObjectIdentifier.init) }
-        var audioGroup: AVMediaSelectionGroup?, subtitleGroup: AVMediaSelectionGroup?
+        var audioGroup: AVMediaSelectionGroup?, subtitleGroup: AVMediaSelectionGroup?, visualGroup: AVMediaSelectionGroup?
         func validate() throws {
             try Task.checkCancellation()
             guard source.sourceIsCurrent, driver.nativeCurrentItem(identity) === item else { throw HLSSourceError.staleResolution }
@@ -238,7 +310,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
             let current = item.tracks.filter(\.isEnabled)
             guard current.map(ObjectIdentifier.init) == trackIDs,
                   current.map({ $0.assetTrack.map(ObjectIdentifier.init) }) == assetIDs else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
-            for group in [audioGroup, subtitleGroup].compactMap({ $0 }) {
+            for group in [audioGroup, subtitleGroup, visualGroup].compactMap({ $0 }) {
                 guard selected.selectedMediaOption(in: group).map(ObjectIdentifier.init) ==
                     item.currentMediaSelection.selectedMediaOption(in: group).map(ObjectIdentifier.init) else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
             }
@@ -247,6 +319,23 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         try validate()
         subtitleGroup = try await item.asset.loadMediaSelectionGroup(for: .legible)
         try validate()
+        var visualGroupLoaded = false
+        do {
+            visualGroup = try await item.asset.loadMediaSelectionGroup(for: .visual)
+            visualGroupLoaded = true
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Unknown visual eligibility keeps exact-wrapper behavior. The same
+            // validation below still propagates cancellation and stale ownership.
+        }
+        try validate()
+        let sourceHasNoVisualAlternates: Bool
+        if case let .hls(graph) = source.source.topology {
+            sourceHasNoVisualAlternates = NativeHLSVisualSelectionEvidence.sourceHasNoAlternates(in: graph)
+        } else { sourceHasNoVisualAlternates = false }
+        let visualSelection = NativeHLSVisualSelectionEvidence.classify(sourceHasNoAlternates: sourceHasNoVisualAlternates,
+            groupLoaded: visualGroupLoaded, groupPresent: visualGroup != nil)
         let selectedAudio = audioGroup.flatMap { selected.selectedMediaOption(in: $0) }
         let expectsAudio = selectedAudio != nil || source.facts.media.contains { !$0.audio.isEmpty }
         let expectsVideo = source.facts.media.contains { $0.video != nil }
@@ -322,10 +411,10 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
             quantum = .init(period: videoQuantum.period, duration: duration, item: identity,
                 physicalItem: ObjectIdentifier(item), videoTrack: videoQuantum.track, videoAsset: videoQuantum.asset,
                 source: source, video: video, revision: revision,
-                selectionRevision: driver.nativeSelectionRevision, retention: retained)
+                selectionRevision: driver.nativeSelectionRevision, retention: retained, visualSelection: visualSelection)
         } else { quantum = nil }
         #if DEBUG
-        print("NATIVE_HLS_QUANTUM item=\(identity.itemGeneration) present=\(quantum != nil) duration=\(duration?.value ?? 0)/\(duration?.timescale ?? 0) \(quantumDetail)")
+        print("NATIVE_HLS_QUANTUM item=\(identity.itemGeneration) present=\(quantum != nil) visual=\(visualSelection.rawValue) duration=\(duration?.value ?? 0)/\(duration?.timescale ?? 0) \(quantumDetail)")
         #endif
         return .init(item: identity, physicalItem: ObjectIdentifier(item), audioSelection: selectedAudio.map(ObjectIdentifier.init),
             video: video, audio: audio, audioConfigurationDigest: audioDigest, observedFrameRate: observedRate,
