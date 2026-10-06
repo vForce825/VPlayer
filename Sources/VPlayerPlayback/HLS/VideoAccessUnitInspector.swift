@@ -1760,6 +1760,7 @@ private func parseHEVCSPS(
         )
         vui.sampleAspectRatio = parsed.sampleAspectRatio
         vui.frameRate = parsed.frameRate
+        vui.pocProportionalToTiming = parsed.pocProportionalToTiming
         vui.range = parsed.range
         vui.primaries = parsed.primaries
         vui.transfer = parsed.transfer

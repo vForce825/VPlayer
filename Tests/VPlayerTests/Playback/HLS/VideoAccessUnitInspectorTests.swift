@@ -2,11 +2,86 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreMedia
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
 
 final class VideoAccessUnitInspectorTests: XCTestCase {
+    func testHEVCSourceRetainsExplicitPOCProportionalTiming() throws {
+        for divisor in [UInt32(0), 1, 2] {
+            let sps = hevcSPS(pocProportionalToTiming: true, ticksPerPOCMinusOne: divisor)
+            let expected = MediaRational(num: 60_000, den: 1_001 * Int32(divisor + 1))
+            let source = try VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc)
+            XCTAssertEqual(source.frameRate, expected)
+            XCTAssertEqual(source.progressiveSourceFlag, true)
+            XCTAssertEqual(source.interlacedSourceFlag, false)
+            let generated = try inspect(annexB([hevcVPS(), sps, hevcPPS(), hevcSlice(nalType: 19)]), codec: .hevc)
+            XCTAssertEqual(generated.format.frameRate, expected)
+            XCTAssertEqual(generated.randomAccessKind, .hevcIDR)
+        }
+    }
+
+    func testHEVCSourceKeepsAbsentAndNonproportionalTimingUnknown() throws {
+        for proportional in [nil, false] as [Bool?] {
+            let sps = hevcSPS(pocProportionalToTiming: proportional)
+            let source = try VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc)
+            XCTAssertNil(source.frameRate)
+            let scan = try VideoSequenceParameterSetInspector.sourceScanFlags(Array(sps), codec: .hevc)
+            XCTAssertTrue(scan.progressiveOnly)
+            XCTAssertFalse(scan.interlacedOnly)
+            let generated = try inspect(annexB([hevcVPS(), sps, hevcPPS(), hevcSlice(nalType: 19)]), codec: .hevc)
+            XCTAssertEqual(generated.format.frameRate, proportional == nil ? nil : MediaRational(num: 60_000, den: 1_001),
+                "The source timing gate must not change generated-media VUI parsing")
+        }
+    }
+
+    func testHEVCSourceTimingStillRejectsConflictingObservedRate() throws {
+        let sps = hevcSPS(pocProportionalToTiming: true)
+        let source = try VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc)
+        XCTAssertThrowsError(try HLSSourceVideoProjection.reconcile(parameterSet: source.frameRate,
+            container: Optional<MediaRational>.none, parser: MediaRational(num: 25, den: 1))) { error in
+            guard case HLSSourceVideoProjection.Failure.contradictory = error else {
+                return XCTFail("Explicit HEVC timing must retain observed-rate contradiction checks")
+            }
+        }
+    }
+
+    func testHEVCSourceTimingDoesNotFillUnknownScanOrGeneratedColor() throws {
+        let sps = hevcSPS(colorPrimaries: 2, colorTransfer: 2, colorMatrix: 2,
+            pocProportionalToTiming: true, progressiveSource: false)
+        let source = try VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc)
+        XCTAssertEqual(source.frameRate, MediaRational(num: 60_000, den: 1_001))
+        XCTAssertNil(source.primaries); XCTAssertNil(source.transfer); XCTAssertNil(source.matrix)
+        let scan = try VideoSequenceParameterSetInspector.sourceScanFlags(Array(sps), codec: .hevc)
+        XCTAssertFalse(scan.progressiveOnly); XCTAssertFalse(scan.interlacedOnly)
+        XCTAssertThrowsError(try VideoSequenceParameterSetInspector.inspectHEVC(Array(sps))) { error in
+            XCTAssertEqual(error as? VideoAccessUnitInspectionError, .unsupportedColorPrimaries(2))
+        }
+    }
+
+    @MainActor
+    func testHEVCSourceTimingCannotReplaceMissingSDKEndQuantum() throws {
+        let sps = hevcSPS(pocProportionalToTiming: true)
+        let rate = try XCTUnwrap(VideoSequenceParameterSetInspector.sourceFormat(Array(sps), codec: .hevc).frameRate)
+        let video = HLSVideoFacts(codec: .hevc, profile: 2, scan: .progressive, parameterSetsValidated: true,
+            frameRate: rate)
+        let context = try sourceContext()
+        let source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL, generation: 1, topology: .media(Data()))
+        let facts = HLSCompatibilityFacts(source: source, media: [.init(url: context.entryURL,
+            container: .fragmentedMP4, video: video, audio: [], hasUnsupportedTracks: false)], complete: true, inspectedBytes: sps.count)
+        XCTAssertNil(video.explicitSequenceFrameRate)
+        XCTAssertNil(SystemNativeHLSAssetInspector.selectedFixedFrameRate(parameterSets: [sps], codec: .hevc))
+        for unknown in [nil, CMTime.invalid] as [CMTime?] {
+            XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: unknown,
+                selectedFixedFrameRate: rate, video: video, expected: facts),
+                "HEVC POC timing must not grant the H264-only fixed-SPS fallback")
+        }
+        let period = CMTime(value: Int64(rate.den), timescale: rate.num)
+        XCTAssertEqual(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: period,
+            video: video, expected: facts), ExactMediaTime(value: Int64(rate.den), timescale: rate.num))
+    }
+
     func testHEVCAlternativeTransferSEIOverridesCompatibilityCurveAndPersistsWithFrozenSPS() throws {
         let generation = MediaGeneration(rawValue: 31)
         var session = VideoAccessUnitInspectionSession(generation: generation, codec: .hevc)
@@ -1065,7 +1140,10 @@ private func hevcSPS(
     colorTransfer: UInt8 = 16,
     colorMatrix: UInt8 = 9,
     chromaLocationType: UInt32? = 0,
-    colorDescriptionPresent: Bool = true
+    colorDescriptionPresent: Bool = true,
+    pocProportionalToTiming: Bool? = false,
+    ticksPerPOCMinusOne: UInt32 = 0,
+    progressiveSource: Bool = true
 ) -> Data {
     var bits = TestBitWriter()
     bits.write(0, count: 4) // sps_video_parameter_set_id
@@ -1075,7 +1153,7 @@ private func hevcSPS(
     bits.write(0, count: 1) // general_tier_flag
     bits.write(2, count: 5) // Main 10 profile
     bits.write(0, count: 32) // compatibility flags
-    bits.write(1, count: 1) // progressive_source_flag
+    bits.write(progressiveSource ? 1 : 0, count: 1) // progressive_source_flag
     bits.write(0, count: 1) // interlaced_source_flag
     bits.write(0, count: 1) // non_packed_constraint_flag
     bits.write(1, count: 1) // frame_only_constraint_flag
@@ -1123,7 +1201,9 @@ private func hevcSPS(
         colorTransfer: colorTransfer,
         colorMatrix: colorMatrix,
         chromaLocationType: chromaLocationType,
-        colorDescriptionPresent: colorDescriptionPresent
+        colorDescriptionPresent: colorDescriptionPresent,
+        pocProportionalToTiming: pocProportionalToTiming,
+        ticksPerPOCMinusOne: ticksPerPOCMinusOne
     )
     bits.write(0, count: 1) // sps_extension_present_flag
     return makeHEVCNAL(type: 33, rbsp: bits.finishRBSP())
@@ -1191,7 +1271,9 @@ private func writeHEVCVUI(
     colorTransfer: UInt8,
     colorMatrix: UInt8,
     chromaLocationType: UInt32?,
-    colorDescriptionPresent: Bool = true
+    colorDescriptionPresent: Bool = true,
+    pocProportionalToTiming: Bool? = false,
+    ticksPerPOCMinusOne: UInt32 = 0
 ) {
     bits.write(1, count: 1)
     bits.write(1, count: 8)
@@ -1214,11 +1296,14 @@ private func writeHEVCVUI(
     bits.write(0, count: 1) // field_seq_flag
     bits.write(0, count: 1) // frame_field_info_present_flag
     bits.write(0, count: 1) // default_display_window_flag
-    bits.write(1, count: 1) // vui_timing_info_present_flag
-    bits.write(1_001, count: 32)
-    bits.write(60_000, count: 32)
-    bits.write(0, count: 1) // vui_poc_proportional_to_timing_flag
-    bits.write(0, count: 1) // vui_hrd_parameters_present_flag
+    bits.write(pocProportionalToTiming == nil ? 0 : 1, count: 1) // vui_timing_info_present_flag
+    if let pocProportionalToTiming {
+        bits.write(1_001, count: 32)
+        bits.write(60_000, count: 32)
+        bits.write(pocProportionalToTiming ? 1 : 0, count: 1)
+        if pocProportionalToTiming { bits.writeUE(ticksPerPOCMinusOne) }
+        bits.write(0, count: 1) // vui_hrd_parameters_present_flag
+    }
     bits.write(0, count: 1) // bitstream_restriction_flag
 }
 

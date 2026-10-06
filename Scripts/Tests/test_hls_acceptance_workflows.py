@@ -118,6 +118,29 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/HLSProxyBackpressureTests',
             'VPlayerTests/NativeHLSMasterSmokeTests',
             'VPlayerTests/NativeOwnedDolbyFallbackSmokeTests',
+            'VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact',
+            'VPlayerTests/HLSCompatibilityProbeTests/testRawTSPrefixAcquiresLaterTablesWithoutChangingUnknownEvidenceRules',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSourcePreparationDiagnosticPreservesTerminalClassificationWithoutRawErrorText',
+            'VPlayerTests/HLSAVPlayerBackendTests/testPreparationDiagnosticLeavesCancellationAndMasterSelectionErrorsUntouched',
+            'VPlayerTests/HLSAVPlayerBackendTests/testPreparationDiagnosticNewStageClearsPriorReasonAndRetainsOnlySourceCategory',
+            'VPlayerTests/HLSAVPlayerBackendTests/testPreparationDiagnosticScopeJoinsBeforeNativeAndReleasesItsOriginalCharge',
+            'VPlayerTests/HLSAVPlayerBackendTests/testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText',
+            'VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow',
+            'VPlayerTests/HLSResourceTransportTests/testContentEncodingDiagnosticCrossesDelegateBoundaryWithoutRetainingTheScope',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterPlannerRejectionStillRequiresExplicitServiceSelection',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeRejectionUsesCoarseStageWithoutInheritingPreflightScope',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testSuccessfulNativePreparationReleasesScalarRecordBeforePlaybackObservers',
+            'VPlayerTests/VideoAccessUnitInspectorTests/testHEVCSourceRetainsExplicitPOCProportionalTiming',
+            'VPlayerTests/VideoAccessUnitInspectorTests/testHEVCSourceKeepsAbsentAndNonproportionalTimingUnknown',
+            'VPlayerTests/VideoAccessUnitInspectorTests/testHEVCSourceTimingStillRejectsConflictingObservedRate',
+            'VPlayerTests/VideoAccessUnitInspectorTests/testHEVCSourceTimingDoesNotFillUnknownScanOrGeneratedColor',
+            'VPlayerTests/VideoAccessUnitInspectorTests/testHEVCSourceTimingCannotReplaceMissingSDKEndQuantum',
+            'VPlayerTests/HLSManifestGraphTests/testSessionDataValuePreservesLiteralResourceMarkersWithoutReferences',
+            'VPlayerTests/HLSManifestGraphTests/testSessionDataResourcesAndVariablesRemainUnsupportedWithoutReferences',
+            'VPlayerTests/HLSManifestGraphTests/testSessionDataRejectsMalformedAttributeShapes',
+            'VPlayerTests/HLSManifestGraphTests/testSessionDataValueDoesNotRelaxOtherExtensionRestrictions',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints',
@@ -128,6 +151,7 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('--timeline-fixture "$fixture_dir/timeline.ts"',command)
         self.assertIn('-maximum-test-execution-time-allowance 300\n',command)
         self.assertNotRegex(command,r'--?skip-testing(?=[:=\s]|$)')
+        self.assertIn('python3 Scripts/Tests/test_native_source_admission.py',fixture)
 
     def test_checkpoints_do_not_run_tests_and_preparation_requires_explicit_workflow_edit(self):
         for path in (ROOT/'.github/workflows').glob('*.yml'):
