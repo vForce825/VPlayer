@@ -41,8 +41,8 @@ class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
         ordered = ['selectionRevision.mismatch(revision)', 'identity == item',
                    'ObjectIdentifier(physical) == physicalItem', 'source.sourceIsCurrent',
                    'physical.tracks.filter', 'enabled.count <= 16', 'videos.count == 1',
-                   'track.assetTrack', 'ObjectIdentifier(track) == videoTrack',
-                   'ObjectIdentifier(asset) == videoAsset']
+                   'track.assetTrack', 'track === videoTrack',
+                   'asset === videoAsset']
         self.assertEqual([helper.index(value) for value in ordered], sorted(helper.index(value) for value in ordered))
         self.assertEqual(helper.count('selectionRevision.mismatch(revision)'), 1)
         self.assertNotIn('await ', helper)
@@ -64,6 +64,7 @@ class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
             'eos-ordering-startup', 'eos-ordering-first-read', 'eos-ordering-refresh',
             'eos-ordering-error', 'eos-ordering-progress',
             'refresh-return-startup', 'refresh-return-first-read',
+            'quantum-owner-original', 'quantum-owner-successor',
         })
         helper = source.split('private func until(', 1)[1].split('private func withController(', 1)[0]
         self.assertIn('file: StaticString = #filePath, line: UInt = #line', helper)

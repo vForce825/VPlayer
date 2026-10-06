@@ -86,20 +86,35 @@ struct NativeHLSQuantumValidationRejection: Sendable {
 /// guard passes may use the remaining attempts of the original snapshot operation.
 struct NativeHLSQuantumRevisionSuperseded: Error, Sendable {}
 
+/// Presence bits: prior=1, current=2. Equality bits, in order: logical item,
+/// physical item, video track, video asset, source owner, revision owner,
+/// video facts, period, duration. Only immutable receipt fields are compared.
+struct NativeHLSQuantumBindingComparison: Sendable, Equatable {
+    static let allFields: UInt16 = 0x1FF
+    let presence: UInt8
+    let equalFields: UInt16
+    var matches: Bool { presence == 0 || (presence == 3 && equalFields == Self.allFields) }
+}
+
 /// Selected SDK/configuration timing evidence, not proof that every final sample rendered.
 /// Its allocation and aliases remain covered by the selected snapshot's charge.
 final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
     let period: ExactMediaTime
     let duration: ExactMediaTime
     private let item: AVPlayerItemInstanceIdentity
-    private let physicalItem: ObjectIdentifier, videoTrack: ObjectIdentifier, videoAsset: ObjectIdentifier
+    private let physicalItem: ObjectIdentifier
+    // Object identity is valid only while the instance lives. Retain the exact
+    // two inspected SDK objects with this already-charged receipt, not an array
+    // of tracks, the driver, or its callback leases.
+    private let videoTrack: AVPlayerItemTrack
+    private let videoAsset: AVAssetTrack
     private let source: HLSOwnedSourcePlan
     private let video: HLSVideoFacts
     private let revision: UInt64
     private let selectionRevision: NativeHLSSelectionRevision
     private let retention: HLSApplicationLifetimeCharge
     fileprivate init(period: ExactMediaTime, duration: ExactMediaTime, item: AVPlayerItemInstanceIdentity,
-        physicalItem: ObjectIdentifier, videoTrack: ObjectIdentifier, videoAsset: ObjectIdentifier,
+        physicalItem: ObjectIdentifier, videoTrack: AVPlayerItemTrack, videoAsset: AVAssetTrack,
         source: HLSOwnedSourcePlan, video: HLSVideoFacts, revision: UInt64,
         selectionRevision: NativeHLSSelectionRevision, retention: HLSApplicationLifetimeCharge) {
         self.period = period; self.duration = duration; self.item = item; self.physicalItem = physicalItem
@@ -128,14 +143,27 @@ final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
         let videos = enabled.filter { $0.assetTrack?.mediaType == .video }
         guard videos.count == 1, let track = videos.first else { return .init(cause: .videoCount) }
         guard let asset = track.assetTrack else { return .init(cause: .videoAsset) }
-        guard ObjectIdentifier(track) == videoTrack else { return .init(cause: .videoTrack) }
-        guard ObjectIdentifier(asset) == videoAsset else { return .init(cause: .videoAssetIdentity) }
+        guard track === videoTrack else { return .init(cause: .videoTrack) }
+        guard asset === videoAsset else { return .init(cause: .videoAssetIdentity) }
         return nil
     }
     func hasSameBinding(as other: NativeHLSFinalPresentationQuantum) -> Bool {
-        item == other.item && physicalItem == other.physicalItem && videoTrack == other.videoTrack &&
-            videoAsset == other.videoAsset && source === other.source && selectionRevision === other.selectionRevision &&
-            video == other.video && period == other.period && duration == other.duration
+        Self.compareBindings(prior: other, current: self).matches
+    }
+    static func compareBindings(prior: NativeHLSFinalPresentationQuantum?, current: NativeHLSFinalPresentationQuantum?) -> NativeHLSQuantumBindingComparison {
+        let presence: UInt8 = (prior == nil ? 0 : 1) | (current == nil ? 0 : 2)
+        guard let prior, let current else { return .init(presence: presence, equalFields: 0) }
+        var equal: UInt16 = 0
+        if current.item == prior.item { equal |= 1 << 0 }
+        if current.physicalItem == prior.physicalItem { equal |= 1 << 1 }
+        if current.videoTrack === prior.videoTrack { equal |= 1 << 2 }
+        if current.videoAsset === prior.videoAsset { equal |= 1 << 3 }
+        if current.source === prior.source { equal |= 1 << 4 }
+        if current.selectionRevision === prior.selectionRevision { equal |= 1 << 5 }
+        if current.video == prior.video { equal |= 1 << 6 }
+        if current.period == prior.period { equal |= 1 << 7 }
+        if current.duration == prior.duration { equal |= 1 << 8 }
+        return .init(presence: presence, equalFields: equal)
     }
 }
 
@@ -223,7 +251,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let expectsAudio = selectedAudio != nil || source.facts.media.contains { !$0.audio.isEmpty }
         let expectsVideo = source.facts.media.contains { $0.video != nil }
         var video: HLSVideoFacts?, audio: HLSSourceAudioFacts?, audioDigest: Data?, observedRate: Double?
-        var videoQuantum: (period: ExactMediaTime, track: ObjectIdentifier, asset: ObjectIdentifier)?
+        var videoQuantum: (period: ExactMediaTime, track: AVPlayerItemTrack, asset: AVAssetTrack)?
         #if DEBUG
         var quantumDetail = "reason=no-selected-video"
         #endif
@@ -254,7 +282,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
                 let decision = Self.presentationQuantumDecision(minimumFrameDuration: minimum,
                     selectedFixedFrameRate: selectedVideo.fixedFrameRate, video: actual, expected: source.facts)
                 if let period = decision.period {
-                    videoQuantum = (period, trackIDs[index], ObjectIdentifier(asset))
+                    videoQuantum = (period, tracks[index], asset)
                 }
                 #if DEBUG
                 quantumDetail = "reason=\(decision.reason) source-rate=\(actual.frameRate?.num ?? 0)/\(actual.frameRate?.den ?? 0) " +

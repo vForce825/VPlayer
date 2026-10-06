@@ -10,6 +10,19 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testQuantumBindingMaskRequiresBothPresenceAndEveryOriginalField() {
+        XCTAssertTrue(NativeHLSFinalPresentationQuantum.compareBindings(prior: nil, current: nil).matches)
+        for presence in [UInt8(1), UInt8(2)] {
+            XCTAssertFalse(NativeHLSQuantumBindingComparison(presence: presence, equalFields: 0).matches)
+        }
+        XCTAssertTrue(NativeHLSQuantumBindingComparison(presence: 3, equalFields: 0x1FF).matches)
+        for bit in 0..<9 {
+            let fields = NativeHLSQuantumBindingComparison.allFields ^ (UInt16(1) << bit)
+            XCTAssertFalse(NativeHLSQuantumBindingComparison(presence: 3, equalFields: fields).matches,
+                "Every original identity/source/format/timing comparison must remain mandatory")
+        }
+    }
+
     func testPrivateEOSIngressRevokesBeforeRefreshAndRejectsStaleEndpointTokens() throws {
         let fence = NativeHLSSelectionRevision(), counter = NativeTimingWakeCounter()
         let owner = NSObject(), replacement = NSObject(), first = UUID(), second = UUID()

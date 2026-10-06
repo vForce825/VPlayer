@@ -25,7 +25,7 @@ class NativeNaturalEndContract(unittest.TestCase):
         install = driver.split('func updateNaturalPlaybackEndQuantum(', 1)[1].split('private func installEndpointObservation(', 1)[0]
         ordered = ['case .natural = endpointBoundary', 'currentItemIdentity == identity',
                    'requiresFreshness: false', 'observedDuration == quantum.duration',
-                   'quantum.hasSameBinding(as: prior)', 'quantum?.revisionMismatch()',
+                   'compareBindings(prior: nativeEndQuantum, current: quantum)', 'quantum?.revisionMismatch()',
                    'guard !mismatch.exhausted', 'nativeEndQuantum = quantum']
         self.assertEqual([install.index(value) for value in ordered], sorted(install.index(value) for value in ordered))
         self.assertIn('naturalEndQuantumUpdateFailureDiagnosticForTesting', install)
@@ -116,7 +116,7 @@ class NativeNaturalEndContract(unittest.TestCase):
 
     def test_escaping_controller_bodies_capture_instance_helpers_explicitly(self):
         source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
-        self.assertEqual(source.count('withController { [self] controller, registry, factory in'), 2)
+        self.assertEqual(source.count('withController { [self] controller, registry, factory in'), 3)
         self.assertIn('withController(deadline: deadline) { [self] controller, registry, factory in', source)
 
     def test_native_quantum_is_selected_sdk_evidence_not_a_global_epsilon(self):
@@ -125,14 +125,23 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('asset.load(.minFrameDuration)', inspector)
         self.assertIn('final class NativeHLSFinalPresentationQuantum', inspector)
         self.assertIn('fileprivate init(', inspector)
+        self.assertTrue('private let videoTrack: AVPlayerItemTrack' in inspector)
+        self.assertTrue('private let videoAsset: AVAssetTrack' in inspector)
         self.assertIn('ObjectIdentifier(physical) == physicalItem', inspector)
-        self.assertIn('ObjectIdentifier(track) == videoTrack', inspector)
-        self.assertIn('ObjectIdentifier(asset) == videoAsset', inspector)
+        self.assertIn('track === videoTrack', inspector)
+        self.assertIn('asset === videoAsset', inspector)
         self.assertIn('minimum == period', inspector)
         self.assertIn('video.frameRate == rate', inspector)
         self.assertIn('endpointBoundary.containsFinalClock(', driver)
         self.assertIn('nativeEndQuantum?.validationFailure', driver)
-        self.assertIn('quantum.hasSameBinding(as: prior)', driver)
+        self.assertIn('compareBindings(prior: nativeEndQuantum, current: quantum)', driver)
+        comparison = inspector.split('static func compareBindings(', 1)[1].split('\n}\n', 1)[0]
+        for index, field in enumerate(['item', 'physicalItem', 'videoTrack', 'videoAsset', 'source', 'selectionRevision', 'video', 'period', 'duration']):
+            self.assertIn(f'current.{field}', comparison)
+            self.assertIn(f'equal |= 1 << {index}', comparison)
+        self.assertNotIn('await ', comparison)
+        self.assertNotIn('.tracks', comparison)
+        self.assertIn('videoQuantum = (period, tracks[index], asset)', inspector)
         self.assertIn('driver.nativeSelectionRevision.matches(revision)', inspector)
         observer = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSObservation.swift').read_text()
         self.assertLess(observer.index('selectionRevision.invalidate(reason: reason)'), observer.index('pending = true;'))

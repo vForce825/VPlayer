@@ -118,6 +118,10 @@ enum AVPlayerNaturalEndFailurePredicate: String, Sendable {
     case confirmFirstEndpoint = "confirm.firstEndpoint"
     case confirmEffectiveEndpoint = "confirm.effectiveEndpoint"
     case confirmFinalClock = "confirm.finalClock"
+    case confirmStableClock = "confirm.stableClock"
+    case ingressAuthority = "ingress.authority"
+    case ingressDeadlineCapacity = "ingress.deadlineCapacity"
+    case ingressRegistryDeadline = "ingress.registryDeadline"
     case refreshBoundary = "refresh.boundary"
     case refreshIdentity = "refresh.identity"
     case refreshQuantum = "refresh.quantum"
@@ -131,6 +135,7 @@ struct AVPlayerNaturalEndFailureDiagnostic: Sendable {
     let predicate: AVPlayerNaturalEndFailurePredicate
     let quantumFailure: NativeHLSQuantumValidationFailure?
     var revision: NativeHLSSelectionRevisionMismatch?
+    var binding: NativeHLSQuantumBindingComparison?
     var first: ExactMediaTime?
     var stable: ExactMediaTime?
     var expected: ExactMediaTime?
@@ -145,7 +150,8 @@ struct AVPlayerNaturalEndFailureDiagnostic: Sendable {
         let revisionDetail = revision.map {
             " r=\($0.expected)/\($0.current) why=\($0.reason.rawValue)" + ($0.exhausted ? " x=1" : "")
         } ?? ""
-        let value = "predicate=\(code)\(revisionDetail) f=\(time(first)) s=\(time(stable)) e=\(time(expected)) a=\(time(effective)) q=\(time(quantum))"
+        let bindingDetail = binding.map { " b=\($0.presence)/\($0.equalFields)" } ?? ""
+        let value = "predicate=\(code)\(revisionDetail)\(bindingDetail) f=\(time(first)) s=\(time(stable)) e=\(time(expected)) a=\(time(effective)) q=\(time(quantum))"
         // Scalar values and enum codes are ASCII. Keep the complete diagnosis
         // inside the original coordinator's 384-byte first-failure record.
         return String(value.prefix(288))
@@ -1437,9 +1443,10 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         var observedDuration: ExactMediaTime?
         func reject(_ predicate: AVPlayerNaturalEndFailurePredicate,
                     cause: NativeHLSQuantumValidationFailure? = nil,
-                    revision: NativeHLSSelectionRevisionMismatch? = nil) -> AVPlayerItemCoordinatorFailure {
+                    revision: NativeHLSSelectionRevisionMismatch? = nil,
+                    binding: NativeHLSQuantumBindingComparison? = nil) -> AVPlayerItemCoordinatorFailure {
             #if DEBUG
-            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision,
+            naturalEndQuantumUpdateFailureDiagnosticForTesting = .init(predicate: predicate, quantumFailure: cause, revision: revision, binding: binding,
                 first: naturalEndObservation?.firstCurrentTime, stable: nil,
                 expected: quantum?.duration ?? nativeEndQuantum?.duration, effective: observedDuration, quantum: quantum?.period)
             #endif
@@ -1457,13 +1464,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             guard observedDuration == quantum.duration else { throw reject(.refreshDuration) }
         }
         if endpointStabilityDeadline != nil {
-            let same: Bool
-            switch (nativeEndQuantum, quantum) {
-            case (nil, nil): same = true
-            case let (prior?, quantum?): same = quantum.hasSameBinding(as: prior)
-            default: same = false
-            }
-            guard same else { throw reject(.refreshPendingBinding) }
+            let binding = NativeHLSFinalPresentationQuantum.compareBindings(prior: nativeEndQuantum, current: quantum)
+            guard binding.matches else { throw reject(.refreshPendingBinding, binding: binding) }
         }
         if let mismatch = quantum?.revisionMismatch() {
             let terminal = reject(.refreshQuantum, cause: .revision, revision: mismatch)
@@ -1534,7 +1536,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 expectedEndpoint: endpoint, constrainedEndpoint: constrained,
                 firstCurrentTime: first,
                 stableCurrentTime: nil)
-            guard self.naturalEndAuthority?.revalidateCurrentAuthority() == true else {
+            guard self.checkNaturalEndPredicate(self.naturalEndAuthority?.revalidateCurrentAuthority() == true, .ingressAuthority) else {
+                self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                 #if DEBUG
                 PlaybackDiagnosticTracker.shared.append(
                     "eos_first_read_authority_rejected_present_\(self.naturalEndAuthority != nil)")
@@ -1550,6 +1553,8 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 guard let deadline = scheduler.schedule(after: 0.1, handler: { [weak self] in
                     self?.naturalEndDeadlineFired(identity: observationIdentity)
                 }) else {
+                    _ = self.checkNaturalEndPredicate(false, .ingressDeadlineCapacity)
+                    self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("eos_manual_deadline_slot_rejected")
                     #endif
@@ -1558,8 +1563,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 }
                 self.endpointStabilityDeadline = deadline
             } else {
-                guard self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
-                    identity: observationIdentity, receiver: self) == true else {
+                guard self.checkNaturalEndPredicate(self.naturalEndAuthority?.scheduleNaturalEnd(item: observedIdentity,
+                    identity: observationIdentity, receiver: self) == true, .ingressRegistryDeadline) else {
+                    self.captureNaturalEndFailureClocks(first: first, stable: nil, expected: endpoint, effective: constrained)
                     #if DEBUG
                     PlaybackDiagnosticTracker.shared.append("eos_registry_deadline_rejected")
                     #endif
@@ -1642,7 +1648,9 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 return
             }
         }
-        guard prior.firstCurrentTime == stable else {
+        guard checkNaturalEndPredicate(prior.firstCurrentTime == stable, .confirmStableClock) else {
+            captureNaturalEndFailureClocks(first: prior.firstCurrentTime, stable: stable,
+                expected: prior.expectedEndpoint, effective: constraint)
             publishNaturalEnd(.failure(.unstableDirectRead), item: currentItemIdentity)
             return
         }

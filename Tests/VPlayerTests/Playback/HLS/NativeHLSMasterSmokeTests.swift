@@ -71,6 +71,96 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         }
     }
 
+    func testNativeQuantumOwnsSelectedSDKReferencesAndChargeThroughRetirement() async throws {
+        let baseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let held = NativeQuantumReceiptHold()
+        var failure: (any Error)?
+        do {
+            try await withController { [self] controller, registry, factory in
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "quantum-owner-original",
+                    streamURL: origin.url("master.m3u8"), title: "Quantum owner original"))
+                try await until(registry: registry, factory: factory, phase: "quantum-owner-original", managed: false) {
+                    guard let current = factory.backend?.nativeCoordinatorForTesting, current.isPrepared,
+                          current.currentActivation != nil,
+                          let player = factory.backend?.presentation?.avPlayerForNativeSmoke else { return false }
+                    return player.currentTime().seconds > 0.25
+                }
+                try await captureQuantumReceipt(held, backend: XCTUnwrap(factory.backend))
+                // All strong snapshot/item/track/asset locals live only in the
+                // capture helper. The external receipt aliases now own our holds.
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "quantum-owner-successor",
+                    streamURL: origin.url("master.m3u8"), title: "Quantum owner successor"))
+                try await until(registry: registry, factory: factory, phase: "quantum-owner-successor", managed: false) {
+                    guard let current = factory.backend?.nativeCoordinatorForTesting,
+                          current.isPrepared, current.currentActivation != nil,
+                          let player = factory.backend?.presentation?.avPlayerForNativeSmoke else { return false }
+                    return current.item != held.item && player.currentTime().seconds > 0.25
+                }
+                try await checkSuccessorRejectsHeldQuantum(held, backend: XCTUnwrap(factory.backend))
+            }
+            // withController has joined real native retirement and callbacks.
+            await nativeEOSMainQueueTurn()
+            XCTAssertNotNil(held.track)
+            XCTAssertNotNil(held.asset)
+            XCTAssertNotNil(held.weakReceipt)
+            let retainedBytes = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+            XCTAssertGreaterThanOrEqual(retainedBytes, 8 * 1_024)
+            held.receipt = nil
+            XCTAssertNotNil(held.weakReceipt, "A second external receipt alias must keep its original ownership")
+            XCTAssertEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, retainedBytes,
+                "Dropping one alias must not return the live receipt's credit")
+            held.alias = nil
+            let deadline = ContinuousClock.now + .seconds(2)
+            while (held.weakReceipt != nil || HLSDeliveryApplicationChargeLedger.shared.chargedBytes > baseline),
+                  ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            XCTAssertNil(held.weakReceipt)
+            XCTAssertLessThanOrEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline)
+            // SDK caches may independently retain these wrappers. Receipt death
+            // releases our references; their final framework deallocation is not
+            // an AVFoundation guarantee and is deliberately not asserted here.
+        } catch { failure = error }
+        held.receipt = nil; held.alias = nil
+        await origin.close()
+        if let failure { throw failure }
+    }
+
+    private func captureQuantumReceipt(_ held: NativeQuantumReceiptHold, backend: HLSAVPlayerPlaybackBackend) async throws {
+        let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+        let driver = try XCTUnwrap(backend.nativeSystemDriverForTesting)
+        let physical = try XCTUnwrap(driver.nativeCurrentItem(coordinator.item))
+        let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+        let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
+        let track = try XCTUnwrap(physical.tracks.first { $0.isEnabled && $0.assetTrack?.mediaType == .video })
+        let asset = try XCTUnwrap(track.assetTrack)
+        XCTAssertTrue(quantum.hasCurrentIdentity(item: coordinator.item, physical: physical))
+        let same = NativeHLSFinalPresentationQuantum.compareBindings(prior: quantum, current: quantum)
+        XCTAssertEqual(same, .init(presence: 3, equalFields: NativeHLSQuantumBindingComparison.allFields))
+        XCTAssertTrue(same.matches)
+        let appeared = NativeHLSFinalPresentationQuantum.compareBindings(prior: nil, current: quantum)
+        let disappeared = NativeHLSFinalPresentationQuantum.compareBindings(prior: quantum, current: nil)
+        XCTAssertEqual(appeared, .init(presence: 2, equalFields: 0))
+        XCTAssertEqual(disappeared, .init(presence: 1, equalFields: 0))
+        XCTAssertFalse(appeared.matches); XCTAssertFalse(disappeared.matches)
+        held.track = track; held.asset = asset; held.item = coordinator.item
+        held.receipt = quantum; held.alias = quantum; held.weakReceipt = quantum
+    }
+
+    private func checkSuccessorRejectsHeldQuantum(_ held: NativeQuantumReceiptHold, backend: HLSAVPlayerPlaybackBackend) async throws {
+        let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+        let driver = try XCTUnwrap(backend.nativeSystemDriverForTesting)
+        let physical = try XCTUnwrap(driver.nativeCurrentItem(coordinator.item))
+        let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+        let prior = try XCTUnwrap(held.receipt), current = try XCTUnwrap(snapshot.finalPresentationQuantum)
+        let comparison = NativeHLSFinalPresentationQuantum.compareBindings(prior: prior, current: current)
+        XCTAssertEqual(comparison.presence, 3)
+        XCTAssertEqual(comparison.equalFields & 1, 0, "A successor cannot reuse the original logical item")
+        XCTAssertFalse(comparison.matches)
+        XCTAssertFalse(prior.hasCurrentIdentity(item: coordinator.item, physical: physical))
+        XCTAssertThrowsError(try driver.updateNaturalPlaybackEndQuantum(prior, item: coordinator.item))
+        XCTAssertNotNil(held.track); XCTAssertNotNil(held.asset)
+    }
+
     private func verifyNativeRefreshReturnEdge(_ mode: NativeRefreshReturnMode) async throws {
         let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
         let player = NativeEOSObservationPlayer()
@@ -159,6 +249,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     let detail = try XCTUnwrap(coordinator.firstFailureDiagnosticForTesting)
                     XCTAssertTrue(detail.contains("step=quantum-install"), detail)
                     XCTAssertTrue(detail.contains(mode == .exhausted ? "predicate=refresh.quantum.revision" : "predicate=refresh.pendingBinding"), detail)
+                    if mode == .bindingChanged { XCTAssertTrue(detail.contains(" b=1/0"), detail) }
                 }
                 player.observation = nil
             }
@@ -301,6 +392,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         XCTAssertTrue(coordinator.firstFailureDiagnosticForTesting?.contains("endpoint-reason=\(expected)") == true)
                         let predicate: String?
                         switch outcome {
+                        case .changedClock: predicate = "confirm.stableClock"
                         case .positiveRate: predicate = "confirm.rate"
                         case .playingControl: predicate = "confirm.control"
                         case .earlyClock: predicate = "confirm.finalClock"
@@ -315,6 +407,10 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                                 XCTAssertTrue(originalFailure.contains(" why="))
                             }
                             XCTAssertTrue(originalFailure.contains(" f=\(first.firstCurrentTime.value)/\(first.firstCurrentTime.timescale)"))
+                            if outcome == .changedClock {
+                                let stable = try ExactMediaTime(CMTimeSubtract(clock, CMTime(value: 1, timescale: 60)))
+                                XCTAssertTrue(originalFailure.contains(" s=\(stable.value)/\(stable.timescale)"), originalFailure)
+                            }
                             XCTAssertLessThanOrEqual(originalFailure.utf8.count, 384)
                             player.observation = nil
                             await controller.stop(); await registry.joinOwnedTerminalCleanup()
@@ -364,6 +460,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         XCTAssertTrue(String(message.prefix(1_024)).contains(retained))
         let stale = AVPlayerNaturalEndFailureDiagnostic(predicate: .confirmQuantum, quantumFailure: .revision,
             revision: .init(expected: .max, current: .max, exhausted: true, reason: .privateEOSRefresh),
+            binding: .init(presence: 3, equalFields: 511),
             first: widest, stable: widest, expected: widest, effective: widest, quantum: widest)
         XCTAssertTrue(stale.summary.contains("predicate=confirm.quantum.revision"))
         XCTAssertTrue(stale.summary.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
@@ -377,6 +474,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let visible = String(("failed - " + report).prefix(1_024))
         XCTAssertTrue(visible.contains("predicate=confirm.quantum.revision"))
         XCTAssertTrue(visible.contains(" r=\(UInt64.max)/\(UInt64.max) why=privateEOSRefresh x=1"))
+        XCTAssertTrue(visible.contains(" b=3/511"))
         let install = AVPlayerNaturalEndFailureDiagnostic(predicate: .refreshQuantum, quantumFailure: .revision,
             revision: .init(expected: .max, current: .max, exhausted: false, reason: .privateEOSRefresh),
             first: widest, stable: nil, expected: widest, effective: widest, quantum: widest)
@@ -891,6 +989,14 @@ private enum NativeEOSSettlementOutcome: Equatable {
 }
 
 private enum NativeRefreshReturnMode: Equatable { case once, mixed, exhausted, bindingChanged, revoked }
+@MainActor private final class NativeQuantumReceiptHold {
+    var receipt: NativeHLSFinalPresentationQuantum?
+    var alias: NativeHLSFinalPresentationQuantum?
+    weak var weakReceipt: NativeHLSFinalPresentationQuantum?
+    weak var track: AVPlayerItemTrack?
+    weak var asset: AVAssetTrack?
+    var item: AVPlayerItemInstanceIdentity?
+}
 private enum NativeRefreshReturnScope { @TaskLocal static var identity: UUID? = nil }
 @MainActor private final class NativeRefreshReturnControl {
     let identity = UUID()
