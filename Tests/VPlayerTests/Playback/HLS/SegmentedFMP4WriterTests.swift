@@ -2655,9 +2655,13 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let counter = Task17LockedUInt64(80_500)
             let branch = AudioRenditionBranch(encoder: encoder, writer: first, coordinator: boundary,
                 writerWindowFactory: { continuation in
-                    XCTAssertEqual(continuation.mediaMembershipSnapshot.count, 1,
-                        "each forced six-second physical window contains only its own media leaf")
-                    XCTAssertEqual(continuation.mediaMembershipSnapshot.pendingCount, 0)
+                    let membership = continuation.mediaMembershipSnapshot
+                    print("HLS_AAC_ROLLOVER_RETIREMENT stage=continuation forceRollover=\(forceRollover) "
+                        + "membershipCount=\(membership.count) membershipPending=\(membership.pendingCount)")
+                    XCTAssertEqual(membership.count, 1,
+                        "forceRollover=\(forceRollover): each six-second physical window contains only its own media leaf")
+                    XCTAssertEqual(membership.pendingCount, 0,
+                        "forceRollover=\(forceRollover): continuation media membership must be drained")
                     let nextBinding = Task17Fixtures.rolloverBinding(from: binding,
                         writerIdentity: .init(rawValue: counter.take()))
                     let next = try Task17Fixtures.makeWriter(seed: 80_451, kind: .aac,
@@ -2700,11 +2704,73 @@ final class SegmentedFMP4WriterTests: XCTestCase {
                 "count actual AVAssetWriter allocations, including every successor")
             XCTAssertTrue(probe.snapshot.isComplete)
             XCTAssertGreaterThanOrEqual(branch.lastCommittedEmissionIdentity?.ordinal ?? 0, 600)
+            func retirementSnapshot(_ stage: String, usage: SegmentedFMP4WriterUsage,
+                                    native: HLSWriterAcceptanceSnapshot) -> String {
+                // Scalar snapshots only; do not keep sample/branch history or
+                // equate native cancellation with the last backing-release edge.
+                return "HLS_AAC_ROLLOVER_RETIREMENT stage=\(stage) forceRollover=\(forceRollover) "
+                    + "windows=\(branch.physicalWriterWindowCount) "
+                    + "branchLive=\(usage.liveInputCount) branchBytes=\(usage.liveInputBytes) "
+                    + "branchAccepted=\(usage.inputAllocationCount) branchReleased=\(usage.inputReleaseCount) "
+                    + "branchEvidence=\(usage.segmentEvidenceCount) branchCallbacks=\(usage.pendingCallbackCount) "
+                    + "probeLive=\(native.liveInputCount) probeBytes=\(native.liveInputBytes) "
+                    + "probeAccepted=\(native.acceptedInputCount) probeReleased=\(native.releasedInputCount) "
+                    + "pendingEmission=\(branch.pendingEmissionIdentity?.ordinal.description ?? "none") "
+                    + "pendingBytes=\(branch.pendingMemoryUsage?.actualFrozenAndMaterializedBytes ?? 0)"
+            }
+            let beforeCancellation = retirementSnapshot("before-cancel",
+                usage: branch.writerUsage, native: probe.snapshot)
             await branch.cancelAndAwait()
-            XCTAssertEqual(branch.writerUsage.liveInputCount, 0)
-            XCTAssertEqual(probe.snapshot.liveInputCount, 0,
-                "native input aliases must retire across all physical AAC windows")
+            let afterCancellationUsage = branch.writerUsage
+            let afterCancellationProbe = probe.snapshot
+            let afterCancellation = retirementSnapshot("after-cancel", usage: afterCancellationUsage,
+                native: afterCancellationProbe)
+            XCTAssertEqual(afterCancellationUsage.liveInputCount, 0,
+                "branch input admission must have no live native aliases; \(afterCancellation)")
+            XCTAssertEqual(afterCancellationProbe.liveInputCount, 0,
+                "native input aliases must retire across all physical AAC windows; \(afterCancellation)")
+            // Keep diagnostic I/O after the original immediate zero checks so
+            // logging cannot itself supply a backing-retirement scheduling gap.
+            print(beforeCancellation)
+            print(afterCancellation)
         }
+    }
+
+    func testCancelledAACBatchKeepsSixteenNativeAliasesChargedUntilTheirLastUse() async throws {
+        // Ordinary bounded cancellation coverage: returning a terminal receipt
+        // must not counterfeit the independent last-CMBlockBuffer release edge.
+        let count = 16
+        let epoch = try Task17Fixtures.aacEpoch(bufferCount: count)
+        let probe = HLSWriterAcceptanceProbe()
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 80_452, kind: .aac,
+            sourceFormatHint: XCTUnwrap(CMSampleBufferGetFormatDescription(epoch.buffers[0])),
+            factory: factory, acceptanceProbe: probe)
+        let boundary = try Task17Fixtures.aacCoordinator(epoch: epoch, writer: writer)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        try await writer.appendAACEncodedEpochAwaitingReadiness(epoch, coordinator: boundary)
+        let native = try XCTUnwrap(factory.lastWriter)
+        var aliases: [CMBlockBuffer] = try (0..<count).map { try native.makeInputBlockAlias(at: $0) }
+        defer { aliases.removeAll() }
+        let terminal = await writer.cancelAwaitingCompletion()
+        XCTAssertEqual(terminal.terminalReason, .cancelled)
+        XCTAssertEqual(terminal.inputCount, count)
+        XCTAssertEqual(native.retainedInputSampleCount, 0)
+        XCTAssertEqual(writer.usage.liveInputCount, count)
+        XCTAssertEqual(writer.usage.inputReleaseCount, 0)
+        XCTAssertEqual(probe.snapshot.liveInputCount, count)
+        XCTAssertEqual(probe.snapshot.acceptedInputCount, UInt64(count))
+        aliases.removeFirst(count - 1)
+        XCTAssertEqual(aliases.count, 1)
+        XCTAssertEqual(writer.usage.liveInputCount, 1)
+        XCTAssertEqual(probe.snapshot.liveInputCount, 1)
+        XCTAssertEqual(probe.snapshot.releasedInputCount, UInt64(count - 1))
+        aliases.removeAll()
+        XCTAssertEqual(writer.usage.liveInputCount, 0)
+        XCTAssertEqual(writer.usage.inputReleaseCount, UInt64(count))
+        XCTAssertEqual(probe.snapshot.liveInputCount, 0)
+        XCTAssertEqual(probe.snapshot.releasedInputCount, probe.snapshot.acceptedInputCount)
+        XCTAssertEqual(writer.terminalReceipt, terminal)
     }
 
     func testAudioBranchRetiresConsumedPumpPrefixWhileKeepingPumpLeaseAndNativeAliases() async throws {
