@@ -35,6 +35,21 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
     }
 
+    func testNativeSmokeFailureReportSurvivesXCResultFieldLimit() {
+        let oversized = String(repeating: "x", count: 8_192)
+        for managed in [false, true] {
+            let message = NativeSmokeFailureReport.message(phase: "full-eof-completion", managed: managed,
+                reason: "deadline", context: "replacement-recovery " + oversized,
+                detail: "original-output=1 " + oversized, trace: oversized + "latest-inspection")
+            let reported = String(("failed - " + message).prefix(4_096))
+            XCTAssertEqual(reported, "failed - " + message, "CI must retain the entire bounded failure record")
+            XCTAssertTrue(reported.contains("phase=full-eof-completion route=\(managed ? "managed" : "native")"))
+            XCTAssertTrue(reported.contains("context={replacement-recovery"))
+            XCTAssertTrue(reported.contains("detail={original-output=1"))
+            XCTAssertTrue(reported.hasSuffix("latest-inspection}"))
+        }
+    }
+
     func testNativeInterruptedResponseDoesNotCompleteDuringBoundedObservation() async throws {
         let bytes = try fixtureBytes()
         let result = try await runEndpointControl(.defaultEnd, bytes: bytes, disconnectAfterBodyBytes: min(32 * 188, bytes.count / 2))
@@ -112,7 +127,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             try await withController { [self] controller, registry, factory in
                 await controller.play(.init(sourceProfileID: UUID(), channelID: "native-early-eof",
                     streamURL: origin.url("master.m3u8"), title: "Native early end control"))
-                try await until(registry: registry) {
+                try await until(registry: registry, factory: factory, phase: "early-eof-startup", managed: false) {
                     guard case .playing = registry.playbackStateSnapshot(),
                           let coordinator = factory.backend?.nativeCoordinatorForTesting,
                           coordinator.isPrepared, let activation = coordinator.currentActivation else { return false }
@@ -145,7 +160,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let finalQuantumStart = try quantum.duration.subtracting(quantum.period)
                 XCTAssertLessThan(CMTimeCompare(early.cmTime, finalQuantumStart.cmTime), 0)
                 NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
-                try await until(registry: registry) {
+                try await until(registry: registry, factory: factory, phase: "early-eof-recovery", managed: false) {
                     guard case .playing = registry.playbackStateSnapshot() else { return false }
                     return backend.nativeCoordinatorForTesting !== coordinator &&
                         backend.nativeCoordinatorForTesting?.isPrepared == true &&
@@ -177,7 +192,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 await controller.play(.init(sourceProfileID: UUID(), channelID: "native-natural-eof-\(managed)",
                     streamURL: origin.url("master.m3u8"), title: "Native full-source EOF",
                     attributes: managed ? ["Authorization": "ordinary fixture"] : [:]))
-                try await until(registry: registry, deadline: min(deadline, .now + .seconds(20))) {
+                try await until(registry: registry, factory: factory, phase: "full-eof-startup", managed: managed,
+                    deadline: min(deadline, .now + .seconds(20))) {
                     guard case .playing = registry.playbackStateSnapshot(),
                           let coordinator = factory.backend?.nativeCoordinatorForTesting,
                           coordinator.isPrepared, let activation = coordinator.currentActivation else { return false }
@@ -201,7 +217,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertNil(driver.naturalEndObservation)
                 // One shared source/player deadline includes both startups and
                 // both real 80-second EOFs, without seeking or changing rate.
-                try await until(registry: registry, deadline: deadline) {
+                try await until(registry: registry, factory: factory, phase: "full-eof-completion", managed: managed,
+                    deadline: deadline, detail: {
+                        self.naturalEOFEvidence(coordinator: coordinator, activation: activation, backend: backend,
+                            driver: driver, player: player, physical: physical)
+                    }) {
                     coordinator.naturalEndVerifiedForTesting && driver.naturalEndObservation?.stableCurrentTime != nil
                 }
                 let observation = try XCTUnwrap(driver.naturalEndObservation)
@@ -246,7 +266,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         streamURL: origin.url("master.m3u8"), title: "Native real fixture",
                         attributes: managed ? ["Authorization": "ordinary fixture"] : [:])
                     await controller.play(request)
-                    try await until(registry: registry) {
+                    try await until(registry: registry, factory: factory, phase: "selected-format-startup", managed: managed) {
                         guard case .playing = registry.playbackStateSnapshot(),
                               registry.outputResourceContextSnapshot()?.prepared == true,
                               registry.outputResourceContextSnapshot()?.interval != nil,
@@ -276,7 +296,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     let selected = try await SystemNativeHLSAssetInspector(driver: XCTUnwrap(playerDriver(backend))).snapshot(item: coordinator.item, source: source)
                     XCTAssertNotNil(selected.video)
                     XCTAssertEqual(selected.audio?.codec, .aac)
-                    try await until(registry: registry) { player.currentItem === physical && player.currentTime().seconds > started + 0.25 }
+                    try await until(registry: registry, factory: factory, phase: "selected-format-progress", managed: managed) {
+                        player.currentItem === physical && player.currentTime().seconds > started + 0.25
+                    }
                     guard player.currentItem === physical, player.currentTime().seconds > started + 0.25,
                           coordinator.isPrepared, coordinator.currentActivation != nil,
                           coordinator.currentActivation == registry.outputResourceContextSnapshot()?.activation,
@@ -408,16 +430,61 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
     }
 
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
-    private func until(registry: ControlTaskRegistry, deadline: ContinuousClock.Instant = .now + .seconds(20), _ predicate: @MainActor () -> Bool) async throws {
+    private func naturalEOFEvidence(coordinator: NativeHLSItemCoordinator, activation: ActivationEpoch,
+        backend: HLSAVPlayerPlaybackBackend, driver: SystemAVPlayerDriver, player: AVPlayer, physical: AVPlayerItem) -> String {
+        func time(_ value: CMTime) -> String { "\(value.value)/\(value.timescale):\(value.epoch):\(value.flags.rawValue)" }
+        let error = physical.error as NSError?
+        let terminal: String
+        switch driver.naturalEndTerminalResult {
+        case .success?: terminal = "success"
+        case let .failure(reason)?: terminal = "failure-\(reason)"
+        case nil: terminal = "none"
+        }
+        return "original-output=\(coordinator.item.outputLifecycleEpoch.outputNonce) original-activation=\(activation.activationNonce) " +
+            "original-failure={\(coordinator.firstFailureDiagnosticForTesting ?? "none")} " +
+            "same-coordinator=\(backend.nativeCoordinatorForTesting === coordinator) same-physical=\(player.currentItem === physical) " +
+            "original-prepared=\(coordinator.isPrepared) original-verified=\(coordinator.naturalEndVerifiedForTesting) " +
+            "original-current=\(time(physical.currentTime())) original-duration=\(time(physical.duration)) " +
+            "original-status=\(physical.status.rawValue) error-domain=\(String((error?.domain ?? "none").prefix(96))) error-code=\(error?.code ?? 0) " +
+            "player-rate=\(player.rate) player-control=\(player.timeControlStatus.rawValue) " +
+            "driver-output=\(driver.currentItemIdentity?.outputLifecycleEpoch.outputNonce ?? 0) driver-terminal=\(terminal) " +
+            "driver-first=\(driver.naturalEndObservation.map { time($0.firstCurrentTime.cmTime) } ?? "none") " +
+            "driver-stable=\(driver.naturalEndObservation?.stableCurrentTime.map { time($0.cmTime) } ?? "none")"
+    }
+    private func until(registry: ControlTaskRegistry, factory: NativeSmokeFactory, phase: StaticString, managed: Bool,
+        deadline: ContinuousClock.Instant = .now + .seconds(20), detail: @MainActor () -> String = { "none" },
+        file: StaticString = #filePath, line: UInt = #line, _ predicate: @MainActor () -> Bool) async throws {
+        func report(_ reason: String) {
+            // The xcresult reporter caps failureText at 4096 characters. Keep
+            // the route/phase and original-item evidence ahead of bounded trace
+            // text; reflecting the entire Registry context hides these fields.
+            let context: String
+            if let value = registry.outputResourceContextSnapshot() {
+                let origin: String
+                switch value.claimOrigin {
+                case .initial: origin = "initial"
+                case let .replacement(ticket): origin = "replacement-\(ticket.reason)"
+                }
+                context = "phase=\(value.phase) origin=\(origin) prepared=\(value.prepared) poisoned=\(value.poisoned) " +
+                    "backend=\(String(describing: value.desiredBackendKind)) object=\(value.backendObjectNonce) " +
+                    "output=\(value.activation?.outputLifecycleEpoch.outputNonce ?? 0) activation=\(value.activation?.activationNonce ?? 0)"
+            } else { context = "none" }
+            XCTFail(NativeSmokeFailureReport.message(phase: String(describing: phase), managed: managed,
+                reason: reason, context: context, detail: detail(), trace: factory.trace.summary), file: file, line: line)
+        }
         while !predicate(), ContinuousClock.now < deadline {
             if case let .failed(failure) = registry.playbackStateSnapshot() {
-                XCTFail("Real native HLS terminated before prepare/progress: \(failure)")
+                report("terminal-\(failure.code)")
                 throw failure
             }
-            try await Task.sleep(for: .milliseconds(10))
+            do { try await Task.sleep(for: .milliseconds(10)) }
+            catch is CancellationError {
+                report("cancelled deadline-expired=\(ContinuousClock.now >= deadline)")
+                throw CancellationError()
+            }
         }
         guard predicate(), ContinuousClock.now < deadline else {
-            XCTFail("Real native HLS failed to prepare/progress: \(String(describing: registry.outputResourceContextSnapshot()))")
+            report("deadline")
             throw HLSSourceError.deadline
         }
     }
@@ -462,6 +529,13 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         await controller.stop(); await registry.joinOwnedTerminalCleanup()
         XCTAssertNil(registry.outputResourceContextSnapshot())
         if let failure { throw failure }
+    }
+}
+
+private enum NativeSmokeFailureReport {
+    static func message(phase: String, managed: Bool, reason: String, context: String, detail: String, trace: String) -> String {
+        "NATIVE_HLS_SMOKE_FAILURE phase=\(phase.prefix(48)) route=\(managed ? "managed" : "native") reason=\(reason.prefix(128)) " +
+            "context={\(context.prefix(512))} detail={\(detail.prefix(1_024))} trace={\(trace.suffix(1_536))}"
     }
 }
 

@@ -312,13 +312,97 @@ final class VPlayerUITests: XCTestCase {
     @MainActor
     private func focusSettingsRow(_ row: XCUIElement, in app: XCUIApplication) {
         let cell = app.cells.containing(.button, identifier: row.identifier).element
+        var presses = 0
         for _ in 0..<5 where !row.hasFocus && !cell.hasFocus {
             XCUIRemote.shared.press(.down)
+            presses += 1
         }
+        // Freeze the original verdict before collecting evidence. A focus
+        // transition during diagnostics must not turn a failed check into a pass.
+        let reachedRow = row.hasFocus || cell.hasFocus
         XCTAssertTrue(
-            row.hasFocus || cell.hasFocus,
+            reachedRow,
             "Expected focus to reach settings row \(row.identifier)"
+                + (reachedRow ? "" : settingsFocusFailureDetails(
+                    row: row, cell: cell, app: app, presses: presses
+                ))
         )
+    }
+
+    @MainActor
+    private func settingsFocusFailureDetails(
+        row: XCUIElement, cell: XCUIElement, app: XCUIApplication, presses: Int
+    ) -> String {
+        // Failure-only evidence for the seeded fixture. Keep the compact state
+        // in assertion text so the bounded CI failure report preserves it even
+        // when the complete UI log or xcresult attachments are unavailable.
+        func frame(_ rect: CGRect) -> String {
+            String(format: "%.0f,%.0f,%.0f,%.0f", rect.minX, rect.minY, rect.width, rect.height)
+        }
+        func describe(_ snapshot: any XCUIElementSnapshot) -> String {
+            "type=\(snapshot.elementType.rawValue),id=\(snapshot.identifier.prefix(64)),"
+                + "focus=\(snapshot.hasFocus),selected=\(snapshot.isSelected),frame=\(frame(snapshot.frame))"
+        }
+
+        let identifier = row.identifier
+        var evidence = " SETTINGS_FOCUS_FAILURE downPresses=\(presses) initialRowOrCellFocus=false"
+        let rowExists = row.exists
+        let cellExists = cell.exists
+        evidence += " lateRowExists=\(rowExists) lateRowHittable=\(rowExists && row.isHittable)"
+            + " lateCellExists=\(cellExists) lateCellHittable=\(cellExists && cell.isHittable)"
+        do {
+            let root = try app.snapshot()
+            var pending: [(node: any XCUIElementSnapshot, ancestors: [String], viewport: CGRect)] = [
+                (root, [], root.frame)
+            ]
+            var visited = 0
+            var target: [String] = []
+            var focused: [String] = []
+            var settings: [String] = []
+            while !pending.isEmpty && visited < 256 {
+                let entry = pending.removeLast()
+                let node = entry.node
+                visited += 1
+                var viewport = entry.viewport
+                if [.scrollView, .collectionView, .table].contains(node.elementType) {
+                    viewport = viewport.intersection(node.frame)
+                }
+                let summary = describe(node)
+                if node.identifier == identifier && target.count < 2 {
+                    target.append("\(summary),viewport=\(frame(viewport)),"
+                        + "intersectsViewport=\(viewport.intersects(node.frame)),"
+                        + "insideViewport=\(viewport.contains(node.frame)),"
+                        + "ancestors=\(entry.ancestors.suffix(5).joined(separator: "/"))")
+                }
+                if node.hasFocus && focused.count < 4 {
+                    focused.append(summary)
+                }
+                if node.elementType == .button && node.identifier.hasPrefix("settings."),
+                   settings.count < 6 {
+                    settings.append(summary)
+                }
+                // Bound both traversal and the ancestry carried by each entry.
+                let ancestor = "\(node.elementType.rawValue):\(node.identifier.prefix(48)):focus=\(node.hasFocus)"
+                let ancestors = Array((entry.ancestors + [ancestor]).suffix(5))
+                let remaining = max(0, 256 - visited - pending.count)
+                pending.append(contentsOf: node.children.prefix(remaining).reversed().map {
+                    ($0, ancestors, viewport)
+                })
+            }
+            evidence += " lateSnapshotScreen=\(frame(root.frame)) visited=\(visited)"
+                + " scanAtLimit=\(visited == 256) target=[\(target.joined(separator: ";"))]"
+                + " focused=[\(focused.joined(separator: ";"))]"
+                + " settings=[\(settings.joined(separator: ";"))]"
+        } catch {
+            evidence += " lateSnapshotError=\(String(describing: error).prefix(256))"
+        }
+        let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        screenshot.name = "settings-focus-failure-\(identifier)"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        // The report limits each failure string to 4096 characters. Reserve
+        // room for XCTest's prefix and the original assertion message.
+        return String(evidence.prefix(3_700))
     }
 }
 

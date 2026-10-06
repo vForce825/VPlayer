@@ -173,6 +173,10 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     #if DEBUG
     func observeSelectedFormatChangeForTesting() async { await refresh(failed: false) }
     var naturalEndVerifiedForTesting: Bool { naturalEndVerified }
+    // One scalar slot, within this coordinator's existing 32 KiB reservation.
+    // At most 384 ASCII bytes; no error object, source data or event history.
+    // Keep it until this original coordinator dies, including after retirement.
+    private(set) var firstFailureDiagnosticForTesting: String?
     #endif
     private func refresh(failed: Bool) async {
         diagnose("refresh.event", detail: "event-failed=\(failed)")
@@ -228,7 +232,18 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     }
     private func fail(_ reason: HLSSourceError, stage: StaticString, detail: @autoclosure () -> String = "") {
         guard !retired, !failureDelivered else { return }
+        #if DEBUG
+        let failureDetail = detail()
+        // Call sites supply only enum names, error types/codes and control-state
+        // integers. Copy bounded printable bytes, never an SDK error or URL.
+        let bytes = "stage=\(stage) reason=\(reason) detail={\(failureDetail)}".utf8.prefix(384).map {
+            (32...126).contains($0) ? $0 : UInt8(63)
+        }
+        firstFailureDiagnosticForTesting = String(decoding: bytes, as: UTF8.self)
+        diagnose(stage, authorityValidated: true, detail: "reason=\(reason) \(failureDetail)")
+        #else
         diagnose(stage, authorityValidated: true, detail: "reason=\(reason) \(detail())")
+        #endif
         failureDelivered = true; cancelProgress()
         metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: nil))
         failure(reason, authorization?.activation)

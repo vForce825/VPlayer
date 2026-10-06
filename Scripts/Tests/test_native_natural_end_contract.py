@@ -37,7 +37,9 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('executionTimeAllowance = 240', source)
         self.assertIn('let deadline = ContinuousClock.now + .seconds(210)', source)
         self.assertIn('verifyNaturalEOF(managed: managed, deadline: deadline)', source)
-        self.assertIn('until(registry: registry, deadline: deadline)', source)
+        completion_wait = source.split('phase: "full-eof-completion", managed: managed,', 1)[1].split('let observation =', 1)[0]
+        self.assertIn('deadline: deadline, detail:', completion_wait)
+        self.assertIn('coordinator.naturalEndVerifiedForTesting && driver.naturalEndObservation?.stableCurrentTime != nil', completion_wait)
         self.assertIn('guard predicate(), ContinuousClock.now < deadline', source)
         self.assertIn('withController(deadline: deadline)', source)
         self.assertIn('ContinuousClock().sleep(until: deadline)', source)

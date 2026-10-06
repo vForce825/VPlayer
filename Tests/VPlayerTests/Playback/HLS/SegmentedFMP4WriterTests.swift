@@ -2619,121 +2619,160 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 
     func testProductionAACBranchCrossesSixSecondBoundaryWithinPumpAndResumesForcedRollover() async throws {
         for forceRollover in [false, true] {
-            let calibration = try await AACPrimingCalibrator().calibrate(plan:
-                AACCalibrationPlan.build([try AACRenditionRequest(
-                    layout: RenditionAudioLayout(labels: [.l, .r]),
-                    capabilityVersion: "writer-six-second-pump-\(forceRollover)")]))
-            let encoder = try XCTUnwrap(calibration.encoders.first)
-            let format = try encoder.incrementalFormatDescription()
-            let start = CMTime(value: 10, timescale: 1)
-            let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(epochStart: start,
-                videoMode: .passthrough, minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
-                maximumPassthroughInterval: CMTime(value: 6, timescale: 1)))
-            // The video inspection adapter supplies real coordinator boundary
-            // transactions only. AAC encoding, native writing, callback evidence
-            // and publication-drain receipts below all use production owners.
-            let videoFactory = Task17FakeSystemWriterFactory()
-            let video = try Task17Fixtures.makeWriter(seed: 80_450, kind: .video,
-                sourceFormatHint: Task17Fixtures.realH264Sample().format, boundary: boundary,
-                factory: videoFactory, ownershipLimits: nil, releaseTransfersImmediately: true)
-            defer { _ = video.cancel() }
-            try video.start(at: start)
-            videoFactory.lastWriter?.setRetainsInputs(false)
-            let binding = Task17Fixtures.binding(seed: 80_451)
-            try boundary.registerAudioRendition(binding.renditionIdentity,
-                accessUnit: .aac(sampleRate: 48_000), firstEffectiveStart: start)
             let probe = HLSWriterAcceptanceProbe()
-            let factory = AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: probe)
-            let limits: SegmentedFMP4WriterOwnershipLimits? = forceRollover
-                ? .init(rolloverThreshold: 1, hardCapacity: 640) : nil
-            let first = try Task17Fixtures.makeWriter(seed: 80_451, kind: .aac,
-                writerBinding: binding, sourceFormatHint: format, boundary: boundary,
-                factory: factory, ownershipLimits: limits, releaseTransfersImmediately: true,
-                acceptanceProbe: probe)
-            try first.start(at: start)
-            let holder = Task17BoundaryHolder(boundary)
-            let counter = Task17LockedUInt64(80_500)
-            let branch = AudioRenditionBranch(encoder: encoder, writer: first, coordinator: boundary,
-                writerWindowFactory: { continuation in
-                    let membership = continuation.mediaMembershipSnapshot
-                    print("HLS_AAC_ROLLOVER_RETIREMENT stage=continuation forceRollover=\(forceRollover) "
-                        + "membershipCount=\(membership.count) membershipPending=\(membership.pendingCount)")
-                    XCTAssertEqual(membership.count, 1,
-                        "forceRollover=\(forceRollover): each six-second physical window contains only its own media leaf")
-                    XCTAssertEqual(membership.pendingCount, 0,
-                        "forceRollover=\(forceRollover): continuation media membership must be drained")
-                    let nextBinding = Task17Fixtures.rolloverBinding(from: binding,
-                        writerIdentity: .init(rawValue: counter.take()))
-                    let next = try Task17Fixtures.makeWriter(seed: 80_451, kind: .aac,
-                        writerBinding: nextBinding, sourceFormatHint: format, boundary: holder.value,
-                        factory: factory, ownershipLimits: limits, continuation: continuation,
-                        releaseTransfersImmediately: true, acceptanceProbe: probe)
-                    return next
-                })
-            // Supply genuine boundary transactions before audio reaches each of
-            // the two six-second cuts. The 16384-frame pumps straddle both cuts.
-            for frame in 0..<3 {
-                let fixture = try Task17Fixtures.realH264Sample(
-                    presentationTimeStamp: CMTime(value: 10 + Int64(frame * 6), timescale: 1),
-                    duration: CMTime(value: 6, timescale: 1))
-                let output = Task17Fixtures.videoOutput(fixture: fixture, generation: 1,
-                    accessUnitID: UInt64(frame + 1), sequenceNumber: UInt64(frame + 1))
-                try video.appendVideo(output,
-                    ticket: boundary.issueVideoAppend(for: output, writerBinding: video.binding))
+            let factory = Task17ObservedNativeSystemWriterFactory(acceptanceProbe: probe)
+            let branch = try await exerciseProductionAACBranchRollover(
+                forceRollover: forceRollover, probe: probe, factory: factory)
+            // The scenario has released every strong branch/writer owner. Observe
+            // real last-use callbacks, as in the source-AAC and Dolby native tests;
+            // cancellation itself cannot promise this edge for external aliases.
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: .seconds(2))
+            while (branch.value != nil || factory.liveOwnerCount != 0 || probe.snapshot.liveInputCount != 0)
+                    && clock.now < deadline {
+                try await clock.sleep(until: min(deadline, clock.now.advanced(by: .milliseconds(1))))
             }
-            for chunk in 0..<40 {
-                var result = try await branch.pumpAwaitingWriter(.pcm((0..<(16_384 * 2)).map {
-                    sin(Float(chunk * 32_768 + $0) * 0.003125) * 0.25
-                }))
-                if result.waitingForWriter {
-                    XCTAssertTrue(branch.isWriterWindowRolloverPending)
-                    let pending = branch.pendingEmissionIdentity
-                    let resumed = try await branch.retryPendingAcrossWriterWindowAwaitingWriter()
-                    result = try XCTUnwrap(resumed)
-                    XCTAssertFalse(result.waitingForWriter)
-                    XCTAssertNotNil(pending)
-                }
-                XCTAssertNil(branch.pendingMemoryUsage)
-                XCTAssertFalse(result.waitingForEncoderBudget)
-            }
-            let admission = try XCTUnwrap(branch.writerAdmissionSnapshot)
-            XCTAssertEqual(admission.maximumBoundarySeconds, 6)
-            XCTAssertLessThanOrEqual(admission.nextBoundaryPacketBytes, admission.reservedPacketBytes)
-            XCTAssertEqual(branch.physicalWriterWindowCount, forceRollover ? 3 : 1)
-            XCTAssertEqual(probe.snapshot.nativeWriterCount, forceRollover ? 3 : 1,
-                "count actual AVAssetWriter allocations, including every successor")
-            XCTAssertTrue(probe.snapshot.isComplete)
-            XCTAssertGreaterThanOrEqual(branch.lastCommittedEmissionIdentity?.ordinal ?? 0, 600)
-            func retirementSnapshot(_ stage: String, usage: SegmentedFMP4WriterUsage,
-                                    native: HLSWriterAcceptanceSnapshot) -> String {
-                // Scalar snapshots only; do not keep sample/branch history or
-                // equate native cancellation with the last backing-release edge.
-                return "HLS_AAC_ROLLOVER_RETIREMENT stage=\(stage) forceRollover=\(forceRollover) "
-                    + "windows=\(branch.physicalWriterWindowCount) "
-                    + "branchLive=\(usage.liveInputCount) branchBytes=\(usage.liveInputBytes) "
-                    + "branchAccepted=\(usage.inputAllocationCount) branchReleased=\(usage.inputReleaseCount) "
-                    + "branchEvidence=\(usage.segmentEvidenceCount) branchCallbacks=\(usage.pendingCallbackCount) "
-                    + "probeLive=\(native.liveInputCount) probeBytes=\(native.liveInputBytes) "
-                    + "probeAccepted=\(native.acceptedInputCount) probeReleased=\(native.releasedInputCount) "
-                    + "pendingEmission=\(branch.pendingEmissionIdentity?.ordinal.description ?? "none") "
-                    + "pendingBytes=\(branch.pendingMemoryUsage?.actualFrozenAndMaterializedBytes ?? 0)"
-            }
-            let beforeCancellation = retirementSnapshot("before-cancel",
-                usage: branch.writerUsage, native: probe.snapshot)
-            await branch.cancelAndAwait()
-            let afterCancellationUsage = branch.writerUsage
-            let afterCancellationProbe = probe.snapshot
-            let afterCancellation = retirementSnapshot("after-cancel", usage: afterCancellationUsage,
-                native: afterCancellationProbe)
-            XCTAssertEqual(afterCancellationUsage.liveInputCount, 0,
-                "branch input admission must have no live native aliases; \(afterCancellation)")
-            XCTAssertEqual(afterCancellationProbe.liveInputCount, 0,
-                "native input aliases must retire across all physical AAC windows; \(afterCancellation)")
-            // Keep diagnostic I/O after the original immediate zero checks so
-            // logging cannot itself supply a backing-retirement scheduling gap.
-            print(beforeCancellation)
-            print(afterCancellation)
+            let retired = probe.snapshot
+            let diagnostic = "HLS_AAC_ROLLOVER_RETIREMENT stage=after-owner-release "
+                + "forceRollover=\(forceRollover) windows=\(retired.nativeWriterCount) "
+                + "liveOwners=\(factory.liveOwnerCount) probeLive=\(retired.liveInputCount) "
+                + "probeBytes=\(retired.liveInputBytes) probeAccepted=\(retired.acceptedInputCount) "
+                + "probeReleased=\(retired.releasedInputCount)"
+            XCTAssertNil(branch.value, "The branch must release its physical writer; \(diagnostic)")
+            XCTAssertEqual(factory.liveOwnerCount, 0,
+                "All physical writer wrappers and native adapters must retire; \(diagnostic)")
+            XCTAssertEqual(retired.liveInputCount, 0,
+                "Native input aliases must retire after all owners release; \(diagnostic)")
+            XCTAssertEqual(retired.liveInputBytes, 0, diagnostic)
+            XCTAssertEqual(retired.releasedInputCount, retired.acceptedInputCount, diagnostic)
+            XCTAssertEqual(retired.evidenceCount, 0, diagnostic)
+            XCTAssertEqual(retired.pendingCallbacks, 0, diagnostic)
+            print(diagnostic)
         }
+    }
+
+    private func exerciseProductionAACBranchRollover(
+        forceRollover: Bool,
+        probe: HLSWriterAcceptanceProbe,
+        factory: Task17ObservedNativeSystemWriterFactory
+    ) async throws -> TestWeakReference<AudioRenditionBranch> {
+        let calibration = try await AACPrimingCalibrator().calibrate(plan:
+            AACCalibrationPlan.build([try AACRenditionRequest(
+                layout: RenditionAudioLayout(labels: [.l, .r]),
+                capabilityVersion: "writer-six-second-pump-\(forceRollover)")]))
+        let encoder = try XCTUnwrap(calibration.encoders.first)
+        let format = try encoder.incrementalFormatDescription()
+        let start = CMTime(value: 10, timescale: 1)
+        let boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(epochStart: start,
+            videoMode: .passthrough, minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: 6, timescale: 1)))
+        // The video inspection adapter supplies real coordinator boundary
+        // transactions only. AAC encoding, native writing, callback evidence
+        // and publication-drain receipts below all use production owners.
+        let videoFactory = Task17FakeSystemWriterFactory()
+        let video = try Task17Fixtures.makeWriter(seed: 80_450, kind: .video,
+            sourceFormatHint: Task17Fixtures.realH264Sample().format, boundary: boundary,
+            factory: videoFactory, ownershipLimits: nil, releaseTransfersImmediately: true)
+        defer { _ = video.cancel() }
+        try video.start(at: start)
+        videoFactory.lastWriter?.setRetainsInputs(false)
+        let binding = Task17Fixtures.binding(seed: 80_451)
+        try boundary.registerAudioRendition(binding.renditionIdentity,
+            accessUnit: .aac(sampleRate: 48_000), firstEffectiveStart: start)
+        let limits: SegmentedFMP4WriterOwnershipLimits? = forceRollover
+            ? .init(rolloverThreshold: 1, hardCapacity: 640) : nil
+        let first = try Task17Fixtures.makeWriter(seed: 80_451, kind: .aac,
+            writerBinding: binding, sourceFormatHint: format, boundary: boundary,
+            factory: factory, ownershipLimits: limits, releaseTransfersImmediately: true,
+            acceptanceProbe: probe)
+        try first.start(at: start)
+        let holder = Task17BoundaryHolder(boundary)
+        let counter = Task17LockedUInt64(80_500)
+        let branch = AudioRenditionBranch(encoder: encoder, writer: first, coordinator: boundary,
+            writerWindowFactory: { continuation in
+                let membership = continuation.mediaMembershipSnapshot
+                print("HLS_AAC_ROLLOVER_RETIREMENT stage=continuation forceRollover=\(forceRollover) "
+                    + "membershipCount=\(membership.count) membershipPending=\(membership.pendingCount)")
+                XCTAssertEqual(membership.count, 1,
+                    "forceRollover=\(forceRollover): each six-second physical window contains only its own media leaf")
+                XCTAssertEqual(membership.pendingCount, 0,
+                    "forceRollover=\(forceRollover): continuation media membership must be drained")
+                let nextBinding = Task17Fixtures.rolloverBinding(from: binding,
+                    writerIdentity: .init(rawValue: counter.take()))
+                let next = try Task17Fixtures.makeWriter(seed: 80_451, kind: .aac,
+                    writerBinding: nextBinding, sourceFormatHint: format, boundary: holder.value,
+                    factory: factory, ownershipLimits: limits, continuation: continuation,
+                    releaseTransfersImmediately: true, acceptanceProbe: probe)
+                return next
+            })
+        // Supply genuine boundary transactions before audio reaches each of
+        // the two six-second cuts. The 16384-frame pumps straddle both cuts.
+        for frame in 0..<3 {
+            let fixture = try Task17Fixtures.realH264Sample(
+                presentationTimeStamp: CMTime(value: 10 + Int64(frame * 6), timescale: 1),
+                duration: CMTime(value: 6, timescale: 1))
+            let output = Task17Fixtures.videoOutput(fixture: fixture, generation: 1,
+                accessUnitID: UInt64(frame + 1), sequenceNumber: UInt64(frame + 1))
+            try video.appendVideo(output,
+                ticket: boundary.issueVideoAppend(for: output, writerBinding: video.binding))
+        }
+        for chunk in 0..<40 {
+            var result = try await branch.pumpAwaitingWriter(.pcm((0..<(16_384 * 2)).map {
+                sin(Float(chunk * 32_768 + $0) * 0.003125) * 0.25
+            }))
+            if result.waitingForWriter {
+                XCTAssertTrue(branch.isWriterWindowRolloverPending)
+                let pending = branch.pendingEmissionIdentity
+                let resumed = try await branch.retryPendingAcrossWriterWindowAwaitingWriter()
+                result = try XCTUnwrap(resumed)
+                XCTAssertFalse(result.waitingForWriter)
+                XCTAssertNotNil(pending)
+            }
+            XCTAssertNil(branch.pendingMemoryUsage)
+            XCTAssertFalse(result.waitingForEncoderBudget)
+        }
+        let admission = try XCTUnwrap(branch.writerAdmissionSnapshot)
+        XCTAssertEqual(admission.maximumBoundarySeconds, 6)
+        XCTAssertLessThanOrEqual(admission.nextBoundaryPacketBytes, admission.reservedPacketBytes)
+        XCTAssertEqual(branch.physicalWriterWindowCount, forceRollover ? 3 : 1)
+        XCTAssertEqual(probe.snapshot.nativeWriterCount, forceRollover ? 3 : 1,
+            "count actual AVAssetWriter allocations, including every successor")
+        XCTAssertTrue(probe.snapshot.isComplete)
+        XCTAssertGreaterThanOrEqual(branch.lastCommittedEmissionIdentity?.ordinal ?? 0, 600)
+        func retirementSnapshot(_ stage: String, usage: SegmentedFMP4WriterUsage,
+                                native: HLSWriterAcceptanceSnapshot) -> String {
+            // Scalar snapshots only; do not keep sample/branch history or
+            // equate native cancellation with the last backing-release edge.
+            return "HLS_AAC_ROLLOVER_RETIREMENT stage=\(stage) forceRollover=\(forceRollover) "
+                + "windows=\(branch.physicalWriterWindowCount) "
+                + "branchLive=\(usage.liveInputCount) branchBytes=\(usage.liveInputBytes) "
+                + "branchAccepted=\(usage.inputAllocationCount) branchReleased=\(usage.inputReleaseCount) "
+                + "branchEvidence=\(usage.segmentEvidenceCount) branchCallbacks=\(usage.pendingCallbackCount) "
+                + "probeLive=\(native.liveInputCount) probeBytes=\(native.liveInputBytes) "
+                + "probeAccepted=\(native.acceptedInputCount) probeReleased=\(native.releasedInputCount) "
+                + "pendingEmission=\(branch.pendingEmissionIdentity?.ordinal.description ?? "none") "
+                + "pendingBytes=\(branch.pendingMemoryUsage?.actualFrozenAndMaterializedBytes ?? 0)"
+        }
+        let beforeCancellation = retirementSnapshot("before-cancel",
+            usage: branch.writerUsage, native: probe.snapshot)
+        await branch.cancelAndAwait()
+        let afterCancellationUsage = branch.writerUsage
+        let afterCancellationProbe = probe.snapshot
+        let afterCancellation = retirementSnapshot("after-cancel", usage: afterCancellationUsage,
+            native: afterCancellationProbe)
+        // Joined cancellation retires transactions, not every native block alias.
+        // These owners still retain the writer/receiver graph at this observation.
+        XCTAssertEqual(afterCancellationUsage.segmentEvidenceCount, 0, afterCancellation)
+        XCTAssertEqual(afterCancellationUsage.pendingCallbackCount, 0, afterCancellation)
+        XCTAssertNil(branch.pendingEmissionIdentity, afterCancellation)
+        XCTAssertNil(branch.pendingMemoryUsage, afterCancellation)
+        XCTAssertEqual(afterCancellationProbe.acceptedInputCount,
+            afterCancellationProbe.releasedInputCount + UInt64(afterCancellationProbe.liveInputCount),
+            "Every remaining native alias must stay charged; \(afterCancellation)")
+        // Capture and assert the immediate snapshots before diagnostic I/O.
+        print(beforeCancellation)
+        print(afterCancellation)
+        return TestWeakReference(branch)
     }
 
     func testCancelledAACBatchKeepsSixteenNativeAliasesChargedUntilTheirLastUse() async throws {
@@ -8979,6 +9018,42 @@ private enum Task17SystemCall: Equatable {
     case markFinished
     case finish
     case cancel
+}
+
+/// Forwards unchanged to AVFoundation and records only weak ownership. The
+/// bounded three-window scenario must release both its wrappers and adapters.
+private final class Task17ObservedNativeSystemWriterFactory: SegmentedFMP4SystemWriterFactory, @unchecked Sendable {
+    private final class Owners {
+        weak var adapter: (any SegmentedFMP4SystemWriting)?
+        weak var writer: (any SegmentedFMP4SystemCallbackSink)?
+        init(adapter: any SegmentedFMP4SystemWriting, writer: any SegmentedFMP4SystemCallbackSink) {
+            self.adapter = adapter; self.writer = writer
+        }
+    }
+    private let native: AVAssetSegmentedFMP4SystemWriterFactory
+    private let lock = NSLock()
+    private var owners: [Owners] = []
+
+    init(acceptanceProbe: HLSWriterAcceptanceProbe) {
+        native = AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe)
+    }
+
+    var liveOwnerCount: Int {
+        lock.withLock {
+            owners.reduce(0) { $0 + ($1.adapter == nil ? 0 : 1) + ($1.writer == nil ? 0 : 1) }
+        }
+    }
+
+    func makeWriter(
+        configuration: SegmentedFMP4SystemConfiguration,
+        sourceFormatHint: CMFormatDescription,
+        callbackSink: any SegmentedFMP4SystemCallbackSink
+    ) throws -> any SegmentedFMP4SystemWriting {
+        let writer = try native.makeWriter(configuration: configuration,
+            sourceFormatHint: sourceFormatHint, callbackSink: callbackSink)
+        lock.withLock { owners.append(Owners(adapter: writer, writer: callbackSink)) }
+        return writer
+    }
 }
 
 private final class Task17WeakCallbackSink: @unchecked Sendable {

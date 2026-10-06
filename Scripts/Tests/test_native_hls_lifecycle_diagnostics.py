@@ -15,6 +15,44 @@ BACKEND = ROOT / 'Sources/VPlayerPlayback/Pipeline/HLSAVPlayerPlaybackBackend.sw
 
 
 class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
+    def test_smoke_wait_failures_identify_the_route_and_actual_wait_phase(self):
+        source = SMOKE.read_text()
+        self.assertEqual(set(re.findall(r'phase: "([a-z-]+)"', source)), {
+            'early-eof-startup', 'early-eof-recovery', 'full-eof-startup',
+            'full-eof-completion', 'selected-format-startup', 'selected-format-progress',
+        })
+        helper = source.split('private func until(', 1)[1].split('private func withController(', 1)[0]
+        self.assertIn('file: StaticString = #filePath, line: UInt = #line', helper)
+        self.assertNotIn('String(describing: registry.outputResourceContextSnapshot())', helper)
+        self.assertIn('catch is CancellationError', helper)
+        self.assertIn('NativeSmokeFailureReport.message(', helper)
+        self.assertIn('testNativeSmokeFailureReportSurvivesXCResultFieldLimit', source)
+
+    def test_full_eof_failure_preserves_original_and_successor_identity_without_new_loads(self):
+        source = SMOKE.read_text()
+        self.assertIn('private func naturalEOFEvidence(', source)
+        helper = source.split('private func naturalEOFEvidence(', 1)[1].split('private func ', 1)[0]
+        for field in ['original-output=', 'original-activation=', 'same-coordinator=',
+                      'same-physical=', 'original-current=', 'driver-terminal=']:
+            self.assertIn(field, helper)
+        self.assertNotIn('await ', helper)
+        self.assertNotIn('revalidateCurrentAuthority', helper)
+        self.assertNotIn('Task {', helper)
+        self.assertNotIn('addObserver', helper)
+
+    def test_original_failure_cause_is_captured_before_recovery_and_survives_retirement(self):
+        source = COORDINATOR.read_text()
+        self.assertTrue('private(set) var firstFailureDiagnosticForTesting: String?' in source)
+        helper = source.split('private func fail(', 1)[1].split('private func observe(', 1)[0]
+        self.assertLess(helper.index('guard !retired, !failureDelivered'), helper.index('firstFailureDiagnosticForTesting ='))
+        self.assertLess(helper.index('firstFailureDiagnosticForTesting ='), helper.index('failureDelivered = true'))
+        self.assertIn('.utf8.prefix(384)', helper)
+        self.assertIn('32...126', helper)
+        self.assertEqual(source.count('firstFailureDiagnosticForTesting ='), 1)
+        self.assertIn('original-failure={', SMOKE.read_text())
+        lifecycle = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSAdapterLifecycleTests.swift').read_text()
+        self.assertIn('testFirstFailureDiagnosticSurvivesRecoveryAndLateOldEvents', lifecycle)
+
     def test_each_recovery_origin_is_identified_without_changing_failure_reason(self):
         source = COORDINATOR.read_text()
         for reason, stage in [

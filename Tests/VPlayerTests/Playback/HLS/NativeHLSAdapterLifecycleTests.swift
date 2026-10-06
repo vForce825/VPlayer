@@ -305,6 +305,31 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testFirstFailureDiagnosticSurvivesRecoveryAndLateOldEvents() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            let original = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+            XCTAssertNil(original.firstFailureDiagnosticForTesting)
+            fixture.inspector.rejectFormat = true
+            await original.observeSelectedFormatChangeForTesting()
+            let first = try XCTUnwrap(original.firstFailureDiagnosticForTesting)
+            let expectedError = HLSSourceError.incompleteEvidence
+            XCTAssertEqual(first, "stage=selection.refresh reason=unsupportedMedia " +
+                "detail={error-type=\(String(reflecting: type(of: expectedError))) error-code=\((expectedError as NSError).code)}")
+            XCTAssertLessThanOrEqual(first.utf8.count, 384)
+            XCTAssertTrue(first.utf8.allSatisfy { (32...126).contains($0) })
+            fixture.inspector.rejectFormat = false
+            try await fixture.until {
+                fixture.isPlaying && backend.nativeCoordinatorForTesting !== original && fixture.driver.plays == 2
+            }
+            XCTAssertNil(backend.nativeCoordinatorForTesting?.firstFailureDiagnosticForTesting)
+            XCTAssertEqual(original.firstFailureDiagnosticForTesting, first, "Replacement cannot erase the retired original's cause")
+            await original.observeSelectedFormatChangeForTesting()
+            XCTAssertEqual(original.firstFailureDiagnosticForTesting, first, "A late old event cannot replace the first cause")
+        }
+    }
+
     func testRecoveryReadyFailureHasNoSuccessorActivationAndTeardownJoins() async throws {
         // Keep the startup budget frozen: only the actual reprepare failure may
         // own terminal cleanup, not the original sixty-second deadline.
