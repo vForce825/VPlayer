@@ -15,10 +15,12 @@ final class NativeHLSObservation: @unchecked Sendable {
     private var notifications: [NSObjectProtocol] = []
     private let handler: @MainActor @Sendable (Bool) async -> Void
     private let retention: HLSApplicationLifetimeCharge
+    private let selectionRevision: NativeHLSSelectionRevision
 
     @MainActor init(item: AVPlayerItem, driver: SystemAVPlayerDriver,
                     handler: @escaping @MainActor @Sendable (Bool) async -> Void) throws {
         retention = try HLSApplicationLifetimeCharge(bytes: 16 * 1_024)
+        selectionRevision = driver.nativeSelectionRevision
         self.handler = handler
         // Shared by all registered SDK closures. Driver retirement joins its last
         // physical alias after KVO/notification removal and this worker's return.
@@ -53,10 +55,14 @@ final class NativeHLSObservation: @unchecked Sendable {
         }
         notifications.append(NotificationCenter.default.addObserver(forName: AVPlayer.eligibleForHDRPlaybackDidChangeNotification,
             object: nil, queue: nil) { [weak self] _ in callback.assertRegistered(); self?.offer(failed: false) })
+        selectionRevision.installEndRefresh(owner: ObjectIdentifier(self)) { [weak self] in self?.offer(failed: false) }
     }
     func offer(failed: Bool) {
         lock.withLock {
             guard !closed else { return }
+            // Revoke cached timing synchronously, before the joined worker can
+            // suspend in SDK loads. Even same-object format changes need a new seal.
+            selectionRevision.invalidate()
             pending = true; self.failed = self.failed || failed
             guard work == nil else { return }
             work = Task { @MainActor [self] in
@@ -73,6 +79,7 @@ final class NativeHLSObservation: @unchecked Sendable {
     }
     @MainActor func close() async {
         let current = lock.withLock { () -> Task<Void, Never>? in closed = true; pending = false; return work }
+        selectionRevision.clearEndRefresh(owner: ObjectIdentifier(self))
         for observation in observations { observation.invalidate() }
         observations.removeAll()
         for notification in notifications { NotificationCenter.default.removeObserver(notification) }

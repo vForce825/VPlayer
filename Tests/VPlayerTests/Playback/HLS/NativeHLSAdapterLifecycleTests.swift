@@ -10,6 +10,91 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testPrivateEOSIngressRevokesBeforeRefreshAndRejectsStaleEndpointTokens() throws {
+        let fence = NativeHLSSelectionRevision(), counter = NativeTimingWakeCounter()
+        let owner = NSObject(), replacement = NSObject(), first = UUID(), second = UUID()
+        fence.installEndRefresh(owner: ObjectIdentifier(owner)) { counter.record() }
+        fence.installEndpoint(token: first)
+        let initial = try XCTUnwrap(fence.current)
+        fence.receiveNativeEnd(token: second)
+        XCTAssertTrue(fence.matches(initial)); XCTAssertEqual(counter.count, 0)
+        fence.receiveNativeEnd(token: first)
+        XCTAssertFalse(fence.matches(initial)); XCTAssertEqual(counter.count, 1)
+        fence.installEndpoint(token: second)
+        let successor = try XCTUnwrap(fence.current)
+        fence.receiveNativeEnd(token: first)
+        XCTAssertTrue(fence.matches(successor)); XCTAssertEqual(counter.count, 1)
+        fence.installEndRefresh(owner: ObjectIdentifier(replacement)) { counter.record() }
+        fence.clearEndRefresh(owner: ObjectIdentifier(owner))
+        fence.receiveNativeEnd(token: second)
+        XCTAssertEqual(counter.count, 2, "Retiring an old observer cannot clear the successor wake")
+        fence.clearEndRefresh(owner: ObjectIdentifier(replacement))
+        let beforeMissingRefresh = try XCTUnwrap(fence.current)
+        fence.receiveNativeEnd(token: second)
+        XCTAssertFalse(fence.matches(beforeMissingRefresh), "Missing refresh never keeps a pre-EOS receipt current")
+        XCTAssertEqual(counter.count, 2)
+        fence.clearEndpoint(token: second)
+        let retired = try XCTUnwrap(fence.current)
+        fence.receiveNativeEnd(token: second)
+        XCTAssertTrue(fence.matches(retired))
+    }
+
+    func testSelectionRevisionInvalidatesSameObjectTimingBeforeAsyncRefresh() throws {
+        let fence = NativeHLSSelectionRevision()
+        let original = try XCTUnwrap(fence.current)
+        XCTAssertTrue(fence.matches(original))
+        fence.invalidate()
+        XCTAssertFalse(fence.matches(original), "Object identity alone cannot keep old timing evidence current")
+        let renewed = try XCTUnwrap(fence.current)
+        XCTAssertNotEqual(renewed, original)
+        XCTAssertTrue(fence.matches(renewed))
+        fence.invalidate()
+        XCTAssertFalse(fence.matches(renewed))
+    }
+
+    func testQuantumRequiresSDKMinimumAndAllAdmittedVideoPeriodsToAgree() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let source = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+            let video = try XCTUnwrap(source.facts.media.first?.video)
+            let minimum = CMTime(value: 1, timescale: 25)
+            XCTAssertEqual(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: minimum,
+                video: video, expected: source.facts), ExactMediaTime(value: 1, timescale: 25))
+            for value in [CMTime.invalid, .indefinite, .zero, CMTime(value: 1, timescale: 30),
+                          CMTime(value: 1, timescale: 25, flags: .valid, epoch: 1)] {
+                XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: value,
+                    video: video, expected: source.facts))
+            }
+            for rate in [MediaRational(num: 30, den: 1), nil] {
+                let alternate = HLSMediaFacts(url: source.facts.media[0].url, container: .mpegTS,
+                    video: NativeFixtureProbe.video(rate: rate), audio: [], hasUnsupportedTracks: false)
+                let mixed = HLSCompatibilityFacts(source: source.source, media: source.facts.media + [alternate], complete: true, inspectedBytes: 188)
+                XCTAssertNil(SystemNativeHLSAssetInspector.validatedPresentationQuantum(minimumFrameDuration: minimum,
+                    video: video, expected: mixed))
+            }
+        }
+    }
+
+    func testNativeFinalQuantumAcceptsObservedClocksAndRejectsOutsideOrMissingEvidence() throws {
+        let end = ExactMediaTime(value: 80, timescale: 1)
+        let quantum = ExactMediaTime(value: 1, timescale: 30)
+        let first = try end.subtracting(quantum)
+        // One real source timebase tick keeps the 1/30 boundary exact within
+        // CMTime's Int32 timescale; a nanosecond offset needs scale3,000,000,000.
+        let tick = ExactMediaTime(value: 1, timescale: 90_000)
+        for time in [end, ExactMediaTime(value: 79_996_292_617, timescale: 1_000_000_000),
+                     ExactMediaTime(value: 79_991_747_177, timescale: 1_000_000_000)] {
+            XCTAssertTrue(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum))
+        }
+        for time in [first, try first.subtracting(tick), ExactMediaTime(value: 1, timescale: 1), try end.adding(tick)] {
+            XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum))
+        }
+        XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(try end.subtracting(tick), expected: end, quantum: nil))
+        XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(end, expected: end, quantum: .init(value: 0, timescale: 1)))
+        XCTAssertFalse(AVPlayerPlaybackEndBoundary.constrained.containsFinalClock(try end.subtracting(tick), expected: end, quantum: quantum))
+        XCTAssertTrue(AVPlayerPlaybackEndBoundary.constrained.containsFinalClock(end, expected: end, quantum: nil))
+    }
+
     func testNativeFullSourceUsesObservationWithoutExplicitTrimMutation() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.inspector.duration = ExactMediaTime(value: 80, timescale: 1)
@@ -434,6 +519,13 @@ private final class NativeAdapterFixture {
     }
 }
 
+private final class NativeTimingWakeCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+    var count: Int { lock.withLock { value } }
+    func record() { lock.withLock { value += 1 } }
+}
+
 private final class NativeFixtureGate: @unchecked Sendable {
     private let lock = NSLock()
     private var open = false, enteredValue = false
@@ -520,11 +612,11 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     private var generatedValue = false
     var generated: Bool { get { lock.withLock { generatedValue } } set { lock.withLock { generatedValue = newValue } } }
     var gate: NativeFixtureGate? { get { lock.withLock { gateValue } } set { lock.withLock { gateValue = newValue } } }
-    static func video(width: Int32 = 1_920) -> HLSVideoFacts {
+    static func video(width: Int32 = 1_920, rate: MediaRational? = MediaRational(num: 25, den: 1)) -> HLSVideoFacts {
         .init(codec: .h264, profile: 100, scan: .progressive, parameterSetsValidated: true,
             configurationFingerprint: Data([UInt8(width == 1_920 ? 1 : 2)]), width: width, height: width == 1_920 ? 1_080 : 720,
             chromaFormat: 1, bitDepth: 8, level: 40, parserProgressiveFrames: 2, compatibilityFlags: 0,
-            tier: .main, frameRate: MediaRational(num: 25, den: 1), videoRange: .sdr,
+            tier: .main, frameRate: rate, videoRange: .sdr,
             colorPrimaries: .bt709, colorTransfer: .bt709, colorMatrix: .bt709, sampleEntry: "avc1")
     }
     static let audio = HLSSourceAudioFacts(codec: .aac, profile: 1, sampleRate: 48_000, channelCount: 2,
@@ -619,7 +711,7 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     func replaceCurrentItemWithNil(item: AVPlayerItemInstanceIdentity) { if currentItemIdentity == item { currentItemIdentity = nil; physical = nil } }
     func removeObservers(item: AVPlayerItemInstanceIdentity) {}
     func constrainPlaybackEnd(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws { explicitEndMutations += 1 }
-    func observeNaturalPlaybackEnd(expected time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws {
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime, presentationQuantum: NativeHLSFinalPresentationQuantum?, item: AVPlayerItemInstanceIdentity) throws {
         guard currentItemIdentity == item, time.value > 0 else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
         naturalEndObservations += 1
     }

@@ -8,6 +8,77 @@ import CoreMedia
 import CryptoKit
 import Foundation
 
+final class NativeHLSSelectionRevision: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+    private var exhausted = false
+    private var endRefresh: (owner: ObjectIdentifier, wake: @Sendable () -> Void)?
+    private var endpointToken: UUID?
+    var current: UInt64? { lock.withLock { exhausted ? nil : value } }
+    func invalidate() {
+        lock.withLock { advanceLocked() }
+    }
+    private func advanceLocked() {
+        guard !exhausted else { return }
+        if value == .max { exhausted = true } else { value += 1 }
+    }
+    func installEndRefresh(owner: ObjectIdentifier, wake: @escaping @Sendable () -> Void) {
+        lock.withLock { endRefresh = (owner, wake) }
+    }
+    func clearEndRefresh(owner: ObjectIdentifier) {
+        lock.withLock { if endRefresh?.owner == owner { endRefresh = nil } }
+    }
+    func installEndpoint(token: UUID) { lock.withLock { endpointToken = token } }
+    func clearEndpoint(token: UUID) { lock.withLock { if endpointToken == token { endpointToken = nil } } }
+    func receiveNativeEnd(token: UUID) {
+        let wake = lock.withLock { () -> (@Sendable () -> Void)? in
+            guard endpointToken == token else { return nil }
+            advanceLocked(); return endRefresh?.wake
+        }
+        // Never hold the revision lock while offering work to the observation owner.
+        wake?()
+    }
+    func matches(_ revision: UInt64) -> Bool { lock.withLock { !exhausted && value == revision } }
+}
+
+/// Selected SDK timing evidence, not evidence that every final sample rendered.
+/// Its allocation and aliases remain covered by the selected snapshot's charge.
+final class NativeHLSFinalPresentationQuantum: @unchecked Sendable {
+    let period: ExactMediaTime
+    let duration: ExactMediaTime
+    private let item: AVPlayerItemInstanceIdentity
+    private let physicalItem: ObjectIdentifier, videoTrack: ObjectIdentifier, videoAsset: ObjectIdentifier
+    private let source: HLSOwnedSourcePlan
+    private let video: HLSVideoFacts
+    private let revision: UInt64
+    private let selectionRevision: NativeHLSSelectionRevision
+    private let retention: HLSApplicationLifetimeCharge
+    fileprivate init(period: ExactMediaTime, duration: ExactMediaTime, item: AVPlayerItemInstanceIdentity,
+        physicalItem: ObjectIdentifier, videoTrack: ObjectIdentifier, videoAsset: ObjectIdentifier,
+        source: HLSOwnedSourcePlan, video: HLSVideoFacts, revision: UInt64,
+        selectionRevision: NativeHLSSelectionRevision, retention: HLSApplicationLifetimeCharge) {
+        self.period = period; self.duration = duration; self.item = item; self.physicalItem = physicalItem
+        self.videoTrack = videoTrack; self.videoAsset = videoAsset; self.source = source; self.retention = retention
+        self.video = video; self.revision = revision; self.selectionRevision = selectionRevision
+    }
+    @MainActor func isCurrent(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
+        selectionRevision.matches(revision) && hasCurrentIdentity(item: identity, physical: physical)
+    }
+    @MainActor func hasCurrentIdentity(item identity: AVPlayerItemInstanceIdentity, physical: AVPlayerItem) -> Bool {
+        guard identity == item, ObjectIdentifier(physical) == physicalItem, source.sourceIsCurrent else { return false }
+        let enabled = physical.tracks.filter(\.isEnabled)
+        guard enabled.count <= 16 else { return false }
+        let videos = enabled.filter { $0.assetTrack?.mediaType == .video }
+        guard videos.count == 1, let track = videos.first, let asset = track.assetTrack else { return false }
+        return ObjectIdentifier(track) == videoTrack && ObjectIdentifier(asset) == videoAsset
+    }
+    func hasSameBinding(as other: NativeHLSFinalPresentationQuantum) -> Bool {
+        item == other.item && physicalItem == other.physicalItem && videoTrack == other.videoTrack &&
+            videoAsset == other.videoAsset && source === other.source && selectionRevision === other.selectionRevision &&
+            video == other.video && period == other.period && duration == other.duration
+    }
+}
+
 struct NativeHLSSelectionSnapshot: Sendable {
     let item: AVPlayerItemInstanceIdentity
     let physicalItem: ObjectIdentifier
@@ -17,14 +88,17 @@ struct NativeHLSSelectionSnapshot: Sendable {
     let audioConfigurationDigest: Data?
     let observedFrameRate: Double?
     let duration: ExactMediaTime?
+    let finalPresentationQuantum: NativeHLSFinalPresentationQuantum?
     private let sourceOwner: HLSOwnedSourcePlan
     private let retention: HLSApplicationLifetimeCharge
     init(item: AVPlayerItemInstanceIdentity, physicalItem: ObjectIdentifier, audioSelection: ObjectIdentifier?,
          video: HLSVideoFacts?, audio: HLSSourceAudioFacts?, audioConfigurationDigest: Data?, observedFrameRate: Double?,
-         sourceOwner: HLSOwnedSourcePlan, retention: HLSApplicationLifetimeCharge, duration: ExactMediaTime? = nil) {
+         sourceOwner: HLSOwnedSourcePlan, retention: HLSApplicationLifetimeCharge, duration: ExactMediaTime? = nil,
+         finalPresentationQuantum: NativeHLSFinalPresentationQuantum? = nil) {
         self.item = item; self.physicalItem = physicalItem; self.audioSelection = audioSelection
         self.video = video; self.audio = audio; self.audioConfigurationDigest = audioConfigurationDigest
         self.observedFrameRate = observedFrameRate; self.duration = duration; self.sourceOwner = sourceOwner; self.retention = retention
+        self.finalPresentationQuantum = finalPresentationQuantum
     }
     var information: PlaybackMediaInformation? {
         guard let video, video.width > 0, video.height > 0, video.scan == .progressive else { return nil }
@@ -57,6 +131,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let callback = try driver.reserveSDKCallbackLease(.logFetch)
         defer { withExtendedLifetime((temporary, callback)) {} }
         guard source.sourceIsCurrent, let item = driver.nativeCurrentItem(identity) else { throw HLSSourceError.staleResolution }
+        guard let revision = driver.nativeSelectionRevision.current else { throw HLSSourceError.capacity }
         // Capture ALL identities before the first asynchronous SDK load. Selecting
         // new identities after loading old formats would manufacture a mixed seal.
         let selected = item.currentMediaSelection
@@ -70,6 +145,7 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         func validate() throws {
             try Task.checkCancellation()
             guard source.sourceIsCurrent, driver.nativeCurrentItem(identity) === item else { throw HLSSourceError.staleResolution }
+            guard driver.nativeSelectionRevision.matches(revision) else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
             guard item.presentationSize == presentationSize else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
             let current = item.tracks.filter(\.isEnabled)
             guard current.map(ObjectIdentifier.init) == trackIDs,
@@ -87,7 +163,8 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         let expectsAudio = selectedAudio != nil || source.facts.media.contains { !$0.audio.isEmpty }
         let expectsVideo = source.facts.media.contains { $0.video != nil }
         var video: HLSVideoFacts?, audio: HLSSourceAudioFacts?, audioDigest: Data?, observedRate: Double?
-        for asset in assets {
+        var videoQuantum: (period: ExactMediaTime, track: ObjectIdentifier, asset: ObjectIdentifier)?
+        for (index, asset) in assets.enumerated() {
             // A nil SDK track can be non-audio text. The final expected-audio
             // and expected-video guards still require real selected format proof.
             guard let asset else { continue }
@@ -107,6 +184,12 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
                         guard abs(Double(rate) - Double(expected.num) / Double(expected.den)) <= 0.02 else { throw HLSSourceError.unsupportedMedia }
                     }
                     observedRate = Double(rate)
+                }
+                let minimum = try? await asset.load(.minFrameDuration)
+                try validate()
+                if let minimum, let period = Self.validatedPresentationQuantum(minimumFrameDuration: minimum,
+                    video: actual, expected: source.facts) {
+                    videoQuantum = (period, trackIDs[index], ObjectIdentifier(asset))
                 }
                 video = actual
             } else {
@@ -134,9 +217,30 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
                 if let value = try? ExactMediaTime(time), value.value > 0 { duration = value }
             }
         }
+        let quantum: NativeHLSFinalPresentationQuantum?
+        if let duration, let videoQuantum, let video {
+            quantum = .init(period: videoQuantum.period, duration: duration, item: identity,
+                physicalItem: ObjectIdentifier(item), videoTrack: videoQuantum.track, videoAsset: videoQuantum.asset,
+                source: source, video: video, revision: revision,
+                selectionRevision: driver.nativeSelectionRevision, retention: retained)
+        } else { quantum = nil }
         return .init(item: identity, physicalItem: ObjectIdentifier(item), audioSelection: selectedAudio.map(ObjectIdentifier.init),
             video: video, audio: audio, audioConfigurationDigest: audioDigest, observedFrameRate: observedRate,
-            sourceOwner: source, retention: retained, duration: duration)
+            sourceOwner: source, retention: retained, duration: duration, finalPresentationQuantum: quantum)
+    }
+
+    static func validatedPresentationQuantum(minimumFrameDuration: CMTime, video: HLSVideoFacts,
+        expected: HLSCompatibilityFacts) -> ExactMediaTime? {
+        guard expected.complete, video.parameterSetsValidated, video.scan == .progressive,
+              let rate = video.frameRate, rate.num > 0, rate.den > 0,
+              let minimum = try? ExactMediaTime(minimumFrameDuration), minimum.value > 0 else { return nil }
+        let period = ExactMediaTime(value: Int64(rate.den), timescale: rate.num)
+        guard minimum == period else { return nil }
+        let variants = expected.media.compactMap(\.video)
+        guard !variants.isEmpty, variants.allSatisfy({ video in
+            video.parameterSetsValidated && video.scan == .progressive && video.frameRate == rate
+        }) else { return nil }
+        return period
     }
 
     static func videoFacts(_ format: CMFormatDescription, expected: HLSCompatibilityFacts) throws -> HLSVideoFacts {

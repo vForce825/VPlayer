@@ -96,6 +96,9 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
         selected = snapshot
         if alreadyArmed {
+            if snapshot.duration != nil {
+                try driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: item)
+            }
             metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
             await metadataChanged(invocation.activation)
             try validateActive(invocation)
@@ -133,7 +136,8 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             try driver.installNaturalEndTerminalHandler(item: item) { [weak self] capability, item in self?.naturalEnd(capability, item: item) }
             // Full native/proxy sources are not a generated trimmed interval.
             // Observe their SDK endpoint without rewriting the playback range.
-            try driver.observeNaturalPlaybackEnd(expected: endpoint, item: item)
+            try driver.observeNaturalPlaybackEnd(expected: endpoint,
+                presentationQuantum: afterPreroll.finalPresentationQuantum, item: item)
         }
         diagnose("activate.endpoint", authorityValidated: true)
         try await driver.play(invocation: invocation, item: item)
@@ -180,6 +184,9 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             try validateActive(invocation)
             if let selected { diagnoseTransition(snapshot, from: selected, stage: "refresh.selected") }
             if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
+            if selected?.duration != nil {
+                try driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: item)
+            }
             selected = snapshot
             metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
             await metadataChanged(invocation.activation)

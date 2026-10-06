@@ -14,7 +14,7 @@ class NativeNaturalEndContract(unittest.TestCase):
         native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
         generated = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerItemCoordinator.swift').read_text()
         driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
-        self.assertIn('try driver.observeNaturalPlaybackEnd(expected: endpoint, item: item)', native)
+        self.assertIn('try driver.observeNaturalPlaybackEnd(expected: endpoint,', native)
         self.assertNotIn('driver.constrainPlaybackEnd(', native)
         self.assertIn('try driver.constrainPlaybackEnd(to: itemEnd, item:', generated)
         self.assertIn('func observeNaturalPlaybackEnd(', driver)
@@ -27,7 +27,7 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertGreaterEqual(source.count('endpointBoundary.observedEndpoint('), 3)
         self.assertIn('prior.firstCurrentTime == stable', source)
         self.assertIn('constraint == prior.expectedEndpoint', source)
-        self.assertIn('CMTimeCompare(stable.cmTime, prior.expectedEndpoint.cmTime) >= 0', source)
+        self.assertIn('endpointBoundary.containsFinalClock(stable, expected: prior.expectedEndpoint', source)
         self.assertIn('naturalEndAuthority?.revalidateCurrentAuthority() == true', source)
         self.assertIn('endpointBoundary = .constrained', source)
 
@@ -61,6 +61,41 @@ class NativeNaturalEndContract(unittest.TestCase):
         source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
         self.assertEqual(source.count('withController { [self] controller, registry, factory in'), 2)
         self.assertIn('withController(deadline: deadline) { [self] controller, registry, factory in', source)
+
+    def test_native_quantum_is_selected_sdk_evidence_not_a_global_epsilon(self):
+        inspector = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSAssetInspector.swift').read_text()
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertIn('asset.load(.minFrameDuration)', inspector)
+        self.assertIn('final class NativeHLSFinalPresentationQuantum', inspector)
+        self.assertIn('fileprivate init(', inspector)
+        self.assertIn('ObjectIdentifier(physical) == physicalItem', inspector)
+        self.assertIn('ObjectIdentifier(track) == videoTrack', inspector)
+        self.assertIn('ObjectIdentifier(asset) == videoAsset', inspector)
+        self.assertIn('minimum == period', inspector)
+        self.assertIn('video.frameRate == rate', inspector)
+        self.assertIn('endpointBoundary.containsFinalClock(', driver)
+        self.assertIn('nativeEndQuantum?.isCurrent', driver)
+        self.assertIn('quantum.hasSameBinding(as: prior)', driver)
+        self.assertIn('driver.nativeSelectionRevision.matches(revision)', inspector)
+        observer = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSObservation.swift').read_text()
+        self.assertLess(observer.index('selectionRevision.invalidate()'), observer.index('pending = true;'))
+        second_read = driver.split('private func completeNaturalEndRead(', 1)[1].split('private func cancelNaturalEndDeadline(', 1)[0]
+        self.assertIn('nativeEndQuantum?.isCurrent', second_read)
+        self.assertIn('selectionRevision.installEndRefresh(owner: ObjectIdentifier(self))', observer)
+        self.assertIn('selectionRevision.clearEndRefresh(owner: ObjectIdentifier(self))', observer)
+        ingress = driver.split('let nativeRevision: NativeHLSSelectionRevision?', 1)[1].split('callbackLease.inspectRegistration()', 1)[0]
+        self.assertLess(ingress.index('nativeRevision?.receiveNativeEnd(token: observationIdentity)'), ingress.index('hub?.receiveEndpoint('))
+        self.assertIn('guard endpointToken == token else { return nil }', inspector)
+        native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
+        armed = native.split('if alreadyArmed {', 1)[1].split('let resuming', 1)[0]
+        self.assertIn('updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum', armed)
+        smoke = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        self.assertIn('return (progressed, failure?.0', smoke)
+        self.assertIn('let sdkFailed = signal.sdkFailed\n', smoke)
+        self.assertNotIn('signal.sdkFailed || item.error', smoke)
+        self.assertIn('XCTAssertNotEqual(result.errorDomain, "control.deadline")', smoke)
+        self.assertIn('testNativeTruncationControlKeepsFirstFailureOwnership', smoke)
+        self.assertIn('XCTAssertLessThan(CMTimeCompare(early.cmTime, finalQuantumStart.cmTime), 0)', smoke)
 
 
 if __name__ == '__main__':

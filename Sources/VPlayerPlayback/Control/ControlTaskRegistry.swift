@@ -1997,6 +1997,18 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
 
         private func installSuspendTimeout(_ context: OutputResourceContext, owner: PreparedCommand) {
+            var context = context
+            if let index = commands.firstIndex(where: { $0?.controlTaskTicket == context.suspend?.task }),
+               let record = commands[index], record.phase == .queued, record.payload == nil {
+                // Cleanup can spend the suspend deadline joining a canceled
+                // prepare. This exact stop never claimed an SDK call or Task;
+                // cancel it before handing physical stopping to retirement.
+                // Queued owned runners and in-flight calls still owe their own
+                // result and must never be settled by this timeout alone.
+                cancel(index)
+                context.suspendRequiresRetirement = true
+                context.suspendPreparedPreserved = false
+            }
             outputContext = context
             snapshot.output.revokeForSafety()
             installPreparedCommand(owner)

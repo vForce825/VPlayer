@@ -1766,6 +1766,62 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
+    func testProductionHLSStopDuringReplacementPrefixJoinsAfterUnclaimedSuspendTimeout() async throws {
+        let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { fixture.server?.stop() }
+        let gate = HLSMediaInformationPrefixGate(bypassingFirstWaits: 1)
+        defer { gate.release() }
+        let factory = AudioReviewProductionBackendFactory(factory: SystemPlaybackBackendFactory(
+            hlsGraphFactory: { source, invocation, ledger, failureSink in
+                let authority = try SystemHLSMediaGraphAuthority(
+                    lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
+                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                    graph: HLSMediaInformationGatedGraph(
+                        graph: SystemHLSDeliveryGraph(authority: authority), gate: gate))
+            }))
+        try await withProductionMediaController(factory: factory) { controller, registry, factory, _ in
+            // Release the prefix before this fixture's error path begins its own Stop.
+            defer { gate.release() }
+            await controller.play(.init(sourceProfileID: UUID(), channelID: "replacement-stop-deadline",
+                streamURL: fixture.source, title: "Replacement stop deadline"))
+            let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
+            let backend = try XCTUnwrap(factory.backend)
+            let authority = try XCTUnwrap(backend.backendPublicationReplacementAuthoritySlot.currentAuthority())
+            XCTAssertTrue(authority.requestReplacement())
+            let prefixDeadline = ContinuousClock.now.advanced(by: .seconds(15))
+            while !gate.isWaiting, ContinuousClock.now < prefixDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            XCTAssertTrue(gate.isWaiting, "Hold the actual successor prefix before AVPlayer installation")
+            let preparing = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let prepare = try XCTUnwrap(preparing.sourceTask)
+            XCTAssertFalse(preparing.prepared)
+            XCTAssertNil(preparing.interval)
+            let stop = Task { await controller.stop() }
+            let timeoutDeadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while registry.outputResourceContextSnapshot()?.suspendTimedOut != true,
+                  ContinuousClock.now < timeoutDeadline {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            let timedOut = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let suspend = try XCTUnwrap(timedOut.suspend)
+            XCTAssertTrue(timedOut.suspendTimedOut, "Keep the real one-second suspend deadline")
+            XCTAssertTrue(timedOut.suspendRequiresRetirement)
+            XCTAssertFalse(timedOut.suspendConfirmed)
+            XCTAssertFalse(timedOut.retirementConfirmed)
+            XCTAssertEqual(registry.phase(of: suspend.task), .terminal(.canceled))
+            XCTAssertEqual(registry.phase(of: prepare), .cancelRequested,
+                "Timeout must retain the physically blocked successor prepare")
+            XCTAssertNotEqual(suspend.lifecycle, old)
+            XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
+            gate.release()
+            await stop.value
+            await registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(registry.outputResourceContextSnapshot(),
+                "The successor's real prepare-failure retirement must finish cleanup after its physical join")
+        }
+    }
+
     func testRealHLSReplacementSnapshotsAreScopedToProducingOutputLifecycle() async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
         defer { fixture.server?.stop() }
@@ -2520,11 +2576,17 @@ private final class HLSMediaInformationPrefixGate: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
     private var released = false
+    private var remainingBypasses: Int
+    init(bypassingFirstWaits: Int = 0) { remainingBypasses = bypassingFirstWaits }
     var isWaiting: Bool { lock.withLock { continuation != nil } }
     func wait() async {
         await withCheckedContinuation { continuation in
             let resume = lock.withLock {
                 guard !released else { return true }
+                if remainingBypasses > 0 {
+                    remainingBypasses -= 1
+                    return true
+                }
                 self.continuation = continuation
                 return false
             }

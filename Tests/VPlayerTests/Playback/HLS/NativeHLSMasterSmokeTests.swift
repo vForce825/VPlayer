@@ -35,6 +35,27 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
     }
 
+    func testNativeTruncatedHTTPResponseFailsWithoutNormalEndNotification() async throws {
+        let bytes = try fixtureBytes()
+        let result = try await runEndpointControl(.defaultEnd, bytes: bytes, disconnectAfterBodyBytes: min(32 * 188, bytes.count / 2))
+        XCTAssertTrue(result.sdkFailed, "A real SDK transport failure is required; a test timeout is not evidence")
+        XCTAssertNotEqual(result.errorDomain, "control.deadline")
+        XCTAssertFalse(result.endedNormally, "The failed transport must not be mislabeled as normal EOF")
+    }
+
+    func testNativeTruncationControlKeepsFirstFailureOwnership() {
+        let timeoutFirst = NativeEndpointControlSignal()
+        timeoutFirst.fail(domain: "control.deadline", code: 0)
+        timeoutFirst.fail(domain: "AVFoundationErrorDomain", code: -11800, sdk: true)
+        XCTAssertFalse(timeoutFirst.sdkFailed)
+        XCTAssertEqual(timeoutFirst.snapshot?.0, "control.deadline")
+        let sdkFirst = NativeEndpointControlSignal()
+        sdkFirst.fail(domain: "CoreMediaErrorDomain", code: -12865, sdk: true)
+        sdkFirst.fail(domain: "control.deadline", code: 0)
+        XCTAssertTrue(sdkFirst.sdkFailed)
+        XCTAssertEqual(sdkFirst.snapshot?.0, "CoreMediaErrorDomain")
+    }
+
     func testNativeEOFDeadlineRejectsExpiredAdmissionAndJoinsHeldBody() async throws {
         var expiredBodyEntered = false
         do {
@@ -80,7 +101,25 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
                 let player = try XCTUnwrap(backend.presentation?.avPlayerForNativeSmoke)
                 let physical = try XCTUnwrap(player.currentItem)
+                let driver = try XCTUnwrap(backend.nativeSystemDriverForTesting)
+                let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+                let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
+                XCTAssertTrue(quantum.isCurrent(item: coordinator.item, physical: physical))
+                let videoTrack = try XCTUnwrap(physical.tracks.first { $0.isEnabled && $0.assetTrack?.mediaType == .video })
+                videoTrack.isEnabled = false
+                XCTAssertFalse(quantum.isCurrent(item: coordinator.item, physical: physical))
+                videoTrack.isEnabled = true
+                XCTAssertTrue(quantum.hasCurrentIdentity(item: coordinator.item, physical: physical))
+                driver.nativeSelectionRevision.invalidate()
+                XCTAssertFalse(quantum.isCurrent(item: coordinator.item, physical: physical),
+                    "A revision change revokes timing even when every SDK object is unchanged")
                 XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                player.pause()
+                XCTAssertEqual(player.rate, 0)
+                XCTAssertEqual(player.timeControlStatus, .paused)
+                let early = try ExactMediaTime(player.currentTime())
+                let finalQuantumStart = try quantum.duration.subtracting(quantum.period)
+                XCTAssertLessThan(CMTimeCompare(early.cmTime, finalQuantumStart.cmTime), 0)
                 NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
                 try await until(registry: registry) {
                     guard case .playing = registry.playbackStateSnapshot() else { return false }
@@ -91,6 +130,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertFalse(coordinator.naturalEndVerifiedForTesting,
                     "An early notification cannot replace exact endpoint and stable paused-clock proof")
                 XCTAssertNil(backend.nativeSystemDriverForTesting?.naturalEndObservation?.stableCurrentTime)
+                let successor = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let successorItem = try XCTUnwrap(player.currentItem)
+                XCTAssertFalse(quantum.isCurrent(item: successor.item, physical: successorItem))
+                XCTAssertThrowsError(try driver.updateNaturalPlaybackEndQuantum(quantum, item: successor.item),
+                    "Old physical item/track evidence must never authorize a successor endpoint")
                 XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
             }
         } catch { failure = error }
@@ -122,6 +166,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let physical = try XCTUnwrap(player.currentItem)
                 let activation = try XCTUnwrap(coordinator.currentActivation)
                 let endpoint = try ExactMediaTime(physical.duration)
+                let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
+                let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
+                XCTAssertEqual(quantum.period, ExactMediaTime(value: 1, timescale: 30))
                 XCTAssertEqual(endpoint, ExactMediaTime(value: 80, timescale: 1))
                 XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
                 XCTAssertNil(driver.naturalEndObservation)
@@ -136,7 +183,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertEqual(observation.expectedEndpoint, endpoint)
                 XCTAssertEqual(observation.constrainedEndpoint, endpoint)
                 XCTAssertEqual(observation.firstCurrentTime, stable)
-                XCTAssertGreaterThanOrEqual(CMTimeCompare(stable.cmTime, endpoint.cmTime), 0)
+                let lower = try endpoint.subtracting(quantum.period)
+                XCTAssertGreaterThan(CMTimeCompare(stable.cmTime, lower.cmTime), 0)
+                XCTAssertLessThanOrEqual(CMTimeCompare(stable.cmTime, endpoint.cmTime), 0)
                 XCTAssertTrue(player.currentItem === physical)
                 XCTAssertEqual(player.rate, 0)
                 XCTAssertEqual(player.timeControlStatus, .paused)
@@ -222,17 +271,17 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "homepod-live-h264-aac-80s", withExtension: "ts", subdirectory: "Video"))
         return try Data(contentsOf: file)
     }
-    private func makeOrigin(bytes: Data, managed: Bool) throws -> NativeHLSHTTPFixture {
+    private func makeOrigin(bytes: Data, managed: Bool, disconnectAfterBodyBytes: Int? = nil) throws -> NativeHLSHTTPFixture {
         let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
         let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
         return try NativeHLSHTTPFixture(resources: [
             "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
-            "/part.ts": .init(data: bytes, contentType: "video/mp2t")], credential: managed ? "ordinary fixture" : nil)
+            "/part.ts": .init(data: bytes, contentType: "video/mp2t", disconnectAfterBodyBytes: disconnectAfterBodyBytes)], credential: managed ? "ordinary fixture" : nil)
     }
-    private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data) async throws
-        -> (progressed: Bool, errorDomain: String?, errorCode: Int?) {
-        let origin = try makeOrigin(bytes: bytes, managed: false)
+    private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data, disconnectAfterBodyBytes: Int? = nil) async throws
+        -> (progressed: Bool, errorDomain: String?, errorCode: Int?, endedNormally: Bool, sdkFailed: Bool) {
+        let origin = try makeOrigin(bytes: bytes, managed: false, disconnectAfterBodyBytes: disconnectAfterBodyBytes)
         let player = AVPlayer()
         let item = AVPlayerItem(url: origin.url("master.m3u8"))
         item.preferredForwardBufferDuration = 3
@@ -242,8 +291,10 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let observer = NotificationCenter.default.addObserver(forName: AVPlayerItem.failedToPlayToEndTimeNotification,
             object: item, queue: nil) { notification in
                 let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
-                signal.fail(domain: error?.domain ?? "none", code: error?.code ?? 0)
+                signal.fail(domain: error?.domain ?? "none", code: error?.code ?? 0, sdk: true)
             }
+        let endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,
+            object: item, queue: nil) { _ in signal.didEnd() }
         let timeout = Task { @MainActor [weak player] in
             do { try await Task.sleep(for: .seconds(20)) } catch { return }
             signal.fail(domain: "control.deadline", code: 0)
@@ -282,18 +333,29 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             let started = player.currentTime()
             guard started.isNumeric, started.seconds.isFinite else { throw HLSSourceError.incompleteEvidence }
             player.play()
-            while !signal.hasFailure, item.status != .failed {
+            while !signal.hasFailure {
+                if item.status == .failed {
+                    let error = item.error as NSError?
+                    signal.fail(domain: error?.domain ?? "AVPlayerItem.failed", code: error?.code ?? 0, sdk: true)
+                    break
+                }
                 let current = player.currentTime()
                 if current.isNumeric, current.seconds.isFinite, current.seconds > started.seconds + 0.25 {
                     progressed = true
-                    break
+                    if disconnectAfterBodyBytes == nil { break }
                 }
                 try await Task.sleep(for: .milliseconds(10))
             }
         } catch {
-            if !signal.hasFailure { signal.fail(domain: String(reflecting: type(of: error)), code: (error as NSError).code) }
+            if !signal.hasFailure {
+                if let sdkError = item.error as NSError? { signal.fail(domain: sdkError.domain, code: sdkError.code, sdk: true) }
+                else { signal.fail(domain: String(reflecting: type(of: error)), code: (error as NSError).code) }
+            }
         }
         let failure = signal.snapshot
+        // Only the first recorded signal owns classification. A deadline first
+        // cancels SDK work, whose resulting item.error is not transport evidence.
+        let sdkFailed = signal.sdkFailed
         let current = item.currentTime(), end = item.forwardPlaybackEndTime
         print("NATIVE_HLS_ENDPOINT_CONTROL diagnostic-only=true boundary=\(boundary.rawValue) stage=\(stage) progressed=\(progressed) " +
             "failure-domain=\(failure?.0 ?? "none") failure-code=\(failure?.1 ?? 0) status=\(item.status.rawValue) " +
@@ -303,9 +365,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         await withCheckedContinuation { continuation in player.setDisconnectedFromSystemAudio(true) { continuation.resume() } }
         player.replaceCurrentItem(with: nil)
         NotificationCenter.default.removeObserver(observer)
+        NotificationCenter.default.removeObserver(endObserver)
+        let endedNormally = signal.endedNormally
         signal.close()
         await origin.close()
-        return (progressed && failure == nil, failure?.0, failure?.1)
+        return (progressed, failure?.0, failure?.1, endedNormally, sdkFailed)
     }
 
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
@@ -374,9 +438,14 @@ private final class NativeEndpointControlSignal: @unchecked Sendable {
     private let lock = NSLock()
     private var failure: (String, Int)?
     private var closed = false
-    func fail(domain: String, code: Int) {
-        lock.withLock { if !closed, failure == nil { failure = (String(domain.prefix(96)), code) } }
+    private var endObserved = false
+    private var failureFromSDK = false
+    func didEnd() { lock.withLock { if !closed { endObserved = true } } }
+    var endedNormally: Bool { lock.withLock { endObserved } }
+    func fail(domain: String, code: Int, sdk: Bool = false) {
+        lock.withLock { if !closed, failure == nil { failure = (String(domain.prefix(96)), code); failureFromSDK = sdk } }
     }
+    var sdkFailed: Bool { lock.withLock { failureFromSDK } }
     var hasFailure: Bool { lock.withLock { failure != nil } }
     var snapshot: (String, Int)? { lock.withLock { failure } }
     func close() { lock.withLock { closed = true } }
