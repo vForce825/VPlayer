@@ -131,7 +131,9 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         selected = afterPreroll
         if let endpoint = afterPreroll.duration {
             try driver.installNaturalEndTerminalHandler(item: item) { [weak self] capability, item in self?.naturalEnd(capability, item: item) }
-            try driver.constrainPlaybackEnd(to: endpoint, item: item)
+            // Full native/proxy sources are not a generated trimmed interval.
+            // Observe their SDK endpoint without rewriting the playback range.
+            try driver.observeNaturalPlaybackEnd(expected: endpoint, item: item)
         }
         diagnose("activate.endpoint", authorityValidated: true)
         try await driver.play(invocation: invocation, item: item)
@@ -166,6 +168,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
 
     #if DEBUG
     func observeSelectedFormatChangeForTesting() async { await refresh(failed: false) }
+    var naturalEndVerifiedForTesting: Bool { naturalEndVerified }
     #endif
     private func refresh(failed: Bool) async {
         diagnose("refresh.event", detail: "event-failed=\(failed)")

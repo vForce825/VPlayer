@@ -61,9 +61,28 @@ func inspectNativePreparationWeakSideTable(_ role: String, _ object: AnyObject,
 }
 #endif
 
+enum AVPlayerPlaybackEndBoundary: Sendable {
+    case constrained, natural
+
+    func observedEndpoint(forwardEnd: CMTime, duration: CMTime) -> ExactMediaTime? {
+        let observed: CMTime
+        switch self {
+        case .constrained: observed = forwardEnd
+        case .natural:
+            // AVPlayer's invalid/default forward end delegates to item.duration.
+            // A later explicit trim cannot reuse this full-source observation.
+            guard !forwardEnd.isValid else { return nil }
+            observed = duration
+        }
+        guard let result = try? ExactMediaTime(observed), result.value > 0 else { return nil }
+        return result
+    }
+}
+
 struct AVPlayerNaturalEndObservation: Sendable, Equatable {
     let item: AVPlayerItemInstanceIdentity
     let expectedEndpoint: ExactMediaTime
+    /// Directly observed effective endpoint: explicit trim or native duration.
     let constrainedEndpoint: ExactMediaTime
     let firstCurrentTime: ExactMediaTime
     let stableCurrentTime: ExactMediaTime?
@@ -674,6 +693,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private var endpointStabilityDeadline: UUID?
     private var endpointObservationIdentity: UUID?
     private(set) var naturalEndObservation: AVPlayerNaturalEndObservation?
+    private var endpointBoundary = AVPlayerPlaybackEndBoundary.constrained
     private(set) var naturalEndTerminalResult: AVPlayerNaturalEndTerminalResult?
     private let naturalEndIssuerIdentity = UUID()
     private var naturalEndTerminalIssued = false
@@ -1330,13 +1350,28 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
 
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item identity: AVPlayerItemInstanceIdentity) throws {
+        try installEndpointObservation(expected: time, item: identity, boundary: .constrained)
+    }
+
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime,
+                                   item identity: AVPlayerItemInstanceIdentity) throws {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
+                  duration: item.duration) == time else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        try installEndpointObservation(expected: time, item: identity, boundary: .natural)
+    }
+
+    private func installEndpointObservation(expected time: ExactMediaTime,
+        item identity: AVPlayerItemInstanceIdentity, boundary: AVPlayerPlaybackEndBoundary) throws {
         guard currentItemIdentity == identity, let item,
               player.currentItem === item, time.value > 0 else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         let callbackLease = try reserveSDKCallbackLease(.endpoint)
         removeEndpointObserver()
-        item.forwardPlaybackEndTime = time.cmTime
+        endpointBoundary = boundary
+        if case .constrained = boundary { item.forwardPlaybackEndTime = time.cmTime }
+        naturalEndObservation = nil
         naturalEndTerminalIssued = false
         naturalEndTerminalConsumed = false
         naturalEndTerminalResult = nil
@@ -1351,13 +1386,21 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                   self.currentItemIdentity == observedIdentity,
                   self.item === item, self.player.currentItem === item,
                   let first = try? ExactMediaTime(self.player.currentTime()),
-                  let constrained = try? ExactMediaTime(item.forwardPlaybackEndTime) else {
+                  let constrained = self.endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
+                      duration: item.duration) else {
                 self.publishNaturalEnd(.failure(.staleItem), item: observedIdentity)
                 return
             }
             guard constrained == endpoint else {
                 self.publishNaturalEnd(.failure(.endpointMismatch), item: observedIdentity)
                 return
+            }
+            if case .natural = self.endpointBoundary {
+                guard item.status == .readyToPlay, item.error == nil,
+                      self.player.rate == 0, self.player.timeControlStatus == .paused else {
+                    self.publishNaturalEnd(.failure(.endpointMismatch), item: observedIdentity)
+                    return
+                }
             }
             self.naturalEndObservation = .init(item: observedIdentity,
                 expectedEndpoint: endpoint, constrainedEndpoint: constrained,
@@ -1434,7 +1477,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let observation = naturalEndObservation, observation.item == identity,
               observation.stableCurrentTime == nil,
               observation.constrainedEndpoint == observation.expectedEndpoint,
-              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime),
+              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration),
               constraint == observation.expectedEndpoint,
               naturalEndAuthority?.activation == activation,
               naturalEndAuthority?.revalidateCurrentAuthority() == true else { return false }
@@ -1452,7 +1495,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let item, let currentItemIdentity, player.currentItem === item,
               let prior = naturalEndObservation, prior.item == currentItemIdentity,
               let stable = try? ExactMediaTime(player.currentTime()),
-              let constraint = try? ExactMediaTime(item.forwardPlaybackEndTime) else { return }
+              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration) else { return }
+        if case .natural = endpointBoundary {
+            guard item.status == .readyToPlay, item.error == nil,
+                  player.rate == 0, player.timeControlStatus == .paused else {
+                publishNaturalEnd(.failure(.endpointMismatch), item: currentItemIdentity)
+                return
+            }
+        }
         guard prior.firstCurrentTime == stable else {
             publishNaturalEnd(.failure(.unstableDirectRead), item: currentItemIdentity)
             return
@@ -1541,6 +1591,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         endpointObserver = nil
         cancelNaturalEndDeadline()
         endpointObservationIdentity = nil
+        endpointBoundary = .constrained
         eventHub.cancelEndpoint()
     }
 

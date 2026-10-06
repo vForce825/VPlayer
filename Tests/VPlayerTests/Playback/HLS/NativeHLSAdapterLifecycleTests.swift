@@ -3,12 +3,42 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+import CoreMedia
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testNativeFullSourceUsesObservationWithoutExplicitTrimMutation() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.inspector.duration = ExactMediaTime(value: 80, timescale: 1)
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.naturalEndObservations, 1)
+            XCTAssertEqual(fixture.driver.explicitEndMutations, 0)
+            XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertEqual(fixture.factory.backend?.generatedBundleCallsForTesting, 0)
+        }
+    }
+
+    func testNaturalEndpointPolicyRequiresUntrimmedFiniteSameItemDuration() throws {
+        let end = CMTime(value: 80, timescale: 1)
+        XCTAssertEqual(AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: .invalid, duration: end),
+            ExactMediaTime(value: 80, timescale: 1))
+        for explicit in [end, CMTime.zero, CMTime.indefinite] {
+            XCTAssertNil(AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: explicit, duration: end),
+                "An explicit boundary must never borrow native full-source EOF proof")
+        }
+        for invalid in [CMTime.invalid, CMTime.indefinite, CMTime.zero,
+                        CMTime(value: 80, timescale: 1, flags: .valid, epoch: 1)] {
+            XCTAssertNil(AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: .invalid, duration: invalid))
+        }
+        XCTAssertEqual(AVPlayerPlaybackEndBoundary.constrained.observedEndpoint(forwardEnd: end,
+            duration: CMTime(value: 90, timescale: 1)), ExactMediaTime(value: 80, timescale: 1))
+        XCTAssertNil(AVPlayerPlaybackEndBoundary.constrained.observedEndpoint(forwardEnd: .invalid, duration: end),
+            "Generated/source-AAC boundaries cannot fall back to the item's natural duration")
+    }
+
     func testNativeFixturePublishesPresentationBeforePositiveRateAdmission() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.play()
@@ -522,6 +552,7 @@ private final class NativeFixtureInspector: NativeHLSAssetInspecting {
     private let driver: NativeFixtureDriver
     var gate: NativeFixtureGate?
     var reads = 0, useAlternate = false, rejectFormat = false, missingExpectedAudio = false
+    var duration: ExactMediaTime?
     init(driver: NativeFixtureDriver) { self.driver = driver }
     func snapshot(item: AVPlayerItemInstanceIdentity, source: HLSOwnedSourcePlan) async throws -> NativeHLSSelectionSnapshot {
         reads += 1
@@ -533,7 +564,7 @@ private final class NativeFixtureInspector: NativeHLSAssetInspecting {
         return try .init(item: item, physicalItem: ObjectIdentifier(physical), audioSelection: ObjectIdentifier(driver.selectedAudio),
             video: NativeFixtureProbe.video(width: useAlternate ? 1_280 : 1_920), audio: NativeFixtureProbe.audio,
             audioConfigurationDigest: Data([1]), observedFrameRate: 25, sourceOwner: source,
-            retention: HLSApplicationLifetimeCharge(bytes: 8 * 1_024))
+            retention: HLSApplicationLifetimeCharge(bytes: 8 * 1_024), duration: duration)
     }
 }
 
@@ -547,6 +578,7 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var selectedAudio = NSObject()
     var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
+    var naturalEndObservations = 0, explicitEndMutations = 0
     var failReady = false
     var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
     private var clock = ExactMediaTime(value: 0, timescale: 1)
@@ -586,7 +618,11 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     }
     func replaceCurrentItemWithNil(item: AVPlayerItemInstanceIdentity) { if currentItemIdentity == item { currentItemIdentity = nil; physical = nil } }
     func removeObservers(item: AVPlayerItemInstanceIdentity) {}
-    func constrainPlaybackEnd(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws {}
+    func constrainPlaybackEnd(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws { explicitEndMutations += 1 }
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws {
+        guard currentItemIdentity == item, time.value > 0 else { throw AVPlayerItemCoordinatorFailure.invalidTimeline }
+        naturalEndObservations += 1
+    }
     func installNaturalEndTerminalHandler(item: AVPlayerItemInstanceIdentity, handler: @escaping @MainActor @Sendable (AVPlayerNaturalEndTerminalCapability, AVPlayerItemInstanceIdentity) -> Void) throws {}
     func consumeNaturalEndTerminal(_ capability: AVPlayerNaturalEndTerminalCapability, item: AVPlayerItemInstanceIdentity) -> AVPlayerNaturalEndTerminalResult? { nil }
     func installTimeControlStatusRelay(item: AVPlayerItemInstanceIdentity, activation: ActivationEpoch, handler: @escaping @MainActor @Sendable (AVPlayer.TimeControlStatus, AVPlayerItemInstanceIdentity, ActivationEpoch) -> Void) throws {}

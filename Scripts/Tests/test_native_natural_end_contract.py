@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 VPlayer contributors
+# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
+"""Portable route/proof wiring checks; actual EOF requires the Apple smoke test."""
+from pathlib import Path
+import unittest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+class NativeNaturalEndContract(unittest.TestCase):
+    def test_only_native_route_preserves_the_untrimmed_sdk_endpoint(self):
+        native = (ROOT / 'Sources/VPlayerPlayback/HLS/Native/NativeHLSItemCoordinator.swift').read_text()
+        generated = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerItemCoordinator.swift').read_text()
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertIn('try driver.observeNaturalPlaybackEnd(expected: endpoint, item: item)', native)
+        self.assertNotIn('driver.constrainPlaybackEnd(', native)
+        self.assertIn('try driver.constrainPlaybackEnd(to: itemEnd, item:', generated)
+        self.assertIn('func observeNaturalPlaybackEnd(', driver)
+        native_method = driver.split('func observeNaturalPlaybackEnd(', 1)[1].split('private func installEndpointObservation(', 1)[0]
+        self.assertNotIn('forwardPlaybackEndTime =', native_method)
+        self.assertIn('boundary: .natural', native_method)
+
+    def test_same_endpoint_policy_is_checked_on_both_reads_and_pending_eof(self):
+        source = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertGreaterEqual(source.count('endpointBoundary.observedEndpoint('), 3)
+        self.assertIn('prior.firstCurrentTime == stable', source)
+        self.assertIn('constraint == prior.expectedEndpoint', source)
+        self.assertIn('CMTimeCompare(stable.cmTime, prior.expectedEndpoint.cmTime) >= 0', source)
+        self.assertIn('naturalEndAuthority?.revalidateCurrentAuthority() == true', source)
+        self.assertIn('endpointBoundary = .constrained', source)
+
+    def test_smoke_covers_actual_natural_eof_and_retains_active_authority(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        self.assertIn('naturalEndObservation?.stableCurrentTime != nil', source)
+        self.assertIn('executionTimeAllowance = 240', source)
+        self.assertIn('let deadline = ContinuousClock.now + .seconds(210)', source)
+        self.assertIn('verifyNaturalEOF(managed: managed, deadline: deadline)', source)
+        self.assertIn('until(registry: registry, deadline: deadline)', source)
+        self.assertIn('guard predicate(), ContinuousClock.now < deadline', source)
+        self.assertIn('withController(deadline: deadline)', source)
+        self.assertIn('ContinuousClock().sleep(until: deadline)', source)
+        self.assertIn('expiry?.cancel(); await expiry?.value', source)
+        self.assertIn('XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)', source)
+        self.assertIn('activation == registry.outputResourceContextSnapshot()?.activation', source)
+        self.assertIn('testNativeEarlyEndNotificationCannotVerifyFullSourceCompletion', source)
+
+    def test_deadline_cancels_and_joins_the_original_body_before_cleanup(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        helper = source.split('private func withController(', 1)[1].split('\n}\n', 1)[0]
+        self.assertIn('let bodyTask = Task { @MainActor in', helper)
+        expiry = helper.split('expiry = Task {', 1)[1].split('} else { expiry = nil }', 1)[0]
+        self.assertLess(expiry.index('bodyTask.cancel()'), expiry.index('await controller.stop()'))
+        self.assertIn('await bodyTask.result', expiry)
+        admission = source.split('private func verifyNaturalEOF(', 1)[1].split('await controller.play(', 1)[0]
+        self.assertGreaterEqual(admission.count('ContinuousClock.now < deadline'), 2)
+        self.assertIn('testNativeEOFDeadlineRejectsExpiredAdmissionAndJoinsHeldBody', source)
+
+    def test_escaping_controller_bodies_capture_instance_helpers_explicitly(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        self.assertEqual(source.count('withController { [self] controller, registry, factory in'), 2)
+        self.assertIn('withController(deadline: deadline) { [self] controller, registry, factory in', source)
+
+
+if __name__ == '__main__':
+    unittest.main()

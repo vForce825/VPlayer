@@ -16,8 +16,145 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         // supply Registry authority or count as native-adapter acceptance.
         for boundary in NativeEndpointControl.allCases {
             let result = try await runEndpointControl(boundary, bytes: bytes)
-            XCTAssertTrue(result, "Real SDK endpoint control failed: \(boundary.rawValue)")
+            if boundary == .defaultEnd {
+                XCTAssertTrue(result.progressed, "The unmodified full source must actually progress")
+                XCTAssertNil(result.errorDomain)
+            } else {
+                // Exact tvOS 27 reproduction for this unchanged TS/master, not
+                // a blanket claim that HLS trimming is unsupported by AVPlayer.
+                XCTAssertFalse(result.progressed)
+                XCTAssertEqual(result.errorDomain, "CoreMediaErrorDomain")
+                XCTAssertEqual(result.errorCode, -12865)
+            }
         }
+    }
+
+    func testRealNativeAndManagedHLSReachVerifiedUntrimmedEOF() async throws {
+        executionTimeAllowance = 240
+        let deadline = ContinuousClock.now + .seconds(210)
+        for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
+    }
+
+    func testNativeEOFDeadlineRejectsExpiredAdmissionAndJoinsHeldBody() async throws {
+        var expiredBodyEntered = false
+        do {
+            try await withController(deadline: .now - .seconds(1)) { _, _, _ in expiredBodyEntered = true }
+            XCTFail("An expired shared deadline must reject body admission")
+        } catch HLSSourceError.deadline {} catch is CancellationError {}
+        XCTAssertFalse(expiredBodyEntered)
+
+        var entered = false, joined = false, admittedAfterExpiry = false
+        do {
+            try await withController(deadline: .now + .seconds(1)) { controller, registry, factory in
+                entered = true
+                defer { joined = true }
+                // Model a held pre-admission await which returns on cancellation
+                // and deliberately continues to the real controller entry.
+                do { try await Task.sleep(for: .seconds(10)) } catch is CancellationError {}
+                XCTAssertTrue(Task.isCancelled)
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "expired-native-control",
+                    streamURL: URL(string: "http://127.0.0.1:1/expired.m3u8")!, title: "Expired admission control"))
+                admittedAfterExpiry = factory.backend != nil || registry.outputResourceContextSnapshot() != nil
+            }
+            XCTFail("A canceled body cannot turn an expired source window into success")
+        } catch is CancellationError {} catch HLSSourceError.deadline {}
+        XCTAssertTrue(entered)
+        XCTAssertTrue(joined, "The helper must join the original body before returning")
+        XCTAssertFalse(admittedAfterExpiry)
+    }
+
+    func testNativeEarlyEndNotificationCannotVerifyFullSourceCompletion() async throws {
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        var failure: (any Error)?
+        do {
+            try await withController { [self] controller, registry, factory in
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "native-early-eof",
+                    streamURL: origin.url("master.m3u8"), title: "Native early end control"))
+                try await until(registry: registry) {
+                    guard case .playing = registry.playbackStateSnapshot(),
+                          let coordinator = factory.backend?.nativeCoordinatorForTesting,
+                          coordinator.isPrepared, let activation = coordinator.currentActivation else { return false }
+                    return activation == registry.outputResourceContextSnapshot()?.activation
+                }
+                let backend = try XCTUnwrap(factory.backend)
+                let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let player = try XCTUnwrap(backend.presentation?.avPlayerForNativeSmoke)
+                let physical = try XCTUnwrap(player.currentItem)
+                XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
+                try await until(registry: registry) {
+                    guard case .playing = registry.playbackStateSnapshot() else { return false }
+                    return backend.nativeCoordinatorForTesting !== coordinator &&
+                        backend.nativeCoordinatorForTesting?.isPrepared == true &&
+                        backend.nativeCoordinatorForTesting?.currentActivation != nil
+                }
+                XCTAssertFalse(coordinator.naturalEndVerifiedForTesting,
+                    "An early notification cannot replace exact endpoint and stable paused-clock proof")
+                XCTAssertNil(backend.nativeSystemDriverForTesting?.naturalEndObservation?.stableCurrentTime)
+                XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+            }
+        } catch { failure = error }
+        await origin.close()
+        if let failure { throw failure }
+    }
+
+    private func verifyNaturalEOF(managed: Bool, deadline: ContinuousClock.Instant) async throws {
+        guard ContinuousClock.now < deadline else { throw HLSSourceError.deadline }
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: managed)
+        var failure: (any Error)?
+        do {
+            try await withController(deadline: deadline) { [self] controller, registry, factory in
+                try Task.checkCancellation()
+                guard ContinuousClock.now < deadline else { throw HLSSourceError.deadline }
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "native-natural-eof-\(managed)",
+                    streamURL: origin.url("master.m3u8"), title: "Native full-source EOF",
+                    attributes: managed ? ["Authorization": "ordinary fixture"] : [:]))
+                try await until(registry: registry, deadline: min(deadline, .now + .seconds(20))) {
+                    guard case .playing = registry.playbackStateSnapshot(),
+                          let coordinator = factory.backend?.nativeCoordinatorForTesting,
+                          coordinator.isPrepared, let activation = coordinator.currentActivation else { return false }
+                    return activation == registry.outputResourceContextSnapshot()?.activation
+                }
+                let backend = try XCTUnwrap(factory.backend)
+                let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let driver = try XCTUnwrap(backend.nativeSystemDriverForTesting)
+                let player = try XCTUnwrap(backend.presentation?.avPlayerForNativeSmoke)
+                let physical = try XCTUnwrap(player.currentItem)
+                let activation = try XCTUnwrap(coordinator.currentActivation)
+                let endpoint = try ExactMediaTime(physical.duration)
+                XCTAssertEqual(endpoint, ExactMediaTime(value: 80, timescale: 1))
+                XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
+                XCTAssertNil(driver.naturalEndObservation)
+                // One shared source/player deadline includes both startups and
+                // both real 80-second EOFs, without seeking or changing rate.
+                try await until(registry: registry, deadline: deadline) {
+                    coordinator.naturalEndVerifiedForTesting && driver.naturalEndObservation?.stableCurrentTime != nil
+                }
+                let observation = try XCTUnwrap(driver.naturalEndObservation)
+                let stable = try XCTUnwrap(observation.stableCurrentTime)
+                XCTAssertEqual(observation.item, coordinator.item)
+                XCTAssertEqual(observation.expectedEndpoint, endpoint)
+                XCTAssertEqual(observation.constrainedEndpoint, endpoint)
+                XCTAssertEqual(observation.firstCurrentTime, stable)
+                XCTAssertGreaterThanOrEqual(CMTimeCompare(stable.cmTime, endpoint.cmTime), 0)
+                XCTAssertTrue(player.currentItem === physical)
+                XCTAssertEqual(player.rate, 0)
+                XCTAssertEqual(player.timeControlStatus, .paused)
+                XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
+                XCTAssertTrue(coordinator.isPrepared)
+                XCTAssertEqual(coordinator.currentActivation, activation)
+                XCTAssertEqual(registry.outputResourceContextSnapshot()?.activation, activation)
+                XCTAssertEqual(backend.routedTransportForTesting, managed ? .proxy : .native)
+                XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+                XCTAssertEqual(origin.deniedCount, 0)
+                // EOF does not mint physical quiescence: withController still
+                // performs the original owned stop/disconnect/retirement below.
+                XCTAssertFalse(driver.disconnectedFromSystemAudio)
+                print("NATIVE_HLS_FULL_SOURCE_EOF managed=\(managed) verified=true end=\(stable.value)/\(stable.timescale)")
+            }
+        } catch { failure = error }
+        await origin.close()
+        if let failure { throw failure }
     }
 
     func testRealAVPlayerNativeAndManagedHLSPrepareSelectedTracksAndProgressWithoutGeneratedGraph() async throws {
@@ -28,7 +165,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             let origin = try makeOrigin(bytes: bytes, managed: managed)
             var failure: (any Error)?
             do {
-                try await withController { controller, registry, factory in
+                try await withController { [self] controller, registry, factory in
                     let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "native-real-\(managed)",
                         streamURL: origin.url("master.m3u8"), title: "Native real fixture",
                         attributes: managed ? ["Authorization": "ordinary fixture"] : [:])
@@ -48,6 +185,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
                     let player = try XCTUnwrap(backend.presentation?.avPlayerForNativeSmoke)
                     let physical = try XCTUnwrap(player.currentItem)
+                    XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
                     let started = player.currentTime().seconds
                     guard started.isFinite else { throw HLSSourceError.incompleteEvidence }
                     let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
@@ -92,7 +230,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/part.ts": .init(data: bytes, contentType: "video/mp2t")], credential: managed ? "ordinary fixture" : nil)
     }
-    private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data) async throws -> Bool {
+    private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data) async throws
+        -> (progressed: Bool, errorDomain: String?, errorCode: Int?) {
         let origin = try makeOrigin(bytes: bytes, managed: false)
         let player = AVPlayer()
         let item = AVPlayerItem(url: origin.url("master.m3u8"))
@@ -166,12 +305,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         NotificationCenter.default.removeObserver(observer)
         signal.close()
         await origin.close()
-        return progressed && failure == nil
+        return (progressed && failure == nil, failure?.0, failure?.1)
     }
 
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
-    private func until(registry: ControlTaskRegistry, _ predicate: @MainActor () -> Bool) async throws {
-        let deadline = ContinuousClock.now + .seconds(20)
+    private func until(registry: ControlTaskRegistry, deadline: ContinuousClock.Instant = .now + .seconds(20), _ predicate: @MainActor () -> Bool) async throws {
         while !predicate(), ContinuousClock.now < deadline {
             if case let .failed(failure) = registry.playbackStateSnapshot() {
                 XCTFail("Real native HLS terminated before prepare/progress: \(failure)")
@@ -179,12 +317,13 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(10))
         }
-        guard predicate() else {
+        guard predicate(), ContinuousClock.now < deadline else {
             XCTFail("Real native HLS failed to prepare/progress: \(String(describing: registry.outputResourceContextSnapshot()))")
             throw HLSSourceError.deadline
         }
     }
-    private func withController(_ body: (PlaybackController, ControlTaskRegistry, NativeSmokeFactory) async throws -> Void) async throws {
+    private func withController(deadline: ContinuousClock.Instant? = nil,
+        _ body: @escaping @MainActor (PlaybackController, ControlTaskRegistry, NativeSmokeFactory) async throws -> Void) async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
@@ -193,11 +332,34 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let factory = NativeSmokeFactory(trace: trace)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
+        let bodyTask = Task { @MainActor in
+            try Task.checkCancellation()
+            if let deadline, ContinuousClock.now >= deadline { throw HLSSourceError.deadline }
+            try await body(controller, registry, factory)
+            try Task.checkCancellation()
+            if let deadline, ContinuousClock.now >= deadline { throw HLSSourceError.deadline }
+        }
+        let expiry: Task<Void, Never>?
+        if let deadline {
+            expiry = Task {
+                do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+                // Cancel the original task even when play has not yet published
+                // a request/reservation and stop would therefore be a no-op.
+                bodyTask.cancel()
+                await controller.stop()
+                _ = await bodyTask.result
+            }
+        } else { expiry = nil }
         var failure: (any Error)?
-        do { try await body(controller, registry, factory) } catch {
+        do {
+            try await withTaskCancellationHandler {
+                try await bodyTask.value
+            } onCancel: { bodyTask.cancel() }
+        } catch {
             print("NATIVE_HLS_SMOKE_TRACE error=\(error)\n\(trace.summary)")
             failure = error
         }
+        expiry?.cancel(); await expiry?.value
         await controller.stop(); await registry.joinOwnedTerminalCleanup()
         XCTAssertNil(registry.outputResourceContextSnapshot())
         if let failure { throw failure }

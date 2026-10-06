@@ -125,6 +125,8 @@ protocol AVPlayerDriving: AnyObject {
     func finishPausedResumeCallbacks(item: AVPlayerItemInstanceIdentity)
     func constrainPlaybackEnd(to time: ExactMediaTime,
                               item: AVPlayerItemInstanceIdentity) throws
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime,
+                                   item: AVPlayerItemInstanceIdentity) throws
     func installNaturalEndTerminalHandler(
         item: AVPlayerItemInstanceIdentity,
         handler: @escaping @MainActor @Sendable (
@@ -145,6 +147,11 @@ protocol AVPlayerDriving: AnyObject {
 }
 
 extension AVPlayerDriving {
+    func observeNaturalPlaybackEnd(expected time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) throws {
+        // Drivers must explicitly support untrimmed EOF proof; never substitute
+        // a trimming mutation or grant proof from a notification alone.
+        throw AVPlayerItemCoordinatorFailure.invalidTimeline
+    }
     func install(url: URL, identity: AVPlayerItemInstanceIdentity, admission: AVPlayerInstallationMutation) throws {
         // A legacy injected driver has not promised callback-safe installation.
         // Native/source-backed tests must implement this exact mutation seam.
