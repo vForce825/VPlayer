@@ -251,84 +251,152 @@ static int ts_section(const uint8_t *p,size_t n,uint8_t table_id,size_t *length)
     if (crc) return -EINVAL;
     *length=size; return 0;
 }
-static int ts_admit(const uint8_t *p,size_t n,int (*interrupt)(void *),void *context) {
-    unsigned pmt=8192, streams=0, video=0;
-    uint8_t pat_copy[184], pmt_copy[184]; size_t pat_size=0,pmt_size=0;
-    unsigned stream_pids[8]={0};
+static int ts_failure(VPSourceAdmission *view,int reason,int result) {
+    view->reason=reason; return result;
+}
+static int ts_payload(const uint8_t *q,size_t *head,unsigned *pid) {
+    if (q[0]!=0x47 || (q[1]&0x80) || (q[3]&0xc0) || !(q[3]&0x30)) return -EINVAL;
+    *pid=((q[1]&31u)<<8)|q[2]; *head=4;
+    if (q[3]&0x20) { if (q[4]>183) return -EINVAL; *head+=1+q[4]; }
+    if (*head>188) return -EINVAL;
+    /* Native auto-guess observes PUSI before payload flags. A packet claiming
+     * a payload-unit start must actually contain payload bytes. */
+    if ((!(q[3]&0x10) || *head==188) && (q[1]&0x40)) return -EINVAL;
+    return (q[3]&0x10) && *head<188;
+}
+static int ts_single_section(const uint8_t *q,size_t head,uint8_t table,const uint8_t **section,size_t *length) {
+    /* Split PSI and additional sections remain outside this bounded subset.
+     * FFmpeg processes trailing sections, so none may escape admission. */
+    if (!(q[1]&0x40)) return -EINVAL;
+    size_t pointer=q[head++];
+    if (pointer>188-head) return -EINVAL;
+    for (size_t i=0;i<pointer;i++) if (q[head+i]!=0xff) return -EINVAL;
+    head+=pointer;
+    if (head>=188 ||
+        ts_section(q+head,188-head,table,length)<0 || *length>184 || !(q[head+5]&1)) return -EINVAL;
+    for (size_t i=head+*length;i<188;i++) if (q[i]!=0xff) return -EINVAL;
+    *section=q+head; return 0;
+}
+static int ts_admit(const uint8_t *p,size_t n,int prefix,int (*interrupt)(void *),void *context,VPSourceAdmission *view) {
+    unsigned pmt=8192, program=0, streams=0, video=0, observed_count=0;
+    uint8_t pat_copy[184],pmt_copy[184]; size_t pat_size=0,pmt_size=0;
+    unsigned stream_pids[8]={0},observed_pids[8]={0};
+    size_t latest_pat=SIZE_MAX, acquisition=SIZE_MAX;
+    /* Discover one exact PAT before interpreting any other PID. No bytes are
+     * forwarded to native code until BOTH bounded passes have succeeded. */
     for (size_t o=0;o<n;o+=188) {
-        if (interrupt && interrupt(context)) return -ECANCELED;
-        const uint8_t *q=p+o;
-        if (q[0]!=0x47 || (q[1]&0x80) || (q[3]&0xc0) || !(q[3]&0x30)) return -EINVAL;
-        unsigned pid=((q[1]&31u)<<8)|q[2]; size_t head=4;
-        if (q[3]&0x20) { if (q[4]>183) return -EINVAL; head+=1+q[4]; }
-        if (!(q[3]&0x10) || head==188) continue;
-        if (head>188) return -EINVAL;
-        if (pid==0 || pid==pmt) {
-            /* With <=8 admitted tracks, ordinary PAT/PMT fit one packet. Split
-             * PSI and multiple programs are explicitly outside this subset. */
-            if (!(q[1]&0x40)) return -EINVAL;
-            if (q[head]>187-head) return -EINVAL;
-            head+=1+q[head];
-            size_t length;
-            if (head>188 || ts_section(q+head,188-head,pid==0?0:2,&length)<0 || length>184) return -EINVAL;
-            const uint8_t *section=q+head;
-            if (pid==0) {
-                if (pat_size) { if (pat_size!=length || memcmp(pat_copy,section,length)) return -EINVAL; continue; }
-                unsigned programs=0;
-                for (size_t k=8;k<length-4;k+=4) {
-                    if (length-4-k<4) return -EINVAL;
-                    if (be16(section+k)) { if (++programs>1) return -EINVAL; pmt=be16(section+k+2)&8191; }
-                }
-                if (programs!=1 || pmt==0 || pmt==8191) return -EINVAL;
-                memcpy(pat_copy,section,length); pat_size=length;
+        view->packet_offset=o; view->pid=-1;
+        if (interrupt && interrupt(context)) return ts_failure(view,VP_SOURCE_ADMISSION_CANCELLED,-ECANCELED);
+        const uint8_t *q=p+o; size_t head; unsigned pid;
+        int payload=ts_payload(q,&head,&pid);
+        if (payload<0) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+        view->pid=(int)pid;
+        if (!payload || pid!=0) continue;
+        const uint8_t *section; size_t length;
+        if (ts_single_section(q,head,0,&section,&length)<0) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+        if (pat_size) {
+            if (pat_size!=length || memcmp(pat_copy,section,length)) return ts_failure(view,VP_SOURCE_ADMISSION_CHANGED_PAT,-EINVAL);
+            continue;
+        }
+        unsigned programs=0;
+        for (size_t k=8;k<length-4;k+=4) {
+            if (length-4-k<4) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+            if (be16(section+k)) {
+                if (++programs>1) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+                program=be16(section+k); pmt=be16(section+k+2)&8191;
+            }
+        }
+        if (programs!=1 || pmt==0 || pmt==8191 || vp_source_ignored_si(pmt)) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+        memcpy(pat_copy,section,length); pat_size=length;
+    }
+    if (!pat_size) return ts_failure(view,VP_SOURCE_ADMISSION_MISSING_PAT,-EINVAL);
+    /* Learn the selected PMT and at most eight observed media PIDs regardless
+     * of their order. A fixed final membership check rejects undeclared media. */
+    for (size_t o=0;o<n;o+=188) {
+        view->packet_offset=o; view->pid=-1;
+        if (interrupt && interrupt(context)) return ts_failure(view,VP_SOURCE_ADMISSION_CANCELLED,-ECANCELED);
+        const uint8_t *q=p+o; size_t head; unsigned pid;
+        int payload=ts_payload(q,&head,&pid);
+        if (payload<0) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+        view->pid=(int)pid;
+        if (!payload) continue;
+        if (pid==0) { latest_pat=o; continue; }
+        if (pid==pmt) {
+            const uint8_t *section; size_t length;
+            if (ts_single_section(q,head,2,&section,&length)<0) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+            if (be16(section+3)!=program) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+            if (pmt_size) {
+                if (pmt_size!=length || memcmp(pmt_copy,section,length)) return ts_failure(view,VP_SOURCE_ADMISSION_CHANGED_PMT,-EINVAL);
             } else {
-                if (pmt_size) { if (pmt_size!=length || memcmp(pmt_copy,section,length)) return -EINVAL; continue; }
-                if (length<16) return -EINVAL;
-                size_t info=be16(section+10)&4095, k=12;
-                if (info>length-4-k || ts_descriptors(section+k,info)<0) return -EINVAL;
+                if (length<16) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+                size_t info=be16(section+10)&4095,k=12;
+                if (info>length-4-k || ts_descriptors(section+k,info)<0) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
                 k+=info;
                 while (k<length-4) {
-                    if (length-4-k<5 || streams==8) return -EINVAL;
+                    if (length-4-k<5 || streams==8) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                     uint8_t type=section[k]; unsigned stream=be16(section+k+1)&8191;
                     size_t extra=be16(section+k+3)&4095; k+=5;
-                    if (extra>length-4-k || ts_descriptors(section+k,extra)<0 || stream==0 || stream==8191 || stream==pmt) return -EINVAL;
-                    for (unsigned j=0;j<streams;j++) if (stream_pids[j]==stream) return -EINVAL;
+                    if (extra>length-4-k || ts_descriptors(section+k,extra)<0 || stream==0 || stream==8191 || stream==pmt || vp_source_ignored_si(stream))
+                        return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+                    for (unsigned j=0;j<streams;j++) if (stream_pids[j]==stream) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                     stream_pids[streams++]=stream;
-                    if ((type==0x1b || type==0x24) && ++video>1) return -EINVAL;
-                    /* Unknown elementary types remain native descriptor evidence,
-                     * never a claim of supported source media. Their PID count is bounded. */
+                    if ((type==0x1b || type==0x24) && ++video>1) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                     k+=extra;
                 }
-                if (!streams) return -EINVAL;
+                if (!streams) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                 memcpy(pmt_copy,section,length); pmt_size=length;
             }
-        } else if (pid!=17 && pid!=8191) {
-            int known=0;
-            for (unsigned j=0;j<streams;j++) if (stream_pids[j]==pid) known=1;
-            if (!known) return -EINVAL;
+            /* Pinned handle_packets stops before packet number nb_packets:
+             * with 32768/188=174, only indexes 0...172 are inspected. */
+            if (acquisition==SIZE_MAX && latest_pat!=SIZE_MAX &&
+                o-latest_pat<(VP_SOURCE_TS_HEADER_BYTES/188-1)*188) acquisition=latest_pat;
+        } else if (pid!=17 && pid!=8191 && !vp_source_ignored_si(pid)) {
+            unsigned j=0;
+            while (j<observed_count && observed_pids[j]!=pid) j++;
+            if (j==observed_count) {
+                if (observed_count==8) return ts_failure(view,VP_SOURCE_ADMISSION_UNKNOWN_PID,-EINVAL);
+                observed_pids[observed_count++]=pid;
+            }
         }
     }
-    return pat_size && pmt_size ? 0 : -EINVAL;
+    if (!pmt_size) return ts_failure(view,VP_SOURCE_ADMISSION_MISSING_PMT,-EINVAL);
+    for (unsigned i=0;i<observed_count;i++) {
+        unsigned j=0;
+        while (j<streams && stream_pids[j]!=observed_pids[i]) j++;
+        if (j==streams) { view->pid=(int)observed_pids[i]; view->packet_offset=SIZE_MAX; return ts_failure(view,VP_SOURCE_ADMISSION_UNKNOWN_PID,-EINVAL); }
+    }
+    if (prefix && acquisition==SIZE_MAX) return ts_failure(view,VP_SOURCE_ADMISSION_ACQUISITION,-EINVAL);
+    view->start_offset=prefix?acquisition:0;
+    view->packet_offset=0; view->pid=-1; return 0;
 }
-int vp_source_admit_container_with_interrupt(const uint8_t *bytes,size_t size,int is_prefix,int32_t *kind,size_t *usable_size,int (*interrupt)(void *),void *context) {
-    if (!bytes || !kind || !usable_size || !size || size>MAX_BYTES) return -EFBIG;
+int vp_source_admit_container_with_view(const uint8_t *bytes,size_t size,int is_prefix,int32_t *kind,size_t *usable_size,
+    int (*interrupt)(void *),void *context,VPSourceAdmission *supplied) {
+    VPSourceAdmission local={0},*view=supplied?supplied:&local;
+    *view=(VPSourceAdmission){.pid=-1};
+    if (!bytes || !kind || !usable_size || !size || size>MAX_BYTES) return ts_failure(view,VP_SOURCE_ADMISSION_LIMIT,-EFBIG);
     *kind=0; *usable_size=size;
     if (bytes[0]==0x47) {
-        if (!is_prefix && size%188) return -EINVAL;
+        if (!is_prefix && size%188) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
         *usable_size=size-size%188;
-        if (*usable_size<188*2) return -EINVAL;
-        int result=ts_admit(bytes,*usable_size,interrupt,context);
+        if (*usable_size<188*2) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
+        int result=ts_admit(bytes,*usable_size,!!is_prefix,interrupt,context,view);
         if (result<0) return result;
         *kind=1; return 0;
     }
-    if (is_prefix || size<8) return -EINVAL;
+    if (is_prefix || size<8) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
     Admission a={.interrupt=interrupt,.context=context};
     int result=boxes(&a,bytes,size,0,0);
-    if (result<0 || !a.moov || !a.tracks || !a.mdat) return result<0?result:-EINVAL;
+    if (result<0 || !a.moov || !a.tracks || !a.mdat) {
+        view->reason=result==-ECANCELED?VP_SOURCE_ADMISSION_CANCELLED:result==-EFBIG?VP_SOURCE_ADMISSION_LIMIT:VP_SOURCE_ADMISSION_STRUCTURE;
+        return result<0?result:-EINVAL;
+    }
     *kind=a.mvex && a.moofs?2:3;
     return 0;
 }
-
+int vp_source_admit_container_with_interrupt(const uint8_t *bytes,size_t size,int is_prefix,int32_t *kind,size_t *usable_size,
+    int (*interrupt)(void *),void *context) {
+    return vp_source_admit_container_with_view(bytes,size,is_prefix,kind,usable_size,interrupt,context,NULL);
+}
 int vp_source_admit_container(const uint8_t *bytes,size_t size,int is_prefix,int32_t *kind,size_t *usable_size) {
     return vp_source_admit_container_with_interrupt(bytes,size,is_prefix,kind,usable_size,NULL,NULL);
 }

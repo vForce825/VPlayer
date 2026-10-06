@@ -180,7 +180,10 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
             try admitFacts(fact, configurationBytes: &retainedConfigurationBytes)
             media = [fact]
         case let .hls(graph):
-            guard graph.unsupportedFeatures.isEmpty else { throw HLSSourceError.unsupportedMedia }
+            guard graph.unsupportedFeatures.isEmpty else {
+                HLSPreparationDiagnostics.current?.reject(.manifestFeatures)
+                throw HLSSourceError.unsupportedMedia
+            }
             let documents = graph.orderedDocuments.filter { $0.kind == .media }
             guard !documents.isEmpty else { throw HLSSourceError.incompleteEvidence }
             guard documents.count <= HLSInitializationReceipts.maximumCount else { throw HLSSourceError.graphLimit }
@@ -244,10 +247,16 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
                                    loaded: inout [HLSManifestGraph.Resource: Data]) async throws -> Data {
         let data = try await fetch(resource, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded)
         guard case let .aes128(keyURL, iv) = encryption else { return data }
-        guard resource.range == nil else { throw HLSSourceError.unsupportedMedia }
+        guard resource.range == nil else {
+            HLSPreparationDiagnostics.current?.reject(.encryptedRange)
+            throw HLSSourceError.unsupportedMedia
+        }
         let keyResource = HLSManifestGraph.Resource(url: keyURL, range: nil)
         let key = try await fetch(keyResource, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded, resourceLimit: 16)
-        guard key.count == 16 else { throw HLSSourceError.unsupportedMedia }
+        guard key.count == 16 else {
+            HLSPreparationDiagnostics.current?.reject(.keyLength)
+            throw HLSSourceError.unsupportedMedia
+        }
         try reserve(data.count + HLSAES128Preflight.workspaceBytes, bytes: &bytes)
         try Task.checkCancellation()
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }

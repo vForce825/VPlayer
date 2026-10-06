@@ -35,6 +35,8 @@ typedef struct {
     int64_t deadline;
     VPFFSourceInterrupt interrupt; void *context;
     SourceTail tails[SOURCE_MAX_TRACKS]; unsigned tail_count;
+    int is_ts;
+    VPFFSourceDiagnostic *diagnostic;
 } SourceInput;
 static int source_interrupt(void *opaque) {
     SourceInput *i=opaque;
@@ -42,10 +44,13 @@ static int source_interrupt(void *opaque) {
 }
 static int prepare_ts_tails(SourceInput *input,int prefix) {
     for (size_t o=0;o<input->size;o+=188) {
+        if (source_interrupt(input)) return AVERROR_EXIT;
         const uint8_t *p=input->bytes+o; size_t head=4;
         if (p[3]&0x20) head+=1+p[4];
         if (!(p[3]&0x10) || head>=188) continue;
         unsigned pid=((p[1]&31u)<<8)|p[2]; SourceTail *tail=NULL;
+        if (vp_source_ignored_si(pid)) continue;
+        if (input->diagnostic) { input->diagnostic->packet_index=(int32_t)(((size_t)input->diagnostic->inspected_offset+o)/188); input->diagnostic->pid=(int32_t)pid; }
         for (unsigned j=0;j<input->tail_count;j++) if (input->tails[j].pid==pid) tail=&input->tails[j];
         if (p[1]&0x40) {
             size_t available=188-head;
@@ -67,7 +72,13 @@ static int prepare_ts_tails(SourceInput *input,int prefix) {
     for (unsigned j=0;j<input->tail_count;j++) {
         SourceTail *tail=&input->tails[j];
         int incomplete=tail->header_size<6 || (tail->expected && tail->bytes<tail->expected);
-        if (incomplete && !prefix) return AVERROR_INVALIDDATA;
+        if (incomplete && !prefix) {
+            if (input->diagnostic) {
+                input->diagnostic->packet_index=(int32_t)(((size_t)input->diagnostic->inspected_offset+tail->start)/188);
+                input->diagnostic->pid=(int32_t)tail->pid;
+            }
+            return AVERROR_INVALIDDATA;
+        }
         tail->withhold=prefix && (incomplete || !tail->expected);
     }
     return 0;
@@ -78,13 +89,14 @@ static int source_read(void *opaque,uint8_t *buffer,int capacity) {
     if (input->position>=input->size) return AVERROR_EOF;
     size_t count=input->size-input->position;
     if (count>(size_t)capacity) count=(size_t)capacity;
-    if (!input->tail_count) memcpy(buffer,input->bytes+input->position,count);
+    if (!input->is_ts) memcpy(buffer,input->bytes+input->position,count);
     else {
         size_t copied=0;
         while (copied<count) {
+            if (source_interrupt(input)) return AVERROR_EXIT;
             size_t absolute=input->position+copied, packet=absolute-absolute%188, within=absolute%188;
             size_t amount=188-within; if (amount>count-copied) amount=count-copied;
-            unsigned pid=((input->bytes[packet+1]&31u)<<8)|input->bytes[packet+2]; int withheld=0;
+            unsigned pid=((input->bytes[packet+1]&31u)<<8)|input->bytes[packet+2]; int withheld=vp_source_ignored_si(pid);
             for (unsigned j=0;j<input->tail_count;j++) if (input->tails[j].pid==pid && input->tails[j].withhold && packet>=input->tails[j].start) withheld=1;
             if (!withheld) memcpy(buffer+copied,input->bytes+absolute,amount);
             else for (size_t j=0;j<amount;j++) { size_t k=within+j; buffer[copied+j]=k==0?0x47:k==1?0x1f:k==2?0xff:k==3?0x10:0xff; }
@@ -361,20 +373,64 @@ static int consume_video(SourceTrack *track,const AVPacket *packet,SourceInput *
     return 0;
 }
 
+static int source_result(VPFFSourceDiagnostic *diagnostic,int result) {
+    diagnostic->native_result=result;
+    if (result>=0) { diagnostic->stage=VPFF_SOURCE_STAGE_COMPLETE; diagnostic->reason=VPFF_SOURCE_REASON_NONE; }
+    else if (!diagnostic->reason) diagnostic->reason=result==AVERROR_EXIT || result==AVERROR(ECANCELED)?VPFF_SOURCE_REASON_CANCELLED:
+        result==AVERROR(EFBIG)?VPFF_SOURCE_REASON_LIMIT:VPFF_SOURCE_REASON_NATIVE;
+    return result;
+}
+static int admission_reason(int reason) {
+    switch (reason) {
+    case VP_SOURCE_ADMISSION_MISSING_PAT:return VPFF_SOURCE_REASON_MISSING_PAT;
+    case VP_SOURCE_ADMISSION_MISSING_PMT:return VPFF_SOURCE_REASON_MISSING_PMT;
+    case VP_SOURCE_ADMISSION_CHANGED_PAT:return VPFF_SOURCE_REASON_CHANGED_PAT;
+    case VP_SOURCE_ADMISSION_CHANGED_PMT:return VPFF_SOURCE_REASON_CHANGED_PMT;
+    case VP_SOURCE_ADMISSION_TOPOLOGY:return VPFF_SOURCE_REASON_TOPOLOGY;
+    case VP_SOURCE_ADMISSION_UNKNOWN_PID:return VPFF_SOURCE_REASON_UNKNOWN_PID;
+    case VP_SOURCE_ADMISSION_ACQUISITION:return VPFF_SOURCE_REASON_ACQUISITION;
+    case VP_SOURCE_ADMISSION_LIMIT:return VPFF_SOURCE_REASON_LIMIT;
+    case VP_SOURCE_ADMISSION_CANCELLED:return VPFF_SOURCE_REASON_CANCELLED;
+    default:return VPFF_SOURCE_REASON_STRUCTURE;
+    }
+}
 int32_t vp_ffmpeg_inspect_source_bytes(const uint8_t *bytes,size_t size,int64_t timeout_us,
     VPFFSourceInterrupt interrupt,VPFFSourceTrackCallback callback,void *context,int32_t *kind) {
     return vp_ffmpeg_inspect_source_bytes_with_completeness(bytes,size,0,timeout_us,interrupt,callback,context,kind);
 }
 int32_t vp_ffmpeg_inspect_source_bytes_with_completeness(const uint8_t *bytes,size_t size,int32_t prefix,int64_t timeout_us,
     VPFFSourceInterrupt interrupt,VPFFSourceTrackCallback callback,void *context,int32_t *kind) {
-    if (!callback || !kind || timeout_us<=0 || timeout_us>10000000) return AVERROR(EINVAL);
-    SourceInput input={.bytes=bytes,.size=size,.deadline=av_gettime_relative()+timeout_us,.interrupt=interrupt,.context=context};
+    return vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics(bytes,size,prefix,timeout_us,interrupt,callback,context,kind,NULL);
+}
+int32_t vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics(const uint8_t *bytes,size_t size,int32_t prefix,int64_t timeout_us,
+    VPFFSourceInterrupt interrupt,VPFFSourceTrackCallback callback,void *context,int32_t *kind,VPFFSourceDiagnostic *supplied) {
+    VPFFSourceDiagnostic local={0},*diagnostic=supplied?supplied:&local;
+    *diagnostic=(VPFFSourceDiagnostic){.stage=VPFF_SOURCE_STAGE_ARGUMENT,.packet_index=-1,.pid=-1,.stream_index=-1,
+        .input_bytes=(int32_t)(size>SOURCE_MAX_BYTES?SOURCE_MAX_BYTES+1:size)};
+    if (!callback || !kind || timeout_us<=0 || timeout_us>10000000) {
+        diagnostic->reason=VPFF_SOURCE_REASON_INVALID_ARGUMENT; return source_result(diagnostic,AVERROR(EINVAL));
+    }
+    SourceInput input={.bytes=bytes,.size=size,.deadline=av_gettime_relative()+timeout_us,.interrupt=interrupt,.context=context,.diagnostic=diagnostic};
     size_t usable=0;
-    int result=vp_source_admit_container_with_interrupt(bytes,size,!!prefix,kind,&usable,source_interrupt,&input);
-    if (result<0) return result;
-    input.size=usable;
-    if (*kind==1 && (result=prepare_ts_tails(&input,!!prefix))<0) return result;
-    if (source_interrupt(&input)) return AVERROR_EXIT;
+    VPSourceAdmission view={0};
+    diagnostic->stage=VPFF_SOURCE_STAGE_CONTAINER;
+    int result=vp_source_admit_container_with_view(bytes,size,!!prefix,kind,&usable,source_interrupt,&input,&view);
+    diagnostic->container_kind=result>=0?*kind:0;
+    diagnostic->usable_bytes=(int32_t)usable;
+    diagnostic->packet_index=view.pid>=0 && view.packet_offset!=SIZE_MAX?(int32_t)(view.packet_offset/188):-1; diagnostic->pid=view.pid;
+    if (result<0) { diagnostic->reason=admission_reason(view.reason); return source_result(diagnostic,result); }
+    /* Prefix acquisition only discards already validated leading packets from
+     * this private, borrowed byte view. Original source/transmission is intact. */
+    input.bytes=bytes+view.start_offset; input.size=usable-view.start_offset; input.is_ts=*kind==1;
+    diagnostic->inspected_offset=(int32_t)view.start_offset;
+    diagnostic->stage=VPFF_SOURCE_STAGE_PES_TAIL;
+    if (*kind==1 && (result=prepare_ts_tails(&input,!!prefix))<0) {
+        diagnostic->reason=result==AVERROR_EXIT?VPFF_SOURCE_REASON_CANCELLED:VPFF_SOURCE_REASON_PES_TAIL;
+        return source_result(diagnostic,result);
+    }
+    if (source_interrupt(&input)) return source_result(diagnostic,AVERROR_EXIT);
+    diagnostic->stage=VPFF_SOURCE_STAGE_DEMUX_OPEN;
+    diagnostic->packet_index=-1; diagnostic->pid=-1;
     pthread_once(&log_once,install_log);
     AVFormatContext *format=avformat_alloc_context(); AVIOContext *io=NULL;
     AVPacket *packet=NULL,*filtered=NULL; AVDictionary *options=NULL;
@@ -386,7 +442,7 @@ int32_t vp_ffmpeg_inspect_source_bytes_with_completeness(const uint8_t *bytes,si
     io->seekable=*kind==1?0:AVIO_SEEKABLE_NORMAL;
     format->pb=io; format->flags|=AVFMT_FLAG_CUSTOM_IO|AVFMT_FLAG_NOPARSE|AVFMT_FLAG_NOFILLIN;
     format->interrupt_callback=(AVIOInterruptCB){source_interrupt,&input}; format->io_open=deny_io;
-    format->max_streams=SOURCE_MAX_TRACKS; format->probesize=32768; format->format_probesize=2048;
+    format->max_streams=SOURCE_MAX_TRACKS; format->probesize=VP_SOURCE_TS_HEADER_BYTES; format->format_probesize=2048;
     format->max_analyze_duration=0; format->max_index_size=1024*1024; format->max_picture_buffer=SOURCE_MAX_BYTES;
     av_dict_set(&options,"protocol_whitelist","",0); av_dict_set(&options,"codec_whitelist","",0);
     if (*kind==1) { av_dict_set(&options,"max_packet_size","262144",0); av_dict_set(&options,"resync_size","188",0); av_dict_set(&options,"scan_all_pmts","0",0); }
@@ -395,11 +451,14 @@ int32_t vp_ffmpeg_inspect_source_bytes_with_completeness(const uint8_t *bytes,si
     if (!input_format) { result=AVERROR_DEMUXER_NOT_FOUND; goto cleanup; }
     result=avformat_open_input(&format,NULL,input_format,&options); av_dict_free(&options);
     if (result<0) goto cleanup;
+    diagnostic->stage=VPFF_SOURCE_STAGE_TRACK;
+    diagnostic->stream_count=(int32_t)(format->nb_streams>SOURCE_MAX_TRACKS?SOURCE_MAX_TRACKS+1:format->nb_streams);
     if (!format->nb_streams || format->nb_streams>SOURCE_MAX_TRACKS) { result=AVERROR(EFBIG); goto cleanup; }
     unsigned track_count=format->nb_streams;
     int audio_count=0;
     for (unsigned i=0;i<format->nb_streams;i++) if (format->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_AUDIO) audio_count++;
     for (unsigned i=0;i<format->nb_streams;i++) {
+        diagnostic->stream_index=(int32_t)i;
         AVStream *stream=format->streams[i]; AVCodecParameters *par=stream->codecpar; SourceTrack *track=&tracks[i];
         if (source_interrupt(&input)) { result=AVERROR_EXIT; goto cleanup; }
         if (par->extradata_size<0 || par->extradata_size>(int)SOURCE_MAX_EXTRADATA) { result=AVERROR(EFBIG); goto cleanup; }
@@ -450,10 +509,14 @@ int32_t vp_ffmpeg_inspect_source_bytes_with_completeness(const uint8_t *bytes,si
     if (!packet || !filtered) { result=AVERROR(ENOMEM); goto cleanup; }
     size_t packet_bytes=0,elementary_bytes=0; int reached_eof=0;
     for (unsigned read=0;read<SOURCE_MAX_PACKETS;read++) {
+        diagnostic->stage=VPFF_SOURCE_STAGE_PACKET; diagnostic->packet_index=-1; diagnostic->stream_index=-1;
         if (source_interrupt(&input)) { result=AVERROR_EXIT; goto cleanup; }
         result=av_read_frame(format,packet);
         if (result==AVERROR_EOF) { reached_eof=1; break; }
         if (result<0) goto cleanup;
+        if (input.is_ts && packet->pos>=0 && (uint64_t)packet->pos<input.size)
+            diagnostic->packet_index=(int32_t)((view.start_offset+(size_t)packet->pos)/188);
+        if (packet->stream_index>=0 && packet->stream_index<SOURCE_MAX_TRACKS) diagnostic->stream_index=packet->stream_index;
         if (format->nb_streams!=track_count || packet->stream_index<0 || (unsigned)packet->stream_index>=format->nb_streams || packet->size<=0 ||
             packet->size>(int)SOURCE_MAX_AU || (size_t)packet->size>SOURCE_MAX_BYTES-packet_bytes || (packet->flags&AV_PKT_FLAG_CORRUPT)) { result=AVERROR_INVALIDDATA; goto cleanup; }
         packet_bytes+=(size_t)packet->size;
@@ -494,8 +557,11 @@ int32_t vp_ffmpeg_inspect_source_bytes_with_completeness(const uint8_t *bytes,si
         }
         av_packet_unref(packet);
     }
+    diagnostic->stage=VPFF_SOURCE_STAGE_FINAL;
+    diagnostic->packet_index=-1;
     if (source_interrupt(&input)) { result=AVERROR_EXIT; goto cleanup; }
     for (unsigned i=0;i<format->nb_streams;i++) {
+        diagnostic->stream_index=(int32_t)i;
         SourceTrack *track=&tracks[i];
         if (track->dolby && vp_source_dolby_finish(track->dolby,reached_eof && !prefix)<0) { result=AVERROR_INVALIDDATA; goto cleanup; }
         if (track->adts_size && reached_eof && !prefix) { result=AVERROR_INVALIDDATA; goto cleanup; }
@@ -521,7 +587,7 @@ cleanup:
     }
     av_free(tracks); avformat_close_input(&format);
     if (io) { av_freep(&io->buffer); avio_context_free(&io); }
-    return result;
+    return source_result(diagnostic,result);
 }
 
 typedef struct { SourceInput input; size_t requested_output; } AACBudget;

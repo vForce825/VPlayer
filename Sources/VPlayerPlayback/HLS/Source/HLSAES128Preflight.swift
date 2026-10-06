@@ -13,7 +13,10 @@ enum HLSAES128Preflight {
 
     static func decrypt(_ ciphertext: Data, key: Data, iv: Data) throws -> Data {
         guard key.count == kCCKeySizeAES128, iv.count == kCCBlockSizeAES128,
-              !ciphertext.isEmpty, ciphertext.count % kCCBlockSizeAES128 == 0 else { throw HLSSourceError.unsupportedMedia }
+              !ciphertext.isEmpty, ciphertext.count % kCCBlockSizeAES128 == 0 else {
+            HLSPreparationDiagnostics.current?.reject(.aesCiphertext)
+            throw HLSSourceError.unsupportedMedia
+        }
         var plaintext = Data(count: ciphertext.count)
         var written = 0
         let status = plaintext.withUnsafeMutableBytes { output in
@@ -29,6 +32,7 @@ enum HLSAES128Preflight {
         }
         guard status == kCCSuccess, written > 0, written <= plaintext.count else {
             plaintext.resetBytes(in: plaintext.startIndex..<plaintext.endIndex)
+            HLSPreparationDiagnostics.current?.reject(.aesDecrypt)
             throw HLSSourceError.unsupportedMedia
         }
         plaintext.removeSubrange(written..<plaintext.count)

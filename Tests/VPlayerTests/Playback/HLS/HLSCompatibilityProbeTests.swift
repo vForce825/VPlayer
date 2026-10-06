@@ -21,6 +21,53 @@ final class HLSCompatibilityProbeTests: XCTestCase {
         XCTAssertEqual(facts.audio.first?.priming, .notSignaledPreserveTimestamps)
         XCTAssertEqual(facts.audio.first?.formatValidated, true)
     }
+    func testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "progressive-h264-aac", withExtension: "ts"))
+        let original = try Data(contentsOf: url), inspector = FFmpegHLSContainerInspector()
+        let control = try await inspector.inspect(data: original, url: url, deadline: HLSMonotonicClock.deadline(seconds: 10))
+        for packet in ordinaryDVBInformationPackets() {
+            for offset in [0, 188 * 30, original.count] {
+                let input = Data(original.prefix(offset)) + packet + Data(original.dropFirst(offset))
+                let facts = try await inspector.inspect(data: input, url: url, deadline: HLSMonotonicClock.deadline(seconds: 10))
+                XCTAssertEqual(facts.container, control.container)
+                XCTAssertEqual(facts.video, control.video)
+                XCTAssertEqual(facts.audio, control.audio)
+                XCTAssertEqual(facts.hasUnsupportedTracks, control.hasUnsupportedTracks)
+            }
+        }
+    }
+    func testRawTSPrefixAcquiresLaterTablesWithoutChangingUnknownEvidenceRules() async throws {
+        let url = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "task22-progressive-h264-aac-16s", withExtension: "ts"))
+        let original = try Data(contentsOf: url)
+        let prefix = Data(original.dropFirst(3 * 188).prefix(1_048_576))
+        let facts = try await FFmpegHLSContainerInspector().inspect(data: prefix, url: url,
+            deadline: HLSMonotonicClock.deadline(seconds: 10), completeness: .prefix)
+        XCTAssertEqual(facts.video?.codec, .h264)
+        XCTAssertEqual(facts.video?.scan, .progressive)
+        XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+        XCTAssertEqual(facts.video?.width, 1280)
+        XCTAssertEqual(facts.audio.first?.sampleRate, 48_000)
+        XCTAssertEqual(facts.audio.first?.channelCount, 2)
+        XCTAssertEqual(facts.audio.first?.channelMask, 3)
+        XCTAssertEqual(facts.audio.first?.formatValidated, true)
+    }
+    private func ordinaryDVBInformationPackets() -> [Data] {
+        func crcSection(_ bytes: [UInt8]) -> [UInt8] {
+            var crc: UInt32 = 0xFFFF_FFFF
+            for byte in bytes {
+                crc ^= UInt32(byte) << 24
+                for _ in 0..<8 { crc = (crc << 1) ^ (crc & 0x8000_0000 != 0 ? 0x04C1_1DB7 : 0) }
+            }
+            return bytes + [24, 16, 8, 0].map { UInt8(truncatingIfNeeded: crc >> $0) }
+        }
+        func packet(_ pid: UInt8, _ section: [UInt8]) -> Data {
+            Data([0x47, 0x40, pid, 0x10, 0] + section + [UInt8](repeating: 0xFF, count: 183 - section.count))
+        }
+        // Empty current NIT/EIT and ordinary TDT, ETSI EN 300 468 sections 5.2.1/4/5.
+        return [packet(0x10, crcSection([0x40, 0xB0, 0x0D, 0, 1, 0xC1, 0, 0, 0xF0, 0, 0xF0, 0])),
+            packet(0x12, crcSection([0x4E, 0xB0, 0x0F, 0, 1, 0xC1, 0, 0, 0, 1, 0, 1, 0, 0x4E])),
+            packet(0x14, [0x70, 0x70, 5, 0xEA, 0x60, 0x12, 0x34, 0x56])]
+    }
     func testFMP4FactsComeFromRealInitAndMedia() async throws {
         let input = try sourceFixture("progressive-init.mp4") + sourceFixture("progressive-0.m4s")
         let facts = try await FFmpegHLSContainerInspector().inspect(data: input, url: URL(string: "https://example.test/media")!, deadline: HLSMonotonicClock.deadline(seconds: 10))
