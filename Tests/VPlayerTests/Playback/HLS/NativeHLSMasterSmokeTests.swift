@@ -67,6 +67,16 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         XCTAssertEqual(sdkFirst.snapshot?.0, "CoreMediaErrorDomain")
     }
 
+    func testEndpointControlSnapshotKeepsPreCleanupStageAndCounters() {
+        let state = NativeEndpointControlState(initialStatus: AVPlayerItem.Status.unknown.rawValue)
+        state.stage = "preroll-1"
+        state.captureBeforeCleanup(status: AVPlayerItem.Status.readyToPlay.rawValue, interruptedBodies: 2)
+        state.stage = "play"
+        XCTAssertEqual(state.beforeCleanup.stage, "preroll-1")
+        XCTAssertEqual(state.beforeCleanup.status, AVPlayerItem.Status.readyToPlay.rawValue)
+        XCTAssertEqual(state.beforeCleanup.interruptedBodies, 2)
+    }
+
     func testNativeEOFDeadlineRejectsExpiredAdmissionAndJoinsHeldBody() async throws {
         var expiredBodyEntered = false
         do {
@@ -313,13 +323,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             }
         let endObserver = NotificationCenter.default.addObserver(forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item, queue: nil) { _ in signal.didEnd() }
-        var stage = "ready", progressed = false
-        var statusBeforeCleanup = item.status.rawValue, stageBeforeCleanup = stage
-        var interruptedBodies = 0
+        let state = NativeEndpointControlState(initialStatus: item.status.rawValue)
+        var progressed = false
         let timeout = Task { @MainActor [weak player] in
             do { try await Task.sleep(for: .seconds(20)) } catch { return }
-            statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage
-            interruptedBodies = origin.completedInterruptedBodies
+            state.captureBeforeCleanup(status: item.status.rawValue, interruptedBodies: origin.completedInterruptedBodies)
             signal.fail(domain: "control.deadline", code: 0)
             player?.cancelPendingPrerolls()
             player?.currentItem?.asset.cancelLoading()
@@ -341,7 +349,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 // Keep both prerolls from the real adapter. Only the placement
                 // of the same observed endpoint differs between controls.
                 if index == 1, boundary == .beforePreroll { item.forwardPlaybackEndTime = duration.cmTime }
-                stage = "preroll-\(index)"
+                state.stage = "preroll-\(index)"
                 let primed = await withCheckedContinuation { continuation in
                     player.preroll(atRate: 1) { continuation.resume(returning: $0) }
                 }
@@ -349,9 +357,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             }
             try Task.checkCancellation()
             guard !signal.hasFailure else { throw HLSSourceError.deadline }
-            stage = "endpoint"
+            state.stage = "endpoint"
             if boundary == .afterPreroll { item.forwardPlaybackEndTime = duration.cmTime }
-            stage = "play"
+            state.stage = "play"
             let started = player.currentTime()
             guard started.isNumeric, started.seconds.isFinite else { throw HLSSourceError.incompleteEvidence }
             player.play()
@@ -376,17 +384,16 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         }
         let failure = signal.snapshot
         if failure?.0 != "control.deadline" {
-            statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage
-            interruptedBodies = origin.completedInterruptedBodies
+            state.captureBeforeCleanup(status: item.status.rawValue, interruptedBodies: origin.completedInterruptedBodies)
         }
         // Only the first recorded signal owns classification. A deadline first
         // cancels SDK work, whose resulting item.error is not transport evidence.
         let sdkFailed = signal.sdkFailed
         let current = item.currentTime(), end = item.forwardPlaybackEndTime
-        print("NATIVE_HLS_ENDPOINT_CONTROL diagnostic-only=true boundary=\(boundary.rawValue) stage=\(stage) progressed=\(progressed) " +
+        print("NATIVE_HLS_ENDPOINT_CONTROL diagnostic-only=true boundary=\(boundary.rawValue) stage=\(state.stage) progressed=\(progressed) " +
             "failure-domain=\(failure?.0 ?? "none") failure-code=\(failure?.1 ?? 0) status=\(item.status.rawValue) " +
             "current=\(current.value)/\(current.timescale):\(current.flags.rawValue) end=\(end.value)/\(end.timescale):\(end.flags.rawValue) " +
-            "interrupted-bodies=\(interruptedBodies) status-before-cleanup=\(statusBeforeCleanup) stage-before-cleanup=\(stageBeforeCleanup)")
+            "interrupted-bodies=\(state.beforeCleanup.interruptedBodies) status-before-cleanup=\(state.beforeCleanup.status) stage-before-cleanup=\(state.beforeCleanup.stage)")
         timeout.cancel(); await timeout.value
         player.cancelPendingPrerolls(); player.pause()
         await withCheckedContinuation { continuation in player.setDisconnectedFromSystemAudio(true) { continuation.resume() } }
@@ -396,7 +403,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let endedNormally = signal.endedNormally
         signal.close()
         await origin.close()
-        return (progressed, failure?.0, failure?.1, endedNormally, sdkFailed, interruptedBodies, statusBeforeCleanup, stageBeforeCleanup)
+        return (progressed, failure?.0, failure?.1, endedNormally, sdkFailed,
+            state.beforeCleanup.interruptedBodies, state.beforeCleanup.status, state.beforeCleanup.stage)
     }
 
     private func playerDriver(_ backend: HLSAVPlayerPlaybackBackend) -> SystemAVPlayerDriver? { backend.nativeSystemDriverForTesting }
@@ -459,6 +467,18 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
 
 private enum NativeEndpointControl: String, CaseIterable {
     case defaultEnd, beforePreroll, afterPreroll
+}
+
+/// One bounded MainActor owner shared by the helper and its timeout Task.
+/// Capturing this immutable reference avoids sharing mutable local capture boxes.
+@MainActor
+private final class NativeEndpointControlState {
+    var stage = "ready"
+    private(set) var beforeCleanup: (status: Int, stage: String, interruptedBodies: Int)
+    init(initialStatus: Int) { beforeCleanup = (initialStatus, "ready", 0) }
+    func captureBeforeCleanup(status: Int, interruptedBodies: Int) {
+        beforeCleanup = (status, stage, interruptedBodies)
+    }
 }
 
 private final class NativeEndpointControlSignal: @unchecked Sendable {

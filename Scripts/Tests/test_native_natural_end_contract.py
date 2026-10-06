@@ -124,8 +124,22 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('completedInterruptedBodiesValue', fixture)
         self.assertIn('didCompleteInterruptedBody', fixture)
         timeout = smoke.split('let timeout = Task', 1)[1].split('player?.cancelPendingPrerolls()', 1)[0]
-        self.assertIn('interruptedBodies = origin.completedInterruptedBodies', timeout)
-        self.assertIn('statusBeforeCleanup = item.status.rawValue; stageBeforeCleanup = stage', timeout)
+        self.assertIn('state.captureBeforeCleanup(status: item.status.rawValue, interruptedBodies: origin.completedInterruptedBodies)', timeout)
+
+    def test_endpoint_timeout_shares_only_main_actor_reference_state(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
+        helper = source.split('private func runEndpointControl(', 1)[1].split('private func playerDriver(', 1)[0]
+        self.assertIn('let state = NativeEndpointControlState(initialStatus: item.status.rawValue)', helper)
+        self.assertNotIn('var stage =', helper)
+        self.assertNotIn('var statusBeforeCleanup =', helper)
+        self.assertNotIn('var interruptedBodies =', helper)
+        self.assertIn('@MainActor\nprivate final class NativeEndpointControlState', source)
+        timeout = helper.split('let timeout = Task', 1)[1].split('player?.cancelPendingPrerolls()', 1)[0]
+        self.assertIn('@MainActor [weak player]', timeout)
+        self.assertIn('Task.sleep(for: .seconds(20))', timeout)
+        self.assertLess(timeout.index('state.captureBeforeCleanup('), timeout.index('signal.fail(domain: "control.deadline"'))
+        self.assertIn('timeout.cancel(); await timeout.value', helper)
+        self.assertIn('testEndpointControlSnapshotKeepsPreCleanupStageAndCounters', source)
 
 
 if __name__ == '__main__':
