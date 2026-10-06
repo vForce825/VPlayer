@@ -20,6 +20,8 @@ class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
         self.assertEqual(set(re.findall(r'phase: "([a-z-]+)"', source)), {
             'early-eof-startup', 'early-eof-recovery', 'full-eof-startup',
             'full-eof-completion', 'selected-format-startup', 'selected-format-progress',
+            'eos-ordering-startup', 'eos-ordering-first-read', 'eos-ordering-refresh',
+            'eos-ordering-error', 'eos-ordering-progress',
         })
         helper = source.split('private func until(', 1)[1].split('private func withController(', 1)[0]
         self.assertIn('file: StaticString = #filePath, line: UInt = #line', helper)

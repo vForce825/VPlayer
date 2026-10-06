@@ -1431,8 +1431,10 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                 return
             }
             if case .natural = self.endpointBoundary {
+                // Native EOS can precede AVPlayer's rate/time-control settlement.
+                // Keep this notification's first clock and original deadline;
+                // completeNaturalEndRead still requires rate zero and paused.
                 guard item.status == .readyToPlay, item.error == nil,
-                      self.player.rate == 0, self.player.timeControlStatus == .paused,
                       self.nativeEndQuantum?.hasCurrentIdentity(item: observedIdentity, physical: item) ?? true else {
                     self.publishNaturalEnd(.failure(.endpointMismatch), item: observedIdentity)
                     return

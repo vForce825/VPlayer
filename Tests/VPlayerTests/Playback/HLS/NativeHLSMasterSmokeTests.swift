@@ -35,6 +35,164 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
     }
 
+    func testNativeEOSFirstReadPrecedesRateAndControlSettlement() async throws {
+        for rate in [Float(1), Float(0)] {
+            try await verifyNativeEOSSettlement(firstRate: rate, outcome: .settled)
+        }
+    }
+
+    func testNativeEOSOriginalDeadlineRejectsUnsettledTransportAndInvalidEvidence() async throws {
+        for outcome in [NativeEOSSettlementOutcome.positiveRate, .playingControl, .changedClock,
+                        .earlyClock, .staleRevision] {
+            try await verifyNativeEOSSettlement(firstRate: 1, outcome: outcome)
+        }
+    }
+
+    func testNativeEOSOwnedStopCancelsOriginalDeadlineAndRejectsLateDelivery() async throws {
+        try await verifyNativeEOSSettlement(firstRate: 1, outcome: .cancelled)
+    }
+
+    func testNativeEOSErrorCancelsOriginalDeadlineAndRejectsLateDelivery() async throws {
+        try await verifyNativeEOSSettlement(firstRate: 1, outcome: .failedToEnd)
+    }
+
+    func testNativeEOSProgressPollPreservesOriginalFirstReadAndDeadline() async throws {
+        try await verifyNativeEOSSettlement(firstRate: 1, outcome: .progressPoll)
+    }
+
+    /// Deterministic SDK-observation ordering controls, not real media-end
+    /// acceptance. The unmodified 80-second test above supplies that evidence.
+    private func verifyNativeEOSSettlement(firstRate: Float, outcome: NativeEOSSettlementOutcome) async throws {
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let player = NativeEOSObservationPlayer()
+        let deadlines = NativeEOSManualDeadlineScheduler()
+        let driver = try SystemAVPlayerDriver.make(player: player, deadlineScheduler: deadlines)
+        var failure: (any Error)?
+        do {
+            try await withController(driver: driver) { [self] controller, registry, factory in
+                defer { player.observation = nil }
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "native-eos-settlement",
+                    streamURL: origin.url("master.m3u8"), title: "Native EOS ordering control"))
+                try await until(registry: registry, factory: factory, phase: "eos-ordering-startup", managed: false) {
+                    factory.backend?.nativeCoordinatorForTesting?.isPrepared == true &&
+                        factory.backend?.nativeCoordinatorForTesting?.currentActivation != nil &&
+                        player.currentTime().seconds > 0.25
+                }
+                let backend = try XCTUnwrap(factory.backend)
+                let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                let activation = try XCTUnwrap(coordinator.currentActivation)
+                let physical = try XCTUnwrap(player.currentItem)
+                let endpoint = try ExactMediaTime(physical.duration)
+                XCTAssertFalse(physical.forwardPlaybackEndTime.isValid,
+                    "This regression must exercise the native untrimmed path, not constrained AAC")
+                XCTAssertEqual(deadlines.count, 0)
+                let foreign = AVPlayerItem(url: origin.url("master.m3u8"))
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: foreign)
+                await nativeEOSMainQueueTurn()
+                XCTAssertNil(driver.naturalEndObservation, "A foreign physical item's notification cannot start the window")
+                XCTAssertEqual(deadlines.count, 0)
+                let clock: CMTime
+                if outcome == .earlyClock { clock = .zero }
+                else { clock = try endpoint.subtracting(ExactMediaTime(value: 1, timescale: 60)).cmTime }
+                player.observation = .init(time: clock, rate: firstRate, control: .playing)
+                // Deliver through the installed private observer, which owns
+                // the original EOS token and post-EOS selection invalidation.
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
+                try await until(registry: registry, factory: factory, phase: "eos-ordering-first-read", managed: false) {
+                    driver.naturalEndObservation != nil || driver.naturalEndTerminalResult != nil
+                }
+                let first = try XCTUnwrap(driver.naturalEndObservation)
+                XCTAssertEqual(first.firstCurrentTime, try ExactMediaTime(clock))
+                XCTAssertNil(first.stableCurrentTime)
+                XCTAssertNil(driver.naturalEndTerminalResult)
+                let original = try XCTUnwrap(deadlines.nextIdentity)
+                XCTAssertEqual(deadlines.nextDelay, 0.1)
+                XCTAssertEqual(deadlines.count, 1)
+                XCTAssertFalse(driver.hasPendingNaturalEndVerification(item: coordinator.item, activation: activation),
+                    "The pause exemption remains unavailable until direct transport reads are paused")
+                NotificationCenter.default.post(name: AVPlayerItem.didPlayToEndTimeNotification, object: physical)
+                await nativeEOSMainQueueTurn()
+                XCTAssertEqual(driver.naturalEndObservation?.firstCurrentTime, first.firstCurrentTime)
+                XCTAssertEqual(deadlines.nextIdentity, original, "A repeated notification cannot renew the window")
+                XCTAssertEqual(deadlines.count, 1)
+                // Observe the original private-EOS refresh's real inspector
+                // receipt. Do not start another refresh or fabricate a receipt.
+                try await until(registry: registry, factory: factory, phase: "eos-ordering-refresh", managed: false) {
+                    guard let refreshed = factory.trace.selectedRevision,
+                          let current = driver.nativeSelectionRevision.current else { return false }
+                    return refreshed == current
+                }
+                await nativeEOSMainQueueTurn()
+                if outcome == .progressPoll {
+                    let reads = player.observationReadCount
+                    // The real Registry progress timer remains active while the
+                    // test scheduler holds only the EOS delivery. No direct clock
+                    // reads are made by this predicate.
+                    try await until(registry: registry, factory: factory, phase: "eos-ordering-progress", managed: false) {
+                        player.observationReadCount > reads
+                    }
+                    XCTAssertEqual(driver.naturalEndObservation?.firstCurrentTime, first.firstCurrentTime)
+                    XCTAssertEqual(deadlines.nextIdentity, original)
+                }
+                player.observation = .init(time: outcome == .changedClock ? CMTimeSubtract(clock, CMTime(value: 1, timescale: 60)) : clock,
+                    rate: outcome == .positiveRate ? 1 : 0,
+                    control: outcome == .playingControl ? .playing : .paused)
+                if outcome == .staleRevision { driver.nativeSelectionRevision.invalidate() }
+                if outcome != .positiveRate && outcome != .playingControl {
+                    driver.eventHub.receive(.paused, item: coordinator.item, activation: activation)
+                    await nativeEOSMainQueueTurn()
+                    XCTAssertTrue(backend.nativeCoordinatorForTesting === coordinator)
+                    XCTAssertTrue(driver.hasPendingNaturalEndVerification(item: coordinator.item, activation: activation))
+                }
+                XCTAssertEqual(driver.naturalEndObservation?.firstCurrentTime, first.firstCurrentTime)
+                XCTAssertEqual(deadlines.nextIdentity, original, "A later pause must not renew the original deadline")
+                XCTAssertNil(driver.naturalEndTerminalResult)
+                let copiedDelivery = try XCTUnwrap(deadlines.nextCallback)
+                if outcome == .cancelled || outcome == .failedToEnd {
+                    if outcome == .failedToEnd {
+                        NotificationCenter.default.post(name: AVPlayerItem.failedToPlayToEndTimeNotification, object: physical)
+                        try await until(registry: registry, factory: factory, phase: "eos-ordering-error", managed: false) {
+                            coordinator.firstFailureDiagnosticForTesting != nil
+                        }
+                        XCTAssertTrue(coordinator.firstFailureDiagnosticForTesting?.contains("stage=observation.failed") == true)
+                        XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                    }
+                    // Clear the observation override before real ownership joins.
+                    player.observation = nil
+                    await controller.stop(); await registry.joinOwnedTerminalCleanup()
+                    XCTAssertEqual(deadlines.count, 0)
+                    copiedDelivery(); await nativeEOSMainQueueTurn()
+                    XCTAssertNil(driver.naturalEndTerminalResult)
+                    XCTAssertNil(driver.currentItemIdentity)
+                    XCTAssertNil(registry.outputResourceContextSnapshot())
+                } else {
+                    XCTAssertTrue(deadlines.fireNext())
+                    // A rejected terminal can initiate recovery, so inspect the
+                    // bounded failure retained by the original coordinator.
+                    await nativeEOSMainQueueTurn()
+                    if outcome == .settled || outcome == .progressPoll {
+                        XCTAssertTrue(coordinator.naturalEndVerifiedForTesting)
+                        let terminal = try XCTUnwrap(driver.naturalEndObservation)
+                        XCTAssertEqual(terminal.firstCurrentTime, terminal.stableCurrentTime)
+                        XCTAssertTrue(player.currentItem === physical)
+                    } else {
+                        XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                        let expected = outcome == .changedClock ? "unstableDirectRead" : "endpointMismatch"
+                        XCTAssertTrue(coordinator.firstFailureDiagnosticForTesting?.contains("endpoint-reason=\(expected)") == true)
+                    }
+                    XCTAssertNotEqual(deadlines.nextIdentity, original)
+                    player.observation = nil
+                }
+                XCTAssertEqual(driver.fixedTimerCount, 0)
+                XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+            }
+            XCTAssertEqual(deadlines.count, 0, "The real controller cleanup must join every outstanding deadline")
+        } catch { failure = error }
+        player.observation = nil
+        await origin.close()
+        if let failure { throw failure }
+    }
+
     func testNativeSmokeFailureReportSurvivesXCResultFieldLimit() {
         let oversized = String(repeating: "x", count: 8_192)
         for managed in [false, true] {
@@ -488,14 +646,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             throw HLSSourceError.deadline
         }
     }
-    private func withController(deadline: ContinuousClock.Instant? = nil,
+    private func withController(deadline: ContinuousClock.Instant? = nil, driver: SystemAVPlayerDriver? = nil,
         _ body: @escaping @MainActor (PlaybackController, ControlTaskRegistry, NativeSmokeFactory) async throws -> Void) async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         let trace = NativeSmokeTrace()
-        let factory = NativeSmokeFactory(trace: trace)
+        let factory = NativeSmokeFactory(trace: trace, driver: driver)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
         let bodyTask = Task { @MainActor in
@@ -543,6 +701,83 @@ private enum NativeEndpointControl: String, CaseIterable {
     case defaultEnd, beforePreroll, afterPreroll
 }
 
+private enum NativeEOSSettlementOutcome: Equatable {
+    case settled, positiveRate, playingControl, changedClock, earlyClock, staleRevision, cancelled, failedToEnd, progressPoll
+}
+
+private func nativeEOSMainQueueTurn() async {
+    await withCheckedContinuation { continuation in
+        DispatchQueue.main.async { continuation.resume() }
+    }
+}
+
+/// Test-only raw SDK reads; no production endpoint/authority injection.
+private final class NativeEOSObservationState: @unchecked Sendable {
+    struct Observation: Sendable {
+        let time: CMTime
+        let rate: Float
+        let control: AVPlayer.TimeControlStatus
+    }
+    private let lock = NSLock()
+    private var value: Observation?
+    private var reads = 0
+    var readCount: Int { lock.withLock { reads } }
+    func readTime() -> CMTime? { lock.withLock { reads += 1; return value?.time } }
+    var observation: Observation? {
+        get { lock.withLock { value } }
+        set { lock.withLock { value = newValue } }
+    }
+}
+
+private final class NativeEOSObservationPlayer: AVPlayer, @unchecked Sendable {
+    nonisolated private let observations = NativeEOSObservationState()
+    var observation: NativeEOSObservationState.Observation? {
+        get { observations.observation }
+        set { observations.observation = newValue }
+    }
+    var observationReadCount: Int { observations.readCount }
+    override var rate: Float {
+        get { observations.observation?.rate ?? super.rate }
+        set { super.rate = newValue }
+    }
+    override var timeControlStatus: AVPlayer.TimeControlStatus {
+        observations.observation?.control ?? super.timeControlStatus
+    }
+    nonisolated override func currentTime() -> CMTime {
+        observations.readTime() ?? super.currentTime()
+    }
+    override func pause() { observations.observation = nil; super.pause() }
+}
+
+/// Models the existing bounded scheduler's delivery, not an additional timer.
+private final class NativeEOSManualDeadlineScheduler: AVPlayerWaitDeadlineScheduling, @unchecked Sendable {
+    private struct Entry {
+        let identity: UUID
+        let delay: TimeInterval
+        let callback: @Sendable () -> Void
+    }
+    private let lock = NSLock()
+    private var entries: [Entry] = []
+    var count: Int { lock.withLock { entries.count } }
+    var nextIdentity: UUID? { lock.withLock { entries.first?.identity } }
+    var nextDelay: TimeInterval? { lock.withLock { entries.first?.delay } }
+    var nextCallback: (@Sendable () -> Void)? { lock.withLock { entries.first?.callback } }
+    func schedule(after seconds: TimeInterval, handler: @escaping @Sendable () -> Void) -> UUID? {
+        lock.withLock {
+            guard entries.count < 4 else { return nil }
+            let identity = UUID()
+            entries.append(.init(identity: identity, delay: seconds, callback: handler))
+            return identity
+        }
+    }
+    func cancel(_ identity: UUID) { lock.withLock { entries.removeAll { $0.identity == identity } } }
+    func fireNext() -> Bool {
+        let callback = lock.withLock { entries.isEmpty ? nil : entries.removeFirst().callback }
+        callback?()
+        return callback != nil
+    }
+}
+
 /// One bounded MainActor owner shared by the helper and its timeout Task.
 /// Capturing this immutable reference avoids sharing mutable local capture boxes.
 @MainActor
@@ -587,9 +822,12 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
     // Explicit test envelope permits the public committed 320×180/30 fixture on a
     // simulator. It supplies no source facts and changes no production policy.
     private let factory: SystemPlaybackBackendFactory
-    init(trace: NativeSmokeTrace) {
+    private let sourceDependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies
+    private let driver: SystemAVPlayerDriver?
+    init(trace: NativeSmokeTrace, driver: SystemAVPlayerDriver? = nil) {
         self.trace = trace
-        factory = SystemPlaybackBackendFactory(sourceDependencies: { context in
+        self.driver = driver
+        let dependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies = { context in
             var dependencies = HLSNativeSourceDependencies(context: context)
             dependencies.makeInspector = { driver in
                 guard let system = driver as? SystemAVPlayerDriver else { throw HLSSourceError.incompleteEvidence }
@@ -602,7 +840,9 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
                     supportsWebVTT: true, supportsGenerated: false, supportsInBandClosedCaptions: true)
             }
             return dependencies
-        })
+        }
+        sourceDependencies = dependencies
+        factory = SystemPlaybackBackendFactory(sourceDependencies: dependencies)
     }
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
         channelID: String, url: URL, eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
@@ -611,8 +851,25 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
     func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
         channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
-        let value = try await factory.makeBackend(kind: kind, identity: identity, tuning: tuning, channelID: channelID,
-            url: url, sourceContext: sourceContext, eventSink: eventSink)
+        let value: any PlaybackBackend
+        if let driver {
+            let context = try XCTUnwrap(sourceContext)
+            let lease = try await MainActor.run {
+                try HomePodAVPlayerSession(identity: identity.sessionIdentity, driver: driver,
+                    presentation: AVPlayerPresentationContext(player: driver.player)).claim(backend: identity)
+            }
+            let backend = HLSAVPlayerPlaybackBackend(identity: identity,
+                bundleBuilder: try SystemHLSOutputItemBundleBuilder(validating: url),
+                presentationContext: await lease.presentation,
+                coordinatorFactory: { _ in throw HLSSourceError.unsupportedMedia },
+                replacementSlot: ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot())
+            backend.configureSourceRouting(dependencies: sourceDependencies(context), sessionLease: lease,
+                builderFactory: { _, _ in throw HLSSourceError.unsupportedMedia }, eventSink: eventSink)
+            value = backend
+        } else {
+            value = try await factory.makeBackend(kind: kind, identity: identity, tuning: tuning, channelID: channelID,
+                url: url, sourceContext: sourceContext, eventSink: eventSink)
+        }
         lock.withLock { result = value as? HLSAVPlayerPlaybackBackend }
         return value
     }
@@ -623,6 +880,9 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
 private final class NativeSmokeTrace: @unchecked Sendable {
     private let lock = NSLock()
     private var lines: [String] = []
+    private var revision: UInt64?
+    var selectedRevision: UInt64? { lock.withLock { revision } }
+    func recordSelectedRevision(_ value: UInt64?) { lock.withLock { revision = value } }
     func record(_ value: String) {
         lock.withLock {
             if lines.count == 16 { lines.removeFirst() }
@@ -644,6 +904,10 @@ private final class NativeSmokeTracingInspector: NativeHLSAssetInspecting {
         record("inspect-start", item: item)
         do {
             let result = try await base.snapshot(item: item, source: source)
+            if let physical = driver.nativeCurrentItem(item),
+               result.finalPresentationQuantum?.isCurrent(item: item, physical: physical) == true {
+                trace.recordSelectedRevision(driver.nativeSelectionRevision.current)
+            }
             let duration = result.duration.map { "\($0.value)/\($0.timescale)" } ?? "none"
             record("inspect-success video=\(result.video != nil) audio=\(result.audio != nil) selected-duration=\(duration)", item: item)
             return result

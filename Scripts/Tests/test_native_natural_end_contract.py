@@ -31,6 +31,28 @@ class NativeNaturalEndContract(unittest.TestCase):
         self.assertIn('naturalEndAuthority?.revalidateCurrentAuthority() == true', source)
         self.assertIn('endpointBoundary = .constrained', source)
 
+    def test_native_eos_waits_for_transport_settlement_only_in_original_deadline(self):
+        source = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        ingress = source.split('eventHub.installEndpoint(endpoint: time, token: observationIdentity)', 1)[1].split('let hub = eventHub', 1)[0]
+        self.assertNotIn('self.player.rate == 0', ingress)
+        self.assertNotIn('self.player.timeControlStatus == .paused', ingress)
+        self.assertIn('item.status == .readyToPlay, item.error == nil', ingress)
+        self.assertIn('nativeEndQuantum?.hasCurrentIdentity', ingress)
+        self.assertIn('firstCurrentTime: first', ingress)
+        self.assertIn('scheduler.schedule(after: 0.1', ingress)
+        self.assertIn('guard self.endpointStabilityDeadline == nil else { return }', ingress)
+        final_read = source.split('private func completeNaturalEndRead(', 1)[1].split('private func cancelNaturalEndDeadline(', 1)[0]
+        for predicate in ['item.status == .readyToPlay, item.error == nil',
+                          'player.rate == 0, player.timeControlStatus == .paused',
+                          'nativeEndQuantum?.isCurrent', 'prior.firstCurrentTime == stable',
+                          'constraint == prior.expectedEndpoint',
+                          'endpointBoundary.containsFinalClock(',
+                          'naturalEndAuthority?.revalidateCurrentAuthority() == true']:
+            self.assertIn(predicate, final_read)
+        self.assertNotIn('schedule(', final_read)
+        pending = source.split('func hasPendingNaturalEndVerification(item identity:', 1)[1].split('private func completeNaturalEndRead(', 1)[0]
+        self.assertIn('player.rate == 0, player.timeControlStatus == .paused', pending)
+
     def test_smoke_covers_actual_natural_eof_and_retains_active_authority(self):
         source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
         self.assertIn('naturalEndObservation?.stableCurrentTime != nil', source)
