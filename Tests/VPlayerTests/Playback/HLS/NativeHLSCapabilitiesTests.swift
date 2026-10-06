@@ -11,7 +11,7 @@ import XCTest
 
 final class NativeHLSCapabilitiesTests: XCTestCase {
     func testExactOwnedNativeDolbyCandidatesRemainIndependentOfGeneratedWriterProof() throws {
-        for codec in [AudioCodec.ac3, .eac3] {
+        for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
             let value = try facts(codec: codec)
             let result = NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: evidence())
             XCTAssertTrue(result.nativeAudioCodecs.contains(codec))
@@ -25,7 +25,7 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         }
     }
     func testWrongRouteMissingMIMEAndUnknownDolbyProfileCannotGrantNativeTrial() throws {
-        for codec in [AudioCodec.ac3, .eac3] {
+        for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
             let value = try facts(codec: codec)
             for ports in [PlaybackRoutePorts.hdmi, [.airPlay, .bluetooth]] {
                 let result = NativeHLSCapabilities.make(facts: value, route: route(ports), evidence: evidence())
@@ -64,7 +64,7 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
     private func route(_ ports: PlaybackRoutePorts) -> PlaybackRouteSemanticIdentity {
         .init(ports: ports, backend: .hlsAVPlayer, outputConfigurationIncarnation: .init(rawValue: 1), endpointTopologyToken: .init(rawValue: 1))
     }
-    private func facts(codec: AudioCodec, profile: Int32? = nil, sampleRate: Int32 = 48_000, mask: UInt64? = nil,
+    private func facts(codec: VPlayerPlayback.AudioCodec, profile: Int32? = nil, sampleRate: Int32 = 48_000, mask: UInt64? = nil,
                        video: HLSVideoFacts? = nil) throws -> HLSCompatibilityFacts {
         let context = try sourceContext()
         let source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL, generation: 1, topology: .media(Data()))
