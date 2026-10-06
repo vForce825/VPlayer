@@ -162,27 +162,48 @@ final class HLSProxyBackpressureTests: XCTestCase {
 
     func testCancellationWhileWaitingForHeadersAndNextByteJoinsRealTasks() async throws {
         for withholdHeaders in [true, false] {
-            let block = Data(repeating: 0x47, count: 188)
+            let block = Data(repeating: 0x47, count: 512 * 1_024)
+            let prefixCount = 188
             try await withOrdinaryProxy(resource: .init(data: block, contentType: "video/mp2t",
-                withholdResponse: withholdHeaders, withholdBody: !withholdHeaders)) { proxy, origin in
+                omitContentLength: !withholdHeaders, withholdResponse: withholdHeaders,
+                pauseAfterBodyBytes: withholdHeaders ? nil : prefixCount)) { proxy, origin in
                 let reader = SlowProxySocket()
-                try await reader.start(proxy.itemURL)
-                let deadline = ContinuousClock.now + .seconds(5)
-                while (withholdHeaders ? origin.requestCount == 0 : proxy.observedIO.awaitingFirstByteReaders == 0),
-                      ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(5)) }
-                XCTAssertGreaterThan(origin.requestCount, 0)
-                if !withholdHeaders {
-                    XCTAssertGreaterThan(origin.completedHeaders, 0)
-                    XCTAssertEqual(proxy.observedIO.awaitingFirstByteReaders, 1,
-                        "The real reader must enter its first-next scope while the origin withholds every body byte")
-                }
-                XCTAssertEqual(proxy.observedIO.readWindows, 1)
-                let joined = await proxy.retire()
+                var failure: (any Error)?
+                do {
+                    try await reader.start(proxy.itemURL)
+                    let deadline = ContinuousClock.now + .seconds(5)
+                    func reachedCancellationPoint() -> Bool {
+                        if withholdHeaders { return origin.requestCount > 0 }
+                        let observed = proxy.observedIO
+                        return origin.pausedBodyCount == 1 && observed.activeUpstreamReaders == 1 &&
+                            observed.deliveredBodyBytes == Int64(prefixCount) && observed.pendingSendAliases == 0
+                    }
+                    while !reachedCancellationPoint(), ContinuousClock.now < deadline {
+                        try await Task.sleep(for: .milliseconds(5))
+                    }
+                    let observed = proxy.observedIO
+                    XCTAssertTrue(reachedCancellationPoint(),
+                        "Cancellation point missing: headers-held=\(withholdHeaders) requests=\(origin.requestCount) " +
+                        "paused=\(origin.pausedBodyCount) readers=\(observed.activeUpstreamReaders) " +
+                        "delivered=\(observed.deliveredBodyBytes) send=\(observed.pendingSendAliases)")
+                    XCTAssertEqual(observed.readWindows, 1)
+                    if !withholdHeaders {
+                        // The real reader has consumed a prefix and is waiting
+                        // for more while the origin deliberately holds the body.
+                        // Do not assume bytes(for:) exposes an empty first-next
+                        // scope merely because the origin sent response headers.
+                        XCTAssertEqual(observed.activeUpstreamReaders, 1)
+                        XCTAssertEqual(observed.deliveredBodyBytes, Int64(prefixCount))
+                        XCTAssertEqual(origin.pausedBodyCount, 1)
+                    }
+                    let joined = await proxy.retire()
+                    XCTAssertTrue(joined)
+                    XCTAssertEqual(proxy.observedIO.readWindows, 0)
+                    XCTAssertEqual(proxy.observedIO.activeUpstreamReaders, 0)
+                    XCTAssertEqual(proxy.observedIO.pendingSendAliases, 0)
+                } catch { failure = error }
                 await reader.close()
-                XCTAssertTrue(joined, "Cancel must unwind bytes(for:) or pending iterator.next(), then physically join")
-                XCTAssertEqual(proxy.observedIO.readWindows, 0)
-                XCTAssertEqual(proxy.observedIO.awaitingFirstByteReaders, 0)
-                XCTAssertEqual(proxy.observedIO.pendingSendAliases, 0)
+                if let failure { throw failure }
             }
         }
     }
@@ -199,7 +220,9 @@ final class HLSProxyBackpressureTests: XCTestCase {
                 let (bytes, response) = try await client.bytes(from: proxy.itemURL)
                 let http = try XCTUnwrap(response as? HTTPURLResponse)
                 XCTAssertEqual(http.statusCode, 200)
-                XCTAssertEqual(http.value(forHTTPHeaderField: "Transfer-Encoding"), "chunked")
+                // URLSession exposes a decoded-body view. Wire framing is
+                // asserted by the separate raw-socket test below.
+                print("PROXY_HTTP_API transfer-encoding=\(http.value(forHTTPHeaderField: "Transfer-Encoding") ?? "none")")
                 var iterator = bytes.makeAsyncIterator()
                 if let byte = try await iterator.next() { observation.record(byte) }
                 bytes.task.cancel()
@@ -283,7 +306,9 @@ final class HLSProxyBackpressureTests: XCTestCase {
             defer { client.invalidateAndCancel() }
             let result = try await client.data(from: proxy.itemURL)
             XCTAssertEqual((result.1 as? HTTPURLResponse)?.statusCode, 200)
-            XCTAssertEqual((result.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "Transfer-Encoding"), "chunked")
+            // tvOS 27 reported Identity here; this metadata is not used as a
+            // substitute for observing the proxy's raw HTTP chunk framing.
+            print("PROXY_HTTP_API transfer-encoding=\((result.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "Transfer-Encoding") ?? "none")")
             XCTAssertEqual(result.0, media)
             var head = URLRequest(url: proxy.itemURL); head.httpMethod = "HEAD"
             let headed = try await client.data(for: head)
@@ -295,6 +320,42 @@ final class HLSProxyBackpressureTests: XCTestCase {
             XCTAssertEqual((unsatisfied.1 as? HTTPURLResponse)?.statusCode, 416)
             XCTAssertEqual((unsatisfied.1 as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Range"), "bytes */\(media.count)")
             XCTAssertEqual(unsatisfied.0, errorBody)
+        }
+    }
+
+    func testRawWireOracleDecodesOrdinarySplitPayloadAndTerminal() throws {
+        let wire = Data(("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" +
+            "2\r\nAB\r\n3\r\nCDE\r\n0\r\n\r\n").utf8)
+        let response = try ProxyRawChunkedResponse(wire, maximumPayloadBytes: 5)
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.headers["transfer-encoding"], "chunked")
+        XCTAssertEqual(response.payload, Data("ABCDE".utf8))
+        XCTAssertEqual(response.chunks, 2)
+    }
+
+    func testUnknownLengthRawWireUsesExactChunkFramingAndPayload() async throws {
+        let media = try Data(contentsOf: XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "progressive-h264-aac", withExtension: "ts")))
+        let payload = Data(media.prefix(2 * 32 * 1_024 + 7))
+        try await withOrdinaryProxy(resource: .init(data: payload, contentType: "video/mp2t",
+            omitContentLength: true)) { proxy, _ in
+            let reader = SlowProxySocket()
+            var result: Result<Data, any Error>
+            do {
+                try await reader.start(proxy.itemURL)
+                // Even one-byte chunks fit: 6 encoded bytes per payload byte,
+                // plus a bounded header and the terminal zero chunk.
+                result = .success(try await reader.readToEnd(maximumBytes: 8 * payload.count + 16 * 1_024))
+            } catch { result = .failure(error) }
+            await reader.close()
+            let raw = try result.get()
+            let response = try ProxyRawChunkedResponse(raw, maximumPayloadBytes: payload.count)
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(response.headers["transfer-encoding"]?.lowercased(), "chunked")
+            XCTAssertNil(response.headers["content-length"])
+            XCTAssertEqual(response.payload, payload)
+            XCTAssertGreaterThan(response.chunks, 0)
+            print("PROXY_HTTP_WIRE transfer-encoding=chunked payload-bytes=\(response.payload.count) chunks=\(response.chunks) terminal-zero=true")
         }
     }
 
@@ -492,6 +553,23 @@ private final class SlowProxySocket: @unchecked Sendable {
             })
         }
     }
+    func readToEnd(maximumBytes: Int) async throws -> Data {
+        guard let connection, maximumBytes > 0 else { throw HLSSourceError.network }
+        var bytes = Data()
+        while true {
+            callbacks.enter()
+            let next: (Data, Bool) = try await withCheckedThrowingContinuation { continuation in
+                connection.receive(minimumIncompleteLength: 1, maximumLength: 16 * 1_024) { [callbacks] data, _, complete, error in
+                    defer { callbacks.leave() }
+                    if error != nil { continuation.resume(throwing: HLSSourceError.network) }
+                    else { continuation.resume(returning: (data ?? Data(), complete)) }
+                }
+            }
+            guard next.0.count <= maximumBytes - bytes.count else { throw HLSSourceError.byteLimit }
+            bytes.append(next.0)
+            if next.1 { return bytes }
+        }
+    }
     private func state(_ state: NWConnection.State) {
         switch state {
         case .ready:
@@ -540,4 +618,53 @@ private final class ProxyFirstByteObservation: @unchecked Sendable {
     private var value: UInt8?
     var first: UInt8? { lock.withLock { value } }
     func record(_ value: UInt8) { lock.withLock { if self.value == nil { self.value = value } } }
+}
+
+/// Bounded raw-wire oracle for the proxy's ordinary synthetic HTTP response.
+/// URLSession is deliberately not involved in parsing or transfer decoding.
+private struct ProxyRawChunkedResponse {
+    let status: Int
+    let headers: [String: String]
+    let payload: Data
+    let chunks: Int
+    init(_ wire: Data, maximumPayloadBytes: Int) throws {
+        let separator = Data("\r\n\r\n".utf8)
+        let lineEnd = Data("\r\n".utf8)
+        guard let boundary = wire.range(of: separator), boundary.lowerBound <= 16 * 1_024,
+              let text = String(data: wire[..<boundary.lowerBound], encoding: .utf8) else { throw HLSSourceError.network }
+        let lines = text.components(separatedBy: "\r\n")
+        let statusFields = lines.first?.split(separator: " ") ?? []
+        guard statusFields.count >= 2, statusFields[0] == "HTTP/1.1", statusFields[1].utf8.count == 3,
+              statusFields[1].utf8.allSatisfy({ (48...57).contains($0) }),
+              let status = Int(statusFields[1]) else { throw HLSSourceError.network }
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { throw HLSSourceError.network }
+            let name = String(line[..<colon]).lowercased()
+            guard !name.isEmpty, headers[name] == nil else { throw HLSSourceError.network }
+            headers[name] = String(line[line.index(after: colon)...]).trimmingCharacters(in: .whitespaces)
+        }
+        guard headers["transfer-encoding"]?.lowercased() == "chunked", headers["content-length"] == nil else { throw HLSSourceError.network }
+        var cursor = boundary.upperBound
+        var payload = Data(capacity: maximumPayloadBytes)
+        var chunks = 0
+        while true {
+            guard let end = wire.range(of: lineEnd, in: cursor..<wire.endIndex),
+                  end.lowerBound - cursor <= 16,
+                  let token = String(data: wire[cursor..<end.lowerBound], encoding: .utf8), !token.isEmpty,
+                  token.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }),
+                  let length = Int(token, radix: 16) else { throw HLSSourceError.network }
+            cursor = end.upperBound
+            if length == 0 {
+                guard wire[cursor...] == lineEnd else { throw HLSSourceError.network }
+                break
+            }
+            guard length <= maximumPayloadBytes - payload.count,
+                  length <= wire.endIndex - cursor, wire.endIndex - cursor - length >= 2,
+                  wire[(cursor + length)..<(cursor + length + 2)] == lineEnd else { throw HLSSourceError.network }
+            payload.append(wire[cursor..<(cursor + length)])
+            cursor += length + 2; chunks += 1
+        }
+        self.status = status; self.headers = headers; self.payload = payload; self.chunks = chunks
+    }
 }

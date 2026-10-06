@@ -309,6 +309,17 @@ class AcceptanceSamplerSourceContract(unittest.TestCase):
     def setUp(self):
         self.source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/PersistentHLSAcceptanceTests.swift').read_text()
 
+    def test_sampler_control_observes_weak_lifetime_before_and_after_join(self):
+        source=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceNativeControlTests.swift').read_text()
+        self.assertNotIn('weak var releasedToken',source)
+        self.assertIn('let releasedToken = AcceptanceSamplerControlTokenObservation(token)',source)
+        self.assertIn('private final class AcceptanceSamplerControlTokenObservation',source)
+        observer=source.split('private final class AcceptanceSamplerControlTokenObservation',1)[1].split('\n}',1)[0]
+        self.assertIn('weak var token: AcceptanceSamplerControlToken?',observer)
+        self.assertNotIn('releasedToken.token = nil',source)
+        self.assertLess(source.index('XCTAssertNotNil(releasedToken.token'),source.index('await joining.value'))
+        self.assertLess(source.index('await joining.value'),source.index('XCTAssertNil(releasedToken.token'))
+
     def test_sampler_captures_weak_values_instead_of_mutable_optional_boxes(self):
         self.assertIn('let sampler = AcceptanceIndependentSampler(',self.source)
         self.assertIn('observe: { [weak graph, weak authority] wall in',self.source)

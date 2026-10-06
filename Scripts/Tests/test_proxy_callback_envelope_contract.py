@@ -38,6 +38,20 @@ class ProxyReadWindowContract(unittest.TestCase):
         self.assertIn('withExtendedLifetime(envelope)', send)
         self.assertIn('queue.async', send)
 
+    def test_reader_diagnostic_spans_the_real_reader_task(self):
+        source = (PROXY / 'HLSProxyUpstream.swift').read_text()
+        reader = source[source.index('private func read('):source.index('private func request(')]
+        self.assertIn('connection.io.beginUpstreamReader()', reader)
+        self.assertIn('defer { connection.io.endUpstreamReader() }', reader)
+        self.assertNotIn('position == 0', reader)
+
+    def test_wire_framing_uses_the_bounded_raw_socket_oracle(self):
+        tests = (ROOT / 'Tests/VPlayerTests/Playback/HLS/HLSProxyBackpressureTests.swift').read_text()
+        self.assertIn('reader.readToEnd(maximumBytes:', tests)
+        self.assertIn('ProxyRawChunkedResponse(raw, maximumPayloadBytes:', tests)
+        self.assertIn('wire[cursor...] == lineEnd', tests)
+        self.assertNotIn('XCTAssertEqual(http.value(forHTTPHeaderField: "Transfer-Encoding"), "chunked")', tests)
+
     def test_cancellation_joins_consumer_and_graceful_session_invalidation(self):
         source = (PROXY / 'HLSProxyUpstream.swift').read_text()
         self.assertIn('try await consumer.value', source)

@@ -9,7 +9,7 @@ final class HLSProxyIOCounters: @unchecked Sendable {
     struct Snapshot: Sendable {
         var readWindowBytes = 0, peakReadWindowBytes = 0
         var pendingSendAliases = 0, peakPendingSendAliases = 0
-        var readWindows = 0, peakReadWindows = 0, suspendedReaders = 0, awaitingFirstByteReaders = 0
+        var readWindows = 0, peakReadWindows = 0, suspendedReaders = 0, activeUpstreamReaders = 0
         var completedSends: UInt64 = 0, bodySpans: UInt64 = 0
         var smallestBodySpanBytes = 0, largestBodySpanBytes = 0
         // Maximum per-transfer scalar counts, not a sum across requests.
@@ -23,8 +23,8 @@ final class HLSProxyIOCounters: @unchecked Sendable {
         value.readWindowBytes += bytes; value.peakReadWindowBytes = max(value.peakReadWindowBytes, value.readWindowBytes)
     } }
     func endReadWindow(_ bytes: Int) { lock.withLock { value.readWindowBytes -= bytes; value.readWindows -= 1 } }
-    func beginAwaitFirstByte() { lock.withLock { value.awaitingFirstByteReaders += 1 } }
-    func endAwaitFirstByte() { lock.withLock { value.awaitingFirstByteReaders -= 1 } }
+    func beginUpstreamReader() { lock.withLock { value.activeUpstreamReaders += 1 } }
+    func endUpstreamReader() { lock.withLock { value.activeUpstreamReaders -= 1 } }
     func suspendReader() { lock.withLock { value.suspendedReaders += 1 } }
     func resumeReader() { lock.withLock { value.suspendedReaders -= 1 } }
     func observeBody(upstream: Int64, delivered: Int64) { lock.withLock {

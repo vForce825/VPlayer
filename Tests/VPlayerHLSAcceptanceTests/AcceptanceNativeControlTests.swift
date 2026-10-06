@@ -721,7 +721,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
         let joinStarted = DispatchSemaphore(value: 0)
         let joined = DispatchSemaphore(value: 0)
         var token: AcceptanceSamplerControlToken? = AcceptanceSamplerControlToken()
-        weak var releasedToken = token
+        let releasedToken = AcceptanceSamplerControlTokenObservation(token)
         let held = AcceptanceIndependentSampler(start: AcceptanceClock.now, collector: heldCollector,
             shouldStop: { false }, observe: { [token] _ in
                 entered.signal()
@@ -732,6 +732,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
             }, onFailure: { _ in })
         token = nil
         XCTAssertEqual(entered.wait(timeout: .now() + 1), .success)
+        XCTAssertNotNil(releasedToken.token, "The held reader must still own its token before join")
         held.cancel()
         let joining = Task.detached {
             joinStarted.signal()
@@ -743,7 +744,7 @@ final class AcceptanceNativeControlTests: XCTestCase {
             "Queue join cannot report completion while an actual read remains held")
         release.signal()
         await joining.value
-        XCTAssertNil(releasedToken, "Joining must release the completed reader closure")
+        XCTAssertNil(releasedToken.token, "Joining must release the completed reader closure")
         XCTAssertEqual(try heldCollector.snapshot().count, 1,
             "An observation already in flight is retained, not discarded at cancellation")
 
@@ -916,6 +917,11 @@ private final class AcceptanceControlRelayHolder: @unchecked Sendable {
 }
 
 private final class AcceptanceSamplerControlToken: @unchecked Sendable { }
+
+private final class AcceptanceSamplerControlTokenObservation {
+    weak var token: AcceptanceSamplerControlToken?
+    init(_ token: AcceptanceSamplerControlToken?) { self.token = token }
+}
 
 private struct WithheldInitializationFactory: SegmentedFMP4SystemWriterFactory {
     func makeWriter(configuration: SegmentedFMP4SystemConfiguration,

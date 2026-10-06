@@ -136,8 +136,8 @@ final class HLSProxyUpstream: NSObject, URLSessionTaskDelegate, @unchecked Senda
     }
     private func read(_ bytes: URLSession.AsyncBytes, into pipe: HLSProxyBudget.BytePipe,
                       upstream: URLSessionDataTask) async {
-        var awaitingFirstByte = false
-        defer { if awaitingFirstByte { connection.io.endAwaitFirstByte() } }
+        connection.io.beginUpstreamReader()
+        defer { connection.io.endUpstreamReader() }
         do {
             var iterator = bytes.makeAsyncIterator()
             var position: UInt64 = 0
@@ -150,9 +150,7 @@ final class HLSProxyUpstream: NSObject, URLSessionTaskDelegate, @unchecked Senda
                     connection.io.resumeReader()
                     try Task.checkCancellation(); upstream.resume()
                 }
-                if position == 0 { connection.io.beginAwaitFirstByte(); awaitingFirstByte = true }
                 let next = try await iterator.next()
-                if awaitingFirstByte { connection.io.endAwaitFirstByte(); awaitingFirstByte = false }
                 guard let byte = next else { break }
                 try Task.checkCancellation()
                 try pipe.publish(byte, at: position)
