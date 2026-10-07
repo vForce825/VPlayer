@@ -2187,6 +2187,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             stage = "output-decode"
             try await inspectLargeIDRVideo(videoOutput, width: width, height: height,
                 frameRate: frameRate, minimumIDRBytes: minimumIDRBytes,
+                initialization: try XCTUnwrap(videoRecords.first { $0.kind == .initialization }).bytes,
                 media: videoMedia, expectedStart: nativeStart, expectedEnd: nativeVideoEnd)
             let audioAsset = AVURLAsset(url: audioOutput)
             let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
@@ -2206,7 +2207,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             // has different container priming semantics. Compare original AUs
             // and naturally drained raw PCM, never subtract an assumed delay.
             let audioInit = try XCTUnwrap(audioRecords.first { $0.kind == .initialization }).bytes
-            var rawAudio: [SyntheticAACRawSample] = []
+            var rawAudio: [SyntheticRawMediaSample] = []
             let audioInspectionLedger = HLSDeliveryApplicationChargeLedger()
             for record in audioMedia {
                 let inspection = try FMP4CompressedAudioInspection.sourceAACFragment(
@@ -2407,70 +2408,89 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     }
 
     private func inspectLargeIDRVideo(_ url: URL, width: Int, height: Int,
-        frameRate: Int32, minimumIDRBytes: Int, media: [SyntheticAACContinuityCapture.Record],
-        expectedStart: CMTime, expectedEnd: CMTime) async throws {
+        frameRate: Int32, minimumIDRBytes: Int, initialization: Data,
+        media: [SyntheticAACContinuityCapture.Record], expectedStart: CMTime, expectedEnd: CMTime) async throws {
         let asset = AVURLAsset(url: url)
         let tracks = try await asset.loadTracks(withMediaType: .video)
         let track = try XCTUnwrap(tracks.first)
         let timescale = try await track.load(.naturalTimeScale)
         XCTAssertEqual(timescale % frameRate, 0)
         let trackRange = try await track.load(.timeRange)
-        print("LARGE_IDR_VIDEO_TRACK scale=\(timescale) start=\(hlsFixtureTimeDescription(trackRange.start)) " +
-            "duration=\(hlsFixtureTimeDescription(trackRange.duration)) expectedStart=\(hlsFixtureTimeDescription(expectedStart)) " +
-            "expectedEnd=\(hlsFixtureTimeDescription(expectedEnd))")
-        let firstFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.first), label: "LARGE_IDR_VIDEO_START")
-        let lastFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.last), label: "LARGE_IDR_VIDEO_END")
-        XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(firstFragment.decodeTime), timescale: timescale), expectedStart), 0)
-        let finalDecodeEnd = Int64(lastFragment.decodeTime) + Int64(lastFragment.sampleCount) * Int64(timescale / frameRate)
-        XCTAssertEqual(CMTimeCompare(CMTime(value: finalDecodeEnd, timescale: timescale), expectedEnd), 0)
+        let rawStart = try ExactMediaTime(expectedStart)
+        let rawEnd = try ExactMediaTime(expectedEnd)
+        let frameDuration = ExactMediaTime(value: 1, timescale: frameRate)
+        let expectedFrames = Int(frameRate * 15)
+        var rawSamples: [SyntheticRawMediaSample] = []
+        for record in media {
+            rawSamples += try SyntheticAACFragmentInspector.videoSamples(initialization: initialization,
+                media: record.bytes, timescale: timescale, maximumSamples: 1_024 - rawSamples.count)
+        }
+        guard rawSamples.count == expectedFrames else { throw AACRenditionFailure.invalidInput }
+        for (ordinal, raw) in rawSamples.enumerated() {
+            let expected = try rawStart.adding(.init(value: Int64(ordinal), timescale: frameRate))
+            guard raw.start == expected, raw.duration == frameDuration else {
+                throw NSError(domain: "SyntheticVideoFragment", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "Native duration or PTS differs at ordinal \(ordinal): \(raw)"])
+            }
+        }
+        let lastRaw = try XCTUnwrap(rawSamples.last)
+        XCTAssertEqual(try lastRaw.start.adding(lastRaw.duration), rawEnd,
+            "Native trun durations, including the final GOP, must reach the original raw endpoint")
+
         let compressed = try AVAssetReader(asset: asset)
         let compressedOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         let compressedProvider = compressed.outputProvider(for: compressedOutput)
         try compressed.start()
         defer { if compressed.status == .reading { compressed.cancelReading() } }
-        var count = 0
-        var compressedEnd: CMTime?
+        var byteTiming = SyntheticReaderByteTiming()
+        var compressedFirst: ExactMediaTime?
+        var compressedEnd: ExactMediaTime?
         var compressedCursor = HLSFixtureVideoReaderCursor(kind: .compressed)
-        var mismatchReports = 0
         while let ready = try await compressedProvider.next() {
-            guard try compressedCursor.consumesMedia(ready) else {
-                if compressedCursor.skippedMarkers <= 8 {
-                    let markerPTS = ready.withUnsafeSampleBuffer { CMSampleBufferGetPresentationTimeStamp($0) }
-                    print("LARGE_IDR_VIDEO_MARKER ordinal=\(count) pts=\(hlsFixtureTimeDescription(markerPTS))")
-                }
-                continue
-            }
+            guard try compressedCursor.consumesMedia(ready) else { continue }
             let sample = try makeOwnedReaderFixtureSample(copying: ready)
-            let expectedPTS = CMTimeAdd(expectedStart, CMTime(value: Int64(count), timescale: frameRate))
+            let ordinal = byteTiming.frames
+            guard ordinal < rawSamples.count else { throw AACRenditionFailure.invalidInput }
+            let raw = rawSamples[ordinal]
+            let size = CMSampleBufferGetTotalSampleSize(sample)
+            guard size == raw.size else { throw AACRenditionFailure.invalidInput }
+            let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+            // The cursor permits extra logical backing. Hash exactly the sample's
+            // declared bytes, also supporting noncontiguous CMBlockBuffer backing.
+            var bytes = Data(count: size)
+            let status = bytes.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: size, destination: $0.baseAddress!)
+            }
+            guard status == noErr else { throw AACRenditionFailure.framework(status) }
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
             let duration = CMSampleBufferGetDuration(sample)
-            let comparison = CMTimeCompare(pts, expectedPTS)
-            if comparison != 0, mismatchReports < 8 {
-                let exactExpected = try ExactMediaTime(expectedStart)
-                    .adding(ExactMediaTime(value: Int64(count), timescale: frameRate)).cmTime
-                let originalPTS = ready.withUnsafeSampleBuffer { CMSampleBufferGetPresentationTimeStamp($0) }
-                print("LARGE_IDR_VIDEO_TIME ordinal=\(count) copied=\(hlsFixtureTimeDescription(pts)) " +
-                    "borrowed=\(hlsFixtureTimeDescription(originalPTS)) duration=\(hlsFixtureTimeDescription(duration)) " +
-                    "\(largeIDRTimeEvidence(actual: pts, expected: expectedPTS, exactExpected: exactExpected))")
-                mismatchReports += 1
-            }
-            XCTAssertEqual(comparison, 0, "Compressed media ordinal \(count)")
-            compressedEnd = CMTimeAdd(pts, duration)
-            if count % Int(frameRate * 5) == 0 {
-                let bytes = CMSampleBufferGetTotalSampleSize(sample)
-                XCTAssertGreaterThanOrEqual(bytes, minimumIDRBytes,
-                    "The actual native output must contain genuine large IDRs")
-                XCTAssertGreaterThan(bytes * Int(2 * 6 * frameRate + 2), 64 * 1_024 * 1_024,
+            try byteTiming.observe(raw: raw, reader: .init(size: size, digest: Data(SHA256.hash(data: bytes)),
+                pts: pts, duration: duration))
+            if compressedFirst == nil { compressedFirst = try ExactMediaTime(pts) }
+            compressedEnd = try ExactMediaTime(pts).adding(ExactMediaTime(duration))
+            if ordinal % Int(frameRate * 5) == 0 {
+                XCTAssertGreaterThanOrEqual(size, minimumIDRBytes,
+                    "The byte-verified native output must contain genuine large IDRs")
+                XCTAssertGreaterThan(size * Int(2 * 6 * frameRate + 2), 64 * 1_024 * 1_024,
                     "This fixture must still expose the rejected old max-AU-times-window projection")
             }
-            count += CMSampleBufferGetNumSamples(sample)
         }
-        XCTAssertEqual(compressed.status, .completed, String(describing: compressed.error))
-        XCTAssertEqual(count, Int(frameRate * 15))
-        XCTAssertEqual(compressedCursor.mediaSamples, count)
-        print("LARGE_IDR_VIDEO_COMPRESSED frames=\(count) markers=\(compressedCursor.skippedMarkers) " +
-            "end=\(hlsFixtureTimeDescription(try XCTUnwrap(compressedEnd)))")
-        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(compressedEnd), expectedEnd), 0)
+        guard compressed.status == .completed else {
+            throw compressed.error ?? AACRenditionFailure.invalidInput
+        }
+        XCTAssertEqual(compressedCursor.mediaSamples, expectedFrames)
+        // No translation is usable until every payload/duration/PTS ordinal,
+        // exact expected count and both independently parsed raw endpoints pass.
+        let mapping = try byteTiming.coverage(expectedSamples: expectedFrames, rawStart: rawStart, rawEnd: rawEnd)
+        let mappedStart = try mapping.presentationTime(forRawTime: rawStart)
+        let mappedEnd = try mapping.presentationTime(forRawTime: rawEnd)
+        XCTAssertEqual(try XCTUnwrap(compressedFirst), mappedStart)
+        XCTAssertEqual(try XCTUnwrap(compressedEnd), mappedEnd)
+        XCTAssertEqual(try ExactMediaTime(trackRange.start), mappedStart)
+        XCTAssertEqual(try ExactMediaTime(trackRange.start).adding(ExactMediaTime(trackRange.duration)), mappedEnd)
+        print("LARGE_IDR_VIDEO_BYTE_PROOF frames=\(byteTiming.frames) markers=\(compressedCursor.skippedMarkers) " +
+            "rawStart=\(rawStart) rawEnd=\(rawEnd) readerStart=\(mappedStart) readerEnd=\(mappedEnd) " +
+            "\(byteTiming.diagnostics)")
 
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(track: track,
@@ -2479,7 +2499,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         try reader.start()
         defer { if reader.status == .reading { reader.cancelReading() } }
         var frames = 0
-        var previousPTS: CMTime?
+        var firstPTS: ExactMediaTime?
+        var previousPTS: ExactMediaTime?
+        var decodedEnd: ExactMediaTime?
         var decodedCursor = HLSFixtureVideoReaderCursor(kind: .decoded)
         while let ready = try await provider.next() {
             guard try decodedCursor.consumesMedia(ready) else { continue }
@@ -2487,41 +2509,33 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
             XCTAssertEqual(CVPixelBufferGetWidth(image), width)
             XCTAssertEqual(CVPixelBufferGetHeight(image), height)
-            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            if frames == 0 { XCTAssertEqual(CMTimeCompare(pts, expectedStart), 0) }
+            guard frames < rawSamples.count else { throw AACRenditionFailure.invalidInput }
+            let raw = rawSamples[frames]
+            let pts = try ExactMediaTime(CMSampleBufferGetPresentationTimeStamp(sample))
+            try mapping.requirePresentationTime(pts, forRawTime: raw.start)
+            let duration = CMSampleBufferGetDuration(sample)
+            if duration.isValid {
+                XCTAssertEqual(try ExactMediaTime(duration), raw.duration,
+                    "A declared decoded duration must agree with its original compressed sample")
+            }
+            if firstPTS == nil { firstPTS = pts }
             if let previousPTS {
-                XCTAssertEqual(CMTimeCompare(CMTimeSubtract(pts, previousPTS),
-                    CMTime(value: 1, timescale: frameRate)), 0, "Decoded frame cadence must survive GOP boundaries")
+                XCTAssertEqual(try pts.subtracting(previousPTS), frameDuration,
+                    "Decoded frame cadence must survive GOP boundaries")
             }
             previousPTS = pts
+            decodedEnd = try pts.adding(raw.duration)
             frames += 1
         }
         XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
-        XCTAssertEqual(frames, Int(frameRate * 15), "Decode every original output frame, including the final GOP")
+        XCTAssertEqual(frames, expectedFrames, "Decode every original output frame, including the final GOP")
         XCTAssertEqual(decodedCursor.mediaSamples, frames)
-        let finalPTS = try XCTUnwrap(previousPTS)
-        let decodedEnd = CMTimeAdd(finalPTS, CMTime(value: 1, timescale: frameRate))
-        let exactDecodedEnd = try ExactMediaTime(finalPTS)
-            .adding(ExactMediaTime(value: 1, timescale: frameRate)).cmTime
+        XCTAssertEqual(try XCTUnwrap(firstPTS), mappedStart)
+        XCTAssertEqual(try XCTUnwrap(decodedEnd), mappedEnd,
+            "The final decoded frame must reach the byte-verified original video endpoint")
         print("LARGE_IDR_VIDEO_DECODED frames=\(frames) markers=\(decodedCursor.skippedMarkers) " +
-            "lastPTS=\(hlsFixtureTimeDescription(finalPTS)) exactEnd=\(hlsFixtureTimeDescription(exactDecodedEnd)) " +
-            "\(largeIDRTimeEvidence(actual: decodedEnd, expected: expectedEnd, exactExpected: expectedEnd))")
-        XCTAssertEqual(CMTimeCompare(decodedEnd, expectedEnd), 0,
-            "The final decoded frame must reach the original video endpoint")
-    }
-
-    /// Keep the native assertion and an independent integer-domain diagnostic.
-    /// CMTimeAdd may round when its LCM scale or value overflows; seconds alone
-    /// cannot distinguish that from changed media timestamps or reader coordinates.
-    /// https://developer.apple.com/documentation/coremedia/cmtimeadd(_:_:)
-    private func largeIDRTimeEvidence(actual: CMTime, expected: CMTime, exactExpected: CMTime) -> String {
-        let exactActual = try? ExactMediaTime(actual)
-        let exactTarget = try? ExactMediaTime(exactExpected)
-        let delta = exactActual.flatMap { value in exactTarget.flatMap { try? value.subtracting($0) } }
-        let deltaText = delta.map { hlsFixtureTimeDescription($0.cmTime) } ?? "non-exact"
-        return "actual=\(hlsFixtureTimeDescription(actual)) expected=\(hlsFixtureTimeDescription(expected)) " +
-            "exactExpected=\(hlsFixtureTimeDescription(exactExpected)) exactDelta=\(deltaText) " +
-            "compare=\(CMTimeCompare(actual, expected))"
+            "firstPTS=\(String(describing: firstPTS)) lastPTS=\(String(describing: previousPTS)) " +
+            "end=\(String(describing: decodedEnd)) mappedEnd=\(mappedEnd)")
     }
 
     private func assertLargeIDRNativeOwnersRetired(_ probe: HLSWriterAcceptanceProbe) async throws {
@@ -2540,36 +2554,153 @@ final class HLSAVPlayerBackendTests: XCTestCase {
 
     func testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift() throws {
         let duration = ExactMediaTime(value: 1_024, timescale: 44_100)
-        let first = SyntheticAACRawSample(start: .init(value: 10, timescale: 1), duration: duration,
+        let first = SyntheticRawMediaSample(start: .init(value: 10, timescale: 1), duration: duration,
             size: 1, digest: Data(SHA256.hash(data: Data([0x21]))))
-        let second = SyntheticAACRawSample(start: try first.start.adding(duration), duration: duration,
+        let second = SyntheticRawMediaSample(start: try first.start.adding(duration), duration: duration,
             size: 1, digest: Data(SHA256.hash(data: Data([0x22]))))
-        func reader(_ sample: SyntheticAACRawSample, pts: ExactMediaTime) -> SyntheticAACByteTiming.ReaderSample {
+        func reader(_ sample: SyntheticRawMediaSample, pts: ExactMediaTime) -> SyntheticReaderByteTiming.ReaderSample {
             .init(size: sample.size, digest: sample.digest, pts: pts.cmTime, duration: sample.duration.cmTime)
         }
-        var exact = SyntheticAACByteTiming()
+        var exact = SyntheticReaderByteTiming()
         try exact.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
         try exact.observe(raw: second, reader: reader(second, pts: duration))
         XCTAssertEqual(exact.frames, 2, "The complete reader may use a different constant time origin")
-        var changedPayload = SyntheticAACByteTiming()
+        var changedPayload = SyntheticReaderByteTiming()
         XCTAssertThrowsError(try changedPayload.observe(raw: first,
             reader: reader(second, pts: .init(value: 0, timescale: 1))))
-        var droppedHead = SyntheticAACByteTiming()
+        var droppedHead = SyntheticReaderByteTiming()
         XCTAssertThrowsError(try droppedHead.observe(raw: first, reader: reader(second, pts: duration)))
-        var shifted = SyntheticAACByteTiming()
+        var shifted = SyntheticReaderByteTiming()
         try shifted.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
         XCTAssertThrowsError(try shifted.observe(raw: second, reader: reader(second,
             pts: duration.adding(.init(value: 1, timescale: 44_100)))))
-        var duplicate = SyntheticAACByteTiming()
+        var duplicate = SyntheticReaderByteTiming()
         try duplicate.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
         XCTAssertThrowsError(try duplicate.observe(raw: second, reader: reader(first, pts: duration)))
-        let repeatedPayload = SyntheticAACRawSample(start: second.start, duration: duration,
+        let repeatedPayload = SyntheticRawMediaSample(start: second.start, duration: duration,
             size: first.size, digest: first.digest)
-        var repeatedTiming = SyntheticAACByteTiming()
+        var repeatedTiming = SyntheticReaderByteTiming()
         try repeatedTiming.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
         XCTAssertThrowsError(try repeatedTiming.observe(raw: repeatedPayload,
             reader: reader(first, pts: .init(value: 0, timescale: 1))),
             "Identical payloads cannot select a different sample ordinal or conceal repeated PTS")
+    }
+
+    func testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint() throws {
+        let start = ExactMediaTime(value: 10, timescale: 1)
+        let duration = ExactMediaTime(value: 1, timescale: 30)
+        let digest = Data(SHA256.hash(data: Data([1, 2, 3, 4])))
+        let first = SyntheticRawMediaSample(start: start, duration: duration, size: 4, digest: digest)
+        // Repeated genuine payloads are allowed, but never choose their own ordinal.
+        let second = SyntheticRawMediaSample(start: try start.adding(duration), duration: duration,
+            size: 4, digest: digest)
+        let end = try second.start.adding(duration)
+        func reader(_ pts: ExactMediaTime, size: Int = 4, hash: Data? = nil,
+                    length: ExactMediaTime? = nil) -> SyntheticReaderByteTiming.ReaderSample {
+            .init(size: size, digest: hash ?? digest, pts: pts.cmTime, duration: (length ?? duration).cmTime)
+        }
+        func firstObserved() throws -> SyntheticReaderByteTiming {
+            var result = SyntheticReaderByteTiming()
+            try result.observe(raw: first, reader: reader(.init(value: 0, timescale: 1)))
+            return result
+        }
+        var proof = try firstObserved()
+        XCTAssertThrowsError(try proof.coverage(expectedSamples: 2, rawStart: start, rawEnd: end),
+            "A first-sample translation cannot authorize endpoint mapping")
+        try proof.observe(raw: second, reader: reader(duration))
+        let mapping = try proof.coverage(expectedSamples: 2, rawStart: start, rawEnd: end)
+        XCTAssertEqual(try mapping.presentationTime(forRawTime: start), .init(value: 0, timescale: 1))
+        XCTAssertEqual(try mapping.presentationTime(forRawTime: second.start), duration)
+        XCTAssertEqual(try mapping.presentationTime(forRawTime: end), try duration.adding(duration))
+        try mapping.requirePresentationTime(duration, forRawTime: second.start)
+        XCTAssertThrowsError(try mapping.requirePresentationTime(
+            duration.adding(.init(value: 1, timescale: 720_000)), forRawTime: second.start),
+            "A shifted interior decoded frame must fail the completed compressed mapping")
+        XCTAssertThrowsError(try mapping.requirePresentationTime(second.start, forRawTime: second.start),
+            "Decoded output cannot select its own independent constant offset")
+        XCTAssertThrowsError(try mapping.presentationTime(forRawTime: start.subtracting(duration)))
+        XCTAssertThrowsError(try mapping.presentationTime(forRawTime: end.adding(duration)))
+        XCTAssertThrowsError(try proof.coverage(expectedSamples: 1, rawStart: start, rawEnd: end))
+        XCTAssertThrowsError(try proof.coverage(expectedSamples: 2, rawStart: second.start, rawEnd: end))
+        XCTAssertThrowsError(try proof.coverage(expectedSamples: 2, rawStart: start, rawEnd: second.start))
+        for fault in [reader(.init(value: 0, timescale: 1)),
+                      reader(try duration.adding(.init(value: 1, timescale: 720_000))),
+                      reader(duration, size: 3),
+                      reader(duration, hash: Data(SHA256.hash(data: Data([4, 3, 2, 1])))),
+                      reader(duration, length: .init(value: 1, timescale: 50))] {
+            var invalid = try firstObserved()
+            XCTAssertThrowsError(try invalid.observe(raw: second, reader: fault),
+                "Duplicate, drifting, resized, changed or shortened samples must fail")
+        }
+        var rawReorder = try firstObserved()
+        XCTAssertThrowsError(try rawReorder.observe(raw: first, reader: reader(duration)))
+        var extra = proof
+        let third = SyntheticRawMediaSample(start: end, duration: duration, size: 4, digest: digest)
+        try extra.observe(raw: third, reader: reader(try duration.adding(duration)))
+        XCTAssertThrowsError(try extra.coverage(expectedSamples: 2, rawStart: start, rawEnd: end))
+    }
+
+    func testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage() throws {
+        func word(_ value: UInt32) -> Data { withUnsafeBytes(of: value.bigEndian) { Data($0) } }
+        func box(_ name: String, _ payload: Data) -> Data {
+            word(UInt32(payload.count + 8)) + Data(name.utf8) + payload
+        }
+        let tkhd = box("tkhd", word(0) + Data(count: 8) + word(1) + Data(count: 68))
+        let mdhd = box("mdhd", word(0) + Data(count: 8) + word(720_000) + Data(count: 8))
+        let trex = box("trex", word(0) + word(1) + word(1) + word(24_000) + word(4) + word(0))
+        let initialization = box("moov", box("trak", tkhd + box("mdia", mdhd)) + box("mvex", trex))
+        func fragment(duration: UInt32 = 24_000, size: UInt32 = 4, composition: UInt32 = 0,
+                      offsetAdjustment: Int32 = 0, count: UInt32 = 2,
+                      payload: Data = Data([1, 2, 3, 4, 5, 6, 7, 8]), useDefaults: Bool = false,
+                      headerDuration: UInt32? = nil, headerSize: UInt32? = nil,
+                      secondDuration: UInt32? = nil) -> Data {
+            let headerFlags: UInt32 = 0x020000 | (headerDuration == nil ? 0 : 8) | (headerSize == nil ? 0 : 0x10)
+            let tfhd = box("tfhd", word(headerFlags) + word(1) +
+                (headerDuration.map { word($0) } ?? Data()) + (headerSize.map { word($0) } ?? Data()))
+            let tfdt = box("tfdt", word(0) + word(7_200_000))
+            func moof(_ offset: Int32) -> Data {
+                let entries = useDefaults ? Data() :
+                    word(duration) + word(size) + word(composition) + word(secondDuration ?? duration) + word(size) + word(composition)
+                let trun = box("trun", word(useDefaults ? 1 : 0x000b01) + word(count) +
+                    word(UInt32(bitPattern: offset)) + entries)
+                return box("moof", box("mfhd", word(0) + word(1)) + box("traf", tfhd + tfdt + trun))
+            }
+            return moof(Int32(moof(0).count + 8) + offsetAdjustment) + box("mdat", payload)
+        }
+        func samples(_ bytes: Data) throws -> [SyntheticRawMediaSample] {
+            try SyntheticAACFragmentInspector.videoSamples(initialization: initialization, media: bytes,
+                timescale: 720_000, maximumSamples: 2)
+        }
+        for defaults in [false, true] {
+            let actual = try samples(fragment(useDefaults: defaults))
+            XCTAssertEqual(actual.count, 2)
+            XCTAssertEqual(actual.map(\.duration), [.init(value: 1, timescale: 30), .init(value: 1, timescale: 30)])
+            XCTAssertEqual(actual[0].start, .init(value: 10, timescale: 1))
+            XCTAssertEqual(actual[1].start, .init(value: 301, timescale: 30))
+            XCTAssertEqual(actual.map(\.size), [4, 4])
+            XCTAssertEqual(actual[0].digest, Data(SHA256.hash(data: Data([1, 2, 3, 4]))))
+            XCTAssertEqual(actual[1].digest, Data(SHA256.hash(data: Data([5, 6, 7, 8]))))
+        }
+        let headerDefaults = try samples(fragment(useDefaults: true, headerDuration: 12_000))
+        XCTAssertEqual(headerDefaults.map(\.duration), [.init(value: 1, timescale: 60), .init(value: 1, timescale: 60)])
+        let runOverrides = try samples(fragment(headerDuration: 12_000, headerSize: 3))
+        XCTAssertEqual(runOverrides.map(\.duration), [.init(value: 1, timescale: 30), .init(value: 1, timescale: 30)])
+        XCTAssertEqual(runOverrides.map(\.size), [4, 4])
+        let compensated = try samples(fragment(duration: 23_999, secondDuration: 24_001))
+        XCTAssertEqual(try compensated[0].duration.adding(compensated[1].duration), .init(value: 1, timescale: 15))
+        var timing = SyntheticReaderByteTiming()
+        XCTAssertThrowsError(try timing.observe(raw: compensated[0], reader: .init(size: 4,
+            digest: compensated[0].digest, pts: .zero, duration: CMTime(value: 1, timescale: 30))),
+            "Compensating native duration changes must not hide behind the same total endpoint")
+        for bytes in [fragment(duration: 0), fragment(size: 0), fragment(composition: 1),
+                      fragment(composition: UInt32.max), fragment(offsetAdjustment: 1),
+                      fragment(offsetAdjustment: -1), fragment(count: 3), fragment(count: 1),
+                      fragment(useDefaults: true, headerDuration: 0), fragment(useDefaults: true, headerSize: 3),
+                      fragment(payload: Data([1, 2, 3, 4, 5, 6, 7])),
+                      fragment(payload: Data([1, 2, 3, 4, 5, 6, 7, 8, 9])), fragment() + box("mdat", Data())] {
+            XCTAssertThrowsError(try samples(bytes),
+                "Malformed duration, CTS, ordinal, data offset or incomplete mdat coverage must fail")
+        }
     }
 
     func testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute() throws {
@@ -2698,7 +2829,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     }
 
     private func inspectSyntheticAACRawPCM(_ url: URL, sampleRate: Int32,
-        rawSamples: [SyntheticAACRawSample]) async throws -> SyntheticAACRawPCM {
+        rawSamples: [SyntheticRawMediaSample]) async throws -> SyntheticAACRawPCM {
         guard !rawSamples.isEmpty, rawSamples.count <= 1_024 else { throw AACRenditionFailure.capacityExceeded }
         let expectedFrames = rawSamples.count * 1_024
         let asset = AVURLAsset(url: url)
@@ -3473,7 +3604,7 @@ private final class SyntheticAACContinuityCapture: @unchecked Sendable {
 }
 
 /// Scalars hashed from each complete, contiguous native mdat payload span.
-private struct SyntheticAACRawSample {
+private struct SyntheticRawMediaSample {
     let start: ExactMediaTime
     let duration: ExactMediaTime
     let size: Int
@@ -3482,7 +3613,7 @@ private struct SyntheticAACRawSample {
 
 /// Match every ordinal before deriving a constant reader-time translation.
 /// Neither first-PTS coincidence nor a duration tolerance establishes coverage.
-private struct SyntheticAACByteTiming {
+private struct SyntheticReaderByteTiming {
     struct ReaderSample {
         let size: Int
         let digest: Data
@@ -3491,14 +3622,15 @@ private struct SyntheticAACByteTiming {
     }
     private(set) var frames = 0
     private var translation: ExactMediaTime?
+    private var rawStart: ExactMediaTime?
     private var rawEnd: ExactMediaTime?
     private var readerEnd: ExactMediaTime?
 
-    mutating func observe(raw: SyntheticAACRawSample, reader: ReaderSample) throws {
+    mutating func observe(raw: SyntheticRawMediaSample, reader: ReaderSample) throws {
         guard raw.size > 0, raw.size == reader.size, raw.digest.count == 32,
               raw.digest == reader.digest else {
-            throw NSError(domain: "SyntheticAACByteTiming", code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "AAC payload identity differs at ordinal \(frames)"])
+            throw NSError(domain: "SyntheticReaderByteTiming", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Media payload identity differs at ordinal \(frames)"])
         }
         let start = try ExactMediaTime(reader.pts)
         let duration = try ExactMediaTime(reader.duration)
@@ -3507,13 +3639,49 @@ private struct SyntheticAACByteTiming {
               translation == nil || translation == offset,
               rawEnd == nil || rawEnd == raw.start,
               readerEnd == nil || readerEnd == start else {
-            throw NSError(domain: "SyntheticAACByteTiming", code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "AAC timing differs at ordinal \(frames): raw=\(raw.start) reader=\(start) offset=\(offset)"])
+            throw NSError(domain: "SyntheticReaderByteTiming", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Media timing differs at ordinal \(frames): raw=\(raw.start) reader=\(start) offset=\(offset)"])
         }
+        if rawStart == nil { rawStart = raw.start }
         rawEnd = try raw.start.adding(duration)
         readerEnd = try start.adding(duration)
         translation = offset
         frames += 1
+    }
+
+    struct Coverage {
+        let rawStart: ExactMediaTime
+        let rawEnd: ExactMediaTime
+        let translation: ExactMediaTime
+
+        func presentationTime(forRawTime time: ExactMediaTime) throws -> ExactMediaTime {
+            guard try time.subtracting(rawStart).value >= 0,
+                  try rawEnd.subtracting(time).value >= 0 else {
+                throw NSError(domain: "SyntheticReaderByteTiming", code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "Endpoint lies outside complete byte-verified coverage"])
+            }
+            return try time.adding(translation)
+        }
+
+        func requirePresentationTime(_ time: ExactMediaTime, forRawTime rawTime: ExactMediaTime) throws {
+            let expected = try presentationTime(forRawTime: rawTime)
+            guard time == expected else {
+                throw NSError(domain: "SyntheticReaderByteTiming", code: 5,
+                    userInfo: [NSLocalizedDescriptionKey: "Decoded PTS \(time) differs from byte-verified \(expected) for raw \(rawTime)"])
+            }
+        }
+    }
+
+    /// Mapping becomes available only after every expected ordinal and both raw
+    /// endpoints have passed. A correct first sample cannot authorize a short tail.
+    func coverage(expectedSamples: Int, rawStart expectedStart: ExactMediaTime,
+                  rawEnd expectedEnd: ExactMediaTime) throws -> Coverage {
+        guard expectedSamples > 0, frames == expectedSamples, rawStart == expectedStart,
+              rawEnd == expectedEnd, let translation else {
+            throw NSError(domain: "SyntheticReaderByteTiming", code: 4,
+                userInfo: [NSLocalizedDescriptionKey: "Incomplete native/reader coverage: \(diagnostics)"])
+        }
+        return Coverage(rawStart: expectedStart, rawEnd: expectedEnd, translation: translation)
     }
     var diagnostics: String {
         "verifiedOrdinals=\(frames) translation=\(String(describing: translation)) " +
@@ -3531,9 +3699,9 @@ private struct SyntheticAACRawPCM {
 /// for more input. Per-AU identity is checked against original native mdat bytes.
 private final class SyntheticAACPacketInput {
     static let needsInputStatus: OSStatus = 0x76706E69
-    let rawSamples: [SyntheticAACRawSample]
+    let rawSamples: [SyntheticRawMediaSample]
     let sampleRate: Int32
-    var timeline: SyntheticAACByteTiming
+    var timeline: SyntheticReaderByteTiming
     private var retained: CMSampleBuffer?
     private var pointer: UnsafeMutablePointer<Int8>?
     private var descriptions: UnsafePointer<AudioStreamPacketDescription>?
@@ -3545,9 +3713,9 @@ private final class SyntheticAACPacketInput {
     private(set) var firstDiagnostic = ""
     private(set) var lastDiagnostic = ""
 
-    init(rawSamples: [SyntheticAACRawSample], sampleRate: Int32) {
+    init(rawSamples: [SyntheticRawMediaSample], sampleRate: Int32) {
         self.rawSamples = rawSamples; self.sampleRate = sampleRate
-        timeline = SyntheticAACByteTiming()
+        timeline = SyntheticReaderByteTiming()
         supplied.initialize(to: AudioStreamPacketDescription())
     }
     deinit { supplied.deinitialize(count: 1); supplied.deallocate() }
@@ -3797,6 +3965,140 @@ private enum SyntheticAACFragmentInspector {
         print("\(label) sequence=\(record.sequence) top=\(top.map(\.type).joined(separator: ",")) " +
             "mfhd=\(sequence) tfdt=\(decodeTime) samples=\(count)")
         return Facts(sequence: sequence, decodeTime: decodeTime, sampleCount: count)
+    }
+
+    /// The large-IDR fixtures have one video track and no reordered pictures.
+    /// Read actual native durations/sizes and zero CTS before treating tfdt as PTS.
+    /// Every mdat byte belongs to exactly one ordinal; no FPS-derived duration or
+    /// first-reader timestamp participates in this independent raw evidence.
+    static func videoSamples(initialization: Data, media: Data, timescale: Int32,
+                             maximumSamples: Int) throws -> [SyntheticRawMediaSample] {
+        func invalid(_ reason: String) -> NSError {
+            NSError(domain: "SyntheticVideoFragment", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: reason])
+        }
+        func one(_ type: String, _ children: [Box]) throws -> Box {
+            let matches = children.filter { $0.type == type }
+            guard matches.count == 1 else { throw invalid("Missing or duplicate \(type)") }
+            return matches[0]
+        }
+        guard timescale > 0, maximumSamples > 0, maximumSamples <= 1_024,
+              initialization.count <= 8 * 1_024 * 1_024, media.count <= 8 * 1_024 * 1_024 else {
+            throw invalid("Video inspection exceeds its fixture bounds")
+        }
+        let moov = try one("moov", boxes(initialization))
+        let movie = try boxes(initialization, from: moov.payload, through: moov.end)
+        let trak = try one("trak", movie)
+        let track = try boxes(initialization, from: trak.payload, through: trak.end)
+        let tkhd = try one("tkhd", track)
+        let mdia = try one("mdia", track)
+        let mdhd = try one("mdhd", boxes(initialization, from: mdia.payload, through: mdia.end))
+        let mvex = try one("mvex", movie)
+        let trex = try one("trex", boxes(initialization, from: mvex.payload, through: mvex.end))
+        guard tkhd.payload + 4 <= tkhd.end, mdhd.payload + 4 <= mdhd.end,
+              initialization[tkhd.payload] <= 1, initialization[mdhd.payload] <= 1,
+              tkhd.end - tkhd.payload == (initialization[tkhd.payload] == 0 ? 84 : 96),
+              mdhd.end - mdhd.payload == (initialization[mdhd.payload] == 0 ? 24 : 36),
+              trex.end - trex.payload == 24, read32(initialization, trex.payload) == 0 else {
+            throw invalid("Unsupported video initialization headers")
+        }
+        let trackID = read32(initialization, tkhd.payload + (initialization[tkhd.payload] == 0 ? 12 : 20))
+        let scale = read32(initialization, mdhd.payload + (initialization[mdhd.payload] == 0 ? 12 : 20))
+        guard trackID > 0, trackID == read32(initialization, trex.payload + 4),
+              read32(initialization, trex.payload + 8) == 1, scale == UInt32(timescale) else {
+            throw invalid("Video track identity or timescale differs from initialization")
+        }
+        var defaultDuration = read32(initialization, trex.payload + 12)
+        var defaultSize = read32(initialization, trex.payload + 16)
+        let top = try boxes(media)
+        let moof = try one("moof", top)
+        let mdat = try one("mdat", top)
+        guard moof.end <= mdat.start else { throw invalid("Video mdat precedes its moof") }
+        let children = try boxes(media, from: moof.payload, through: moof.end)
+        let mfhd = try one("mfhd", children)
+        let traf = try one("traf", children)
+        let fragmentTrack = try boxes(media, from: traf.payload, through: traf.end)
+        let tfhd = try one("tfhd", fragmentTrack)
+        let tfdt = try one("tfdt", fragmentTrack)
+        guard mfhd.end - mfhd.payload == 8, read32(media, mfhd.payload) == 0,
+              read32(media, mfhd.payload + 4) > 0, tfhd.end - tfhd.payload >= 8,
+              media[tfhd.payload] == 0, read32(media, tfhd.payload + 4) == trackID,
+              tfdt.end - tfdt.payload >= 8, media[tfdt.payload] <= 1,
+              read32(media, tfdt.payload) & 0x00ff_ffff == 0,
+              tfdt.end - tfdt.payload == (media[tfdt.payload] == 0 ? 8 : 12) else {
+            throw invalid("Unsupported video fragment headers")
+        }
+        let tfhdFlags = read32(media, tfhd.payload) & 0x00ff_ffff
+        // One traf uses its moof as the implicit or explicit default base.
+        // Absolute bases and duration-is-empty are outside these finite fixtures.
+        guard tfhdFlags & ~UInt32(0x02003a) == 0 else { throw invalid("Unsupported video tfhd flags") }
+        var headerPosition = tfhd.payload + 8
+        func headerField() throws -> UInt32 {
+            guard headerPosition + 4 <= tfhd.end else { throw invalid("Truncated video tfhd field") }
+            defer { headerPosition += 4 }
+            return read32(media, headerPosition)
+        }
+        if tfhdFlags & 2 != 0, try headerField() != 1 { throw invalid("Unexpected video sample description") }
+        if tfhdFlags & 8 != 0 { defaultDuration = try headerField() }
+        if tfhdFlags & 0x10 != 0 { defaultSize = try headerField() }
+        if tfhdFlags & 0x20 != 0 { _ = try headerField() }
+        guard headerPosition == tfhd.end else { throw invalid("Trailing video tfhd fields") }
+        let baseTime = media[tfdt.payload] == 0 ? UInt64(read32(media, tfdt.payload + 4)) : read64(media, tfdt.payload + 4)
+        guard var decodeTime = Int64(exactly: baseTime) else { throw invalid("Video tfdt exceeds exact time bounds") }
+        let runs = fragmentTrack.filter { $0.type == "trun" }
+        guard !runs.isEmpty else { throw invalid("Missing video sample run") }
+        var result: [SyntheticRawMediaSample] = []
+        var payloadPosition = mdat.payload
+        var runDataPosition: Int?
+        for run in runs {
+            guard run.end - run.payload >= 8, media[run.payload] <= 1 else { throw invalid("Unsupported video trun") }
+            let flags = read32(media, run.payload) & 0x00ff_ffff
+            let count = Int(read32(media, run.payload + 4))
+            guard flags & ~UInt32(0x000f05) == 0, flags & 4 == 0 || flags & 0x400 == 0,
+                  count > 0, count <= maximumSamples - result.count else {
+                throw invalid("Video trun flags or count exceed bounds")
+            }
+            var position = run.payload + 8
+            if flags & 1 != 0 {
+                guard position + 4 <= run.end else { throw invalid("Truncated video data offset") }
+                let offset = Int(Int32(bitPattern: read32(media, position)))
+                let sum = moof.start.addingReportingOverflow(offset)
+                guard !sum.overflow else { throw invalid("Video data offset overflow") }
+                runDataPosition = sum.partialValue
+                position += 4
+            }
+            if flags & 4 != 0 { position += 4 }
+            let fields = (flags & 0x100 != 0 ? 1 : 0) + (flags & 0x200 != 0 ? 1 : 0) +
+                (flags & 0x400 != 0 ? 1 : 0) + (flags & 0x800 != 0 ? 1 : 0)
+            guard position <= run.end, count * fields * 4 == run.end - position,
+                  runDataPosition == payloadPosition else { throw invalid("Video trun fields or mdat span are incomplete") }
+            for _ in 0..<count {
+                let duration = flags & 0x100 == 0 ? defaultDuration : read32(media, position)
+                if flags & 0x100 != 0 { position += 4 }
+                let size = flags & 0x200 == 0 ? defaultSize : read32(media, position)
+                if flags & 0x200 != 0 { position += 4 }
+                if flags & 0x400 != 0 { position += 4 }
+                if flags & 0x800 != 0 {
+                    guard read32(media, position) == 0 else { throw invalid("Video fixture has reordered presentation timestamps") }
+                    position += 4
+                }
+                guard duration > 0, size > 0, payloadPosition <= mdat.end,
+                      Int(size) <= mdat.end - payloadPosition else { throw invalid("Invalid video sample duration or size") }
+                let payloadEnd = payloadPosition + Int(size)
+                let end = decodeTime.addingReportingOverflow(Int64(duration))
+                guard !end.overflow else { throw invalid("Video sample timestamp overflow") }
+                let digest = media.withUnsafeBytes { bytes in
+                    Data(SHA256.hash(data: UnsafeRawBufferPointer(rebasing: bytes[payloadPosition..<payloadEnd])))
+                }
+                result.append(.init(start: .init(value: decodeTime, timescale: timescale),
+                    duration: .init(value: Int64(duration), timescale: timescale), size: Int(size), digest: digest))
+                decodeTime = end.partialValue
+                payloadPosition = payloadEnd
+                runDataPosition = payloadEnd
+            }
+        }
+        guard payloadPosition == mdat.end else { throw invalid("Unaccounted video mdat bytes") }
+        return result
     }
 
     private static func read32(_ bytes: Data, _ offset: Int) -> UInt32 {
