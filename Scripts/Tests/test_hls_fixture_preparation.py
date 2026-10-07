@@ -23,6 +23,7 @@ printf 'source %s\\n' "$1" >> calls.log
 if [ "$1" = --generate ]; then printf 'fresh synthetic IV' > Tests/Fixtures/SourcePlanning/encrypted-av.mp4; fi
 ''',True)
         self.write('Scripts/generate-homepod-audio-diagnostic-fixture.py',"from pathlib import Path\nwith Path('calls.log').open('a') as stream:stream.write('diagnostic\\n')\n")
+        self.write('Scripts/generate-homepod-large-idr-fixtures.py',"import sys\nfrom pathlib import Path\nassert sys.argv[1:] == ['--verify']\nwith Path('calls.log').open('a') as stream:stream.write('large-idr-verify\\n')\n")
         self.write('Scripts/generate-hls-acceptance-fixture.py',"from pathlib import Path\nwith Path('calls.log').open('a') as stream:stream.write('large360\\n')\n")
         self.write('Tests/Fixtures/SourcePlanning/encrypted-av.mp4','fixed committed synthetic IV')
         self.write('Tests/Fixtures/SourcePlanning/SHA256SUMS','committed fixture manifest')
@@ -40,16 +41,16 @@ if [ "$1" = --generate ]; then printf 'fresh synthetic IV' > Tests/Fixtures/Sour
 
     def test_final_gates_never_regenerate_committed_source_or_large_fixture(self):
         result=self.run_mode('--verify-committed');self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual((self.root/'calls.log').read_text(),'source --verify\ndiagnostic\n')
+        self.assertEqual((self.root/'calls.log').read_text(),'source --verify\nlarge-idr-verify\ndiagnostic\n')
         self.assertEqual((self.root/'Tests/Fixtures/SourcePlanning/encrypted-av.mp4').read_text(),'fixed committed synthetic IV')
 
     def test_acceptance_alone_adds_large_fixture(self):
         result=self.run_mode('--acceptance');self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual((self.root/'calls.log').read_text(),'source --verify\ndiagnostic\nlarge360\n')
+        self.assertEqual((self.root/'calls.log').read_text(),'source --verify\nlarge-idr-verify\ndiagnostic\nlarge360\n')
 
     def test_readback_alone_regenerates_source_family(self):
         result=self.run_mode('--project-readback');self.assertEqual(result.returncode,0,result.stderr)
-        self.assertEqual((self.root/'calls.log').read_text(),'source --generate\ndiagnostic\n')
+        self.assertEqual((self.root/'calls.log').read_text(),'source --generate\nlarge-idr-verify\ndiagnostic\n')
 
     def test_final_gates_reject_changed_or_untracked_inputs(self):
         self.write('Tests/Fixtures/SourcePlanning/encrypted-av.mp4','changed local bytes')

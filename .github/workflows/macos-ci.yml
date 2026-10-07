@@ -435,6 +435,8 @@ jobs:
             --only-testing VPlayerTests/VideoRemuxEligibilityTests/testSourceRec601CannotEnterGeneratedRemuxColorContract \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100 \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \

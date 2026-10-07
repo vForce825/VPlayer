@@ -162,6 +162,8 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/VideoRemuxEligibilityTests/testSourceRec601CannotEnterGeneratedRemuxColorContract',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail',
             'VPlayerTests/HLSTimelineTests',

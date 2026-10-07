@@ -2040,6 +2040,291 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         if let bodyError { throw bodyError }
     }
 
+    func testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100() async throws {
+        let probe = try await exerciseProductionLargeIDRFixture(
+            named: "homepod-large-idr-h264-1080p30-aac44100.mp4",
+            codec: .h264, width: 1_920, height: 1_080, frameRate: 30,
+            audioRate: 44_100, minimumIDRBytes: 600_000)
+        try await assertLargeIDRNativeOwnersRetired(probe)
+    }
+
+    func testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs() async throws {
+        let probe = try await exerciseProductionLargeIDRFixture(
+            named: "homepod-large-idr-hevc-hlg-2160p50-aac48000.mp4",
+            codec: .hevc, width: 3_840, height: 2_160, frameRate: 50,
+            audioRate: 48_000, minimumIDRBytes: 500_000)
+        try await assertLargeIDRNativeOwnersRetired(probe)
+    }
+
+    private func exerciseProductionLargeIDRFixture(named name: String, codec: VideoCodec,
+        width: Int, height: Int, frameRate: Int32, audioRate: Int32,
+        minimumIDRBytes: Int) async throws -> HLSWriterAcceptanceProbe {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: name, withExtension: nil, subdirectory: "Video"))
+        let origin = try NativeHLSHTTPFixture(resources: [
+            "/source.mp4": .init(data: Data(contentsOf: file), contentType: "video/mp4")])
+        let resolver = URLSessionPlaybackSourceResolver()
+        let probe = HLSWriterAcceptanceProbe()
+        var assembler: HLSMediaGraphAssembler?
+        var failure: (any Error)?
+        do {
+            // Keep the original paid, inspected source owner. Real source AAC
+            // must pass through at 44.1/48 kHz without compatibility calibration.
+            let context = try sourceContext(url: origin.url("source.mp4"))
+            let sourceCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.sourceRetention)
+            let source = try await resolver.resolve(context, reason: .initial)
+            let factsCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.factsRetention)
+            let facts = try await HLSCompatibilityProbe().inspect(source, retainingFacts: factsCharge)
+            let videoFacts = try XCTUnwrap(facts.media.first?.video)
+            XCTAssertEqual(videoFacts.codec, codec)
+            XCTAssertEqual(videoFacts.width, Int32(width))
+            XCTAssertEqual(videoFacts.height, Int32(height))
+            if codec == .hevc {
+                XCTAssertEqual(videoFacts.bitDepth, 10)
+                XCTAssertEqual(videoFacts.colorTransfer, .hlg)
+                XCTAssertEqual(videoFacts.colorPrimaries, .bt2020)
+            }
+            XCTAssertEqual(facts.media.first?.audio.first?.sampleRate, audioRate)
+            let plan = try HLSPlaybackPlanner.makePlan(source: source, facts: facts,
+                capabilities: .init(videoProfiles: [codec: [codec == .h264 ? 100 : 2]],
+                    compressedAudioCodecs: [.aac], supportsGenerated: true))
+            XCTAssertEqual(plan.transport, .generated)
+            XCTAssertEqual(plan.video, .remux)
+            XCTAssertEqual(plan.audio, .passthrough(.aac))
+            let owned = HLSOwnedSourcePlan(source: source, facts: facts, plan: plan,
+                resolver: resolver, sourceCharge: sourceCharge, factsCharge: factsCharge)
+            let owner = try XCTUnwrap(context.owner)
+            let video = SyntheticAACContinuityCapture(codecPrefix: codec == .h264 ? "avc1" : "hvc1")
+            let audio = SyntheticAACContinuityCapture()
+            let authority = try SystemHLSMediaGraphAuthority(
+                lifecycle: .init(backendIdentity: owner.backendIdentity, outputNonce: owner.outputLifecycleNonce),
+                acceptanceProbe: probe,
+                // Three GOPs use the supported finite-EOF publication floor.
+                // Writer ownershipLimits remains nil, and the real graph's
+                // maximumPassthroughInterval remains the production six seconds.
+                initialWindowMinimumSeconds: 3, generatedSource: owned)
+            authority.publicationForTesting.installBeforeReceiveForTesting {
+                video.receive($0); audio.receive($0)
+            }
+            let graph = HLSMediaGraphAssembler(sourceURL: origin.url("source.mp4"),
+                applicationLedger: HLSDeliveryApplicationChargeLedger(),
+                graph: SystemHLSDeliveryGraph(authority: authority))
+            assembler = graph
+            let prefix: AVPlayerItemReplacementBundle
+            do {
+                prefix = try await graph.startUntilPlayablePrefix()
+            } catch {
+                let observation = probe.snapshot
+                XCTFail("Large-IDR default writer did not append/publish: nativeConstructors=\(observation.nativeWriterCount) " +
+                    "inputReservations=\(observation.acceptedInputCount) error=\(authority.failureDescriptionForDiagnostics ?? String(describing: error)). " +
+                    "Constructor/start success alone does not cover the first compressed append.")
+                throw error
+            }
+            XCTAssertEqual(prefix.mediaInformation?.outputFrameRate, Double(frameRate))
+            let complete = await authority.finishAllTracksAtNaturalEOF()
+            XCTAssertTrue(complete, authority.failureDescriptionForDiagnostics ?? "Large-IDR source did not reach EOF")
+            XCTAssertEqual(authority.audioCalibrationAttemptsForTesting, 0,
+                "Source AAC must not silently switch to a newly encoded 48 kHz rendition")
+            let publication = try XCTUnwrap(authority.publicationForTesting.publisher?.visible)
+            XCTAssertEqual(publication.sourceAACTerminalBindings.count, 1)
+            XCTAssertTrue(publication.aacTerminalBindings.isEmpty)
+            let sourceAAC = try XCTUnwrap(publication.sourceAACTerminalBindings.values.first)
+            let seal = try XCTUnwrap(sourceAAC.finalSeal)
+            let sourceStart = ExactMediaTime(value: 10, timescale: 1)
+            XCTAssertEqual(sourceAAC.configuration.firstPresentationTime, sourceStart,
+                "The real timeline must map this zero-based fixture to the production 10-second origin")
+            XCTAssertEqual(try seal.writtenStart.subtracting(seal.timelineOffset), sourceStart)
+            let nativeStart = seal.writtenStart.cmTime
+            let sourceAudioSamples = Int64((15 * audioRate + 1_023) / 1_024) * 1_024
+            let audioDuration = CMTime(value: sourceAudioSamples, timescale: audioRate)
+            let nativeAudioEnd = CMTimeAdd(nativeStart, audioDuration)
+            let nativeVideoEnd = CMTimeAdd(nativeStart, CMTime(value: 15, timescale: 1))
+            XCTAssertEqual(CMTimeCompare(seal.writtenEnd.cmTime, nativeAudioEnd), 0)
+            XCTAssertEqual(seal.inputCount, UInt64(sourceAudioSamples / 1_024))
+            XCTAssertEqual(probe.snapshot.nativeWriterCount, 2,
+                "One video writer and one source-AAC writer must cover all three GOPs")
+            let videoRecords = try video.snapshot()
+            let audioRecords = try audio.snapshot()
+            let videoMedia = try assertLargeIDRFragmentSequence(videoRecords, expectedSamples: UInt64(frameRate * 5),
+                expectedStart: nativeStart, expectedEnd: nativeVideoEnd)
+            let audioMedia = try assertLargeIDRFragmentSequence(audioRecords, expectedSamples: nil,
+                expectedTotalSamples: UInt64(sourceAudioSamples / 1_024),
+                expectedStart: nativeStart, expectedEnd: nativeAudioEnd)
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            func writeOriginal(_ records: [SyntheticAACContinuityCapture.Record],
+                               media: [SyntheticAACContinuityCapture.Record], name: String) throws -> URL {
+                var bytes = try XCTUnwrap(records.first { $0.kind == .initialization }).bytes
+                for record in media { bytes.append(record.bytes) }
+                let url = directory.appendingPathComponent(name)
+                try bytes.write(to: url)
+                return url
+            }
+            // Preserve the native mfhd/tfdt/trun and sole canonical init exactly.
+            let videoOutput = try writeOriginal(videoRecords, media: videoMedia, name: "original-video.mp4")
+            let audioOutput = try writeOriginal(audioRecords, media: audioMedia, name: "original-audio.mp4")
+            try await inspectLargeIDRVideo(videoOutput, width: width, height: height,
+                frameRate: frameRate, minimumIDRBytes: minimumIDRBytes,
+                media: videoMedia, expectedStart: nativeStart, expectedEnd: nativeVideoEnd)
+            let audioAsset = AVURLAsset(url: audioOutput)
+            let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
+            let audioTrack = try XCTUnwrap(audioTracks.first)
+            let audioFormats = try await audioTrack.load(.formatDescriptions)
+            let audioFormat = try XCTUnwrap(audioFormats.first)
+            let description = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(audioFormat))
+            XCTAssertEqual(description.pointee.mSampleRate, Double(audioRate))
+            let audioTimescale = try await audioTrack.load(.naturalTimeScale)
+            XCTAssertEqual(audioTimescale, audioRate)
+            let firstAudio = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(audioMedia.first), label: "LARGE_IDR_AUDIO_START")
+            let lastAudio = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(audioMedia.last), label: "LARGE_IDR_AUDIO_END")
+            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(firstAudio.decodeTime), timescale: audioTimescale), nativeStart), 0)
+            XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(lastAudio.decodeTime + lastAudio.sampleCount * 1_024),
+                timescale: audioTimescale), nativeAudioEnd), 0)
+            // Decode the original source with the same Apple reader. This admits
+            // only actual decoder behavior shared by source and output, not a
+            // broad duration tolerance that could hide a missing head or tail.
+            let original = try await inspectSyntheticAACPCM(file, sampleRate: audioRate)
+            let decoded = try await inspectSyntheticAACPCM(audioOutput, sampleRate: audioRate)
+            XCTAssertGreaterThan(original.frames, 0)
+            XCTAssertEqual(decoded.frames, original.frames)
+            XCTAssertEqual(CMTimeCompare(try XCTUnwrap(decoded.firstPresentationTime),
+                CMTimeAdd(try XCTUnwrap(original.firstPresentationTime), nativeStart)), 0)
+            XCTAssertEqual(CMTimeCompare(try XCTUnwrap(decoded.endPresentationTime),
+                CMTimeAdd(try XCTUnwrap(original.endPresentationTime), nativeStart)), 0)
+            XCTAssertLessThanOrEqual(decoded.maximumGapSamples, 1)
+            XCTAssertEqual(decoded.silentWindows, 0)
+            print("LARGE_IDR_NATIVE codec=\(codec) frameRate=\(frameRate) gops=\(videoMedia.count) " +
+                "sourceAACRate=\(audioRate) originalBytes=true physicalHomePodVerified=false")
+        } catch { failure = error }
+        if let assembler {
+            let retired = await assembler.retireAndAwaitReceipt()
+            XCTAssertTrue(retired, "Even a first-append rejection must join the real graph's cleanup")
+            XCTAssertEqual(assembler.currentPhase, .retired)
+        }
+        await resolver.invalidate()
+        await origin.close()
+        if let failure { throw failure }
+        return probe
+    }
+
+    private func assertLargeIDRFragmentSequence(_ records: [SyntheticAACContinuityCapture.Record],
+        expectedSamples: UInt64?, expectedTotalSamples: UInt64? = nil,
+        expectedStart: CMTime, expectedEnd: CMTime) throws -> [SyntheticAACContinuityCapture.Record] {
+        XCTAssertEqual(records.filter { $0.kind == .initialization }.count, 1)
+        let media = records.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
+        XCTAssertEqual(media.count, 3, "The same writer must publish three actual five-second GOP fragments")
+        XCTAssertEqual(Set(records.map(\.writer)).count, 1)
+        let first = try XCTUnwrap(media.first)
+        let last = try XCTUnwrap(media.last)
+        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(first.start), expectedStart), 0,
+            "Video and source AAC must share the same authenticated native start mapping")
+        XCTAssertEqual(CMTimeCompare(CMTimeAdd(try XCTUnwrap(last.start), try XCTUnwrap(last.duration)), expectedEnd), 0,
+            "The final compressed report must include the complete source endpoint")
+        let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0, label: "LARGE_IDR_FRAGMENT") }
+        if let expectedTotalSamples {
+            XCTAssertEqual(fragments.reduce(UInt64(0)) { $0 + $1.sampleCount }, expectedTotalSamples,
+                "The original fragment truns must account for every complete source AAC access unit")
+        }
+        XCTAssertEqual(fragments.map(\.sequence), [1, 2, 3], "Native sequence numbers must not be rewritten or reset")
+        for (previous, current) in zip(media, media.dropFirst()) {
+            XCTAssertEqual(current.sequence, previous.sequence + 1)
+            let end = CMTimeAdd(try XCTUnwrap(previous.start), try XCTUnwrap(previous.duration))
+            XCTAssertEqual(CMTimeSubtract(try XCTUnwrap(current.start), end).seconds, 0, accuracy: 1.0 / 44_100)
+        }
+        for (index, fragment) in fragments.enumerated() {
+            if let expectedSamples {
+                XCTAssertEqual(fragment.sampleCount, expectedSamples)
+                XCTAssertEqual(try XCTUnwrap(media[index].duration).seconds, 5, accuracy: 0.0001)
+            } else if index > 0 {
+                let previous = fragments[index - 1]
+                XCTAssertEqual(fragment.decodeTime, previous.decodeTime + previous.sampleCount * 1_024,
+                    "Every original source-AAC AU must retain its native decode timestamp")
+            }
+        }
+        return media
+    }
+
+    private func inspectLargeIDRVideo(_ url: URL, width: Int, height: Int,
+        frameRate: Int32, minimumIDRBytes: Int, media: [SyntheticAACContinuityCapture.Record],
+        expectedStart: CMTime, expectedEnd: CMTime) async throws {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let track = try XCTUnwrap(tracks.first)
+        let timescale = try await track.load(.naturalTimeScale)
+        XCTAssertEqual(timescale % frameRate, 0)
+        let firstFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.first), label: "LARGE_IDR_VIDEO_START")
+        let lastFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.last), label: "LARGE_IDR_VIDEO_END")
+        XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(firstFragment.decodeTime), timescale: timescale), expectedStart), 0)
+        let finalDecodeEnd = Int64(lastFragment.decodeTime) + Int64(lastFragment.sampleCount) * Int64(timescale / frameRate)
+        XCTAssertEqual(CMTimeCompare(CMTime(value: finalDecodeEnd, timescale: timescale), expectedEnd), 0)
+        let compressed = try AVAssetReader(asset: asset)
+        let compressedOutput = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        let compressedProvider = compressed.outputProvider(for: compressedOutput)
+        try compressed.start()
+        defer { if compressed.status == .reading { compressed.cancelReading() } }
+        var count = 0
+        var compressedEnd: CMTime?
+        while let ready = try await compressedProvider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            let expectedPTS = CMTimeAdd(expectedStart, CMTime(value: Int64(count), timescale: frameRate))
+            XCTAssertEqual(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), expectedPTS), 0)
+            compressedEnd = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sample), CMSampleBufferGetDuration(sample))
+            if count % Int(frameRate * 5) == 0 {
+                let bytes = CMSampleBufferGetTotalSampleSize(sample)
+                XCTAssertGreaterThanOrEqual(bytes, minimumIDRBytes,
+                    "The actual native output must contain genuine large IDRs")
+                XCTAssertGreaterThan(bytes * Int(2 * 6 * frameRate + 2), 64 * 1_024 * 1_024,
+                    "This fixture must still expose the rejected old max-AU-times-window projection")
+            }
+            count += CMSampleBufferGetNumSamples(sample)
+        }
+        XCTAssertEqual(compressed.status, .completed, String(describing: compressed.error))
+        XCTAssertEqual(count, Int(frameRate * 15))
+        XCTAssertEqual(CMTimeCompare(try XCTUnwrap(compressedEnd), expectedEnd), 0)
+
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track,
+            outputSettings: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange])
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        var frames = 0
+        var previousPTS: CMTime?
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
+            XCTAssertEqual(CVPixelBufferGetWidth(image), width)
+            XCTAssertEqual(CVPixelBufferGetHeight(image), height)
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            if frames == 0 { XCTAssertEqual(CMTimeCompare(pts, expectedStart), 0) }
+            if let previousPTS {
+                XCTAssertEqual(CMTimeCompare(CMTimeSubtract(pts, previousPTS),
+                    CMTime(value: 1, timescale: frameRate)), 0, "Decoded frame cadence must survive GOP boundaries")
+            }
+            previousPTS = pts
+            frames += 1
+        }
+        XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
+        XCTAssertEqual(frames, Int(frameRate * 15), "Decode every original output frame, including the final GOP")
+        XCTAssertEqual(CMTimeCompare(CMTimeAdd(try XCTUnwrap(previousPTS), CMTime(value: 1, timescale: frameRate)),
+            expectedEnd), 0, "The final decoded frame must reach the original video endpoint")
+    }
+
+    private func assertLargeIDRNativeOwnersRetired(_ probe: HLSWriterAcceptanceProbe) async throws {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while probe.snapshot.liveInputCount != 0, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let retired = probe.snapshot
+        XCTAssertTrue(retired.isComplete)
+        XCTAssertEqual(retired.liveInputCount, 0)
+        XCTAssertEqual(retired.liveInputBytes, 0)
+        XCTAssertEqual(retired.acceptedInputCount, retired.releasedInputCount)
+        XCTAssertEqual(retired.evidenceCount, 0)
+        XCTAssertEqual(retired.pendingCallbacks, 0)
+    }
+
     func testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute() throws {
         let frameCount = 48_000
         var samples = [Float](repeating: 0.1, count: frameCount * 2)
@@ -2142,7 +2427,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
-    private func inspectSyntheticAACPCM(_ url: URL) async throws -> SyntheticAACPCMStatistics {
+    private func inspectSyntheticAACPCM(_ url: URL, sampleRate: Int32 = 48_000) async throws -> SyntheticAACPCMStatistics {
         let asset = AVURLAsset(url: url)
         let duration = try await asset.load(.duration)
         print("AC3_READER file=\(url.lastPathComponent) assetDuration=\(duration.seconds)")
@@ -2159,7 +2444,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let provider = reader.outputProvider(for: output)
         try reader.start()
         defer { if reader.status == .reading { reader.cancelReading() } }
-        var statistics = SyntheticAACPCMStatistics()
+        var statistics = SyntheticAACPCMStatistics(sampleRate: sampleRate)
         while let ready = try await provider.next() {
             let sample = try makeOwnedReaderFixtureSample(copying: ready)
             try statistics.consume(sample)
@@ -2746,7 +3031,7 @@ private final class HLSMediaInformationGatedGraph: HLSMediaGraphAssembler.Delive
     func retireAndAwaitReceipt() async -> Bool { await graph.retireAndAwaitReceipt() }
 }
 
-/// Test-owned copies of synthetic AAC output. Never intercepts or replaces delivery.
+/// Bounded test-owned byte copies. Never retains native media owners or replaces delivery.
 private final class SyntheticAACContinuityCapture: @unchecked Sendable {
     struct Record: Sendable {
         let kind: SealedMediaObjectKind
@@ -2760,9 +3045,12 @@ private final class SyntheticAACContinuityCapture: @unchecked Sendable {
     private var records: [Record] = []
     private var copiedBytes = 0
     private var exceededCapacity = false
+    private let codecPrefix: String
+
+    init(codecPrefix: String = "mp4a.40.2") { self.codecPrefix = codecPrefix }
 
     func receive(_ object: SealedMediaObject) {
-        guard object.publicationEvidence?.format.codec == "mp4a.40.2" else { return }
+        guard object.publicationEvidence?.format.codec.hasPrefix(codecPrefix) == true else { return }
         lock.withLock {
             guard records.count < 256, object.bytes.count <= 8 * 1_024 * 1_024 - copiedBytes else {
                 exceededCapacity = true
@@ -2796,6 +3084,7 @@ private final class SyntheticAACContinuityCapture: @unchecked Sendable {
 }
 
 private struct SyntheticAACPCMStatistics {
+    let sampleRate: Int32
     var frames = 0
     var maximumGapSamples = 0.0
     var silentWindows = 0
@@ -2808,14 +3097,18 @@ private struct SyntheticAACPCMStatistics {
     private var pendingShortWindows: [(end: Double, rms: Double)] = []
     var checkedShortWindows = 0
     var silentWindowEndTimes: [Double] = []
+    private(set) var firstPresentationTime: CMTime?
+    var endPresentationTime: CMTime? { previousEnd }
     private var previousEnd: CMTime?
     private var windowSamples = 0
     private var windowPower = 0.0
 
+    init(sampleRate: Int32 = 48_000) { self.sampleRate = sampleRate }
+
     mutating func consume(_ sample: CMSampleBuffer) throws {
         let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
         let asbd = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(format)).pointee
-        XCTAssertEqual(asbd.mSampleRate, 48_000)
+        XCTAssertEqual(asbd.mSampleRate, Double(sampleRate))
         XCTAssertEqual(asbd.mChannelsPerFrame, 2)
         XCTAssertEqual(asbd.mBitsPerChannel, 32)
         XCTAssertNotEqual(asbd.mFormatFlags & kAudioFormatFlagIsFloat, 0)
@@ -2823,10 +3116,11 @@ private struct SyntheticAACPCMStatistics {
         let count = CMSampleBufferGetNumSamples(sample)
         let start = CMSampleBufferGetPresentationTimeStamp(sample)
         XCTAssertTrue(start.isNumeric)
+        if firstPresentationTime == nil { firstPresentationTime = start }
         if let previousEnd {
-            maximumGapSamples = max(maximumGapSamples, abs(CMTimeSubtract(start, previousEnd).seconds * 48_000))
+            maximumGapSamples = max(maximumGapSamples, abs(CMTimeSubtract(start, previousEnd).seconds * Double(sampleRate)))
         }
-        previousEnd = CMTimeAdd(start, CMTime(value: Int64(count), timescale: 48_000))
+        previousEnd = CMTimeAdd(start, CMTime(value: Int64(count), timescale: sampleRate))
         let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
         let length = CMBlockBufferGetDataLength(block)
         XCTAssertEqual(length, count * 2 * MemoryLayout<Float>.stride)
@@ -2847,8 +3141,8 @@ private struct SyntheticAACPCMStatistics {
                 shortWindowPower += power
                 shortWindowSamples += 1
                 observedSamples += 1
-                if shortWindowSamples == 240 * 2 {
-                    let seconds = Double(observedSamples) / (2 * 48_000)
+                if shortWindowSamples == Int((Double(sampleRate) / 200).rounded()) * 2 {
+                    let seconds = Double(observedSamples) / (2 * Double(sampleRate))
                     if seconds >= 0.255 {
                         let rms = sqrt(shortWindowPower / Double(shortWindowSamples))
                         pendingShortWindows.append((seconds, rms))
@@ -2867,7 +3161,7 @@ private struct SyntheticAACPCMStatistics {
                     shortWindowSamples = 0
                     shortWindowPower = 0
                 }
-                if windowSamples == 4_800 * 2 {
+                if windowSamples == Int(sampleRate / 10) * 2 {
                     let rms = sqrt(windowPower / Double(windowSamples))
                     minimumRMS = min(minimumRMS, rms)
                     if rms < 0.001 { silentWindows += 1 }
@@ -2915,7 +3209,7 @@ private enum SyntheticAACFragmentInspector {
         return result
     }
 
-    static func inspect(_ record: SyntheticAACContinuityCapture.Record) throws -> Facts {
+    static func inspect(_ record: SyntheticAACContinuityCapture.Record, label: String = "AC3_FRAGMENT") throws -> Facts {
         let top = try boxes(record.bytes)
         guard top.filter({ $0.type == "moof" }).count == 1,
               top.filter({ $0.type == "mdat" }).count == 1 else {
@@ -2945,7 +3239,7 @@ private enum SyntheticAACFragmentInspector {
             count += UInt64(read32(record.bytes, run.payload + 4))
         }
         let sequence = read32(record.bytes, mfhd.payload + 4)
-        print("AC3_FRAGMENT sequence=\(record.sequence) top=\(top.map(\.type).joined(separator: ",")) " +
+        print("\(label) sequence=\(record.sequence) top=\(top.map(\.type).joined(separator: ",")) " +
             "mfhd=\(sequence) tfdt=\(decodeTime) samples=\(count)")
         return Facts(sequence: sequence, decodeTime: decodeTime, sampleCount: count)
     }
