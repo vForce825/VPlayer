@@ -8,6 +8,71 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PersistentHLSWriterTests: XCTestCase {
+    func testRemuxWriterByteBudgetUsesDeclaredRateAndExactFrozenFrameDuration() throws {
+        for (count, rate, duration, charge, expected) in [
+            (180, UInt64(25_500_000), ExactMediaTime(value: 1, timescale: 30), 648_828 + 64, 19_349_148),
+            (300, UInt64(40_800_000), ExactMediaTime(value: 1, timescale: 50), 552_086 + 64, 30_823_328),
+        ] {
+            let budget = try WriterRemuxByteBudget(segmentInputCount: count,
+                declaredBitsPerSecond: rate, frameDuration: duration)
+            XCTAssertEqual(budget.maximumSegmentBytes, expected)
+            XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: charge), expected)
+            XCTAssertGreaterThan((2 * count + 2) * charge, FMP4WriterLimits.video.writerHardByteCount)
+            XCTAssertLessThan(expected, FMP4WriterLimits.video.writerHardByteCount)
+        }
+        let fractional = try WriterRemuxByteBudget(segmentInputCount: 1,
+            declaredBitsPerSecond: 1, frameDuration: .init(value: 1, timescale: 3))
+        XCTAssertEqual(fractional.maximumSegmentBytes, 193, "fractional payload bytes round up exactly")
+    }
+
+    func testRemuxWriterByteBudgetKeepsSmallHighLevelStreamsOnObservedMaximum() throws {
+        let budget = try WriterRemuxByteBudget(segmentInputCount: 300,
+            declaredBitsPerSecond: 81_600_000, frameDuration: .init(value: 1, timescale: 50))
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: 128), 302 * 128)
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: 256,
+            currentSegmentBytes: 1_280, currentSegmentInputCount: 10, nextInputBytes: 256), 292 * 256)
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: 552_150), budget.maximumSegmentBytes)
+    }
+
+    func testRemuxWriterByteBudgetAcceptsExactCeilingAndRejectsOneByteMore() throws {
+        let budget = try WriterRemuxByteBudget(segmentInputCount: 1,
+            declaredBitsPerSecond: 8, frameDuration: .init(value: 1, timescale: 1))
+        XCTAssertEqual(budget.maximumSegmentBytes, 195)
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: 195, nextInputBytes: 195), 195)
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: 195,
+            currentSegmentBytes: 130, currentSegmentInputCount: 1, nextInputBytes: 65), 65)
+        for (used, incoming) in [(0, 196), (130, 66), (195, 1)] {
+            XCTAssertThrowsError(try budget.forwardBytes(maximumInputBytes: 196,
+                currentSegmentBytes: used, currentSegmentInputCount: used == 0 ? 0 : 1,
+                nextInputBytes: incoming)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+            }
+        }
+    }
+
+    func testRemuxWriterByteBudgetRejectsOverflowWithoutWrappingOrRoundingDown() throws {
+        for (count, rate, duration) in [
+            (Int.max, UInt64(1), ExactMediaTime(value: 1, timescale: 1)),
+            (Int.max - 2, UInt64.max, ExactMediaTime(value: Int64.max, timescale: 1)),
+            (1, UInt64.max, ExactMediaTime(value: 8, timescale: 1)),
+        ] {
+            XCTAssertThrowsError(try WriterRemuxByteBudget(segmentInputCount: count,
+                declaredBitsPerSecond: rate, frameDuration: duration)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .arithmeticOverflow)
+            }
+        }
+        let budget = try WriterRemuxByteBudget(segmentInputCount: 180,
+            declaredBitsPerSecond: 25_500_000, frameDuration: .init(value: 1, timescale: 30))
+        // A saturated observed-maximum product still has the exact finite ceiling.
+        XCTAssertEqual(try budget.forwardBytes(maximumInputBytes: Int.max), budget.maximumSegmentBytes)
+        XCTAssertThrowsError(try budget.forwardBytes(maximumInputBytes: 1,
+            currentSegmentBytes: Int.max, nextInputBytes: 1))
+        XCTAssertThrowsError(try WriterRemuxByteBudget(segmentInputCount: 0,
+            declaredBitsPerSecond: 1, frameDuration: .init(value: 1, timescale: 1)))
+        XCTAssertThrowsError(try WriterRemuxByteBudget(segmentInputCount: 1,
+            declaredBitsPerSecond: 0, frameDuration: .init(value: 1, timescale: 1)))
+    }
+
     func testFiveAndSixSecondHeadroomHasExplicitLiveAndEvidenceBounds() throws {
         for seconds in [5, 6] {
             let segment = (48_000 * seconds + 1_023) / 1_024

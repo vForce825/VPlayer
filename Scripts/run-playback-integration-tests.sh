@@ -449,8 +449,9 @@ set -e
 test_pid=''
 if [[ $test_status -ne 0 && -d "$test_artifacts/PlaybackIntegration.xcresult" ]] && \
    command -v xcrun >/dev/null 2>&1; then
-  xcrun xcresulttool get test-results summary \
-    --path "$test_artifacts/PlaybackIntegration.xcresult" \
-    --format json || true
+  # Emit the same bounded, schema-checked summary used by the other CI gates
+  # while this runner still owns the bundle. Reporting cannot replace test_status.
+  python3 "$root/Scripts/report-xcresult-failures.py" \
+    "$test_artifacts/PlaybackIntegration.xcresult" || true
 fi
 exit "$test_status"

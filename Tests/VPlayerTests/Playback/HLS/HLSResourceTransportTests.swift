@@ -18,6 +18,35 @@ final class HLSResourceTransportTests: XCTestCase {
         return .init(url: URL(string: "https://example.test\(path)")!, headers: context.headers,
             range: range, maximumBytes: maximumBytes, deadline: HLSMonotonicClock.deadline(seconds: 10), mode: mode)
     }
+    private func fetchCheckingDiagnosticRetirement(_ transport: URLSessionHLSResourceTransport,
+                                                   _ request: HLSResourceRequest,
+                                                   file: StaticString = #filePath, line: UInt = #line) async throws -> HLSResourceResponse {
+        let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
+        var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(
+            metadataOwner: try HLSRuntimeFailureMetadataOwner.reserve(in: ledger))
+        let observed = TestWeakReference(diagnostic)
+        XCTAssertNotNil(observed.value, file: file, line: line)
+        XCTAssertGreaterThan(ledger.chargedBytes, 0, file: file, line: line)
+        defer {
+            diagnostic = nil
+            // This must hold when fetch returns or throws, before waiting for
+            // the custom protocol's separate stopLoading callback.
+            XCTAssertNil(observed.value, "The session delegate must release its diagnostic alias before fetch returns", file: file, line: line)
+            XCTAssertEqual(ledger.chargedBytes, 0, file: file, line: line)
+            XCTAssertNil(HLSPreparationDiagnostics.current, file: file, line: line)
+        }
+        return try await HLSPreparationDiagnostics.$current.withValue(diagnostic) {
+            try await transport.fetch(request)
+        }
+    }
+    private func assertProtocolStopped(_ fixture: AcquisitionHTTPFixture,
+                                       file: StaticString = #filePath, line: UInt = #line) async {
+        // finishTasksAndInvalidate joins task/delegate callbacks. Its contract
+        // does not order URLProtocol.stopLoading before session invalidation.
+        // Observe the real stop callback; never manufacture fixture retirement.
+        await fulfillment(of: [fixture.protocolStopped], timeout: 2)
+        XCTAssertEqual(fixture.activeCount, 0, file: file, line: line)
+    }
     func testContentEncodingDiagnosticCrossesDelegateBoundaryWithoutRetainingTheScope() async throws {
         let ledger = PlaybackResourceContextLedger(applicationLedger: HLSDeliveryApplicationChargeLedger())
         var diagnostic: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(
@@ -76,11 +105,11 @@ final class HLSResourceTransportTests: XCTestCase {
                 headersAt: initialMiB * AcquisitionTSFixture.mib + 1_024)
             let fixture = AcquisitionHTTPFixture(body: body, chunkSizes: [body.count], finishes: false)
             defer { fixture.remove() }
-            let response = try await fixture.transport.fetch(fixture.request())
+            let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
             XCTAssertEqual(response.data, body.prefix(initialMiB * AcquisitionTSFixture.mib + 256 * 1_024))
             XCTAssertEqual(response.completeness, .prefix)
             XCTAssertEqual(fixture.startedRequests.count, 1)
-            XCTAssertEqual(fixture.activeCount, 0, "Cancellation must join the protocol before fetch returns")
+            await assertProtocolStopped(fixture)
         }
     }
 
@@ -89,21 +118,21 @@ final class HLSResourceTransportTests: XCTestCase {
             patAt: AcquisitionTSFixture.mib + 188, headersAt: AcquisitionTSFixture.mib + 1_880)
         let fixture = AcquisitionHTTPFixture(body: body, chunkSizes: [1, 187, 189, 32_767, 262_145], finishes: false)
         defer { fixture.remove() }
-        let response = try await fixture.transport.fetch(fixture.request())
+        let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
         XCTAssertEqual(response.data, body.prefix(AcquisitionTSFixture.mib + 256 * 1_024))
         XCTAssertEqual(response.completeness, .prefix)
         XCTAssertEqual(fixture.startedRequests.count, 1)
-        XCTAssertEqual(fixture.activeCount, 0)
+        await assertProtocolStopped(fixture)
     }
 
     func testReadyTSStopsAtInitialBoundaryWithoutWaitingForUnknownLengthEOF() async throws {
         let body = AcquisitionTSFixture.make(byteCount: AcquisitionTSFixture.mib, headersAt: 376)
         let fixture = AcquisitionHTTPFixture(body: body, finishes: false)
         defer { fixture.remove() }
-        let response = try await fixture.transport.fetch(fixture.request())
+        let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
         XCTAssertEqual(response.data, body)
         XCTAssertEqual(response.completeness, .prefix)
-        XCTAssertEqual(fixture.activeCount, 0)
+        await assertProtocolStopped(fixture)
     }
 
     func testExactLimitManifestWaitsForKnownOrUnknownLengthEOFAndRemainsComplete() async throws {
@@ -129,10 +158,10 @@ final class HLSResourceTransportTests: XCTestCase {
         let body = Data(repeating: 0x41, count: AcquisitionTSFixture.mib + 1)
         let fixture = AcquisitionHTTPFixture(body: body, chunkSizes: [AcquisitionTSFixture.mib, 1], finishes: false)
         defer { fixture.remove() }
-        let response = try await fixture.transport.fetch(fixture.request())
+        let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
         XCTAssertEqual(response.data, body.prefix(AcquisitionTSFixture.mib))
         XCTAssertEqual(response.completeness, .prefix)
-        XCTAssertEqual(fixture.activeCount, 0)
+        await assertProtocolStopped(fixture)
     }
 
     func testMissingPATStopsExactlyAtEightMiBCapEvenInOneOversizedCallback() async throws {
@@ -141,11 +170,11 @@ final class HLSResourceTransportTests: XCTestCase {
         for maximum in [AcquisitionTSFixture.mib, 376] {
             let fixture = AcquisitionHTTPFixture(body: body, finishes: false)
             defer { fixture.remove() }
-            let response = try await fixture.transport.fetch(fixture.request(maximum: maximum))
+            let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request(maximum: maximum))
             XCTAssertEqual(response.data, body.prefix(8 * AcquisitionTSFixture.mib))
             XCTAssertEqual(response.completeness, .prefix)
             XCTAssertEqual(fixture.startedRequests.count, 1)
-            XCTAssertEqual(fixture.activeCount, 0)
+            await assertProtocolStopped(fixture)
         }
     }
 
@@ -230,7 +259,7 @@ final class HLSResourceTransportTests: XCTestCase {
             headersAt: AcquisitionTSFixture.mib + 188)
         let fixture = AcquisitionHTTPFixture(body: body, finishes: false)
         defer { fixture.remove() }
-        let response = try await fixture.transport.fetch(fixture.request(redirect: true))
+        let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request(redirect: true))
         XCTAssertEqual(response.responseURL.host, "acquisition-other.test")
         XCTAssertEqual(response.data, body.prefix(AcquisitionTSFixture.mib + 256 * 1_024))
         let requests = fixture.startedRequests
@@ -239,7 +268,7 @@ final class HLSResourceTransportTests: XCTestCase {
         XCTAssertNil(requests.last?.value(forHTTPHeaderField: "Authorization"))
         XCTAssertTrue(requests.allSatisfy { $0.value(forHTTPHeaderField: "Accept-Encoding") == "identity" })
         XCTAssertTrue(requests.allSatisfy { $0.value(forHTTPHeaderField: "Range") == nil })
-        XCTAssertEqual(fixture.activeCount, 0)
+        await assertProtocolStopped(fixture)
     }
 
     func testCancellationWhileAwaitingContinuationJoinsTheOnlyRequest() async throws {
@@ -249,13 +278,13 @@ final class HLSResourceTransportTests: XCTestCase {
         defer { fixture.remove() }
         let request = try fixture.request()
         let transport = fixture.transport
-        let task = Task { try await transport.fetch(request) }
+        let task = Task { try await self.fetchCheckingDiagnosticRetirement(transport, request) }
         await fulfillment(of: [delivered], timeout: 2)
         task.cancel()
         do { _ = try await task.value; XCTFail("Cancelled acquisition returned a source") }
         catch { XCTAssertTrue(error is CancellationError) }
         XCTAssertEqual(fixture.startedRequests.count, 1)
-        XCTAssertEqual(fixture.activeCount, 0)
+        await assertProtocolStopped(fixture)
     }
 
     func testDeadlineWhileAwaitingContinuationJoinsTheOnlyRequest() async throws {
@@ -364,6 +393,7 @@ enum AcquisitionTSFixture {
 }
 
 private final class AcquisitionHTTPFixture: @unchecked Sendable {
+    let protocolStopped = XCTestExpectation(description: "Active request received URLProtocol.stopLoading")
     let body: Data
     let chunkSizes: [Int]
     let knownLength: Bool
@@ -400,6 +430,12 @@ private final class AcquisitionHTTPFixture: @unchecked Sendable {
     var activeCount: Int { lock.withLock { active.count } }
     func start(_ request: URLRequest, id: UUID) { lock.withLock { requests.append(request); _ = active.insert(id) } }
     func stop(_ id: UUID) { _ = lock.withLock { active.remove(id) } }
+    func didStopLoading(_ id: UUID) {
+        let wasActive = lock.withLock { active.remove(id) != nil }
+        // A redirected protocol may stop after the next request starts. Only
+        // stopping a still-active ID proves retirement of the held-open body.
+        if wasActive { protocolStopped.fulfill() }
+    }
     func remove() { AcquisitionHTTPProtocol.registry.remove(url.lastPathComponent) }
 }
 
@@ -449,6 +485,6 @@ private final class AcquisitionHTTPProtocol: URLProtocol, @unchecked Sendable {
         }
     }
     override func stopLoading() {
-        if let url = request.url { Self.registry.get(url.lastPathComponent)?.stop(id) }
+        if let url = request.url { Self.registry.get(url.lastPathComponent)?.didStopLoading(id) }
     }
 }

@@ -309,7 +309,7 @@ time.sleep(60)
 
 
 class PlaybackFixtureRunnerTests(unittest.TestCase):
-    def run_runner(self, modern=False, status=0):
+    def run_runner(self, modern=False, status=0, report_mode=None):
         with tempfile.TemporaryDirectory(prefix="vplayer runner regression ") as directory:
             root = Path(directory)
             fixtures = root / "fixtures"
@@ -335,6 +335,8 @@ if args[0] == "build-for-testing":
     destination.mkdir(parents=True)
     shutil.copy(root / "seed.xctestrun", destination / "Fake.xctestrun")
 else:
+    if os.environ.get("PROBE_REPORT_MODE"):
+        pathlib.Path(args[args.index("-resultBundlePath") + 1]).mkdir()
     shutil.copy(args[args.index("-xctestrun") + 1], root / "patched.xctestrun")
     document = plistlib.loads((root / "patched.xctestrun").read_bytes())
     target = (document["TestConfigurations"][0]["TestTargets"][0]
@@ -349,6 +351,29 @@ else:
                        VPLAYER_RUNNER_TEMP_PARENT=str(scratch),
                        VPLAYER_RUNNER_XCODEBUILD=str(fake), PROBE_ROOT=str(root),
                        PROBE_STATUS=str(status))
+            summary = root / "job-summary.md"
+            if report_mode:
+                xcrun = root / "xcrun"
+                xcrun.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ["PROBE_ROOT"])
+if os.environ["PROBE_REPORT_MODE"] == "error":
+    sys.exit(9)
+if "help" in args:
+    print("--path --schema")
+elif "--schema" in args:
+    print(json.dumps({"properties": {"testFailures": {"items": {"properties": {
+        "testName": {}, "failureText": {}, "attachments": {}}}}}}))
+else:
+    assert pathlib.Path(args[args.index("--path") + 1]).is_dir()
+    (root / "report-before-cleanup").touch()
+    print(json.dumps({"testFailures": [{"testName": "Synthetic.test", "failureText": "expected <ready>",
+        "attachments": [{"private": "ATTACHMENT_MUST_NOT_BE_PUBLISHED"}]}]}))
+''')
+                xcrun.chmod(0o700)
+                env.update(PATH=str(root) + os.pathsep + env["PATH"],
+                           GITHUB_STEP_SUMMARY=str(summary), PROBE_REPORT_MODE=report_mode)
             selectors = ["VPlayerTests/PlaybackFixtureIntegrationTests", "VPlayerTests/HLSTimelineTests"]
             flags = ["-test-timeouts-enabled", "YES", "-default-test-execution-time-allowance", "120",
                      "-maximum-test-execution-time-allowance", "300"]
@@ -374,6 +399,18 @@ else:
             self.assertNotIn("VPLAYER_TIMELINE_FIXTURE_PATH", injected)
             self.assertRegex(injected["VPLAYER_FIXTURE_BASE_URL"], r"^http://127\.0\.0\.1:\d+$")
             self.assertEqual(list(scratch.iterdir()), [], "runner must clean all transient outputs")
+            if report_mode:
+                self.assertTrue(summary.is_file(), "failed HTTP tests must publish the bounded job summary")
+                text = summary.read_text()
+                self.assertLessEqual(len(text.encode("utf-8")), 64 * 1024)
+                if report_mode == "error":
+                    self.assertIn("CI_TEST_FAILURE_REPORT_ERROR=RuntimeError", text)
+                else:
+                    self.assertTrue((root / "report-before-cleanup").exists())
+                    self.assertIn("CI_TEST_FAILURE_COUNT=1", text)
+                    self.assertIn("Synthetic.test", text)
+                    self.assertIn("expected &lt;ready&gt;", text)
+                    self.assertNotIn("ATTACHMENT_MUST_NOT_BE_PUBLISHED", text + result.stdout)
 
     def test_multiple_selectors_timeout_flags_and_fixture_path_reach_legacy_test_target(self):
         self.run_runner()
@@ -383,6 +420,12 @@ else:
 
     def test_test_failure_preserves_exit_status_and_cleans_outputs(self):
         self.run_runner(status=42)
+
+    def test_test_failure_publishes_bounded_summary_before_cleanup(self):
+        self.run_runner(status=42, report_mode="valid")
+
+    def test_reporter_failure_cannot_replace_original_test_exit_or_cleanup(self):
+        self.run_runner(status=42, report_mode="error")
 
 
 if __name__ == "__main__":
