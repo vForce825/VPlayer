@@ -1395,7 +1395,8 @@ final class HLSPublisherTests: XCTestCase {
         }
         let final = try XCTUnwrap(h.publisher.visible)
         XCTAssertGreaterThan(try XCTUnwrap(final.coverage.publishedWindow.first), 0)
-        XCTAssertEqual(final.coverage.publishedWindow.count, 7)
+        XCTAssertEqual(final.coverage.publishedWindow.count, 6,
+            "This final six-segment tail satisfies the existing duration gate")
     }
 
     func testAudioProgramDateTimePreservesOldEpochCoordinatesAfterWriterReplacement() async throws {

@@ -217,6 +217,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             stopObservation["harness_graph_owners_released"] = ownersReleased
             #if !HLS_ACCEPTANCE_BASELINE
             stopObservation.merge(AcceptanceReport.retirement(probe.snapshot)) { _, new in new }
+            stopObservation["input_residence_renditions"] = AcceptanceReport.inputResidenceRenditions(probe.renditions)
             #endif
             guard ownersReleased, ledgers() == ledgerBefore else {
                 throw AcceptanceError.invalid("retired graph charges did not return to the initialized ledger baseline")
@@ -258,6 +259,7 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
             let final = probe.snapshot
             guard final.isComplete else { throw AcceptanceError.invalid("incomplete native diagnostics") }
             report.merge(AcceptanceReport.retirement(final)) { _, new in new }
+            report["input_residence_renditions"] = AcceptanceReport.inputResidenceRenditions(probe.renditions)
             report["ledger_policy"] = ledgerPolicy()
             report["global_maximum_charged_bytes"] = HLSDeliveryApplicationChargeLedger.shared.maximumChargedBytes
             #endif
@@ -384,10 +386,12 @@ final class PersistentHLSAcceptanceTests: XCTestCase {
                 "store_should_backpressure":usage?.shouldBackpressure ?? false]
     }
     private nonisolated static func diagnosticFields(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
-        ["live_inputs":value.liveInputCount,"live_bytes":value.liveInputBytes,"evidence":value.evidenceCount,
+        var result: [String: Any] = ["live_inputs":value.liveInputCount,"live_bytes":value.liveInputBytes,"evidence":value.evidenceCount,
          "callbacks":value.pendingCallbacks,"hard_inputs":value.hardInputCount,"hard_bytes":value.hardInputBytes,
          "hard_evidence":value.hardEvidenceCount,"hard_callbacks":value.hardCallbackCount,
          "accepted_inputs":value.acceptedInputCount,"released_inputs":value.releasedInputCount]
+        result.merge(AcceptanceReport.inputResidence(value)) { _, new in new }
+        return result
     }
     #endif
     private func decode(_ track: AcceptanceCapture.Track) async throws -> [String: Any] {

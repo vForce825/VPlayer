@@ -44,6 +44,8 @@ final class WriterInputAdmission: @unchecked Sendable {
     // exact-timing copy overlap. Each envelope includes bounded timing/sizing/
     // packet arrays and attachment metadata. Retain this conservative charge until
     // the final block alias releases; destroying the temporary returns no credit.
+    // The optional diagnostic Instant adds at most 32 bytes of closure capture
+    // within this existing envelope; it introduces no additional owner/container.
     static let metadataBytes = 2 * 4_096
     static let additionalSampleMetadataBytes = 2 * 256
     private static var nativeHeaderArraysFitReservation: Bool {
@@ -97,7 +99,7 @@ final class WriterInputAdmission: @unchecked Sendable {
 
     func admit(bytes: Int, sampleCount: Int = 1,
                release: @escaping @Sendable () -> Void = {}) throws -> WriterInputLifetime {
-        let lease = try lock.withLock { () throws -> HLSDataPlaneAdmission.Lease in
+        let admittedInput = try lock.withLock { () throws -> (HLSDataPlaneAdmission.Lease, ContinuousClock.Instant?) in
             guard Self.nativeHeaderArraysFitReservation,
                   !cancelled, bytes > 0, bytes <= maximumBytes - liveBytes,
                   liveCount < capacity, (1...64).contains(sampleCount), admitted < UInt64.max else {
@@ -112,10 +114,13 @@ final class WriterInputAdmission: @unchecked Sendable {
             liveCount += 1
             liveBytes += bytes
             admitted += 1
-            observation?.admitted(bytes: bytes)
-            return lease
+            return (lease, observation?.admitted(bytes: bytes))
         }
-        return WriterInputLifetime(capacityWakeup: lock.withLock { capacityWakeup }) { [self, lease] in
+        return WriterInputLifetime(capacityWakeup: lock.withLock { capacityWakeup }) {
+            [self, lease = admittedInput.0, admittedAt = admittedInput.1] in
+            // Observe entry to the exactly-once FreeBlock/rollback release body,
+            // before downstream release work. No probe means no clock reads.
+            let residence = admittedAt.flatMap { observation?.residenceSeconds(since: $0) }
             release()
             lease.release()
             lock.withLock {
@@ -123,7 +128,7 @@ final class WriterInputAdmission: @unchecked Sendable {
                 liveCount -= 1
                 liveBytes -= bytes
                 released += 1
-                observation?.released(bytes: bytes)
+                observation?.released(bytes: bytes, residenceSeconds: residence)
             }
         }
     }
@@ -152,6 +157,10 @@ struct HLSWriterAcceptanceSnapshot: Sendable, Equatable {
     /// Successful local input reservations, including rolled-back preflight.
     var acceptedInputCount: UInt64 = 0
     var releasedInputCount: UInt64 = 0
+    /// Cumulative observations from successful reservation to actual release-body
+    /// entry, including preflight rollback. Never estimates the age of live inputs.
+    var releasedInputResidenceCount: UInt64 = 0
+    var maximumReleasedInputResidenceSeconds = 0.0
     var isComplete = true
 }
 
@@ -165,11 +174,18 @@ struct HLSWriterRenditionAcceptanceSnapshot: Sendable, Equatable {
 
 final class HLSWriterAcceptanceProbe: @unchecked Sendable {
     private let lock = NSLock()
+    // Only diagnostic timestamps use this clock. Admission, deadlines and credit
+    // release decisions never consult it. Tests can advance it without sleeping.
+    private let now: @Sendable () -> ContinuousClock.Instant
     private var nativeWriterCount = 0
     private var nativeAC3WriterCount = 0
     private var nativeEAC3WriterCount = 0
     private var complete = true
     private var values: [AudioRenditionIdentity: HLSWriterRenditionAcceptanceSnapshot] = [:]
+
+    init(now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now }) {
+        self.now = now
+    }
 
     var renditions: [HLSWriterRenditionAcceptanceSnapshot] {
         lock.withLock { Array(values.values) }
@@ -194,6 +210,9 @@ final class HLSWriterAcceptanceProbe: @unchecked Sendable {
                 result.hardCallbackCount += usage.hardCallbackCount
                 result.acceptedInputCount += usage.acceptedInputCount
                 result.releasedInputCount += usage.releasedInputCount
+                result.releasedInputResidenceCount += usage.releasedInputResidenceCount
+                result.maximumReleasedInputResidenceSeconds = max(result.maximumReleasedInputResidenceSeconds,
+                    usage.maximumReleasedInputResidenceSeconds)
             }
             return result
         }
@@ -248,18 +267,29 @@ final class HLSWriterAcceptanceProbe: @unchecked Sendable {
             self.probe = probe
             self.binding = binding
         }
-        func admitted(bytes: Int) {
+        func admitted(bytes: Int) -> ContinuousClock.Instant {
+            let admittedAt = probe.now()
             probe.update(binding) {
                 $0.usage.liveInputCount += 1
                 $0.usage.liveInputBytes += bytes
                 $0.usage.acceptedInputCount += 1
             }
+            return admittedAt
         }
-        func released(bytes: Int) {
+        func residenceSeconds(since admittedAt: ContinuousClock.Instant) -> Double {
+            let duration = admittedAt.duration(to: probe.now()).components
+            return Double(duration.seconds) + Double(duration.attoseconds) / 1_000_000_000_000_000_000
+        }
+        func released(bytes: Int, residenceSeconds: Double?) {
             probe.update(binding) {
                 $0.usage.liveInputCount -= 1
                 $0.usage.liveInputBytes -= bytes
                 $0.usage.releasedInputCount += 1
+                if let residenceSeconds {
+                    $0.usage.releasedInputResidenceCount += 1
+                    $0.usage.maximumReleasedInputResidenceSeconds = max(
+                        $0.usage.maximumReleasedInputResidenceSeconds, residenceSeconds)
+                }
             }
         }
         func evidenceChanged(by count: Int) {

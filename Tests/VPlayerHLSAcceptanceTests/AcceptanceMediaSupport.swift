@@ -1364,11 +1364,32 @@ enum AcceptanceReport {
          "producer_eof":eof,"producer_packet_age_seconds":packetAge]
     }
     #if !HLS_ACCEPTANCE_BASELINE
+    /// Cumulative release observations, in monotonic wall-clock seconds. A maximum
+    /// covers only released inputs until retirement. Coverage of every admitted
+    /// input requires count == released_inputs == allocated_inputs, no final live
+    /// inputs, and a complete probe. Rollback is included. These are diagnostics,
+    /// never acceptance thresholds, and cannot prove a future residence bound.
+    static func inputResidence(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
+        ["released_input_residence_count":value.releasedInputResidenceCount,
+         "maximum_released_input_residence_seconds":value.maximumReleasedInputResidenceSeconds]
+    }
+    static func inputResidenceRenditions(_ values: [HLSWriterRenditionAcceptanceSnapshot]) -> [[String: Any]] {
+        values.sorted { $0.renditionIdentity.rawValue < $1.renditionIdentity.rawValue }.map { value in
+            var result: [String: Any] = ["rendition_identity":value.renditionIdentity.rawValue,
+                "latest_writer_identity":value.latestWriterIdentity.rawValue,
+                "live_inputs":value.usage.liveInputCount,"live_bytes":value.usage.liveInputBytes,
+                "accepted_inputs":value.usage.acceptedInputCount,"released_inputs":value.usage.releasedInputCount]
+            result.merge(inputResidence(value.usage)) { _, new in new }
+            return result
+        }
+    }
     static func retirement(_ value: HLSWriterAcceptanceSnapshot) -> [String: Any] {
-        ["native_writer_count":value.nativeWriterCount,"final_live_inputs":value.liveInputCount,
+        var result: [String: Any] = ["native_writer_count":value.nativeWriterCount,"final_live_inputs":value.liveInputCount,
          "final_live_bytes":value.liveInputBytes,"final_evidence":value.evidenceCount,
          "final_callbacks":value.pendingCallbacks,"allocated_inputs":value.acceptedInputCount,
          "released_inputs":value.releasedInputCount]
+        result.merge(inputResidence(value)) { _, new in new }
+        return result
     }
     #endif
 }

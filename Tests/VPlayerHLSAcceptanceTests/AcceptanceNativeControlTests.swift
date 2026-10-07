@@ -805,7 +805,8 @@ final class AcceptanceNativeControlTests: XCTestCase {
         negative["wrap"] = AcceptanceReport.fragment(wrapped)
 
         // Retain a real CoreMedia alias after the original backing owner is gone.
-        let probe = HLSWriterAcceptanceProbe()
+        let residenceClock = AcceptanceResidenceControlClock()
+        let probe = HLSWriterAcceptanceProbe(now: { residenceClock.now })
         let observation = try XCTUnwrap(probe.register(binding: binding(41), hardInputCount: 1,
             hardInputBytes: 16, hardEvidenceCount: 1, hardCallbackCount: 1))
         let ledger = HLSDeliveryApplicationChargeLedger()
@@ -818,15 +819,25 @@ final class AcceptanceNativeControlTests: XCTestCase {
             referenceBuffer: try XCTUnwrap(original), offsetToData: 0, dataLength: 4,
             flags: 0, blockBufferOut: &retained), noErr)
         original = nil
+        residenceClock.advance(by: .milliseconds(1_250))
         try withExtendedLifetime(XCTUnwrap(retained)) {
             XCTAssertEqual(probe.snapshot.liveInputCount, 1)
             XCTAssertGreaterThan(ledger.chargedBytes, 0)
             negative["retained_input"] = AcceptanceReport.retirement(probe.snapshot)
+            XCTAssertEqual(AcceptanceReport.inputResidence(probe.snapshot)["released_input_residence_count"] as? UInt64, 0)
         }
         retained = nil
         XCTAssertEqual(probe.snapshot.liveInputCount, 0)
         XCTAssertEqual(ledger.chargedBytes, 0)
         positive["retained_input"] = AcceptanceReport.retirement(probe.snapshot)
+        let residence = AcceptanceReport.inputResidence(probe.snapshot)
+        XCTAssertEqual(residence["released_input_residence_count"] as? UInt64, probe.snapshot.releasedInputCount)
+        XCTAssertEqual(residence["maximum_released_input_residence_seconds"] as? Double, 1.25)
+        let residenceRenditions = AcceptanceReport.inputResidenceRenditions(probe.renditions)
+        XCTAssertEqual(residenceRenditions.count, 1)
+        XCTAssertEqual(residenceRenditions[0]["released_input_residence_count"] as? UInt64, 1)
+        XCTAssertEqual(residenceRenditions[0]["maximum_released_input_residence_seconds"] as? Double, 1.25)
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: residenceRenditions))
 
         // The real SegmentedFMP4Writer reserves its initialization callback. Only
         // its inspection adapter withholds delivery; no probe count is fabricated.
@@ -917,6 +928,13 @@ private final class AcceptanceControlRelayHolder: @unchecked Sendable {
 }
 
 private final class AcceptanceSamplerControlToken: @unchecked Sendable { }
+
+private final class AcceptanceResidenceControlClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock.now
+    var now: ContinuousClock.Instant { lock.withLock { instant } }
+    func advance(by duration: Duration) { lock.withLock { instant = instant.advanced(by: duration) } }
+}
 
 private final class AcceptanceSamplerControlTokenObservation {
     weak var token: AcceptanceSamplerControlToken?
