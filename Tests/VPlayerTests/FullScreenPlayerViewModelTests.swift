@@ -397,6 +397,99 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         XCTAssertNil(model.mediaInformation)
     }
 
+    func testSourceMetadataAppearsAtCurrentResetBoundaryWhileStartAndRetryAreStillPreparing() async throws {
+        let media = ViewModelMediaGenerationFeed(previous: mediaInformation(width: 640))
+        let clearGates = [ViewModelAsyncGate(), ViewModelAsyncGate()]
+        let readyGates = [ViewModelAsyncGate(), ViewModelAsyncGate()]
+        let engine = PreparingMediaViewModelPlaybackEngine(media: media, clearGates: clearGates, readyGates: readyGates)
+        let model = FullScreenPlayerViewModel(request: makeRequest(), engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            mediaInformationProvider: { await media.stream() }, settings: makeSettings())
+        var failure: (any Error)?
+        do {
+            model.start()
+            for index in 0..<2 {
+                if index == 1 {
+                    await media.prepareNextPlay()
+                    let failed = retryableFailure()
+                    await engine.emit(.failed(failed))
+                    try await eventually { model.state == .failed(failed) }
+                    model.retry()
+                }
+                try await eventually { await clearGates[index].hasWaiter }
+                XCTAssertNil(model.mediaInformation, "Do not replay predecessor facts before this attempt clears them")
+                let subscribedBeforeReset = await media.hasSubscriber
+                XCTAssertFalse(subscribedBeforeReset)
+                await clearGates[index].open()
+                try await eventually {
+                    let waiting = await readyGates[index].hasWaiter
+                    let subscribed = await media.hasSubscriber
+                    return waiting && subscribed
+                }
+                let width: Int32 = index == 0 ? 1_920 : 3_840
+                await media.emit(.init(sourceWidth: width, sourceHeight: 1_080,
+                    scanMode: .interlaced, sourceFrameRate: MediaRational(num: 25, den: 1)))
+                try await eventually { model.mediaInformation?.width == width }
+                XCTAssertTrue(model.mediaInformation?.isSourceProbe == true)
+                let completed = await engine.completedPlays
+                XCTAssertEqual(completed, index, "Source metadata must arrive before play returns")
+                await readyGates[index].open()
+                try await eventually { await engine.completedPlays == index + 1 }
+            }
+        } catch { failure = error }
+        for gate in clearGates + readyGates { await gate.open() }
+        await model.stop()
+        if let failure { throw failure }
+    }
+
+    func testReplayedTerminalStateCannotLoseEarlyMetadataSubscription() async throws {
+        let media = ViewModelMediaGenerationFeed(previous: mediaInformation(width: 640))
+        let clear = ViewModelAsyncGate(), ready = ViewModelAsyncGate()
+        let engine = PreparingMediaViewModelPlaybackEngine(media: media, clearGates: [clear], readyGates: [ready])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            mediaInformationProvider: { await media.stream() }, settings: makeSettings())
+        var failure: (any Error)?
+        do {
+            model.start(); await clear.open()
+            try await eventually { await media.subscriptionCount == 1 }
+            let failed = retryableFailure()
+            // Model a predecessor terminal value dequeued before the reset callback
+            // but applied after it. The current preparing state follows it.
+            await engine.emit(.failed(failed))
+            try await eventually { model.state == .failed(failed) }
+            await engine.emit(.preparing(request))
+            try await eventually { await media.subscriptionCount == 2 }
+            await media.emit(.init(sourceWidth: 1_920, sourceHeight: 1_080,
+                scanMode: .progressive, sourceFrameRate: MediaRational(num: 25, den: 1)))
+            try await eventually { model.mediaInformation?.width == 1_920 }
+            let completed = await engine.completedPlays
+            XCTAssertEqual(completed, 0)
+        } catch { failure = error }
+        await clear.open(); await ready.open(); await model.stop()
+        if let failure { throw failure }
+    }
+
+    func testLateMediaResetBoundaryCannotResubscribeAfterStop() async throws {
+        let media = ViewModelMediaGenerationFeed(previous: mediaInformation(width: 640))
+        let clear = ViewModelAsyncGate(), ready = ViewModelAsyncGate()
+        let engine = PreparingMediaViewModelPlaybackEngine(media: media, clearGates: [clear], readyGates: [ready])
+        let model = FullScreenPlayerViewModel(request: makeRequest(), engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            mediaInformationProvider: { await media.stream() }, settings: makeSettings())
+        model.start()
+        var failure: (any Error)?
+        do { try await eventually { await clear.hasWaiter } } catch { failure = error }
+        let stop = Task { await model.stop() }
+        do { try await eventually { model.state == .stopped } } catch { failure = failure ?? error }
+        await clear.open(); await ready.open(); await stop.value
+        let subscribed = await media.hasSubscriber
+        XCTAssertFalse(subscribed)
+        XCTAssertNil(model.mediaInformation)
+        if let failure { throw failure }
+    }
+
     func testMediaInformationWaitsForCurrentPlayClearBoundaryBeforeAcceptingSnapshot() async throws {
         let media = ViewModelMediaGenerationFeed(previous: mediaInformation(width: 1_280))
         let playGate = ViewModelAsyncGate()
@@ -2147,6 +2240,37 @@ private actor ViewModelAsyncGate {
     }
 }
 
+private actor PreparingMediaViewModelPlaybackEngine: PlaybackMediaInformationPreparing {
+    let media: ViewModelMediaGenerationFeed
+    let clearGates: [ViewModelAsyncGate]
+    let readyGates: [ViewModelAsyncGate]
+    private var continuations: [AsyncStream<PlaybackState>.Continuation] = []
+    private var playCount = 0
+    private(set) var completedPlays = 0
+    init(media: ViewModelMediaGenerationFeed, clearGates: [ViewModelAsyncGate], readyGates: [ViewModelAsyncGate]) {
+        self.media = media; self.clearGates = clearGates; self.readyGates = readyGates
+    }
+    func events() -> AsyncStream<PlaybackState> {
+        let pair = AsyncStream.makeStream(of: PlaybackState.self)
+        continuations.append(pair.continuation)
+        return pair.stream
+    }
+    func emit(_ state: PlaybackState) { continuations.forEach { $0.yield(state) } }
+    func play(_ request: PlaybackRequest) async { await play(request, afterMediaInformationReset: {}) }
+    func play(_ request: PlaybackRequest, afterMediaInformationReset: @escaping @Sendable () async -> Void) async {
+        let index = playCount; playCount += 1
+        await clearGates[index].wait()
+        await media.markPlayCompleted()
+        emit(.preparing(request))
+        // Deliberately cancellation-insensitive to exercise the viewmodel fence.
+        await afterMediaInformationReset()
+        await readyGates[index].wait()
+        completedPlays += 1
+    }
+    func setPaused(_ paused: Bool) {}
+    func stop() {}
+}
+
 private actor ControlledViewModelPlaybackEngine: PlaybackEngine, PlaybackPresentationControlling {
     private let eventsGate: ViewModelBlockingGate?
     private let stopGate: ViewModelAsyncGate?
@@ -2439,6 +2563,7 @@ private actor ViewModelMediaGenerationFeed {
     private var pair: (stream: AsyncStream<PlaybackMediaInformation?>,
                        continuation: AsyncStream<PlaybackMediaInformation?>.Continuation)?
     private var playCompleted = false
+    private(set) var subscriptionCount = 0
 
     init(previous: PlaybackMediaInformation) {
         self.previous = previous
@@ -2447,6 +2572,7 @@ private actor ViewModelMediaGenerationFeed {
     var hasSubscriber: Bool { pair != nil }
 
     func stream() -> AsyncStream<PlaybackMediaInformation?> {
+        subscriptionCount += 1
         let next = AsyncStream.makeStream(of: PlaybackMediaInformation?.self)
         pair = next
         if playCompleted {

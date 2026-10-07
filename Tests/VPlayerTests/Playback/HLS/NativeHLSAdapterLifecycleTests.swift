@@ -10,6 +10,117 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testSourceMetadataArrivesBeforeCapabilitiesAndIsReplacedByPreparedMetadata() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            let gate = fixture.hold(.capabilities)
+            fixture.play(observingMediaInformation: true)
+            try await fixture.until { gate.entered && fixture.metadata.last??.isSourceProbe == true }
+            let information = try XCTUnwrap(fixture.metadata.last ?? nil)
+            XCTAssertEqual(information.width, 1_920)
+            XCTAssertEqual(information.sourceFrameRate, MediaRational(num: 25, den: 1))
+            XCTAssertNil(information.outputFrameRate)
+            XCTAssertFalse(information.isSmoothMotionEnhanced)
+            XCTAssertFalse(fixture.registry.outputResourceContextSnapshot()?.prepared == true)
+            XCTAssertNil(fixture.registry.outputResourceContextSnapshot()?.interval)
+            XCTAssertEqual(fixture.driver.installs, 0)
+            XCTAssertEqual(fixture.driver.plays, 0)
+            gate.release()
+            try await fixture.until { fixture.isPlaying && fixture.metadata.last??.isSourceProbe == false }
+            XCTAssertEqual(fixture.metadata.last??.width, 1_920)
+            XCTAssertEqual(fixture.metadata.last??.outputFrameRate, 25)
+        }
+    }
+
+    func testGeneratedSourceMetadataArrivesBeforeGraphConstructionAndClearsOnFailure() async throws {
+        try await NativeAdapterFixture.withFixture(generated: true) { fixture in
+            await fixture.observeMetadata()
+            let gate = fixture.hold(.capabilities)
+            fixture.play()
+            try await fixture.until { gate.entered && fixture.metadata.last??.isSourceProbe == true }
+            XCTAssertTrue(fixture.factory.retry.decisions.isEmpty)
+            XCTAssertEqual(fixture.driver.installs, 0)
+            XCTAssertNil(fixture.metadata.last??.outputFrameRate)
+            gate.release()
+            try await fixture.until { fixture.failure != nil && fixture.metadata.last != nil && fixture.metadata.last! == nil }
+        }
+    }
+
+    func testMasterProbeDoesNotPublishAnArbitraryVariantBeforeSelection() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            await fixture.observeMetadata()
+            let gate = fixture.hold(.capabilities)
+            fixture.play(); try await fixture.until { gate.entered }
+            XCTAssertFalse(fixture.metadata.contains { $0 != nil })
+            gate.release()
+            try await fixture.until { fixture.isPlaying && fixture.metadata.last??.width == 1_920 }
+            XCTAssertFalse(fixture.metadata.contains { $0?.isSourceProbe == true })
+        }
+    }
+
+    func testLateSourceProbeCannotRepublishAfterStop() async throws {
+        for phase in [NativeAdapterFixture.Phase.probe, .capabilities] {
+            try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+                await fixture.observeMetadata()
+                let gate = fixture.hold(phase)
+                fixture.play(); try await fixture.until { gate.entered }
+                if phase == .capabilities {
+                    try await fixture.until { fixture.metadata.last??.isSourceProbe == true }
+                }
+                fixture.spawn { await fixture.controller.stop() }
+                try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.teardownRequested == true }
+                gate.release()
+                try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+                var current = await fixture.controller.playbackMediaInformation().makeAsyncIterator()
+                let latest = await current.next()
+                XCTAssertNil(try XCTUnwrap(latest))
+                XCTAssertEqual(fixture.driver.plays, 0)
+                if phase == .probe { XCTAssertFalse(fixture.metadata.contains { $0 != nil }) }
+            }
+        }
+    }
+
+    func testQueuedProbeNotificationCannotOverwriteReplacementMetadata() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            let gate = fixture.hold(.capabilities)
+            fixture.play(); try await fixture.until { gate.entered }
+            let invocation = try fixture.prepareInvocation()
+            let source = try XCTUnwrap(fixture.probe.lastSource)
+            fixture.play()
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.teardownRequested == true }
+            gate.release()
+            try await fixture.until { fixture.isPlaying }
+            let late = PlaybackMediaInformation(sourceWidth: 640, sourceHeight: 360,
+                scanMode: .progressive, sourceFrameRate: MediaRational(num: 24, den: 1))
+            // Invoke the receiver directly to cover the check after its actor hop.
+            await fixture.controller.updateProbedSourceMediaInformation(late, source: source, invocation: invocation)
+            var stream = await fixture.controller.playbackMediaInformation().makeAsyncIterator()
+            let value = await stream.next()
+            let current = try XCTUnwrap(try XCTUnwrap(value))
+            XCTAssertEqual(current.width, 1_920)
+            XCTAssertFalse(current.isSourceProbe)
+        }
+    }
+
+    func testQueuedProbeNotificationRevalidatesSourceAfterActorHop() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            let gate = fixture.hold(.capabilities)
+            fixture.play(); try await fixture.until { gate.entered }
+            let invocation = try fixture.prepareInvocation()
+            let source = try XCTUnwrap(fixture.probe.lastSource)
+            let resolver = try XCTUnwrap(fixture.factory.resolver)
+            await resolver.invalidate()
+            XCTAssertTrue(invocation.revalidateCurrentPreparation(), "Keep the Registry scope current to isolate source retirement")
+            let late = PlaybackMediaInformation(sourceWidth: 640, sourceHeight: 360,
+                scanMode: .progressive, sourceFrameRate: MediaRational(num: 24, den: 1))
+            await fixture.controller.updateProbedSourceMediaInformation(late, source: source, invocation: invocation)
+            var stream = await fixture.controller.playbackMediaInformation().makeAsyncIterator()
+            let value = await stream.next()
+            XCTAssertEqual(try XCTUnwrap(try XCTUnwrap(value)).width, 1_920)
+            gate.release()
+            try await fixture.until { fixture.failure != nil }
+        }
+    }
+
     func testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.probe.failUnsupported = true
@@ -628,7 +739,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
 /// releases gates and joins tasks before Registry/controller teardown finishes.
 @MainActor
 private final class NativeAdapterFixture {
-    enum Phase: CaseIterable { case probe, ready, preroll, format }
+    enum Phase: CaseIterable { case probe, capabilities, ready, preroll, format }
     let registry: ControlTaskRegistry
     let controller: PlaybackController
     let driver = NativeFixtureDriver()
@@ -640,12 +751,12 @@ private final class NativeAdapterFixture {
     var metadata: [PlaybackMediaInformation?] = []
     var cleanupCompleted = false
     private let manualClock: ManualPlaybackClock?
-    private init(generated: Bool, clock: ManualPlaybackClock?) throws {
+    private init(generated: Bool, singleMedia: Bool, clock: ManualPlaybackClock?) throws {
         manualClock = clock
         registry = clock.map { ControlTaskRegistry(allocator: PlaybackIdentityAllocator(), clock: $0) } ?? ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         inspector = NativeFixtureInspector(driver: driver)
         probe.generated = generated
-        factory = NativeFixtureFactory(driver: driver, inspector: inspector, probe: probe, generated: generated)
+        factory = NativeFixtureFactory(driver: driver, inspector: inspector, probe: probe, generated: generated, singleMedia: singleMedia)
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
@@ -653,9 +764,9 @@ private final class NativeAdapterFixture {
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
         inspector.preflightDiagnosticAlive = { [weak probe] in probe?.diagnosticAlive == true }
     }
-    static func withFixture(generated: Bool = false, clock: ManualPlaybackClock? = nil,
+    static func withFixture(generated: Bool = false, singleMedia: Bool = false, clock: ManualPlaybackClock? = nil,
                             _ body: (NativeAdapterFixture) async throws -> Void) async throws {
-        let fixture = try NativeAdapterFixture(generated: generated, clock: clock)
+        let fixture = try NativeAdapterFixture(generated: generated, singleMedia: singleMedia, clock: clock)
         var failure: (any Error)?
         do { try await body(fixture) } catch { failure = error }
         fixture.gates.forEach { $0.release() }
@@ -682,14 +793,36 @@ private final class NativeAdapterFixture {
         return nil
     }
     func spawn(_ body: @escaping @MainActor () async -> Void) { tasks.append(Task { await body() }) }
-    func play() {
-        spawn { await self.controller.play(.init(sourceProfileID: UUID(), channelID: "native-fixture",
-            streamURL: NativeFixtureFactory.rootURL, title: "Native fixture")) }
+    func prepareInvocation() throws -> ControlTaskRegistry.BackendPrepareInvocation {
+        let ticket = try XCTUnwrap(registry.outputResourceContextSnapshot()?.prepareTicket)
+        let authority = try XCTUnwrap(factory.backend?.backendPublicationReplacementAuthoritySlot.currentAuthority())
+        return .init(ticket: ticket, replacementAuthority: authority)
+    }
+    func observeMetadata() async {
+        let stream = await controller.playbackMediaInformation()
+        spawn {
+            for await information in stream {
+                self.metadata.append(information)
+                if Task.isCancelled { break }
+            }
+        }
+    }
+    func play(observingMediaInformation: Bool = false) {
+        spawn {
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "native-fixture",
+                streamURL: NativeFixtureFactory.rootURL, title: "Native fixture")
+            if observingMediaInformation {
+                await self.controller.play(request) { await self.observeMetadata() }
+            } else {
+                await self.controller.play(request)
+            }
+        }
     }
     func hold(_ phase: Phase) -> NativeFixtureGate {
         let gate = NativeFixtureGate(); gates.append(gate)
         switch phase {
         case .probe: probe.gate = gate
+        case .capabilities: probe.capabilitiesGate = gate
         case .ready: driver.readyGate = gate
         case .preroll: driver.prerollGate = gate
         case .format: inspector.gate = gate
@@ -745,13 +878,16 @@ private final class NativeFixtureGate: @unchecked Sendable {
 private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sendable {
     nonisolated static let rootURL = URL(string: "https://native-fixture.invalid/master")!
     var backend: HLSAVPlayerPlaybackBackend?
+    let resolverCapture = NativeFixtureResolverCapture()
+    var resolver: URLSessionPlaybackSourceResolver? { resolverCapture.current }
     private let driver: NativeFixtureDriver
     private let inspector: NativeFixtureInspector
     private let probe: NativeFixtureProbe
     private let generated: Bool
+    private let singleMedia: Bool
     let retry = NativeRetryRecorder()
-    init(driver: NativeFixtureDriver, inspector: NativeFixtureInspector, probe: NativeFixtureProbe, generated: Bool) {
-        self.driver = driver; self.inspector = inspector; self.probe = probe; self.generated = generated
+    init(driver: NativeFixtureDriver, inspector: NativeFixtureInspector, probe: NativeFixtureProbe, generated: Bool, singleMedia: Bool) {
+        self.driver = driver; self.inspector = inspector; self.probe = probe; self.generated = generated; self.singleMedia = singleMedia
     }
     nonisolated func makeBackend(kind: PlaybackBackendKind, identity: PlaybackBackendIdentity, tuning: PlaybackTuning,
         channelID: String, url: URL, eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
@@ -763,23 +899,31 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
         let context = try XCTUnwrap(sourceContext)
         let media = URL(string: "https://native-fixture.invalid/media")!
         let alternate = URL(string: "https://native-fixture.invalid/alternate")!
-        let root = generated ? "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n" :
+        let root = generated || singleMedia ? "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n" :
             "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nmedia\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\nalternate\n"
         let transport = SourceTestTransport(responses: [url: .init(responseURL: url, data: Data(root.utf8)),
             media: .init(responseURL: media, data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n".utf8)),
             alternate: .init(responseURL: alternate, data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n".utf8))])
         var dependencies = HLSNativeSourceDependencies(context: context)
-        dependencies.makeResolver = { URLSessionPlaybackSourceResolver(transport: transport) }
+        dependencies.makeResolver = { [resolverCapture] in
+            let resolver = URLSessionPlaybackSourceResolver(transport: transport)
+            resolverCapture.record(resolver)
+            return resolver
+        }
         dependencies.probe = probe
         dependencies.makeInspector = { [inspector] _ in inspector }
         if generated {
-            dependencies.capabilities = { _, _ in
-                .init(videoProfiles: [.h264: [100]], compressedAudioCodecs: [.ac3],
+            dependencies.capabilities = { [probe] _, _ in
+                await probe.capabilitiesGate?.wait()
+                return .init(videoProfiles: [.h264: [100]], compressedAudioCodecs: [.ac3],
                     compressedAudioAdmissionCandidates: [.init(codec: .ac3, profile: 8, sampleRate: 48_000,
                         channelCount: 6, channelMask: 0x3F, decoderConfiguration: Data(),
                         outputRouteIdentifier: "bounded-fixture-candidate", requiresAACCompatibilityRendition: false)], supportsGenerated: true)
             }
-        } else { dependencies.capabilities = { _, _ in NativeFixtureProbe.capabilities } }
+        } else { dependencies.capabilities = { [probe] _, _ in
+            await probe.capabilitiesGate?.wait()
+            return NativeFixtureProbe.capabilities
+        } }
         let lease = try HomePodAVPlayerSession(identity: identity.sessionIdentity, driver: driver).claim(backend: identity)
         let slot = ControlTaskRegistry.BackendPublicationReplacementAuthoritySlot()
         let backend = HLSAVPlayerPlaybackBackend(identity: identity,
@@ -799,9 +943,19 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
     }
 }
 
+private final class NativeFixtureResolverCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: URLSessionPlaybackSourceResolver?
+    var current: URLSessionPlaybackSourceResolver? { lock.withLock { value } }
+    func record(_ resolver: URLSessionPlaybackSourceResolver) { lock.withLock { value = resolver } }
+}
+
 private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Sendable {
     private let lock = NSLock()
     private var gateValue: NativeFixtureGate?
+    private var capabilitiesGateValue: NativeFixtureGate?
+    private var lastSourceValue: ResolvedPlaybackSource?
+    var lastSource: ResolvedPlaybackSource? { lock.withLock { lastSourceValue } }
     private var generatedValue = false
     private var failUnsupportedValue = false, unknownScanValue = false, observedDiagnosticValue = false
     private weak var lastDiagnostic: HLSPreparationDiagnostics?
@@ -811,6 +965,7 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     var diagnosticAlive: Bool { lock.withLock { lastDiagnostic != nil } }
     var generated: Bool { get { lock.withLock { generatedValue } } set { lock.withLock { generatedValue = newValue } } }
     var gate: NativeFixtureGate? { get { lock.withLock { gateValue } } set { lock.withLock { gateValue = newValue } } }
+    var capabilitiesGate: NativeFixtureGate? { get { lock.withLock { capabilitiesGateValue } } set { lock.withLock { capabilitiesGateValue = newValue } } }
     static func video(width: Int32 = 1_920, rate: MediaRational? = MediaRational(num: 25, den: 1),
         sequenceRate: MediaRational? = MediaRational(num: 25, den: 1), scan: HLSScanEvidence = .progressive) -> HLSVideoFacts {
         .init(codec: .h264, profile: 100, scan: scan, parameterSetsValidated: true,
@@ -829,7 +984,7 @@ private final class NativeFixtureProbe: HLSCompatibilityProbing, @unchecked Send
     }
     func inspect(_ source: ResolvedPlaybackSource) async throws -> HLSCompatibilityFacts {
         let diagnostic = HLSPreparationDiagnostics.current
-        lock.withLock { lastDiagnostic = diagnostic; observedDiagnosticValue = observedDiagnosticValue || diagnostic != nil }
+        lock.withLock { lastSourceValue = source; lastDiagnostic = diagnostic; observedDiagnosticValue = observedDiagnosticValue || diagnostic != nil }
         await gate?.wait()
         if failUnsupported { throw HLSSourceError.unsupportedMedia }
         guard case let .hls(graph) = source.topology else { throw HLSSourceError.unsupportedMedia }

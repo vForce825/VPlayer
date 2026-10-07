@@ -9,6 +9,27 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackMediaInformationPresentationTests: XCTestCase {
+    func testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput() {
+        let subject = PlaybackMediaInformationPresentation(information: .init(
+            sourceWidth: 1_920, sourceHeight: 1_080, scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1)))
+        XCTAssertEqual(subject.visualText, "源视频 1920×1080i · 25 fps")
+        XCTAssertEqual(subject.accessibilityText, "源视频，1920 乘 1080 隔行扫描，每秒 25 帧")
+        XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
+    }
+
+    func testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate() {
+        let subject = PlaybackMediaInformationPresentation(information: .init(
+            sourceWidth: 1_920, sourceHeight: 1_080, scanMode: nil, sourceFrameRate: nil))
+        XCTAssertEqual(subject.visualText, "源视频 1920×1080 · 帧率检测中…")
+        XCTAssertEqual(subject.accessibilityText, "源视频，1920 乘 1080 扫描方式检测中，帧率检测中")
+        XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
+        let unknownSize = PlaybackMediaInformationPresentation(information: .init(
+            sourceWidth: 0, sourceHeight: 0, scanMode: nil,
+            sourceFrameRate: MediaRational(num: 30_000, den: 1_001)))
+        XCTAssertEqual(unknownSize.visualText, "源视频分辨率检测中… · 29.97 fps")
+    }
+
     func testFormatsInterlacedDoubleRateWithCompactVisualHighlight() {
         let subject = PlaybackMediaInformationPresentation(
             information: PlaybackMediaInformation(

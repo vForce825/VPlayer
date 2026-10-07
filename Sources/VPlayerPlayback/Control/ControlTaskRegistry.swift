@@ -130,6 +130,27 @@ final class ControlTaskRegistry: @unchecked Sendable {
             replacementAuthority.preparationRoute(ticket: ticket)
         }
 
+        /// This source-only path deliberately does not consult mountable/ready
+        /// output. Both sides of the actor hop validate the original prepare and
+        /// source generation, in Registry -> source lock order.
+        func revalidateProbedSource(_ source: ResolvedPlaybackSource) -> Bool {
+            guard !Task.isCancelled,
+                  let owner = try? PlaybackSourceOwner(ticket: ticket, lifecycle: outputLifecycleEpoch) else { return false }
+            var current = false
+            _ = try? performCurrentPreparationMutation {
+                current = source.withCurrentResolution(owner: owner, generation: source.generation, operation: { true }) == true
+            }
+            return current
+        }
+
+        func deliverProbedSourceMediaInformation(_ information: PlaybackMediaInformation,
+                                                 source: ResolvedPlaybackSource) async {
+            guard information.isSourceProbe, revalidateProbedSource(source),
+                  let registry = replacementAuthority.registry else { return }
+            await registry.mediaInformationReceiver()?.updateProbedSourceMediaInformation(
+                information, source: source, invocation: self)
+        }
+
         func deliverNativeMediaInformation(activation: ActivationEpoch?, invalidated: Bool) async {
             guard let registry = replacementAuthority.registry,
                   registry.nativeMetadataScopeIsCurrent(lifecycle: outputLifecycleEpoch, activation: activation, invalidated: invalidated) else { return }

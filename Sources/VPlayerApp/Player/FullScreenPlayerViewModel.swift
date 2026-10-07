@@ -72,6 +72,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var presentationSuccessorPending = false
     private var mediaInformationProviderTask: Task<Void, Never>?
     private var mediaInformationTask: Task<Void, Never>?
+    private var mediaInformationPreparationBegan = false
     private var pauseTask: Task<Void, Never>?
     @ObservationIgnored private var pauseWorkerTask: Task<Void, Never>?
     @ObservationIgnored private var pauseWorkerID: UUID?
@@ -195,12 +196,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
                     self.apply(state)
                 }
             }
-            await engine.play(request)
+            await playWithMediaInformation(lifecycle: lifecycle, playback: playback)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            beginMediaInformationSubscription(
-                lifecycle: lifecycle,
-                playback: playback
-            )
             await beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
@@ -334,12 +331,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
                     self.apply(state)
                 }
             }
-            await engine.play(request)
+            await playWithMediaInformation(lifecycle: lifecycle, playback: playback)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-            beginMediaInformationSubscription(
-                lifecycle: lifecycle,
-                playback: playback
-            )
             await beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
     }
@@ -377,6 +370,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         presentationTask = nil
         mediaInformationProviderTask = nil
         mediaInformationTask = nil
+        mediaInformationPreparationBegan = false
         resetPauseIntent()
         stateTask = nil
         self.mediaInformation = nil
@@ -701,10 +695,26 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         }
     }
 
+    private func playWithMediaInformation(lifecycle: UInt64, playback: UInt64) async {
+        if let preparing = engine as? any PlaybackMediaInformationPreparing {
+            await preparing.play(request) { [weak self] in
+                await self?.beginMediaInformationSubscription(lifecycle: lifecycle, playback: playback,
+                                                              afterPreparationReset: true)
+            }
+        } else {
+            // Compatibility engines do not expose their clear boundary.
+            await engine.play(request)
+            beginMediaInformationSubscription(lifecycle: lifecycle, playback: playback)
+        }
+    }
+
     private func beginMediaInformationSubscription(
         lifecycle: UInt64,
-        playback: UInt64
+        playback: UInt64,
+        afterPreparationReset: Bool = false
     ) {
+        guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
+        if afterPreparationReset { mediaInformationPreparationBegan = true }
         let provider = mediaInformationProvider
         mediaInformationProviderTask = Task { [weak self] in
             let mediaStream = await provider()
@@ -735,6 +745,12 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
              let .playing(eventRequest), let .paused(eventRequest):
             guard eventRequest.id == request.id else { return }
             receivedRequestState = true
+            // A predecessor terminal state may already have been dequeued when
+            // this attempt's reset callback runs. Restart its canceled subscriber
+            // when the matching current active state arrives, still before ready.
+            if mediaInformationPreparationBegan, mediaInformationProviderTask == nil, mediaInformationTask == nil {
+                beginMediaInformationSubscription(lifecycle: lifecycleGeneration, playback: playbackGeneration)
+            }
         case .idle, .stopped, .failed: break
         }
         state = newState
@@ -758,7 +774,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         case .stopped, .failed:
             resetPauseIntent()
             if case .failed = newState {
-                resetMediaInformation()
+                resetMediaInformation(preservingPreparationBoundary: true)
             }
         case .idle:
             break
@@ -803,7 +819,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         acceptsAuthoritativePauseState = false
     }
 
-    private func resetMediaInformation() {
+    private func resetMediaInformation(preservingPreparationBoundary: Bool = false) {
+        if !preservingPreparationBoundary { mediaInformationPreparationBegan = false }
         mediaInformationProviderTask?.cancel()
         mediaInformationProviderTask = nil
         mediaInformationTask?.cancel()

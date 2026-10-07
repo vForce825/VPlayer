@@ -147,6 +147,12 @@ struct HLSNativeSourceDependencies: Sendable {
             diagnostics?.begin(.probe)
             let facts = try await inspect(source, retainingFacts: factsCharge, diagnostics: diagnostics)
             try validate(invocation)
+            if let information = Self.probedMediaInformation(source: source, facts: facts) {
+                // Stay on the paid, joined prepare task. The receiver retains only
+                // scalars; source/facts charges outlive this awaited notification.
+                await invocation.deliverProbedSourceMediaInformation(information, source: source)
+                try validate(invocation)
+            }
             diagnostics?.begin(.capabilities)
             let capabilities = await capabilities(facts, invocation.currentPreparationRoute())
             try validate(invocation)
@@ -173,6 +179,34 @@ struct HLSNativeSourceDependencies: Sendable {
             return .init(source: source, facts: facts, plan: plan, resolver: resolver, sourceCharge: sourceCharge, factsCharge: factsCharge)
         } catch { await resolver.invalidate(); throw error }
     }
+    /// A source snapshot is not a selected AVPlayer variant or prepared output.
+    /// Masters keep detecting until native selection provides exact metadata.
+    static func probedMediaInformation(source: ResolvedPlaybackSource,
+                                      facts: HLSCompatibilityFacts) -> PlaybackMediaInformation? {
+        guard let owner = source.context.owner, facts.owner == owner,
+              facts.resolutionGeneration == source.generation, facts.complete,
+              facts.inspectedBytes > 0, facts.inspectedBytes <= HLSCompatibilityProbe.maximumBytes,
+              facts.media.count == 1, let media = facts.media.first, !media.hasUnsupportedTracks,
+              let video = media.video, video.parameterSetsValidated,
+              video.scan != .contradictory,
+              source.withCurrentResolution(owner: owner, generation: source.generation, operation: { true }) == true else { return nil }
+        switch source.topology {
+        case .media:
+            guard media.url == source.responseURL else { return nil }
+        case let .hls(graph):
+            guard graph.documents.count == 1, let root = graph.document(for: graph.rootURL),
+                  root.kind == .media, media.url == root.responseURL else { return nil }
+        }
+        let scan: PlaybackScanMode?
+        switch video.scan {
+        case .progressive: scan = .progressive
+        case .interlaced: scan = .interlaced
+        case .unknown, .contradictory: scan = nil
+        }
+        return .init(sourceWidth: video.width, sourceHeight: video.height,
+            scanMode: scan, sourceFrameRate: video.frameRate)
+    }
+
     private func validate(_ invocation: ControlTaskRegistry.BackendPrepareInvocation) throws {
         try Task.checkCancellation()
         guard invocation.revalidateCurrentPreparation() else { throw CancellationError() }

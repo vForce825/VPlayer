@@ -16,7 +16,7 @@ final class DefaultAudioSessionCompletionReceiver: PlaybackAudioSessionCompletio
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {}
 }
 
-public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
+public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackMediaInformationPreparing, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
     private let registry: ControlTaskRegistry
     private let deadlineScheduler: PlaybackDeadlineScheduler
     private let audioSessionOwner: PlaybackAudioSessionOwner
@@ -305,6 +305,16 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     public func play(_ request: PlaybackRequest) async {
+        await preparePlayback(request, afterMediaInformationReset: nil)
+    }
+
+    public func play(_ request: PlaybackRequest,
+                     afterMediaInformationReset: @escaping @Sendable () async -> Void) async {
+        await preparePlayback(request, afterMediaInformationReset: afterMediaInformationReset)
+    }
+
+    private func preparePlayback(_ request: PlaybackRequest,
+                                 afterMediaInformationReset: (@Sendable () async -> Void)?) async {
         guard !Task.isCancelled else { return }
         let originalActionEpoch = AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot)
         let (generation, overflow) = playAdmissionGeneration.addingReportingOverflow(1)
@@ -353,7 +363,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         controllerState.readinessCycle = 0
         controllerState.activeRoutePorts = nil
         publish(.preparing(request))
-        
+        if let afterMediaInformationReset {
+            await afterMediaInformationReset()
+            // A queued UI callback may return after Stop or a newer play attempt.
+            guard !Task.isCancelled, playAdmissionGeneration == generation, isCurrent(runIdentity) else { return }
+        }
+
         // 1. Predecessor teardown
         diagnosticStage = "joining_cleanup"
         await joinOwnedSessionCleanup(reason: .stop)
@@ -1760,6 +1775,19 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     private func publishMediaInformation(_ information: PlaybackMediaInformation?) {
         currentMediaInformation = information
         registry.publishMediaInformation(information)
+    }
+
+    func updateProbedSourceMediaInformation(_ information: PlaybackMediaInformation,
+        source: ResolvedPlaybackSource, invocation: ControlTaskRegistry.BackendPrepareInvocation) {
+        let lifecycle = invocation.outputLifecycleEpoch
+        guard information.isSourceProbe, let run = admittedRun, isCurrent(run),
+              finishedPresentationSession != lifecycle.backendIdentity.sessionIdentity,
+              invocation.revalidateProbedSource(source) else { return }
+        // A delayed probe notification can never replace selected/output facts.
+        if mediaInformationLifecycle == lifecycle, currentMediaInformation?.isSourceProbe == false { return }
+        if mediaInformationLifecycle != lifecycle { clearMediaInformation() }
+        mediaInformationLifecycle = lifecycle
+        publishMediaInformation(information)
     }
 
     /// No await: the notifying Registry runner may itself be awaited by play or

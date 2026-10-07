@@ -175,6 +175,64 @@ final class HLSPlaybackPlanTests: XCTestCase {
         XCTAssertThrowsError(try HLSPlaybackPlanner.makePlan(source: source, facts: facts(source), capabilities: broad))
     }
 
+    func testProbeMetadataProjectsOnlyConfirmedSourceFacts() throws {
+        for raw in [false, true] {
+            let source = try source(raw: raw)
+            let information = try XCTUnwrap(HLSNativeSourceDependencies.probedMediaInformation(
+                source: source, facts: facts(source, video: video(scan: .interlaced))))
+            XCTAssertTrue(information.isSourceProbe)
+            XCTAssertEqual(information.width, 1_920)
+            XCTAssertEqual(information.height, 1_080)
+            XCTAssertEqual(information.scanMode, .interlaced)
+            XCTAssertEqual(information.sourceFrameRate, MediaRational(num: 30, den: 1))
+            XCTAssertNil(information.outputFrameRate)
+            XCTAssertFalse(information.isSmoothMotionEnhanced)
+        }
+    }
+
+    func testProbeMetadataPreservesUnknownScanAndRate() throws {
+        let source = try source(raw: true)
+        let video = HLSVideoFacts(codec: .h264, profile: 100, scan: .unknown,
+            parameterSetsValidated: true, width: 1_920, height: 1_080)
+        let information = try XCTUnwrap(HLSNativeSourceDependencies.probedMediaInformation(
+            source: source, facts: facts(source, video: video)))
+        XCTAssertEqual(information.width, 1_920)
+        XCTAssertNil(information.scanMode)
+        XCTAssertNil(information.sourceFrameRate)
+        XCTAssertNil(information.outputFrameRate)
+    }
+
+    func testProbeMetadataRejectsAmbiguousIncompleteUnvalidatedAndForeignFacts() throws {
+        let source = try source(), valid = facts(source)
+        let master = try self.source(master: true)
+        XCTAssertNil(HLSNativeSourceDependencies.probedMediaInformation(source: master, facts: facts(master)),
+            "Even a single declared master variant has no selected-output authority")
+        let foreign = try self.source()
+        XCTAssertNil(HLSNativeSourceDependencies.probedMediaInformation(source: source, facts: facts(foreign)))
+        let successor = ResolvedPlaybackSource(context: source.context, responseURL: source.responseURL,
+            generation: source.generation + 1, topology: source.topology)
+        XCTAssertNil(HLSNativeSourceDependencies.probedMediaInformation(source: successor, facts: valid))
+        for invalid in [
+            HLSCompatibilityFacts(source: source, media: valid.media, complete: false, inspectedBytes: 100),
+            HLSCompatibilityFacts(source: source, media: valid.media + valid.media, complete: true, inspectedBytes: 100),
+            HLSCompatibilityFacts(source: source, media: valid.media, complete: true, inspectedBytes: 0),
+            HLSCompatibilityFacts(source: source, media: [.init(url: URL(string: "https://other.invalid/media")!,
+                container: .mpegTS, video: video(), audio: [], hasUnsupportedTracks: false)], complete: true, inspectedBytes: 100),
+            HLSCompatibilityFacts(source: source, media: [.init(url: source.responseURL,
+                container: .mpegTS, video: video(), audio: [], hasUnsupportedTracks: true)], complete: true, inspectedBytes: 100),
+            facts(source, video: .init(codec: .h264, profile: 100, scan: .contradictory,
+                parameterSetsValidated: false, width: 1_920, height: 1_080))
+        ] {
+            XCTAssertNil(HLSNativeSourceDependencies.probedMediaInformation(source: source, facts: invalid))
+        }
+    }
+
+    func testProbeMetadataStillFitsExistingFixedEventPayload() {
+        XCTAssertLessThanOrEqual(MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride,
+            PlaybackPipelineEventStorage.payloadStride)
+        PlaybackPipelineEventStorage.validateLayout()
+    }
+
     private func source(master: Bool = false, raw: Bool = false, managed: Bool = false, declaration: String = "") throws -> ResolvedPlaybackSource {
         let context = try sourceContext(attributes: managed ? ["User-Agent": "fixture"] : [:])
         if raw { return .init(context: context, responseURL: context.entryURL, generation: 1, topology: .media(Data([0x47]))) }
