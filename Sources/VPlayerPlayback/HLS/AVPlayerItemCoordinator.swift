@@ -1452,6 +1452,9 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         retiredReplacementFence = .init(item: item)
         state.phase = .quiescent
         retainedGraphReservation = quiescentReservation
+        guard await joinRetiredNativeCallbackTails() else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
     }
 
     /// Registry 的普通停止与 publication replacement 共用同一个 suspend/retire
@@ -2364,6 +2367,15 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         authorizationArmed = false
         retainedGraphReservation = .empty
         state.phase = .quiescent
+    }
+
+    /// Observer removal does not prove SDK callback closures have released their
+    /// admission aliases. Keep this coordinator/driver owned until those real
+    /// tails leave; only then may the backend release its one-player lease.
+    func joinRetiredNativeCallbackTails() async -> Bool {
+        guard request == nil, driver.currentItemIdentity == nil else { return false }
+        await driver.joinNativeCallbackTails()
+        return request == nil && driver.currentItemIdentity == nil
     }
 
     func cancel(item: AVPlayerItemInstanceIdentity) {

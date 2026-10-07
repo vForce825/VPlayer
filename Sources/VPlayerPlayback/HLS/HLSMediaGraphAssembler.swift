@@ -172,6 +172,9 @@ final class HLSMediaGraphAssembler: @unchecked Sendable {
             condition.withLock { phase = .failed }
             let failure = graph.failureDiagnostic
             _ = await retireAndAwaitReceipt()
+            // Cancellation wakes prefix readiness, but cannot bypass the real
+            // producer retirement or surface as an insufficient-coverage fault.
+            try Task.checkCancellation()
             if let failure { throw failure }
             throw AVPlayerItemCoordinatorFailure.insufficientCoverage
         }

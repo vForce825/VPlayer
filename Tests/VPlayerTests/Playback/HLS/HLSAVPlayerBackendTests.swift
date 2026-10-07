@@ -1813,6 +1813,63 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
+    func testProductionCanceledPrefixReleasesDriverAdmissionForDifferentChannel() async throws {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: "task22-progressive-h264-aac-16s.ts", withExtension: nil))
+        let stalled = try Task22LatePublicationFixtureServer(fileURL: file, prefixByteLimit: 188)
+        let next = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
+        defer { stalled.stop(); next.server?.stop() }
+        let observation = HLSPreparingGraphObservation()
+        let factory = AudioReviewProductionBackendFactory(factory: SystemPlaybackBackendFactory(
+            hlsGraphFactory: { source, invocation, ledger, failureSink in
+                let authority = try SystemHLSMediaGraphAuthority(
+                    lifecycle: invocation.outputLifecycleEpoch, failureSink: failureSink)
+                if source == stalled.sourceURL { observation.record(authority) }
+                return HLSMediaGraphAssembler(sourceURL: source, applicationLedger: ledger,
+                    graph: SystemHLSDeliveryGraph(authority: authority))
+            }))
+        try await withProductionMediaController(factory: factory) { controller, registry, factory, _ in
+            let play = Task { await controller.play(.init(sourceProfileID: UUID(), channelID: "cancel-stalled-prefix",
+                streamURL: stalled.sourceURL, title: "Stalled prefix")) }
+            let entryDeadline = ContinuousClock.now + .seconds(10)
+            while !observation.waiting, ContinuousClock.now < entryDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            XCTAssertTrue(observation.waiting, "Hold the real graph before any playable publication")
+            let original = factory.backend?.identity
+            XCTAssertNotNil(original, "The production factory has allocated the real SystemAVPlayerDriver")
+            XCTAssertNil(factory.backend?.outputItemGeneration, "No prefix may install an item")
+            let stopped = PlaybackStreamRecorder<Bool>()
+            let stop = Task { await controller.stop(); stopped.append(true) }
+            let stopDeadline = ContinuousClock.now + .seconds(3)
+            while stopped.snapshot.isEmpty, ContinuousClock.now < stopDeadline {
+                try await Task.sleep(for: .milliseconds(5))
+            }
+            let finished = !stopped.snapshot.isEmpty
+            XCTAssertTrue(finished, "Stop must cancel and join the real prefix wait without source EOF")
+            XCTAssertFalse(stalled.hasSentSourceEOF)
+            // Only bound a failed RED after its cancellation assertion. Do not
+            // release source readiness on the passing cancellation path.
+            if !finished { stalled.stop() }
+            await play.value
+            await stop.value
+            await registry.joinOwnedTerminalCleanup()
+            XCTAssertNil(registry.outputResourceContextSnapshot())
+            XCTAssertNil(factory.backend, "No test-owned backend alias may keep driver admission alive")
+            guard finished else { return }
+
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "different-after-prefix-cancel",
+                streamURL: next.source, title: "Different channel")
+            await controller.play(request)
+            let state = await controller.currentStateForTesting
+            XCTAssertEqual(state, .playing(request))
+            XCTAssertNotNil(factory.backend)
+            XCTAssertNotEqual(factory.backend?.identity, original,
+                "A new production backend must pass real process-wide driver admission")
+            XCTAssertTrue(registry.outputResourceContextSnapshot()?.prepared ?? false)
+        }
+    }
+
     func testProductionHLSPrepareWhilePausedPublishesButCanceledPrepareDoesNot() async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
         defer { fixture.server?.stop() }
@@ -3648,13 +3705,14 @@ private final class Task22LatePublicationFixtureServer: @unchecked Sendable {
     let sourceURL: URL
     var hasSentSourceEOF: Bool { connections.hasSentEOF }
 
-    init(fileURL: URL, sendEntireBodyWithoutEOF: Bool = false) throws {
+    init(fileURL: URL, sendEntireBodyWithoutEOF: Bool = false, prefixByteLimit: Int? = nil) throws {
         let payload = try Data(contentsOf: fileURL)
         // Retain one whole TS packet and keep the declared response incomplete.
         // This tests live publication; no EOF can activate the separate drain.
-        let prefixBytes = sendEntireBodyWithoutEOF
+        let normalPrefixBytes = sendEntireBodyWithoutEOF
             ? (payload.count / 188 - 1) * 188
             : (payload.count * 3 / 4) / 188 * 188
+        let prefixBytes = prefixByteLimit.map { min(normalPrefixBytes, $0 / 188 * 188) } ?? normalPrefixBytes
         guard prefixBytes > 0, prefixBytes < payload.count else {
             throw NSError(domain: "Task22LatePublicationFixtureServer", code: 1)
         }
@@ -3788,6 +3846,14 @@ private final class AudioReviewProductionBackendFactory: PlaybackBackendFactory,
         lock.withLock { created = value as? HLSAVPlayerPlaybackBackend }
         return value
     }
+}
+
+/// A weak observation cannot hold producer ownership beyond the real prepare join.
+private final class HLSPreparingGraphObservation: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var authority: SystemHLSMediaGraphAuthority?
+    func record(_ authority: SystemHLSMediaGraphAuthority) { lock.withLock { self.authority = authority } }
+    var waiting: Bool { lock.withLock { authority?.prefixPreparationInFlightForTesting == true } }
 }
 
 /// Stops only the handoff of an already-proven real prefix. All source, writer,

@@ -1073,7 +1073,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                     } else if ticket == reservation.task(for: .retirement) {
                         if let invocation = registry.claimOutputBackendCleanup(ticket, owner: owner),
                            let lifecycle = invocation.lifecycle {
-                            let result = await invocation.backend.retireOutput(epoch: lifecycle)
+                            let result = await registry.performOutputRetirement(invocation)
                             #if DEBUG
                             PlaybackDiagnosticTracker.shared.append("teardown_retire_\(result)")
                             #endif
@@ -1399,7 +1399,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             } else if context.retirement == ticket {
                 guard let invocation = registry.claimOutputBackendCleanup(ticket, owner: owner),
                       let lifecycle = invocation.lifecycle else { return }
-                let result = await invocation.backend.retireOutput(epoch: lifecycle)
+                let result = await registry.performOutputRetirement(invocation)
                 #if DEBUG
                 PlaybackDiagnosticTracker.shared.append("context_retire_\(result)")
                 #endif

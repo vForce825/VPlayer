@@ -616,6 +616,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 try await MainActor.run {
                     try coordinator.completeLifecycleCleanup(receipt)
                 }
+                guard await coordinator.joinRetiredNativeCallbackTails() else { return .unconfirmed }
             }
         } catch {
             #if DEBUG

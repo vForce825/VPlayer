@@ -2120,7 +2120,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_start")
         #endif
-        guard minimumSeconds == 3 else { return nil }
+        guard minimumSeconds == 3, !Task.isCancelled else { return nil }
         let mayPrepare = condition.withLock { () -> Bool in
             guard state != .failed, state != .retiring, state != .retired,
                   !prefixPreparationInFlight else { return false }
@@ -2139,6 +2139,20 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             }
             waiter?.resume()
         }
+        return await withTaskCancellationHandler {
+            await prepareAllTrackPlayablePrefix()
+        } onCancel: {
+            // Only the admitted prefix owner may cancel this real condition
+            // wait. Closing publication admission releases no media resources;
+            // the caller still joins their existing retirement path.
+            // Mark the actual media worker canceled before its publication wait
+            // wakes, so deliberate closure cannot become a new runtime fault.
+            worker.cancel()
+            publication.cancelLivePublication()
+        }
+    }
+
+    private func prepareAllTrackPlayablePrefix() async -> AVPlayerItemReplacementBundle? {
         do {
             let readiness = Task.detached(priority: .userInitiated) {
                 try self.publication.waitForVisible(
@@ -2153,6 +2167,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 #endif
                 return nil
             }
+            guard !Task.isCancelled else { return nil }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_waitVisible_ready")
             #endif
@@ -2168,7 +2183,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
                 while failureDispatchInFlight && state != .retiring && state != .retired { condition.wait() }
-                guard state != .failed, state != .retiring, state != .retired else { return nil }
+                guard !Task.isCancelled, state != .failed, state != .retiring, state != .retired else { return nil }
                 state = .playable
                 return AVPlayerItemReplacementBundle(
                     request: prepared.replacement.request,
@@ -2176,6 +2191,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     mediaInformation: mediaInformation)
             }
         } catch {
+            guard !Task.isCancelled else { return nil }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_fail")
             #endif

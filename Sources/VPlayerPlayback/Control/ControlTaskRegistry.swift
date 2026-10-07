@@ -4335,7 +4335,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                                 result = .canceled
                                 break
                             }
-                            let retired = await cleanup.backend.retireOutput(epoch: invocation.lifecycle)
+                            let retired = await performOutputRetirement(cleanup)
                             result = retired == .confirmedLocalOutputStopped &&
                                 completeOutputRetirement(retirement, lifecycle: invocation.lifecycle)
                                 ? .succeeded : .canceled
@@ -4440,8 +4440,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         ticket: suspendTicket, runner: suspendRunner)
                     return
                 }
-                let retirementResult = await cleanup.backend.retireOutput(
-                    epoch: pending.retiredLifecycle)
+                let retirementResult = await performOutputRetirement(cleanup)
                 guard retirementResult == .confirmedLocalOutputStopped,
                       completeOutputRetirement(retirement, lifecycle: pending.retiredLifecycle) else {
                     finishFailedBackendPublicationReplacement(
@@ -4748,12 +4747,15 @@ final class ControlTaskRegistry: @unchecked Sendable {
             shouldCancel: Bool)? = try? transaction { _ in
             guard let record = authority.commands.first(where: { $0?.controlTaskTicket == ticket }) ?? nil,
                   let runner = record.backendOperation else { return nil }
-            return (runner, runner.task, record.slot == .activation &&
-                runner.operation.slot == .activation && record.phase == .cancelRequested)
+            return (runner, runner.task,
+                (record.slot == .prepare || record.slot == .activation) &&
+                runner.operation.slot == record.slot && record.phase == .cancelRequested)
         }
         guard let execution else { return .canceled }
         // Join delivers only a cancellation already authorized for this exact
-        // activation. Never cancel cleanup/suspend runners or newer work, and
+        // preparation/activation. Owner sealing only revokes the record; the
+        // exact join must also wake its cancellation-aware source/player wait.
+        // Never cancel cleanup/suspend runners or newer work, and
         // never invoke a cancellation handler while the Cell lock is held.
         if execution.shouldCancel { execution.task?.cancel() }
         await execution.task?.value
@@ -4769,15 +4771,18 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }) ?? .canceled
     }
 
-    func joinOutputBackendOperations(owner: OutputTransitionOwnerTicket) async -> Bool {
+    func joinOutputBackendOperations(owner: OutputTransitionOwnerTicket,
+        retiring invocation: OutputBackendCleanupInvocation? = nil) async -> Bool {
         var cursor = 0
         while cursor < 32 {
             let ticket: ControlTaskTicket? = try? transaction { _ in
                 guard let context = authority.outputContext, context.owner == owner else { cursor = 32; return nil }
+                if let invocation, !matchesOutputRetirementLocked(invocation) { cursor = 32; return nil }
                 while cursor < 32 {
                     let index = cursor
                     cursor += 1
                     guard let record = authority.commands[index], record.backendOperation != nil,
+                          invocation == nil || record.slot == .factory || record.slot == .prepare || record.slot == .activation,
                           record.groupTicket == context.reservation.ownerGroup ||
                             authority.isDescendant(record.groupTicket, of: context.reservation.ownerGroup) else { continue }
                     return record.controlTaskTicket
@@ -4786,7 +4791,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
             if let ticket { _ = await joinOutputBackendOperation(ticket) }
         }
-        return outputResourceContextSnapshot()?.owner == owner
+        return (try? transaction { _ in
+            guard authority.outputContext?.owner == owner else { return false }
+            return invocation.map { matchesOutputRetirementLocked($0) } ?? true
+        }) == true
     }
 
     /// receiver只提交原owner；任务分配、handle换手及退出尾部均留在原固定record。
@@ -8494,6 +8502,54 @@ final class ControlTaskRegistry: @unchecked Sendable {
             return .init(task: ticket, owner: owner, contextNonce: context.contextNonce,
                 backend: backend, lifecycle: resource.lifecycle, suspendInvocation: suspendInvocation)
         }
+    }
+
+    /// A suspend deadline can expire while the exact prepare is still joining.
+    /// Its never-started stop remains canceled; physical stopping is delegated
+    /// to the already claimed retirement stack using the original signed ticket.
+    /// Neither cancellation nor a successful late stop commits quiescence here.
+    func performOutputRetirement(_ invocation: OutputBackendCleanupInvocation) async -> BackendTeardownResult {
+        // A bare retirement claim is not proof that a forward Task has exited.
+        // Exclude suspend/cleanup runners: this method may execute on that very
+        // runner after its actual stop returned requiresRetirement.
+        guard await joinOutputBackendOperations(owner: invocation.owner, retiring: invocation) else {
+            return .unconfirmed
+        }
+        let work: (lifecycle: OutputLifecycleEpoch, lateStop: BackendSuspendInvocation?)? = try? transaction { _ in
+            guard matchesOutputRetirementLocked(invocation),
+                  let context = authority.outputContext, let lifecycle = invocation.lifecycle,
+                  authority.isTerminal(context.reservation.workGroup) else { return nil }
+            var lateStop: BackendSuspendInvocation?
+            if context.suspendTimedOut, context.suspendRequiresRetirement, !context.suspendConfirmed,
+               let stop = context.suspend, stop.lifecycle == lifecycle,
+               let original = authority.commands.first(where: { $0?.controlTaskTicket == stop.task }) ?? nil,
+               original.phase == .terminal(.canceled), original.payload == nil {
+                if let close = context.closeClaim {
+                    guard close.suspendTicket == stop, close.intervalKey == context.interval else { return nil }
+                } else if context.interval != nil { return nil }
+                guard let issuer = allocator.issuerIdentity else { return nil }
+                lateStop = .init(registryIssuerIdentity: issuer, suspendTicket: stop, closeClaim: context.closeClaim)
+            }
+            return (lifecycle, lateStop)
+        }
+        guard let work else { return .unconfirmed }
+        if let lateStop = work.lateStop {
+            _ = await invocation.backend.suspendOutput(invocation: lateStop)
+        }
+        // Pre-install preparation has no coordinator to suspend. Its authentic
+        // producer-only retirement proof must still reach the normal backend leaf.
+        return await invocation.backend.retireOutput(epoch: work.lifecycle)
+    }
+
+    private func matchesOutputRetirementLocked(_ invocation: OutputBackendCleanupInvocation) -> Bool {
+        guard let context = authority.outputContext, context.owner == invocation.owner,
+              context.retirement == invocation.task, context.contextNonce == invocation.contextNonce,
+              let record = authority.commands.first(where: { $0?.controlTaskTicket == invocation.task }) ?? nil,
+              record.phase == .running, record.payload == nil,
+              let resource = authority.ownedBackendResources,
+              resource.object === invocation.backend, resource.identity == invocation.backend.identity,
+              let lifecycle = resource.lifecycle, lifecycle == invocation.lifecycle else { return false }
+        return true
     }
 
     func advanceOutputCleanup(owner: OutputTransitionOwnerTicket) throws -> ControlTaskTicket? {

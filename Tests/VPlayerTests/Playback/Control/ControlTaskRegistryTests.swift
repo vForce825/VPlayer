@@ -9,6 +9,47 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class ControlTaskRegistryTests: XCTestCase {
+    func testStopAndTerminalOwnerJoinCancelHeldPreparationTask() async throws {
+        for reason: OutputTransitionReason in [.stop, .terminal] {
+            let gate = RegistryHeldActivationCancellationGate()
+            let backend = CurrentPlaybackRateGateBackend(consumeActivation: true, prepareGate: gate)
+            let graph = try OutputGraphFixture(backendObject: backend)
+            let registry = graph.registry
+            backend.configure(identity: graph.lifecycle.backendIdentity)
+            let prepare = try XCTUnwrap(registry.outputResourceContextSnapshot()?.sourceTask)
+            XCTAssertTrue(registry.startOutputPrepareOperation(prepare))
+            defer { gate.releaseForFailedRED() }
+            let entryDeadline = ContinuousClock.now + .seconds(2)
+            while !gate.started, ContinuousClock.now < entryDeadline { await Task.yield() }
+            guard gate.started else {
+                XCTFail("The original preparation must enter its cancellation-aware await")
+                gate.releaseForFailedRED()
+                _ = await registry.joinOutputBackendOperation(prepare)
+                return
+            }
+            let context = try XCTUnwrap(registry.outputResourceContextSnapshot())
+            let owner = try XCTUnwrap(registry.beginOutputTransition(contextNonce: context.contextNonce,
+                reason: reason, anchorInstant: registry.clock.nowNanoseconds, teardown: true))
+            XCTAssertEqual(registry.phase(of: prepare), .cancelRequested)
+            let join = Task { await registry.joinOutputBackendOperations(owner: owner) }
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !gate.cancellationObserved, ContinuousClock.now < deadline { await Task.yield() }
+            let canceled = gate.cancellationObserved
+            XCTAssertTrue(canceled, "Owner sealing must deliver cancellation to the exact prepare runner")
+            XCTAssertFalse(registry.outputResourceContextSnapshot()?.retirementConfirmed ?? true,
+                "Cancellation does not manufacture physical retirement")
+            XCTAssertEqual(registry.outputResourceContextSnapshot()?.owner, owner)
+            if !canceled { gate.releaseForFailedRED() }
+            let joined = await join.value
+            XCTAssertTrue(joined)
+            guard case .canceled = await registry.joinOutputBackendOperation(prepare) else {
+                return XCTFail("The original prepare must physically exit canceled")
+            }
+            XCTAssertEqual(registry.phase(of: prepare), .terminal(.canceled))
+            XCTAssertFalse(gate.hasWaiter)
+        }
+    }
+
     func testStopOwnerJoinCancelsHeldActivationTask() async throws {
         try await checkOwnerJoinCancelsHeldActivation(reason: .stop)
     }
@@ -1611,6 +1652,7 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     private let lock = NSLock()
     private let consumeActivation: Bool
     private let activationGate: RegistryHeldActivationCancellationGate?
+    private let prepareGate: RegistryHeldActivationCancellationGate?
     private var storedIdentity = PlaybackBackendIdentity(
         sessionIdentity: .init(sessionID: 0, requestID: UUID()), backendGeneration: 0)
     private var storedActivation: ControlTaskRegistry.BackendPositiveRateInvocation?
@@ -1618,9 +1660,11 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     private var storedRate: Float = 0
     private var storedFirstPositiveCalls = 0
 
-    init(consumeActivation: Bool, activationGate: RegistryHeldActivationCancellationGate? = nil) {
+    init(consumeActivation: Bool, activationGate: RegistryHeldActivationCancellationGate? = nil,
+         prepareGate: RegistryHeldActivationCancellationGate? = nil) {
         self.consumeActivation = consumeActivation
         self.activationGate = activationGate
+        self.prepareGate = prepareGate
     }
     var identity: PlaybackBackendIdentity { lock.withLock { storedIdentity } }
     var presentation: PlaybackPresentation? { nil }
@@ -1630,7 +1674,9 @@ private final class CurrentPlaybackRateGateBackend: PlaybackBackend,
     var physicalRate: Float { lock.withLock { storedRate } }
     var firstPositiveCalls: Int { lock.withLock { storedFirstPositiveCalls } }
     func configure(identity: PlaybackBackendIdentity) { lock.withLock { storedIdentity = identity } }
-    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
+    func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
+        if let prepareGate { try await prepareGate.wait() }
+    }
     func reprepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {}
     func activateOutput(invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         lock.withLock { storedActivation = invocation }
