@@ -60,11 +60,16 @@ func sourceContext(url: URL = URL(string: "https://example.test/stream?sig=secre
 actor SourceTestTransport: HLSResourceTransport {
     let responses: [URL: HLSResourceResponse]
     var requests: [HLSResourceRequest] = []
-    init(responses: [URL: HLSResourceResponse]) { self.responses = responses }
+    let enforcesRequestLimit: Bool
+    init(responses: [URL: HLSResourceResponse], enforcesRequestLimit: Bool = true) {
+        self.responses = responses; self.enforcesRequestLimit = enforcesRequestLimit
+    }
     func fetch(_ request: HLSResourceRequest) async throws -> HLSResourceResponse {
         requests.append(request)
         guard let response = responses[request.url] else { throw HLSSourceError.network }
-        guard response.data.count <= request.maximumBytes else { throw HLSSourceError.byteLimit }
+        if enforcesRequestLimit {
+            guard response.data.count <= (request.maximumTSContinuationBytes ?? request.maximumBytes) else { throw HLSSourceError.byteLimit }
+        }
         return response
     }
 }
@@ -84,6 +89,10 @@ extension PlaybackSourceResolverTests {
         XCTAssertEqual(graph.documents.count, 2); XCTAssertEqual(graph.document(for: root)?.variants.count, 2)
         let requests = await transport.requests
         XCTAssertEqual(requests.count, 2)
+        XCTAssertEqual(requests.first?.maximumBytes, HLSManifestGraph.maximumPlaylistBytes)
+        XCTAssertEqual(requests.first?.maximumTSContinuationBytes, HLSCompatibilityProbe.maximumBytes)
+        XCTAssertEqual(requests.first?.mode, .classify)
+        XCTAssertNil(requests.last?.maximumTSContinuationBytes)
         await resolver.invalidate()
         XCTAssertNil(source.withCurrentResolution(owner: try XCTUnwrap(context.owner), generation: source.generation) { true })
     }
@@ -94,4 +103,90 @@ extension PlaybackSourceResolverTests {
         guard case .media = source.topology else { return XCTFail("raw media became a manifest") }
         XCTAssertEqual(source.mediaCompleteness, .prefix); XCTAssertNil(source.refreshReason())
     }
+}
+
+extension PlaybackSourceResolverTests {
+    func testRawTSExtensionRetainsAllOriginalBytesAndPrefixProvenance() async throws {
+        let context = try sourceContext()
+        let data = AcquisitionTSFixture.make(byteCount: HLSManifestGraph.maximumPlaylistBytes + 256 * 1_024,
+            headersAt: HLSManifestGraph.maximumPlaylistBytes + 188)
+        let transport = SourceTestTransport(responses: [context.entryURL:
+            .init(responseURL: context.entryURL, data: data, completeness: .prefix)])
+        let source = try await URLSessionPlaybackSourceResolver(transport: transport).resolve(context, reason: .initial)
+        guard case let .media(bytes) = source.topology else { return XCTFail("TS prefix became a manifest") }
+        XCTAssertEqual(bytes, data)
+        XCTAssertEqual(source.mediaCompleteness, .prefix)
+        let requests = await transport.requests
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.maximumBytes, HLSManifestGraph.maximumPlaylistBytes)
+        XCTAssertEqual(requests.first?.maximumTSContinuationBytes, HLSCompatibilityProbe.maximumBytes)
+        XCTAssertNil(requests.first?.range)
+    }
+
+    func testResolverIndependentlyRejectsOversizedManifestAndNonTSRootResponses() async throws {
+        let context = try sourceContext()
+        var manifest = Data("#EXTM3U\n".utf8)
+        manifest.append(Data(repeating: 0x20, count: HLSManifestGraph.maximumPlaylistBytes))
+        let bodies = [manifest, Data(repeating: 0x41, count: HLSManifestGraph.maximumPlaylistBytes + 1),
+                      Data(repeating: 0x47, count: HLSCompatibilityProbe.maximumBytes + 1)]
+        for body in bodies {
+            let transport = SourceTestTransport(responses: [context.entryURL:
+                .init(responseURL: context.entryURL, data: body)], enforcesRequestLimit: false)
+            do {
+                _ = try await URLSessionPlaybackSourceResolver(transport: transport).resolve(context, reason: .initial)
+                XCTFail("The resolver must enforce its own manifest and raw-media bounds")
+            } catch { XCTAssertEqual(error as? HLSSourceError, .byteLimit) }
+        }
+    }
+
+    func testSupersedingResolutionCancelsAndJoinsTheExtendedLoadBeforeStartingAnother() async throws {
+        let started = expectation(description: "First response started")
+        let cancelled = expectation(description: "First response cancelled")
+        let transport = JoiningSourceTestTransport(started: { started.fulfill() }, cancelled: { cancelled.fulfill() })
+        let context = try sourceContext()
+        let resolver = URLSessionPlaybackSourceResolver(transport: transport)
+        let first = Task { try await resolver.resolve(context, reason: .initial) }
+        await fulfillment(of: [started], timeout: 2)
+        let second = Task { try await resolver.resolve(context, reason: .topologyChanged) }
+        await fulfillment(of: [cancelled], timeout: 2)
+        let beforeJoin = await transport.requests
+        XCTAssertEqual(beforeJoin.count, 1, "A replacement must not overlap the previous transport workspace")
+        await transport.completeFirst()
+        do { _ = try await first.value; XCTFail("A superseded source escaped cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let source = try await second.value
+        XCTAssertEqual(source.generation, 2)
+        let current = await resolver.isCurrent(source)
+        XCTAssertTrue(current)
+        let afterJoin = await transport.requests
+        XCTAssertEqual(afterJoin.count, 2)
+        await resolver.invalidate()
+        let retired = await resolver.isCurrent(source)
+        XCTAssertFalse(retired)
+    }
+}
+
+private actor JoiningSourceTestTransport: HLSResourceTransport {
+    private let started: @Sendable () -> Void
+    private let cancelled: @Sendable () -> Void
+    private var continuation: CheckedContinuation<Void, Never>?
+    var requests: [HLSResourceRequest] = []
+    init(started: @escaping @Sendable () -> Void, cancelled: @escaping @Sendable () -> Void) {
+        self.started = started; self.cancelled = cancelled
+    }
+    func fetch(_ request: HLSResourceRequest) async throws -> HLSResourceResponse {
+        requests.append(request)
+        if requests.count == 1 {
+            let cancelled = self.cancelled
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    self.continuation = continuation; started()
+                }
+            } onCancel: { cancelled() }
+        }
+        // Intentionally ignore task cancellation to test the resolver's own
+        // post-join cancellation fence against a late successful transport.
+        return .init(responseURL: request.url, data: Data([0x47, 0]), completeness: .prefix)
+    }
+    func completeFirst() { continuation?.resume(); continuation = nil }
 }

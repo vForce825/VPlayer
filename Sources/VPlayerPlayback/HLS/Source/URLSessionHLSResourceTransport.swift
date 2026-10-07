@@ -13,6 +13,10 @@ public struct URLSessionHLSResourceTransport: HLSResourceTransport {
         try Task.checkCancellation()
         _ = try PlaybackSourceOrigin(request.url)
         guard request.maximumBytes > 0, request.maximumBytes <= 8 * 1_024 * 1_024 else { throw HLSSourceError.byteLimit }
+        if let ceiling = request.maximumTSContinuationBytes {
+            guard request.mode == .classify, request.range == nil,
+                  ceiling > request.maximumBytes, ceiling <= HLSCompatibilityProbe.maximumBytes else { throw HLSSourceError.byteLimit }
+        }
         guard HLSMonotonicClock.now < request.deadline else { throw HLSSourceError.deadline }
         if let range = request.range {
             guard range.offset >= 0, range.length > 0, range.length <= Int64(request.maximumBytes),
@@ -43,7 +47,11 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
     private var task: URLSessionDataTask?
     private var continuation: CheckedContinuation<HLSResourceResponse, any Error>?
     private var result: Result<HLSResourceResponse, any Error>?
+    // Body and acquisition state belong to the serial delegate queue. Only
+    // cancellation crosses queues; never hold its lock across a native hint.
     private var body = Data()
+    private var acquisitionBoundary: Int
+    private var reservedContinuation = false
     private var response: HTTPURLResponse?
     private var contentRange: HLSHTTPContentRange?
     private var failure: (any Error)?
@@ -55,6 +63,7 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
     init(request: HLSResourceRequest, configuration: URLSessionConfiguration,
          preparationDiagnostics: HLSPreparationDiagnostics?) {
         self.request = request; self.configuration = configuration
+        acquisitionBoundary = request.maximumBytes
         self.preparationDiagnostics = preparationDiagnostics
     }
     func run() async throws -> HLSResourceResponse {
@@ -131,6 +140,10 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
         completionHandler(accepted ? .allow : .cancel)
     }
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if let ceiling = request.maximumTSContinuationBytes {
+            if receiveAcquisitionBytes(data, ceiling: ceiling) { dataTask.cancel() }
+            return
+        }
         let stop = lock.withLock { () -> Bool in
             guard failure == nil, !cancelled, HLSMonotonicClock.now < request.deadline else {
                 if failure == nil { failure = cancelled ? CancellationError() : HLSSourceError.deadline }; return true
@@ -146,6 +159,64 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
             return false
         }
         if stop { dataTask.cancel() }
+    }
+    /// A callback may cross several milestones. Admit only the bytes up to each
+    /// boundary before inspecting, then resume from the same callback offset.
+    /// The body borrow ends before either append or its one extended reservation.
+    private func receiveAcquisitionBytes(_ data: Data, ceiling: Int) -> Bool {
+        if stoppedPrefix || stopForInterruption() { return true }
+        var offset = 0
+        while offset < data.count {
+            if stopForInterruption() { return true }
+            let remaining = acquisitionBoundary - body.count
+            let count = min(data.count - offset, remaining)
+            data.withUnsafeBytes { bytes in
+                if let base = bytes.bindMemory(to: UInt8.self).baseAddress, count > 0 {
+                    body.append(base.advanced(by: offset), count: count)
+                }
+            }
+            offset += count
+            guard body.count == acquisitionBoundary else { return false }
+            if body.first != 0x47 {
+                // Non-TS keeps the original complete-at-limit contract. An
+                // exact-size manifest must be allowed to deliver its EOF; a
+                // later positive callback is rejected before appending bytes.
+                if offset < data.count || (response?.expectedContentLength ?? -1) > Int64(body.count) {
+                    stoppedPrefix = true; return true
+                }
+                return false
+            }
+            let hint = body.withUnsafeBytes { bytes in
+                vp_ffmpeg_source_ts_acquisition_hint(bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count,
+                    { context in
+                        guard let context else { return 1 }
+                        let transfer = Unmanaged<BoundedSourceTransfer>.fromOpaque(context).takeUnretainedValue()
+                        return transfer.isInterrupted ? 1 : 0
+                    }, Unmanaged.passUnretained(self).toOpaque())
+            }
+            if stopForInterruption() { return true }
+            // READY and STOP only end acquisition. Neither bypasses the full
+            // inspector/planner. A raw TS boundary intentionally cancels even
+            // when Content-Length is absent or an EOF callback is still queued.
+            guard hint == VPFF_SOURCE_ACQUISITION_NEEDS_MORE,
+                  body.count < ceiling else {
+                stoppedPrefix = true; return true
+            }
+            if !reservedContinuation { body.reserveCapacity(ceiling); reservedContinuation = true }
+            // Production's 1 MiB initial limit gives at most 29 hints through
+            // 8 MiB; any smaller positive initial limit still gives at most 33.
+            acquisitionBoundary = min(ceiling, acquisitionBoundary + 256 * 1_024)
+        }
+        return false
+    }
+    private var isInterrupted: Bool { lock.withLock { cancelled } || HLSMonotonicClock.now >= request.deadline }
+    private func stopForInterruption() -> Bool {
+        lock.withLock {
+            if failure != nil { return true }
+            if cancelled { failure = CancellationError(); return true }
+            if HLSMonotonicClock.now >= request.deadline { failure = HLSSourceError.deadline; return true }
+            return false
+        }
     }
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
         lock.withLock {
