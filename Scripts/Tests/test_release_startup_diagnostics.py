@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / 'Scripts/test-release-startup.sh'
@@ -31,6 +32,14 @@ xcrun() {
     printf '%s\n' '{"devices":{"com.apple.CoreSimulator.SimRuntime.tvOS-27-0":[{"udid":"build-test-udid","name":"Apple TV 4K (3rd generation)","isAvailable":true,"state":"Booted","dataPath":"/unused-simulator"}]}}'
 }
 xcodebuild() {
+    if [[ "$1" == build ]]; then
+        for argument in "$@"; do
+            if [[ "$argument" == -enableCodeCoverage ]]; then
+                printf 'xcodebuild: error: The flag -enableCodeCoverage is only supported when testing.\n' >&2
+                return 64
+            fi
+        done
+    fi
     printf 'selected build stdout\n'
     printf 'selected build stderr\n' >&2
 ''' + command + '\n}\n' +
@@ -96,11 +105,11 @@ xcodebuild() {
         self.assertEqual(args[:2], ['build', '-project'])
         self.assertTrue(args[2].endswith('/VPlayer.xcodeproj'))
         self.assertEqual(args[3:12], [
-            '-scheme', 'VPlayer', '-configuration', 'Release', '-sdk', 'appletvsimulator',
+            '-scheme', 'VPlayerReleaseStartupTests', '-configuration', 'Release', '-sdk', 'appletvsimulator',
             '-destination', 'platform=tvOS Simulator,id=build-test-udid', '-derivedDataPath'])
         self.assertTrue(args[12].endswith('/ReleaseStartup'))
         self.assertEqual(args[13:], [
-            '-enableCodeCoverage', 'NO', 'ONLY_ACTIVE_ARCH=YES',
+            'ONLY_ACTIVE_ARCH=YES',
             'CLANG_ENABLE_CODE_COVERAGE=NO', 'CODE_SIGNING_ALLOWED=NO'])
 
     def test_fresh_build_uses_selected_architecture_without_swift_coverage(self):
@@ -114,9 +123,33 @@ xcodebuild() {
                          'platform=tvOS Simulator,id=build-test-udid')
         self.assertIn('ONLY_ACTIVE_ARCH=YES', args)
         # CLANG_ENABLE_CODE_COVERAGE alone leaves Swift coverage enabled by the
-        # VPlayer scheme, changing the production product and forcing a rebuild.
-        self.assertIn('-enableCodeCoverage', args)
-        self.assertEqual(args[args.index('-enableCodeCoverage') + 1], 'NO')
+        # VPlayer scheme. Build must use a coverage-disabled production scheme;
+        # xcodebuild accepts -enableCodeCoverage only for testing actions.
+        self.assertNotIn('-enableCodeCoverage', args)
+        scheme_name = args[args.index('-scheme') + 1]
+        self.assertEqual(scheme_name, 'VPlayerReleaseStartupTests')
+        schemes = ROOT / 'VPlayer.xcodeproj/xcshareddata/xcschemes'
+        scheme = ET.parse(schemes / f'{scheme_name}.xcscheme').getroot()
+        self.assertEqual(scheme.find('TestAction').get('codeCoverageEnabled', 'NO'), 'NO')
+        self.assertIsNone(scheme.find('TestAction/TestPlans'))
+        for action in ('TestAction', 'LaunchAction', 'ProfileAction',
+                       'AnalyzeAction', 'ArchiveAction'):
+            self.assertEqual(scheme.find(action).get('buildConfiguration'), 'Release')
+        running = [entry.find('BuildableReference').attrib for entry in
+                   scheme.findall('BuildAction/BuildActionEntries/BuildActionEntry')
+                   if entry.get('buildForRunning') == 'YES']
+        main = ET.parse(schemes / 'VPlayer.xcscheme').getroot()
+        self.assertEqual(running, [entry.find('BuildableReference').attrib for entry in
+                         main.findall('BuildAction/BuildActionEntries/BuildActionEntry')
+                         if entry.get('buildForRunning') == 'YES'])
+        self.assertCountEqual([entry['BlueprintName'] for entry in running],
+                              ['VPlayer', 'VPlayerCore', 'VPlayerPlayback'])
+        ui_test = scheme.find("BuildAction/BuildActionEntries/BuildActionEntry/"
+                              "BuildableReference[@BlueprintName='VPlayerUITests']/..")
+        self.assertIsNotNone(ui_test)
+        self.assertEqual(ui_test.get('buildForTesting'), 'YES')
+        for action in ('Running', 'Profiling', 'Archiving', 'Analyzing'):
+            self.assertEqual(ui_test.get(f'buildFor{action}'), 'NO')
         self.assertFalse(any(arg.startswith(('ENABLE_TESTABILITY=',
                                             'SWIFT_OPTIMIZATION_LEVEL=',
                                             'SWIFT_COMPILATION_MODE=', 'ARCHS='))
