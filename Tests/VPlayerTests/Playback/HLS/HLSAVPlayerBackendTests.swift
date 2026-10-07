@@ -2830,50 +2830,14 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             print("AC3_DIAGNOSTIC graphComplete=\(complete) error=\(authority.failureDescriptionForDiagnostics ?? "none")")
             try capture.printSummary()
             XCTAssertTrue(complete, authority.failureDescriptionForDiagnostics ?? "Synthetic graph did not finish")
-            XCTAssertEqual(authority.audioCalibrationAttemptsForTesting, 1,
-                "The selected Dolby source must enter exactly one compatible AAC encoder epoch")
-            let fallback = authority.compressedAudioFallbackForTesting
-            XCTAssertEqual(fallback.count, 1)
-            let transition = try XCTUnwrap(fallback.first)
-            XCTAssertEqual(transition.codec, .ac3)
-            XCTAssertTrue(transition.hadDolbyProducer)
-            XCTAssertTrue(transition.producerWasCurrent)
-            XCTAssertEqual(transition.boundaryDecision, .trimLeading(expected.firstTrim))
-            XCTAssertEqual(transition.normalizedStart, expected.origin.effectiveStart)
-            XCTAssertEqual(transition.origin?.sourceTime, expected.origin.sourceTime)
-            XCTAssertEqual(CMTimeCompare(transition.sourcePresentationTime, expected.firstSourcePTS), 0)
-            XCTAssertEqual(CMTimeCompare(transition.sourceDuration, expected.firstSourceDuration), 0)
-            print("AC3_COMPATIBLE_TRANSITION count=\(fallback.count) installedDolby=\(transition.hadDolbyProducer) " +
-                "currentDolby=\(transition.producerWasCurrent) sourcePTS=\(transition.sourcePresentationTime) " +
-                "normalizedStart=\(transition.normalizedStart) trim=\(expected.firstTrim)")
-            XCTAssertTrue(owned.isCurrent)
-            XCTAssertEqual(probe.snapshot.nativeAC3WriterCount, 0)
-            XCTAssertEqual(probe.snapshot.nativeEAC3WriterCount, 0)
-            let publication = try XCTUnwrap(authority.publicationForTesting.publisher?.visible)
-            XCTAssertTrue(publication.sourceAACTerminalBindings.isEmpty)
-            XCTAssertEqual(publication.aacTerminalBindings.count, 1)
-            let terminal = try XCTUnwrap(publication.aacTerminalBindings.values.first)
-            let endpoint = try XCTUnwrap(terminal.endpointAuthority?.receipt)
-            let mapping = try XCTUnwrap(terminal.timelineMappingReceipt)
-            XCTAssertEqual(endpoint.sampleRate, 48_000)
-            XCTAssertEqual(endpoint.inputEffectiveBase, expected.origin.effectiveStart)
-            XCTAssertEqual(endpoint.realSampleCount, expected.realSampleCount,
-                "Every admitted source sample after the first crossing trim must reach the same AAC epoch")
-            XCTAssertEqual(endpoint.totalDecodedFrames,
-                endpoint.leadingFrames + endpoint.realSampleCount + endpoint.trailingFrames)
-            XCTAssertEqual(endpoint.lastEffectiveEnd, try endpoint.writtenEffectiveBase.adding(
-                .init(value: expected.realSampleCount, timescale: 48_000)))
-            print("AC3_AAC_MAPPING rate=\(endpoint.sampleRate) leading=\(endpoint.leadingFrames) trailing=\(endpoint.trailingFrames) " +
-                "real=\(endpoint.realSampleCount) decoded=\(endpoint.totalDecodedFrames) " +
-                "inputPhysical=\(mapping.inputPhysicalBase) inputEffective=\(mapping.inputEffectiveBase) " +
-                "writtenPhysical=\(mapping.writtenPhysicalBase) writtenEffective=\(mapping.writtenEffectiveBase) offset=\(mapping.offset) " +
-                "physicalEnd=\(endpoint.terminalPhysicalEnd) effectiveEnd=\(endpoint.lastEffectiveEnd)")
-            try printSyntheticAACPublication(publication, phase: "final")
-            // Copy bytes at the existing read-only callback hook; do not retain a
-            // sealed object, publication lease, or the producer's AAC workspace.
+            // Inspect original callback bytes before consulting final authorities,
+            // so a missing downstream receipt cannot suppress native timing evidence.
+            // Keep only bounded byte copies, never sealed/publication/producer owners.
             let records = try capture.snapshot()
             let media = records.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
             let initial = try XCTUnwrap(records.first { $0.kind == .initialization })
+            try printSyntheticAACInitialization(initial.bytes, label: "AC3_AAC_NATIVE_INIT")
+            let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0) }
             XCTAssertGreaterThanOrEqual(media.count, 60)
             XCTAssertEqual(Set(media.map(\.writer)).count, 1,
                 "Stable AAC input must retain one persistent native writer across all fragment windows")
@@ -2892,8 +2856,6 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             var bytes = initial.bytes
             for segment in media { bytes.append(segment.bytes) }
             try bytes.write(to: output)
-            try printSyntheticAACInitialization(initial.bytes, label: "AC3_AAC_NATIVE_INIT")
-            let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0) }
             XCTAssertTrue(zip(fragments, fragments.dropFirst()).allSatisfy { pair in pair.1.sequence > pair.0.sequence },
                 "Native mfhd values must increase across persistent-writer fragments: \(fragments.map(\.sequence))")
             for (previous, current) in zip(fragments, fragments.dropFirst()) {
@@ -2920,18 +2882,85 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                         "scale=48000 cto=0 sampleDuration=1024 samples=\(samples.count) end=\(end)")
                 }
             }
-            XCTAssertEqual(try XCTUnwrap(rawAudio.first).start, endpoint.writtenPhysicalBase)
+            XCTAssertEqual(authority.audioCalibrationAttemptsForTesting, 1,
+                "The selected Dolby source must enter exactly one compatible AAC encoder epoch")
+            let fallback = authority.compressedAudioFallbackForTesting
+            XCTAssertEqual(fallback.count, 1)
+            let transition = try XCTUnwrap(fallback.first)
+            XCTAssertEqual(transition.codec, .ac3)
+            XCTAssertTrue(transition.hadDolbyProducer)
+            XCTAssertTrue(transition.producerWasCurrent)
+            XCTAssertEqual(transition.boundaryDecision, .trimLeading(expected.firstTrim))
+            XCTAssertEqual(transition.normalizedStart, expected.origin.effectiveStart)
+            XCTAssertEqual(transition.origin?.sourceTime, expected.origin.sourceTime)
+            XCTAssertEqual(CMTimeCompare(transition.sourcePresentationTime, expected.firstSourcePTS), 0)
+            XCTAssertEqual(CMTimeCompare(transition.sourceDuration, expected.firstSourceDuration), 0)
+            print("AC3_COMPATIBLE_TRANSITION count=\(fallback.count) installedDolby=\(transition.hadDolbyProducer) " +
+                "currentDolby=\(transition.producerWasCurrent) sourcePTS=\(transition.sourcePresentationTime) " +
+                "normalizedStart=\(transition.normalizedStart) trim=\(expected.firstTrim)")
+            XCTAssertTrue(owned.isCurrent)
+            XCTAssertEqual(probe.snapshot.nativeAC3WriterCount, 0)
+            XCTAssertEqual(probe.snapshot.nativeEAC3WriterCount, 0)
+            let publication = try XCTUnwrap(authority.publicationForTesting.publisher?.visible)
+            XCTAssertTrue(publication.sourceAACTerminalBindings.isEmpty)
+            XCTAssertEqual(publication.aacTerminalBindings.count, 1)
+            try printSyntheticAACPublication(publication, phase: "final")
+            let participantID = try XCTUnwrap(publication.aacTerminalBindings.keys.first)
+            let terminal = try XCTUnwrap(publication.aacTerminalBindings[participantID])
+            let rendition = try XCTUnwrap(publication.aacRenditionBindings[participantID])
+            // Natural EOF authenticates the encoder/writer final receipt. Playback
+            // endpoint authority additionally requires real HTTP membership and is
+            // intentionally not manufactured by this graph/byte-decoding test.
+            let final = try XCTUnwrap(rendition.finalWriterReceipt)
+            let mapping = try XCTUnwrap(terminal.timelineMappingReceipt)
+            XCTAssertTrue(final.terminalBinding === terminal)
+            XCTAssertEqual(final.binding, mapping.binding)
+            XCTAssertEqual(final.systemTerminal.binding, final.binding)
+            XCTAssertEqual(final.systemTerminal.terminalReason, .finished)
+            XCTAssertEqual(rendition.acceptedWindowCount, 1)
+            XCTAssertEqual(final.sampleRate, 48_000)
+            XCTAssertEqual(final.sampleRate, mapping.sampleRate)
+            XCTAssertEqual(mapping.inputEffectiveBase, expected.origin.effectiveStart)
+            XCTAssertEqual(final.realSampleCount, expected.realSampleCount,
+                "Every admitted source sample after the first crossing trim must reach the same AAC epoch")
+            XCTAssertEqual(final.totalDecodedFrames,
+                Int64(final.leadingFrames) + final.realSampleCount + final.trailingFrames)
+            XCTAssertEqual(mapping.inputEffectiveBase, try mapping.inputPhysicalBase.adding(
+                .init(value: Int64(final.leadingFrames), timescale: final.sampleRate)))
+            XCTAssertEqual(mapping.writtenPhysicalBase, try mapping.inputPhysicalBase.adding(mapping.offset))
+            XCTAssertEqual(mapping.writtenEffectiveBase, try mapping.inputEffectiveBase.adding(mapping.offset))
+            XCTAssertEqual(final.lastEffectiveEnd, try mapping.writtenEffectiveBase.adding(
+                .init(value: expected.realSampleCount, timescale: final.sampleRate)))
+            XCTAssertEqual(final.terminalPhysicalEnd, try mapping.writtenPhysicalBase.adding(
+                .init(value: final.totalDecodedFrames, timescale: final.sampleRate)))
+            XCTAssertEqual(final.callbackMembership.snapshot.pendingCount, 0)
+            XCTAssertEqual(final.callbackMembership.snapshot.count, UInt64(media.count))
+            XCTAssertEqual(final.systemTerminal.mediaCallbackCount, media.count)
+            XCTAssertEqual(final.systemTerminal.initializationCallbackCount, 1)
+            let firstMedia = try XCTUnwrap(media.first), lastMedia = try XCTUnwrap(media.last)
+            XCTAssertEqual(final.binding.writerIdentity.rawValue, firstMedia.writer)
+            XCTAssertEqual(final.firstMedia.key.logicalSequence, firstMedia.sequence)
+            XCTAssertEqual(final.terminalMedia.key.logicalSequence, lastMedia.sequence)
+            XCTAssertEqual(final.firstMedia.sealedDigest, Data(SHA256.hash(data: firstMedia.bytes)))
+            XCTAssertEqual(final.terminalMedia.sealedDigest, Data(SHA256.hash(data: lastMedia.bytes)))
+            print("AC3_AAC_MAPPING rate=\(final.sampleRate) leading=\(final.leadingFrames) trailing=\(final.trailingFrames) " +
+                "real=\(final.realSampleCount) decoded=\(final.totalDecodedFrames) " +
+                "inputPhysical=\(mapping.inputPhysicalBase) inputEffective=\(mapping.inputEffectiveBase) " +
+                "writtenPhysical=\(mapping.writtenPhysicalBase) writtenEffective=\(mapping.writtenEffectiveBase) offset=\(mapping.offset) " +
+                "physicalEnd=\(final.terminalPhysicalEnd) effectiveEnd=\(final.lastEffectiveEnd) " +
+                "writerFinal=true playbackEndpointIssued=\(rendition.endpointAuthority != nil)")
+            XCTAssertEqual(try XCTUnwrap(rawAudio.first).start, mapping.writtenPhysicalBase)
             let lastRaw = try XCTUnwrap(rawAudio.last)
-            XCTAssertEqual(try lastRaw.start.adding(lastRaw.duration), endpoint.terminalPhysicalEnd)
-            XCTAssertEqual(Int64(rawAudio.count) * 1_024, endpoint.totalDecodedFrames,
+            XCTAssertEqual(try lastRaw.start.adding(lastRaw.duration), final.terminalPhysicalEnd)
+            XCTAssertEqual(Int64(rawAudio.count) * 1_024, final.totalDecodedFrames,
                 "Original native bytes must contain every encoded AU, including both endpoints")
             let rawDecoded = try await inspectSyntheticAACRawPCM(output, sampleRate: 48_000,
-                rawSamples: rawAudio, startupLeadingFrames: try XCTUnwrap(Int(exactly: endpoint.leadingFrames)))
-            XCTAssertEqual(Int64(rawDecoded.statistics.frames), endpoint.totalDecodedFrames)
+                rawSamples: rawAudio, startupLeadingFrames: final.leadingFrames)
+            XCTAssertEqual(Int64(rawDecoded.statistics.frames), final.totalDecodedFrames)
             XCTAssertEqual(rawDecoded.statistics.checkedStartupWindows, 19)
             XCTAssertEqual(rawDecoded.statistics.silentStartupWindows, 0,
                 "Losing the crossing or following source AU must not hide as silence in the first 100 ms")
-            print("AC3_AAC_RAW_STARTUP leading=\(endpoint.leadingFrames) windows=\(rawDecoded.statistics.checkedStartupWindows) " +
+            print("AC3_AAC_RAW_STARTUP leading=\(final.leadingFrames) windows=\(rawDecoded.statistics.checkedStartupWindows) " +
                 "silent5ms=\(rawDecoded.statistics.silentStartupWindows) minRMS=\(rawDecoded.statistics.minimumStartupRMS)")
             // Decode the actual canonical init and all original media bytes. No
             // sequence-number rewrite, box removal, or timing normalization is allowed.
