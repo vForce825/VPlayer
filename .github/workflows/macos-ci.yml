@@ -393,6 +393,31 @@ jobs:
             --only-testing VPlayerTests/SampleBufferBuilderTests \
             --only-testing VPlayerTests/HLSManagedDemuxSmokeTests \
             --only-testing VPlayerTests/HLSProxyBackpressureTests \
+            --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testSourceMetadataAppearsAtCurrentResetBoundaryWhileStartAndRetryAreStillPreparing \
+            --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testReplayedTerminalStateCannotLoseEarlyMetadataSubscription \
+            --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testLateMediaResetBoundaryCannotResubscribeAfterStop \
+            --only-testing VPlayerTests/ControlTaskRegistryTests/testStopAndTerminalOwnerJoinCancelHeldPreparationTask \
+            --only-testing VPlayerTests/GeneratedAudioFailureFenceTests/testCancelRealPrefixWaitExitsWithoutPublicationOrRuntimeFailure \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionCanceledPrefixReleasesDriverAdmissionForDifferentChannel \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataProjectsOnlyConfirmedSourceFacts \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataPreservesUnknownScanAndRate \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataRejectsAmbiguousIncompleteUnvalidatedAndForeignFacts \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testSourceCategoryUsesResolvedTopologyRatherThanURLSuffix \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testRouteEnrichmentPreservesSourceAndOutputFactsAndFixedPayload \
+            --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataStillFitsExistingFixedEventPayload \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSourceMetadataArrivesBeforeCapabilitiesAndIsReplacedByPreparedMetadata \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testGeneratedSourceMetadataArrivesBeforeGraphConstructionAndClearsOnFailure \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterProbeDoesNotPublishAnArbitraryVariantBeforeSelection \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPlannedPathArrivesBeforeReadyAndIsPresentInExistingMetricsExport \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testLateSourceProbeCannotRepublishAfterStop \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testQueuedProbeNotificationCannotOverwriteReplacementMetadata \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testQueuedProbeNotificationRevalidatesSourceAfterActorHop \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testRealNativeReadyCancellationReopensDriverAdmissionForDifferentChannel \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testStopCancelsPreparationAndAdmitsDifferentChannelWithoutManualRelease \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testInstalledPreparationAfterSuspendDeadlineStillPhysicallyStopsBeforeChannelReuse \
+            --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput \
+            --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate \
+            --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testSourceAndPlannedPathAreExplicitWithoutReadinessClaims \
             --only-testing VPlayerTests/NativeHLSMasterSmokeTests \
             --only-testing VPlayerTests/NativeOwnedDolbyFallbackSmokeTests \
             --only-testing VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact \
