@@ -809,6 +809,7 @@ enum SegmentedFMP4WriterFailure: Error, Sendable, Equatable {
     case aacEndpointMismatch
     case inputEvidenceCapacityExceeded
     case terminalOwnershipCapacityExceeded
+    case predecessorInputCapacityPending
     case rolloverRequired
     case newGenerationRequired
     case unsupportedCompressedAudioFormat
@@ -2792,6 +2793,59 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
     }
 
+    /// One pending encoded sample and one physical successor remain owned across
+    /// real predecessor releases. Every refused ticket has already been aborted.
+    func appendVideoAwaitingPredecessorCapacity(
+        _ output: HLSVideoEncodedOutput,
+        initialTicket: SegmentBoundaryAppendTicket? = nil,
+        boundary: SegmentBoundaryCoordinator,
+        wakeup: WriterCapacityWakeup
+    ) async throws {
+        defer { initialTicket?.abort(binding: binding, session: boundarySession) }
+        let deadline = try wakeup.makeDeadline()
+        var firstTicket = initialTicket
+        while true {
+            try Task.checkCancellation()
+            let revision = wakeup.currentRevision
+            do {
+                let ticket = try firstTicket ?? boundary.issueVideoAppend(for: output, writerBinding: binding)
+                firstTicket = nil
+                try await appendVideoAwaitingReadiness(output, ticket: ticket)
+                return
+            } catch SegmentedFMP4WriterFailure.predecessorInputCapacityPending {
+                guard try await wakeup.wait(after: revision, until: deadline) else {
+                    throw SegmentedFMP4WriterFailure.predecessorInputCapacityPending
+                }
+            }
+        }
+    }
+
+    /// Reclaims only the same pending core on the already-authorized successor;
+    /// neither a new writer window nor a second media payload is created.
+    func appendRemuxVideoAwaitingPredecessorCapacity(
+        _ initialAttempt: HLSVideoRemuxWriterAttempt,
+        boundary: SegmentBoundaryCoordinator,
+        wakeup: WriterCapacityWakeup
+    ) async throws {
+        var attempt = initialAttempt
+        defer { _ = attempt.relinquishAfterAbort() }
+        let deadline = try wakeup.makeDeadline()
+        while true {
+            try Task.checkCancellation()
+            let revision = wakeup.currentRevision
+            do {
+                let ticket = try boundary.issueRemuxVideoAppend(for: attempt)
+                try await appendRemuxVideoAwaitingReadiness(attempt, ticket: ticket)
+                return
+            } catch SegmentedFMP4WriterFailure.predecessorInputCapacityPending {
+                guard try await wakeup.wait(after: revision, until: deadline) else {
+                    throw SegmentedFMP4WriterFailure.predecessorInputCapacityPending
+                }
+                attempt = try initialAttempt.pending.claimWriterAttempt(binding: binding)
+            }
+        }
+    }
+
     func appendRemuxVideoAwaitingReadiness(
         _ submission: HLSVideoRemuxSubmission,
         ticket: SegmentBoundaryAppendTicket
@@ -2914,6 +2968,13 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             try relay.installCapacityWakeup(wakeup)
             compressedCapacityWakeup = wakeup
         }
+    }
+
+    /// Install before the first native input so every predecessor backing tail
+    /// captures this same logical-rendition wakeup before a future rollover.
+    func installVideoCapacityWakeup(_ wakeup: WriterCapacityWakeup) throws {
+        guard trackKind == .video else { throw SegmentedFMP4WriterFailure.illegalState }
+        try installCompressedCapacityWakeup(wakeup)
     }
 
     func appendSourceAACAwaitingReadiness(_ unit: SourceAACAccessUnit,
@@ -4598,8 +4659,18 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let willFlushCurrentSegment = ticket.requiresFlushBeforeAppend && currentSegmentInputCount > 0
         if currentSegmentInputCount == 0, !rolloverPending,
            !(try hasNextBoundaryHeadroomIsolated(remuxByteBudget: remuxByteBudget)) {
-            // A new physical writer cannot erase predecessor native occupancy.
-            // This is retryable admission pressure, not another rollover request.
+            // Only an empty, authenticated video successor can prove all live
+            // input occupancy belongs to its finished predecessor. A release can
+            // repair this admission only if the same reserve/input fits at zero
+            // occupancy. Other capacity failures retain their terminal meaning.
+            if trackKind == .video, writerWindowAdmission != nil, inputCount == 0,
+               !live.cancelled, live.count > 0,
+               inputAdmission.fitsEmptyCapacity(bytes: facts.projectedCharge,
+                   sampleCount: facts.sampleCount),
+               try hasNextBoundaryHeadroomIsolated(remuxByteBudget: remuxByteBudget,
+                   ignoringLiveInputs: true) {
+                throw SegmentedFMP4WriterFailure.predecessorInputCapacityPending
+            }
             throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
         }
         let decision = WriterContinuationPolicy.decide(
@@ -4849,7 +4920,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     }
 
     private func hasNextBoundaryHeadroomIsolated(excluding admission: AppendPreflightAdmission? = nil,
-                                                remuxByteBudget: WriterRemuxByteBudget? = nil) throws -> Bool {
+                                                remuxByteBudget: WriterRemuxByteBudget? = nil,
+                                                ignoringLiveInputs: Bool = false) throws -> Bool {
         guard let boundaryReserve else { throw SegmentedFMP4WriterFailure.illegalState }
         let nextCount = boundaryReserve.segmentInputCount + (trackKind == .aac ? 32 : 0) + 2
         let nextBytes: Int
@@ -4868,9 +4940,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let hardCount = min(ownershipLimits.hardCapacity, inputAdmission.capacity)
         let byteLimit = min(inputAdmission.maximumBytes, trackKind == .video
             ? FMP4WriterLimits.video.writerHardByteCount : FMP4WriterLimits.audio.writerHardByteCount)
+        let liveCount = ignoringLiveInputs ? 0 : live.count - pendingCount
+        let liveBytes = ignoringLiveInputs ? 0 : live.bytes - pendingBytes
         return nextCount <= hardCount && nextBytes <= byteLimit
-            && live.count - pendingCount <= hardCount - nextCount
-            && live.bytes - pendingBytes <= byteLimit - nextBytes
+            && liveCount <= hardCount - nextCount
+            && liveBytes <= byteLimit - nextBytes
             && incrementalAACLiveContext?.hasNextWriterBoundaryHeadroom != false
     }
 

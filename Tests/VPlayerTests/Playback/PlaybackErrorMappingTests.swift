@@ -2,12 +2,100 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
-import XCTest
+import CoreMedia
 import VideoToolbox
 import VPlayerCore
+import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackErrorMappingTests: XCTestCase {
+    func testInterlacedWriterCauseSurvivesRuntimeSnapshotAndPresentation() {
+        let causes: [(any Error, String)] = [
+            (SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded,
+             "writer.terminalOwnershipCapacityExceeded"),
+            (SegmentedFMP4WriterFailure.sourceFormatMismatch, "writer.sourceFormatMismatch"),
+            (SegmentedFMP4WriterFailure.boundaryMismatch, "writer.boundaryMismatch"),
+            (SegmentedFMP4WriterFailure.systemFailure, "writer.systemFailure"),
+            (SegmentBoundaryFailure.ticketMismatch, "boundary.ticketMismatch"),
+            (CancellationError(), "CancellationError"),
+        ]
+        for (cause, expected) in causes {
+            // A synthetic timescale: the device's redacted diagnostic did not preserve its units.
+            let message = HLSInterlacedOutputDiagnostic.message(
+                stage: "writerAppend", error: cause,
+                pts: CMTime(value: 29_786_400, timescale: 180_000),
+                expectedVideoStart: CMTime(value: 10, timescale: 1),
+                context: String(repeating: "duration=3600@180000 lastPTS=29782800@180000 ", count: 30))
+            let snapshot = PlaybackErrorDiagnostics.snapshot(PlaybackCoreError.videoSampleBuffer(message))
+            let failure = PlaybackController.failure(for:
+                .capture(snapshot, stage: "hls.mediaGraph.runtime"))
+
+            XCTAssertTrue(failure.userMessage.contains("stage=writerAppend"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("underlying=\(expected)"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("pts=29786400@180000"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("initialStart=10@1"), failure.userMessage)
+            XCTAssertEqual(failure.code, "playback.hls.mediaGraph.runtime")
+            XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
+            XCTAssertLessThanOrEqual(snapshot.summary.utf8.count - snapshot.typeName.utf8.count - 3, 256)
+        }
+    }
+
+    func testInterlacedTimingKeepsExactValuesAndTimescalesThroughPrivacyRedaction() {
+        let times = [
+            CMTime(value: 29_786_400, timescale: 180_000),
+            CMTime(value: 3_600, timescale: 180_000),
+            CMTime(value: 29_782_800, timescale: 180_000),
+            CMTime(value: -1, timescale: 90_000),
+            CMTime(value: 10, timescale: 1),
+        ]
+        let text = times.map(HLSInterlacedOutputDiagnostic.time).joined(separator: " ")
+        let snapshot = ErrorDiagnosticSnapshot(typeName: "timing", message: text)
+        XCTAssertTrue(snapshot.summary.contains(
+            "29786400@180000 3600@180000 29782800@180000 -1@90000 10@1"), snapshot.summary)
+        XCTAssertFalse(snapshot.summary.contains("路径已隐藏"))
+    }
+
+    func testInterlacedSystemWriterErrorPreservesOriginalDomainAndCode() {
+        let original = ErrorDiagnosticSnapshot(NSError(domain: "AVFoundationErrorDomain", code: -11_800,
+            userInfo: [NSLocalizedDescriptionKey: "Writer rejected sample " + String(repeating: "说明📺", count: 200)]))
+        let message = HLSInterlacedOutputDiagnostic.message(
+            stage: "writerAppend", error: SegmentedFMP4WriterFailure.systemError(original),
+            pts: .zero, expectedVideoStart: .zero, context: String(repeating: "context ", count: 100))
+        let snapshot = PlaybackErrorDiagnostics.snapshot(PlaybackCoreError.videoSampleBuffer(message))
+        let failure = PlaybackController.failure(for: .capture(snapshot, stage: "hls.mediaGraph.runtime"))
+
+        XCTAssertTrue(failure.userMessage.contains("underlying=writer.systemError"), failure.userMessage)
+        XCTAssertTrue(failure.userMessage.contains("AVFoundationErrorDomain(-11800)"), failure.userMessage)
+        XCTAssertFalse(failure.userMessage.contains("�"))
+        XCTAssertLessThanOrEqual(snapshot.summary.utf8.count - snapshot.typeName.utf8.count - 3, 256)
+    }
+
+    func testInterlacedUnknownCauseKeepsPrivacyAndUTF8Bounds() {
+        let secrets = [
+            ("https://private-fixture.invalid/live?token=fixture-secret", "地址已隐藏"),
+            ("/Users/private-fixture/private-media.ts", "路径已隐藏"),
+            ("token=fixture-secret", "凭据已隐藏"),
+        ]
+        for (secret, redaction) in secrets {
+            let original = NSError(domain: "FixtureWriter", code: -42, userInfo: [
+                NSLocalizedDescriptionKey: "\(secret) " + String(repeating: "说明📺", count: 200)
+            ])
+            let message = HLSInterlacedOutputDiagnostic.message(
+                stage: "writerAppend", error: original, pts: .zero,
+                expectedVideoStart: .zero, context: secret)
+            let snapshot = PlaybackErrorDiagnostics.snapshot(PlaybackCoreError.videoSampleBuffer(message))
+            let failure = PlaybackController.failure(for: .capture(snapshot, stage: "hls.mediaGraph.runtime"))
+
+            XCTAssertTrue(failure.userMessage.contains(redaction), failure.userMessage)
+            XCTAssertFalse(failure.userMessage.contains("private-fixture"), failure.userMessage)
+            XCTAssertFalse(failure.userMessage.contains("private-media"), failure.userMessage)
+            XCTAssertFalse(failure.userMessage.contains("fixture-secret"), failure.userMessage)
+            XCTAssertFalse(failure.userMessage.contains("�"))
+            XCTAssertLessThanOrEqual(snapshot.typeName.utf8.count, 128)
+            XCTAssertLessThanOrEqual(snapshot.summary.utf8.count - snapshot.typeName.utf8.count - 3, 256)
+        }
+    }
+
     func testAssociatedFailureDetailsAreVisibleAndDistinguishDifferentCauses() {
         let pairs: [(PlaybackCoreError, PlaybackCoreError, String, String)] = [
             (.demuxOpen(-100), .demuxOpen(-200), "-100", "-200"),

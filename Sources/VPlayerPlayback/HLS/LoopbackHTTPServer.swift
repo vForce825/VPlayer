@@ -1291,37 +1291,267 @@ enum LoopbackEndpointValidator {
     }
 }
 
-private final class LoopbackStartupGate: @unchecked Sendable {
-    private let lock = NSLock()
-    private var completed = false
-    func claim() -> Bool { lock.withLock {
-        guard !completed else { return false }
-        completed = true
-        return true
-    } }
+#if DEBUG
+/// Capability-gated test scheduling only. The closures defer original queue
+/// work; they never manufacture a Network.framework state or cleanup receipt.
+final class LoopbackHTTPStartupTestHooks: @unchecked Sendable {
+    @TaskLocal static var current: LoopbackHTTPStartupTestHooks?
+    let beforeProbeStart: @Sendable (LoopbackHTTPServer, NWConnection, @escaping @Sendable () -> Void) -> Void
+    let beforeProbeTerminalTail: @Sendable (@escaping @Sendable () -> Void) -> Void
+    let beforeStartupConnectionTerminalTail: (@Sendable (@escaping @Sendable () -> Void) -> Void)?
+    let probeStarted: (@Sendable () -> Void)?
+    let listenerTerminal: @Sendable () -> Void
+    init(capability: LoopbackHTTPTestingCapability,
+         beforeProbeStart: @escaping @Sendable (LoopbackHTTPServer, NWConnection, @escaping @Sendable () -> Void) -> Void,
+         beforeProbeTerminalTail: @escaping @Sendable (@escaping @Sendable () -> Void) -> Void,
+         listenerTerminal: @escaping @Sendable () -> Void,
+         beforeStartupConnectionTerminalTail: (@Sendable (@escaping @Sendable () -> Void) -> Void)? = nil,
+         probeStarted: (@Sendable () -> Void)? = nil) {
+        self.beforeProbeStart = beforeProbeStart
+        self.beforeProbeTerminalTail = beforeProbeTerminalTail
+        self.listenerTerminal = listenerTerminal
+        self.beforeStartupConnectionTerminalTail = beforeStartupConnectionTerminalTail
+        self.probeStarted = probeStarted
+    }
 }
+#endif
 
-private final class LoopbackStartupCancellationRelay: @unchecked Sendable {
+/// One bounded owner replaces the former result gate/cancellation relay. Its
+/// original continuation owns this object until the real listener/probe callback
+/// tails have joined. SDK and server callbacks retain only weak aliases.
+private final class LoopbackStartupOwner: @unchecked Sendable {
     private let lock = NSLock()
-    private var handler: (() -> Void)?
-    private var pending = false
+    private var cancellationRequested = false
+    private var committed = false
+    private let queue = DispatchQueue(label: "org.vplayer.loopback-http.start")
+    private let listener: NWListener
+    private let testing: LoopbackHTTPTestingConfiguration?
+    private var makeServer: (@Sendable (UInt16) throws -> LoopbackHTTPServer)?
+    private var continuation: CheckedContinuation<LoopbackHTTPServer, any Error>?
+    private var server: LoopbackHTTPServer?
+    private var probe: NWConnection?
+    private var failure: (any Error)?
+    private var listenerStarted = false, probeStarted = false
+    private var listenerTerminalJoined = false, probeTerminalJoined = false
+    private var serverJoinRequested = false, serverConnectionsJoined = false
+    private var endpointAccepted = false
+    #if DEBUG
+    private let hooks = LoopbackHTTPStartupTestHooks.current
+    #endif
 
-    func install(_ handler: @escaping () -> Void) {
-        let fire = lock.withLock { () -> Bool in
-            if pending { return true }
-            self.handler = handler
-            return false
+    init(listener: NWListener, testing: LoopbackHTTPTestingConfiguration?,
+         makeServer: @escaping @Sendable (UInt16) throws -> LoopbackHTTPServer) {
+        self.listener = listener; self.testing = testing; self.makeServer = makeServer
+    }
+
+    func begin(_ continuation: CheckedContinuation<LoopbackHTTPServer, any Error>) {
+        queue.async { [self] in
+            self.continuation = continuation
+            listener.newConnectionHandler = { connection in connection.cancel() }
+            listener.stateUpdateHandler = { [weak self] state in self?.listenerChanged(state) }
+            listenerStarted = true
+            listener.start(queue: queue)
+            if isCancellationRequested { fail(CancellationError()) }
         }
-        if fire { handler() }
     }
 
     func cancel() {
-        let current = lock.withLock { () -> (() -> Void)? in
-            guard let handler else { pending = true; return nil }
-            self.handler = nil
-            return handler
+        let accepted = lock.withLock {
+            guard !committed else { return false }
+            cancellationRequested = true
+            return true
         }
-        current?()
+        if accepted { queue.async { [self] in fail(CancellationError()) } }
+    }
+
+    private var isCancellationRequested: Bool { lock.withLock { cancellationRequested } }
+
+    private func listenerChanged(_ state: NWListener.State) {
+        switch state {
+        case .ready:
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("lb_ready")
+            #endif
+            guard failure == nil, !isCancellationRequested else { fail(CancellationError()); return }
+            guard server == nil, let port = listener.port?.rawValue, port > 0,
+                  let endpointPort = NWEndpoint.Port(rawValue: port),
+                  let host = IPv4Address("127.0.0.1"), let makeServer else {
+                fail(LoopbackHTTPServerError.invalidBinding); return
+            }
+            do {
+                let created = try makeServer(port)
+                server = created
+                #if DEBUG
+                created.installStartupTerminalTestHook(hooks?.beforeStartupConnectionTerminalTail)
+                #endif
+                listener.newConnectionHandler = { [weak created] connection in
+                    guard let created else { connection.cancel(); return }
+                    created.accept(connection)
+                }
+                let probe = NWConnection(to: .hostPort(host: .ipv4(host), port: endpointPort), using: .tcp)
+                self.probe = probe
+                probe.stateUpdateHandler = { [weak self] state in self?.probeChanged(state) }
+                created.installStartupEndpointProbe { [weak self] accepted in
+                    guard let self else { return }
+                    self.queue.async { [weak self] in self?.probeAccepted(accepted) }
+                }
+                #if DEBUG
+                if let hooks {
+                    hooks.beforeProbeStart(created, probe) { [weak self] in
+                        guard let self else { return }
+                        self.queue.async { [weak self] in self?.startProbe() }
+                    }
+                    return
+                }
+                #endif
+                startProbe()
+            } catch {
+                #if DEBUG
+                PlaybackDiagnosticTracker.shared.append("lb_catch_\(error)")
+                #endif
+                fail(error)
+            }
+        case .failed(let error):
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("lb_failed_\(error)")
+            #endif
+            fail(PlaybackErrorDiagnostics.snapshot(error))
+        case .cancelled:
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("lb_cancelled")
+            #endif
+            // This marker follows the SDK callback's stack on its original queue.
+            queue.async { [self] in
+                listenerTerminalJoined = true
+                #if DEBUG
+                hooks?.listenerTerminal()
+                #endif
+                if failure == nil { fail(LoopbackHTTPServerError.transportUnavailable); return }
+                settleIfJoined()
+            }
+        default: break
+        }
+    }
+
+    private func startProbe() {
+        guard !probeStarted, let probe else { return }
+        // Even cancellation before this point must start the registered native
+        // object on its original queue before waiting for its terminal callback.
+        probeStarted = true
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.append("lb_probe_start")
+        #endif
+        probe.start(queue: queue)
+        #if DEBUG
+        hooks?.probeStarted?()
+        #endif
+        if failure != nil || isCancellationRequested { fail(CancellationError()) }
+        else if endpointAccepted { probe.cancel() }
+    }
+
+    private func probeAccepted(_ accepted: Bool) {
+        #if DEBUG
+        PlaybackDiagnosticTracker.shared.append("lb_probe_cb_\(accepted)")
+        #endif
+        server?.cancelStartupEndpointProbe()
+        guard accepted, !isCancellationRequested,
+              testing?.cancelAfterStartupProbeAccepted != true else {
+            fail(isCancellationRequested || testing?.cancelAfterStartupProbeAccepted == true
+                ? CancellationError() : LoopbackHTTPServerError.invalidBinding)
+            return
+        }
+        guard failure == nil else {
+            if probeStarted { probe?.cancel() }
+            return
+        }
+        endpointAccepted = true
+        if probeStarted { probe?.cancel() }
+    }
+
+    private func probeChanged(_ state: NWConnection.State) {
+        switch state {
+        case .failed(let error):
+            // A previous cancellation never skips physical probe shutdown.
+            fail(PlaybackErrorDiagnostics.snapshot(error))
+        case .cancelled:
+            let finish: @Sendable () -> Void = { [weak self] in
+                guard let self else { return }
+                self.queue.async { [weak self] in
+                    guard let self else { return }
+                    self.probeTerminalJoined = true
+                    self.settleIfJoined()
+                }
+            }
+            #if DEBUG
+            if let hooks { hooks.beforeProbeTerminalTail(finish); return }
+            #endif
+            finish()
+        default: break
+        }
+    }
+
+    private func fail(_ error: any Error) {
+        if failure == nil { failure = error }
+        server?.cancelStartupEndpointProbe()
+        if listenerStarted { listener.cancel() }
+        if probeStarted { probe?.cancel() }
+        settleIfJoined()
+    }
+
+    private func settleIfJoined() {
+        guard let continuation else { return }
+        if isCancellationRequested, failure == nil { fail(CancellationError()); return }
+        if let failure {
+            guard listenerTerminalJoined, probe == nil || probeStarted && probeTerminalJoined else { return }
+            if let server {
+                _ = server.closeAdmission()
+                joinServerConnections(server)
+                guard serverConnectionsJoined else { return }
+            }
+            var result = failure
+            if let server {
+                server.cancelStartupEndpointProbe()
+                let ticket = server.closeAdmission()
+                do { try server.drain(cleanupTicket: ticket); try server.retire(cleanupTicket: ticket) }
+                catch { result = error }
+            }
+            lock.withLock { committed = true }
+            self.continuation = nil
+            listener.stateUpdateHandler = nil; listener.newConnectionHandler = nil
+            probe?.stateUpdateHandler = nil
+            probe = nil; server = nil; makeServer = nil
+            continuation.resume(throwing: result)
+        } else {
+            guard endpointAccepted, probeTerminalJoined, let server else { return }
+            joinServerConnections(server)
+            guard serverConnectionsJoined else { return }
+            let mayHandoff = lock.withLock {
+                guard !cancellationRequested, !committed else { return false }
+                committed = true
+                return true
+            }
+            guard mayHandoff else { fail(CancellationError()); return }
+            server.cancelStartupEndpointProbe()
+            server.completeStartupHandoff()
+            listener.stateUpdateHandler = { [weak server] state in server?.listenerChanged(state) }
+            probe?.stateUpdateHandler = nil
+            self.continuation = nil
+            probe = nil; self.server = nil; makeServer = nil
+            continuation.resume(returning: server)
+        }
+    }
+
+    private func joinServerConnections(_ server: LoopbackHTTPServer) {
+        guard !serverJoinRequested else { return }
+        serverJoinRequested = true
+        server.joinStartupConnections { [weak self] in
+            guard let self else { return }
+            self.queue.async { [weak self] in
+                guard let self else { return }
+                self.serverConnectionsJoined = true
+                self.settleIfJoined()
+            }
+        }
     }
 }
 
@@ -1802,6 +2032,16 @@ final class LoopbackHTTPServer: @unchecked Sendable {
     private var connections: [ObjectIdentifier: LoopbackHTTPConnection] = [:]
     private var closingConnections: [ObjectIdentifier: LoopbackHTTPConnection] = [:]
     private var startupEndpointProbe: ((Bool) -> Void)?
+    private var startupAdmissionOpen = true
+    private var startupHandoffComplete = false
+    private var startupIdleCompletion: (@Sendable () -> Void)?
+    #if DEBUG
+    private var startupTerminalTestHook: (@Sendable (@escaping @Sendable () -> Void) -> Void)?
+    fileprivate func installStartupTerminalTestHook(
+        _ hook: (@Sendable (@escaping @Sendable () -> Void) -> Void)?) {
+        queueSync { startupTerminalTestHook = hook }
+    }
+    #endif
     private var pausedBodySends: [ObjectIdentifier: () -> Void] = [:]
     private var automaticCleanupTicket: LoopbackHTTPCleanupTicket?
     private var activeResponses = 0
@@ -2240,115 +2480,24 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         let listener: NWListener
         do { listener = try NWListener(using: parameters) }
         catch { throw PlaybackErrorDiagnostics.snapshot(error) }
-        let startupQueue = DispatchQueue(label: "org.vplayer.loopback-http.start")
-        let gate = LoopbackStartupGate()
-        let cancellationRelay = LoopbackStartupCancellationRelay()
-        return try await withTaskCancellationHandler(operation: {
-            try await withCheckedThrowingContinuation { continuation in
-                cancellationRelay.install {
-                    continuation.resume(throwing: CancellationError())
-                }
-                listener.newConnectionHandler = { connection in connection.cancel() }
-                listener.stateUpdateHandler = { state in
-                    switch state {
-                    case .ready:
-                        #if DEBUG
-                        PlaybackDiagnosticTracker.shared.append("lb_ready")
-                        #endif
-                        guard !Task.isCancelled,
-                              let assignedPort = listener.port?.rawValue, assignedPort > 0,
-                              let loopbackPort = NWEndpoint.Port(rawValue: assignedPort) else {
-                            listener.cancel()
-                            guard gate.claim() else { return }
-                            continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                                : LoopbackHTTPServerError.invalidBinding)
-                            return
-                        }
-                        do {
-                            #if DEBUG
-                            PlaybackDiagnosticTracker.shared.append("lb_kb_start")
-                            #endif
-                            let bindingEvidence = try kernelBindingEvidence(port: assignedPort,
-                                                                           testing: testing)
-                            #if DEBUG
-                            PlaybackDiagnosticTracker.shared.append("lb_kb_ok")
-                            #endif
-                            let server = try LoopbackHTTPServer(listener: listener, port: assignedPort, store: store,
-                                declaration: declaration, publishedSnapshot: publishedSnapshot,
-                                sessionCapability: sessionCapability,
-                                socketBindingEvidence: bindingEvidence,
-                                now: now, logger: logger, responseFailure: responseFailure,
-                                testing: testing)
-                            listener.newConnectionHandler = { [weak server] connection in server?.accept(connection) }
-                            listener.stateUpdateHandler = { [weak server] state in server?.listenerChanged(state) }
-                            let endpoint: NWEndpoint = .hostPort(host: .ipv4(loopback), port: loopbackPort)
-                            let probe = NWConnection(to: endpoint, using: .tcp)
-                            #if DEBUG
-                            PlaybackDiagnosticTracker.shared.append("lb_probe_start")
-                            #endif
-                            server.installStartupEndpointProbe { accepted in
-                                #if DEBUG
-                                PlaybackDiagnosticTracker.shared.append("lb_probe_cb_\(accepted)")
-                                #endif
-                                probe.cancel()
-                                guard gate.claim() else { return }
-                                if testing?.cancelAfterStartupProbeAccepted == true {
-                                    let ticket = server.closeAdmission()
-                                    try? server.drain(cleanupTicket: ticket)
-                                    try? server.retire(cleanupTicket: ticket)
-                                    continuation.resume(throwing: CancellationError())
-                                } else if accepted, !Task.isCancelled {
-                                    continuation.resume(returning: server)
-                                } else {
-                                    let ticket = server.closeAdmission()
-                                    try? server.drain(cleanupTicket: ticket)
-                                    try? server.retire(cleanupTicket: ticket)
-                                    continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                                        : LoopbackHTTPServerError.invalidBinding)
-                                }
-                            }
-                            probe.stateUpdateHandler = { probeState in
-                                guard case .failed(let error) = probeState, gate.claim() else { return }
-                                let failure = PlaybackErrorDiagnostics.snapshot(error)
-                                server.cancelStartupEndpointProbe()
-                                let ticket = server.closeAdmission()
-                                try? server.drain(cleanupTicket: ticket)
-                                try? server.retire(cleanupTicket: ticket)
-                                continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                                    : failure)
-                            }
-                            probe.start(queue: startupQueue)
-                        } catch {
-                            #if DEBUG
-                            PlaybackDiagnosticTracker.shared.append("lb_catch_\(error)")
-                            #endif
-                            listener.cancel()
-                            guard gate.claim() else { return }
-                            continuation.resume(throwing: error)
-                        }
-                    case .failed(let err):
-                        #if DEBUG
-                        PlaybackDiagnosticTracker.shared.append("lb_failed_\(err)")
-                        #endif
-                        guard gate.claim() else { return }
-                        continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                            : PlaybackErrorDiagnostics.snapshot(err))
-                    case .cancelled:
-                        #if DEBUG
-                        PlaybackDiagnosticTracker.shared.append("lb_cancelled")
-                        #endif
-                        guard gate.claim() else { return }
-                        continuation.resume(throwing: Task.isCancelled ? CancellationError()
-                            : LoopbackHTTPServerError.transportUnavailable)
-                    default: break
-                    }
-                }
-                listener.start(queue: startupQueue)
-            }
-        }, onCancel: {
-            listener.cancel()
-            if gate.claim() { cancellationRelay.cancel() }
-        })
+        let owner = LoopbackStartupOwner(listener: listener, testing: testing) { port in
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("lb_kb_start")
+            #endif
+            let bindingEvidence = try kernelBindingEvidence(port: port, testing: testing)
+            #if DEBUG
+            PlaybackDiagnosticTracker.shared.append("lb_kb_ok")
+            #endif
+            return try LoopbackHTTPServer(listener: listener, port: port, store: store,
+                declaration: declaration, publishedSnapshot: publishedSnapshot,
+                sessionCapability: sessionCapability, socketBindingEvidence: bindingEvidence,
+                now: now, logger: logger, responseFailure: responseFailure, testing: testing)
+        }
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { owner.begin($0) }
+        } onCancel: {
+            owner.cancel()
+        }
     }
 
     func path(for key: HLSResourceKey) throws -> String {
@@ -3827,12 +3976,54 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         return try queue.sync(execute: operation)
     }
 
-    private func installStartupEndpointProbe(_ completion: @escaping (Bool) -> Void) {
+    fileprivate func installStartupEndpointProbe(_ completion: @escaping (Bool) -> Void) {
         queueSync { startupEndpointProbe = completion }
     }
 
-    private func cancelStartupEndpointProbe() {
+    fileprivate func cancelStartupEndpointProbe() {
         queueSync { startupEndpointProbe = nil }
+    }
+
+    /// Startup is not visible to a caller yet. Freeze new peers, then keep each
+    /// already admitted startup connection until its native canceled tail exits.
+    /// The one completion is delivered behind the last such server-queue stack.
+    fileprivate func joinStartupConnections(_ completion: @escaping @Sendable () -> Void) {
+        queueSync {
+            precondition(!startupHandoffComplete && startupIdleCompletion == nil)
+            startupAdmissionOpen = false
+            startupIdleCompletion = completion
+            for connection in Array(connections.values) + Array(closingConnections.values) {
+                connection.stop(terminal: .cancelled)
+            }
+            completeStartupIdleIfPossible()
+        }
+    }
+
+    fileprivate func completeStartupHandoff() {
+        queueSync {
+            precondition(!startupAdmissionOpen && !startupHandoffComplete && startupIdleCompletion == nil)
+            precondition(connections.isEmpty && closingConnections.isEmpty && activeResponses == 0)
+            startupHandoffComplete = true
+            startupAdmissionOpen = true
+        }
+    }
+
+    private func completeStartupIdleIfPossible() {
+        guard !startupAdmissionOpen, connections.isEmpty, closingConnections.isEmpty,
+              activeResponses == 0, backingLedger.usage.distinctBackingCount == 0,
+              let completion = startupIdleCompletion else { return }
+        startupIdleCompletion = nil
+        queue.async(execute: completion)
+    }
+
+    fileprivate func enqueueStartupConnectionTerminal(_ completion: @escaping @Sendable () -> Void) {
+        #if DEBUG
+        if let hook = startupTerminalTestHook {
+            hook { [queue] in queue.async(execute: completion) }
+            return
+        }
+        #endif
+        queue.async(execute: completion)
     }
 
     private func install(snapshot: HLSPublishedSnapshot) throws {
@@ -3861,9 +4052,9 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         }
     }
 
-    private func accept(_ connection: NWConnection) {
+    fileprivate func accept(_ connection: NWConnection) {
         queue.async { [weak self] in
-            guard let self, self.isIPv4Loopback(connection.endpoint) else {
+            guard let self, self.startupAdmissionOpen, self.isIPv4Loopback(connection.endpoint) else {
                 connection.cancel(); return
             }
             let closing: Bool
@@ -3900,7 +4091,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
                 connection.cancel(); return
             }
             let context = LoopbackHTTPConnection(connection: connection, server: self,
-                parserReservation: parserReservation)
+                parserReservation: parserReservation, joinsStartupTerminal: !self.startupHandoffComplete)
             if closing { self.closingConnections[ObjectIdentifier(context)] = context }
             else { self.connections[ObjectIdentifier(context)] = context }
             self.maximumConnections = max(self.maximumConnections,
@@ -4815,6 +5006,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         }
         context.stagingReservation = nil
         continueAutomaticCleanupIfPossible()
+        completeStartupIdleIfPossible()
     }
 
     fileprivate func connectionFinished(_ context: LoopbackHTTPConnection) {
@@ -4823,6 +5015,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         pausedBodySends.removeValue(forKey: ObjectIdentifier(context))
         HLSDeliveryApplicationChargeLedger.shared.release(context.parserReservation)
         continueAutomaticCleanupIfPossible()
+        completeStartupIdleIfPossible()
     }
 
     private func sendStatus(_ status: Int, on context: LoopbackHTTPConnection) {
@@ -5097,7 +5290,7 @@ final class LoopbackHTTPServer: @unchecked Sendable {
         "\"" + digest.map { String(format: "%02x", $0) }.joined() + "\""
     }
 
-    private func listenerChanged(_ state: NWListener.State) {
+    fileprivate func listenerChanged(_ state: NWListener.State) {
         switch state {
         case .failed, .cancelled: break
         default: return
@@ -5148,11 +5341,14 @@ private final class LoopbackHTTPConnection: @unchecked Sendable {
     private var activeCleanup: ((LoopbackSendTerminal) -> Void)?
     private var bodySendWasPaused = false
     private var successfulBodyChunks = 0
+    private let joinsStartupTerminal: Bool
+    private var startupTerminalMarkerQueued = false
 
     init(connection: NWConnection, server: LoopbackHTTPServer,
-         parserReservation: PlaybackApplicationChargeReservation) {
+         parserReservation: PlaybackApplicationChargeReservation, joinsStartupTerminal: Bool) {
         self.connection = connection; self.server = server
         self.parserReservation = parserReservation
+        self.joinsStartupTerminal = joinsStartupTerminal
         deadlineTimer = DispatchSource.makeTimerSource(queue: server.queue)
     }
 
@@ -5210,10 +5406,20 @@ private final class LoopbackHTTPConnection: @unchecked Sendable {
         cleanup?(terminal)
         server?.activeFinished(self)
         connection.cancel()
-        server?.connectionFinished(self)
+        if !joinsStartupTerminal { server?.connectionFinished(self) }
     }
 
     private func changed(_ state: NWConnection.State, overloaded: Bool) {
+        if case .cancelled = state, joinsStartupTerminal {
+            stop(terminal: .cancelled)
+            guard !startupTerminalMarkerQueued, let server else { return }
+            startupTerminalMarkerQueued = true
+            server.enqueueStartupConnectionTerminal { [self] in
+                connection.stateUpdateHandler = nil
+                self.server?.connectionFinished(self)
+            }
+            return
+        }
         guard !ended else { return }
         switch state {
         case .ready:

@@ -7,6 +7,39 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class GeneratedAudioFailureFenceTests: XCTestCase {
+    func testCancelRealPrefixWaitExitsWithoutPublicationOrRuntimeFailure() async throws {
+        let sink = GeneratedAudioCounter()
+        let graph = try SystemHLSMediaGraphAuthority(
+            lifecycle: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 24_901),
+            failureSink: { _ in sink.increment() })
+        let done = GeneratedAudioCounter()
+        let prefix = Task {
+            let result = await graph.awaitAllTrackPlayablePrefix(minimumSeconds: 3)
+            done.increment()
+            return result
+        }
+        let entryDeadline = ContinuousClock.now + .seconds(2)
+        while !graph.prefixPreparationInFlightForTesting, ContinuousClock.now < entryDeadline {
+            await Task.yield()
+        }
+        XCTAssertTrue(graph.prefixPreparationInFlightForTesting)
+        XCTAssertNil(graph.publicationForTesting.publisher?.visible)
+        prefix.cancel()
+        let cancellationDeadline = ContinuousClock.now + .seconds(2)
+        while done.value == 0, ContinuousClock.now < cancellationDeadline { await Task.yield() }
+        XCTAssertEqual(done.value, 1,
+            "Cancellation must wake the real wait; no EOF, ready publication, or manual gate release")
+        // A failed RED is still bounded. Retirement is deliberately after the
+        // cancellation assertion, so it cannot make missing cancellation pass.
+        let retired = await graph.retireAllResourcesAndAwaitReceipt()
+        let result = await prefix.value
+        XCTAssertNil(result)
+        XCTAssertTrue(retired)
+        XCTAssertFalse(graph.prefixPreparationInFlightForTesting)
+        XCTAssertNil(graph.failureDiagnostic)
+        XCTAssertEqual(sink.value, 0, "User cancellation is not a source runtime failure")
+    }
+
     func testSameFormatAACAndDolbyDiscontinuityUsesOneOwnedGenerationRecovery() async throws {
         for codec: AudioCodec in [.aac, .ac3, .eac3] {
             let context = try GeneratedAudioTestContext(codec: codec) { true }

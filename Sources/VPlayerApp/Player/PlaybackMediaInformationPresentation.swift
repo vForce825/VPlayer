@@ -33,6 +33,27 @@ struct PlaybackMediaInformationPresentation: Sendable {
         visualParts.highlightsFrameRate
     }
 
+    var sourceRoutingText: String? {
+        guard let information, let category = information.sourceCategory else { return nil }
+        let source: String
+        switch category {
+        case .direct: source = "直接媒体"
+        case .hlsMedia: source = "HLS 媒体列表"
+        case .hlsMaster: source = "HLS 主列表"
+        }
+        guard let transport = information.plannedTransport else {
+            return "来源：\(source) · 路径规划中…"
+        }
+        let path: String
+        switch transport {
+        case .native: path = "原生播放"
+        case .proxy: path = "代理 HLS"
+        case .generated: path = "生成 HLS"
+        }
+        let phase = information.isSourceProbe ? "规划路径" : "当前路径"
+        return "来源：\(source) · \(phase)：\(path)"
+    }
+
     var visualText: String {
         guard information != nil else { return Self.detectingText }
 
@@ -43,6 +64,13 @@ struct PlaybackMediaInformationPresentation: Sendable {
 
     var accessibilityText: String {
         guard let information else { return Self.detectingText }
+
+        if information.isSourceProbe {
+            let resolution = Self.accessibilityResolutionText(for: information) ?? "分辨率检测中"
+            let rate = Self.normalizedFrameRate(information.sourceFrameRate.map { Double($0.num) / Double($0.den) })
+                .map { "每秒 \(Self.formatFrameRate($0)) 帧" } ?? "帧率检测中"
+            return ["源视频", resolution, rate].joined(separator: "，")
+        }
 
         let resolution = Self.accessibilityResolutionText(for: information)
         let smoothMotionEnhancementIsActive = Self.smoothMotionEnhancementIsActive(for: information)
@@ -74,6 +102,14 @@ struct PlaybackMediaInformationPresentation: Sendable {
                 frameRate: nil,
                 highlightsFrameRate: false
             )
+        }
+
+        if information.isSourceProbe {
+            let resolution = Self.visualResolutionText(for: information).map { "源视频 \($0)" }
+                ?? "源视频分辨率检测中…"
+            let rate = Self.normalizedFrameRate(information.sourceFrameRate.map { Double($0.num) / Double($0.den) })
+                .map { "\(Self.formatFrameRate($0)) fps" } ?? "帧率检测中…"
+            return VisualParts(resolution: resolution, frameRate: rate, highlightsFrameRate: false)
         }
 
         let resolution = Self.visualResolutionText(for: information)
@@ -112,26 +148,30 @@ struct PlaybackMediaInformationPresentation: Sendable {
         for information: PlaybackMediaInformation
     ) -> String? {
         guard information.width > 0, information.height > 0 else {
-            return scanLabel(for: information.scanMode)
+            return information.isSourceProbe ? "分辨率检测中" : scanLabel(for: information.scanMode)
         }
         return "\(information.width) 乘 \(information.height) \(scanLabel(for: information.scanMode))"
     }
 
-    private static func scanSuffix(for scanMode: PlaybackScanMode) -> String {
+    private static func scanSuffix(for scanMode: PlaybackScanMode?) -> String {
         switch scanMode {
         case .progressive:
             "p"
         case .interlaced:
             "i"
+        case nil:
+            ""
         }
     }
 
-    private static func scanLabel(for scanMode: PlaybackScanMode) -> String {
+    private static func scanLabel(for scanMode: PlaybackScanMode?) -> String {
         switch scanMode {
         case .progressive:
             "逐行扫描"
         case .interlaced:
             "隔行扫描"
+        case nil:
+            "扫描方式检测中"
         }
     }
 

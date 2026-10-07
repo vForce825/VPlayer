@@ -196,7 +196,23 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     var outputItemGeneration: UInt64? { lock.withLock { nativeAdapter?.itemGeneration ?? bundle?.itemGeneration } }
 
     func preparedMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
-        lock.withLock { nativeAdapter?.metadata.snapshot(for: lifecycle) ?? bundle?.preparedMediaInformation(for: lifecycle) }
+        let snapshot = lock.withLock { nativeAdapter?.metadata.snapshot(for: lifecycle) ?? bundle?.preparedMediaInformation(for: lifecycle) }
+        guard let snapshot, let information = snapshot.information,
+              let routing = currentSourceRouting(for: lifecycle) else { return snapshot }
+        return .init(lifecycle: lifecycle, information: information.withSourceRouting(
+            category: routing.category, transport: routing.transport))
+    }
+
+    private func currentSourceRouting(for lifecycle: OutputLifecycleEpoch? = nil)
+        -> (category: PlaybackSourceCategory, transport: HLSPlaybackPlan.Transport)? {
+        let current = lock.withLock { (ownedSource, sourceScope) }
+        guard let owned = current.0, let scope = current.1,
+              lifecycle == nil || lifecycle == scope,
+              scope.backendIdentity == identity, owned.plan.owner.backendIdentity == identity,
+              owned.plan.owner.outputLifecycleNonce == scope.outputNonce,
+              owned.plan.resolutionGeneration == owned.source.generation, owned.isCurrent,
+              let category = HLSNativeSourceDependencies.sourceCategory(for: owned.source) else { return nil }
+        return (category, owned.plan.transport)
     }
 
     func prepare(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws {
@@ -600,6 +616,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 try await MainActor.run {
                     try coordinator.completeLifecycleCleanup(receipt)
                 }
+                guard await coordinator.joinRetiredNativeCallbackTails() else { return .unconfirmed }
             }
         } catch {
             #if DEBUG
@@ -904,6 +921,8 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             } else {
                 logSnapshot = .empty
             }
+            let routing = currentSourceRouting()
+            let routingSummary = "source=\(routing?.category.rawValue ?? "unavailable"),transport=\(routing?.transport.rawValue ?? "unavailable")"
             let summary = String(
                 format: "avplayer:gen=%llu,tc=%@,item=%@,rate=%.3f,buffer=%.3f,empty=%d,keepUp=%d,access=%ld,errorLog=%ld,error=%@",
                 itemGeneration,
@@ -916,7 +935,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 logSnapshot.accessEventCount,
                 logSnapshot.errorEventCount,
                 errorCode
-            )
+            ) + "," + routingSummary
             metrics?.update(scanType: isInterlaced
                 ? .interlaced(.init(
                     parity: .top,

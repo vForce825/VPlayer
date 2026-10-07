@@ -176,6 +176,48 @@ enum HLSInterlacedYADIFPolicy {
     }
 }
 
+/// Keep the failure ahead of optional timing context in the fixed 256-byte snapshot.
+enum HLSInterlacedOutputDiagnostic {
+    static func message(stage: String, error: any Error, pts: CMTime,
+                        expectedVideoStart: CMTime, context: String) -> String {
+        "task22.interlaced.output stage=\(stage) underlying=\(boundedCause(error)) " +
+            "pts=\(time(pts)) initialStart=\(time(expectedVideoStart)) context=\(context)"
+    }
+
+    /// Exact CMTime value@timescale; '/' is intentionally avoided because it is a path delimiter.
+    static func time(_ value: CMTime) -> String { "\(value.value)@\(value.timescale)" }
+
+    private static func boundedCause(_ error: any Error) -> String {
+        let cause: String
+        switch error {
+        case let failure as SegmentedFMP4WriterFailure:
+            if case .systemError(let diagnostic) = failure {
+                cause = "writer.systemError \(diagnostic.summary)"
+            } else {
+                cause = "writer.\(failure)"
+            }
+        case let failure as SegmentBoundaryFailure:
+            cause = "boundary.\(failure)"
+        case let failure as HLSVideoRemuxSubmissionFailure:
+            cause = "submission.\(failure)"
+        case is CancellationError:
+            cause = "CancellationError"
+        default:
+            // Unknown errors must pass through the existing privacy filter before clipping.
+            cause = PlaybackErrorDiagnostics.snapshot(error).summary
+        }
+        var result = ""
+        var byteCount = 0
+        for scalar in cause.unicodeScalars {
+            let text = String(scalar)
+            guard byteCount + text.utf8.count <= 128 else { break }
+            result += text
+            byteCount += text.utf8.count
+        }
+        return result
+    }
+}
+
 /// 单 source item 的生产媒体图 owner。demux callback 只移交带 admission tail 的事件；
 /// 唯一 worker 顺序执行 timeline、音视频 writer、publisher 与自然 EOF。
 final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unchecked Sendable {
@@ -208,6 +250,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         private let expectedVideoStart: CMTime
         private let outputSemaphore: DispatchSemaphore
         private let inputCapacityWakeup: HLSVideoInputCapacityWakeup
+        private let writerCapacityWakeup: WriterCapacityWakeup
         private weak var authority: SystemHLSMediaGraphAuthority?
         private var writer: SegmentedFMP4Writer?
         private var lastWrittenPTS: CMTime?
@@ -233,6 +276,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
              boundary: SegmentBoundaryCoordinator, expectedVideoStart: CMTime,
              outputSemaphore: DispatchSemaphore,
              inputCapacityWakeup: HLSVideoInputCapacityWakeup,
+             writerCapacityWakeup: WriterCapacityWakeup,
              authority: SystemHLSMediaGraphAuthority) {
             self.publication = publication
             self.binding = binding
@@ -240,6 +284,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             self.expectedVideoStart = expectedVideoStart
             self.outputSemaphore = outputSemaphore
             self.inputCapacityWakeup = inputCapacityWakeup
+            self.writerCapacityWakeup = writerCapacityWakeup
             self.authority = authority
             boundary.installAudioBoundaryAdvanceSink { [weak self] in
                 guard let self else { return }
@@ -324,7 +369,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 processTask = Task { [self, envelope, active, output, ticket] in
                     let result: Result<Void, Error>
                     do {
-                        try await active.appendVideoAwaitingReadiness(output, ticket: ticket)
+                        try await active.appendVideoAwaitingPredecessorCapacity(
+                            output, initialTicket: ticket, boundary: boundary,
+                            wakeup: writerCapacityWakeup)
                         result = .success(())
                     } catch { result = .failure(error) }
                     writerQueue.async { [self, envelope, active, output] in
@@ -441,11 +488,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
                 authority?.fail(PlaybackCoreError.videoSampleBuffer(
-                    "task22.interlaced.output pts=\(pts.value)/\(pts.timescale) " +
-                    "expected=\(expectedVideoStart.value)/\(expectedVideoStart.timescale) " +
-                    "stage=\(stage) " +
-                    "context=\(failureContext(output)) " +
-                    "underlying=\(String(reflecting: error))"))
+                    HLSInterlacedOutputDiagnostic.message(
+                        stage: stage, error: error, pts: pts,
+                        expectedVideoStart: expectedVideoStart, context: failureContext(output))))
             }
             completeCurrentEnvelope()
         }
@@ -463,11 +508,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
                 authority?.fail(PlaybackCoreError.videoSampleBuffer(
-                    "task22.interlaced.output pts=\(pts.value)/\(pts.timescale) " +
-                    "expected=\(expectedVideoStart.value)/\(expectedVideoStart.timescale) " +
-                    "stage=\(stage) " +
-                    "context=\(failureContext(output)) " +
-                    "underlying=\(String(reflecting: error))"))
+                    HLSInterlacedOutputDiagnostic.message(
+                        stage: stage, error: error, pts: pts,
+                        expectedVideoStart: expectedVideoStart, context: failureContext(output))))
             }
         }
 
@@ -490,14 +533,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 false
             }
             let dimensions = format.map { CMVideoFormatDescriptionGetDimensions($0) }
-            let lastPTS = snapshot.0.map { "\($0.value)/\($0.timescale)" } ?? "nil"
-            let lastDuration = snapshot.1.map { "\($0.value)/\($0.timescale)" } ?? "nil"
+            let lastPTS = snapshot.0.map(HLSInterlacedOutputDiagnostic.time) ?? "nil"
+            let lastDuration = snapshot.1.map(HLSInterlacedOutputDiagnostic.time) ?? "nil"
             let dimensionsText = dimensions.map { "\($0.width)x\($0.height)" } ?? "nil"
             let lastSource = snapshot.4.map {
                 "au\($0.accessUnitID)-seq\($0.sequenceNumber)-g\($0.generation.rawValue)"
             } ?? "nil"
             let currentSource = output.sourceIdentity
-            return "duration=\(duration.value)/\(duration.timescale) " +
+            return "duration=\(HLSInterlacedOutputDiagnostic.time(duration)) " +
                 "lastPTS=\(lastPTS) " +
                 "lastDuration=\(lastDuration) " +
                 "formatMatchesFirst=\(formatMatches) " +
@@ -526,6 +569,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
                     writerWindowContinuation: continuation, acceptanceProbe: acceptanceProbe)
             }
+            try created.installVideoCapacityWakeup(writerCapacityWakeup)
             try created.start(at: startTime)
             writer = created
             return created
@@ -632,6 +676,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 cancelled = true
                 audioFlushActive = false
             }
+            writerCapacityWakeup.cancel()
             writerQueue.async { [self] in
                 if let continuation = audioFlushContinuation {
                     audioFlushContinuation = nil
@@ -695,6 +740,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var mediaEpoch: AudioMediaEpochIdentity?
     private var videoBinding: FMP4WriterBinding?
     private var videoWriter: SegmentedFMP4Writer?
+    private var videoCapacityWakeup: WriterCapacityWakeup?
     private var interlacedVideoBranch: HLSVideoBranch?
     private var interlacedVideoOutput: InterlacedVideoOutput?
     private var interlacedInputWakeup: HLSVideoInputCapacityWakeup?
@@ -1263,6 +1309,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             try await appendInterlacedVideo(timed, track: track, inspection: proof)
             return
         }
+        let writerCapacityWakeup = try requireVideoCapacityWakeup()
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: track.frameRate)
             condition.withLock {
@@ -1303,23 +1350,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
                     acceptanceProbe: acceptanceProbe)
             }
+            try writer.installVideoCapacityWakeup(writerCapacityWakeup)
             try writer.start(at: timed.timing.presentationTimeStamp.cmTime)
             videoBinding = binding
             videoBuilder = builder
             condition.withLock { videoWriter = writer }
         }
+        var currentWriter = condition.withLock { videoWriter }
         guard duration.value > 0, let builder = videoBuilder,
-              let writer = videoWriter, let boundary, let binding = videoBinding else {
+              currentWriter != nil, let boundary, let binding = videoBinding else {
             throw HLSVideoRemuxSubmissionFailure.writerAttemptMismatch
         }
         let submission = try builder.makeSubmission(for: timed, admission: admission)
         do {
-            try await writer.appendRemuxVideoAwaitingReadiness(
+            try await currentWriter!.appendRemuxVideoAwaitingReadiness(
                 submission,
                 ticket: try boundary.issueRemuxVideoAppend(
                     for: submission, writerBinding: binding))
         } catch SegmentedFMP4WriterFailure.rolloverRequired {
-            let continuation = try await writer.finishWriterWindow()
+            let continuation = try await currentWriter!.finishWriterWindow()
+            try Task.checkCancellation()
             let nextBinding = FMP4WriterBinding(
                 outputLifecycleEpoch: binding.outputLifecycleEpoch,
                 itemGeneration: binding.itemGeneration,
@@ -1345,16 +1395,40 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     resuming: builder, binding: nextBinding, admission: admission)
                 let attempt = try submission.claimWriterAttempt(
                     binding: nextBinding, admission: admission)
+                try nextWriter.installVideoCapacityWakeup(writerCapacityWakeup)
                 try nextWriter.start(at: .zero)
-                try await nextWriter.appendRemuxVideoAwaitingReadiness(
-                    attempt, ticket: try boundary.issueRemuxVideoAppend(for: attempt))
-                videoBinding = nextBinding
-                videoBuilder = nextBuilder
-                condition.withLock { videoWriter = nextWriter }
+                try condition.withLock {
+                    guard !Task.isCancelled, state != .retiring, state != .retired,
+                          state != .failed, state != .failing,
+                          videoWriter === currentWriter else { throw CancellationError() }
+                    videoBinding = nextBinding
+                    videoBuilder = nextBuilder
+                    videoWriter = nextWriter
+                }
+                // A terminal predecessor can still hold native aliases. Drop
+                // both active-owner references before the successor awaits their
+                // real release; continuation metadata does not retain the writer.
+                currentWriter = nil
+                try await nextWriter.appendRemuxVideoAwaitingPredecessorCapacity(
+                    attempt, boundary: boundary, wakeup: writerCapacityWakeup)
             } catch {
                 _ = await nextWriter.cancelAwaitingCompletion()
                 throw error
             }
+        }
+    }
+
+    /// Audio-only graphs retain their existing fixed charge. The media worker
+    /// creates this once, before the first video native input; retirement and
+    /// creation share the same lifecycle fence.
+    private func requireVideoCapacityWakeup() throws -> WriterCapacityWakeup {
+        try condition.withLock {
+            guard !Task.isCancelled, state != .retiring, state != .retired,
+                  state != .failed, state != .failing else { throw CancellationError() }
+            if let videoCapacityWakeup { return videoCapacityWakeup }
+            let wakeup = try WriterCapacityWakeup.make(ledger: sourceApplicationLedger)
+            videoCapacityWakeup = wakeup
+            return wakeup
         }
     }
 
@@ -1424,10 +1498,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 frameRate: outputFrameRate,
                 bitrate: bitrate, maximumPendingFrameCount: 8))
             let inputWakeup = HLSVideoInputCapacityWakeup()
+            let writerCapacityWakeup = try requireVideoCapacityWakeup()
             let output = InterlacedVideoOutput(
                 publication: publication, binding: binding, boundary: boundary,
                 expectedVideoStart: start, outputSemaphore: interlacedOutputSemaphore,
                 inputCapacityWakeup: inputWakeup,
+                writerCapacityWakeup: writerCapacityWakeup,
                 authority: self)
             let transcode = HLSVideoTranscodeBranch(
                 generation: timed.source.generation, inputFormat: input,
@@ -2120,7 +2196,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         #if DEBUG
         PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_start")
         #endif
-        guard minimumSeconds == 3 else { return nil }
+        guard minimumSeconds == 3, !Task.isCancelled else { return nil }
         let mayPrepare = condition.withLock { () -> Bool in
             guard state != .failed, state != .retiring, state != .retired,
                   !prefixPreparationInFlight else { return false }
@@ -2139,6 +2215,20 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             }
             waiter?.resume()
         }
+        return await withTaskCancellationHandler {
+            await prepareAllTrackPlayablePrefix()
+        } onCancel: {
+            // Only the admitted prefix owner may cancel this real condition
+            // wait. Closing publication admission releases no media resources;
+            // the caller still joins their existing retirement path.
+            // Mark the actual media worker canceled before its publication wait
+            // wakes, so deliberate closure cannot become a new runtime fault.
+            worker.cancel()
+            publication.cancelLivePublication()
+        }
+    }
+
+    private func prepareAllTrackPlayablePrefix() async -> AVPlayerItemReplacementBundle? {
         do {
             let readiness = Task.detached(priority: .userInitiated) {
                 try self.publication.waitForVisible(
@@ -2153,6 +2243,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 #endif
                 return nil
             }
+            guard !Task.isCancelled else { return nil }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_waitVisible_ready")
             #endif
@@ -2168,7 +2259,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
                 while failureDispatchInFlight && state != .retiring && state != .retired { condition.wait() }
-                guard state != .failed, state != .retiring, state != .retired else { return nil }
+                guard !Task.isCancelled, state != .failed, state != .retiring, state != .retired else { return nil }
                 state = .playable
                 return AVPlayerItemReplacementBundle(
                     request: prepared.replacement.request,
@@ -2176,6 +2267,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     mediaInformation: mediaInformation)
             }
         } catch {
+            guard !Task.isCancelled else { return nil }
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("g_awaitPrefix_fail")
             #endif
@@ -2228,8 +2320,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         publication.cancelLivePublication()
         worker.cancel()
         let targets = condition.withLock {
-            (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup)
+            (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup, videoCapacityWakeup)
         }
+        targets.4?.cancel()
         targets.0?.cancel()
         targets.1?.cancel()
         targets.2?.requestCancellation()

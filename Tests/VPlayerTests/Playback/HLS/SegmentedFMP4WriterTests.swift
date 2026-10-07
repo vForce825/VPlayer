@@ -1727,6 +1727,9 @@ final class SegmentedFMP4WriterTests: XCTestCase {
 #if DEBUG
     func testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease() async throws {
         let retainedIDRCount = 7
+        let clock = ManualPlaybackClock(0)
+        let wakeup = try WriterCapacityWakeup.make(clock: clock)
+        defer { wakeup.cancel() }
         let nativeVideo = try await Task17NativeRetentionFixtures.largeH264Samples(count: 174)
         var parameterSets = nativeVideo.parameterSets
         parameterSets[0][3] = 51 // Admit the existing picture at the bounded 81.6 Mbit/s envelope.
@@ -1749,6 +1752,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             boundary: fixture.boundary, ownershipLimits: nil,
             releaseTransfersImmediately: true)
         defer { _ = first?.cancel() }
+        try first!.installVideoCapacityWakeup(wakeup)
         let weakFirst = TestWeakReference(first)
         let aliases = Task17RetainedNativeInputAliases(capacity: retainedIDRCount)
         let lastAliases = Task17RetainedNativeInputAliases(capacity: retainedIDRCount)
@@ -1797,6 +1801,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             boundary: fixture.boundary, factory: nextFactory, ownershipLimits: nil,
             writerWindowContinuation: continuation, releaseTransfersImmediately: true)
         defer { _ = next.cancel() }
+        try next.installVideoCapacityWakeup(wakeup)
         try next.start(at: CMTime(value: 10, timescale: 1))
         XCTAssertEqual(nextFactory.configurations.first?.initialMovieFragmentSequenceNumber, 2)
         XCTAssertEqual(next.usage.liveInputCount, retainedIDRCount)
@@ -1820,7 +1825,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             let boundaryBefore = fixture.boundary.usage
             let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
             XCTAssertThrowsError(try next.appendRemuxVideo(attempt, ticket: ticket)) {
-                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .predecessorInputCapacityPending)
             }
             XCTAssertEqual(next.usage, before)
             XCTAssertEqual(fixture.boundary.usage, boundaryBefore)
@@ -1833,11 +1838,35 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             XCTAssertEqual(next.usage.liveInputBytes, retainedBytes)
             attempt = try pending.claimWriterAttempt(binding: nextBinding)
         }
+        let pendingIdentity = attempt.pendingIdentity
+        let waitingAttempt = attempt
+        let boundary = Task17BoundaryHolder(fixture.boundary)
+        let completed = Task17LockedBool()
+        let append = Task {
+            defer { completed.setTrue() }
+            try await next.appendRemuxVideoAwaitingPredecessorCapacity(
+                waitingAttempt, boundary: boundary.value, wakeup: wakeup)
+        }
+        defer { append.cancel() }
+        let waitLimit = Date().addingTimeInterval(2)
+        while !wakeup.isWaitingForTesting && Date() < waitLimit { await Task.yield() }
+        XCTAssertTrue(wakeup.isWaitingForTesting)
+        XCTAssertTrue(clock.hasScheduledDeadlineTimer)
+        if !wakeup.isWaitingForTesting { append.cancel() }
+        XCTAssertEqual(nextFactory.lastWriter?.appendCount, 0)
+        XCTAssertEqual(next.usage.liveInputBytes, retainedBytes)
+        XCTAssertNil(weakFirst.value, "The production capacity wait must not retain its predecessor")
+        let revisionBeforeRelease = wakeup.currentRevision
         lastAliases.releaseAll()
-        XCTAssertEqual(next.usage.liveInputBytes, 0)
-        let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
-        try next.appendRemuxVideo(attempt, ticket: ticket)
-        XCTAssertNotNil(ticket.committedBoundary)
+        XCTAssertGreaterThan(wakeup.currentRevision, revisionBeforeRelease,
+            "The actual predecessor native backing must signal the wakeup installed before its first append")
+        try await task17AwaitVideoCapacityResult(append, completed: completed, clock: clock)
+        XCTAssertEqual(waitingAttempt.pendingIdentity, pendingIdentity)
+        XCTAssertEqual(pendingIdentity, ObjectIdentifier(pending))
+        XCTAssertFalse(wakeup.isWaitingForTesting)
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        XCTAssertThrowsError(try pending.claimWriterAttempt(binding: nextBinding),
+            "The production retry must consume the original pending AU exactly once")
         XCTAssertEqual(nextFactory.configurations.count, 1)
         XCTAssertEqual(nextFactory.lastWriter?.appendCount, 1)
         XCTAssertEqual(next.usage.liveInputCount, 1)
@@ -1935,7 +1964,7 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         let boundaryBefore = fixture.boundary.usage
         let before = next.usage
         XCTAssertThrowsError(try next.appendRemuxVideo(attempt, ticket: ticket)) {
-            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .predecessorInputCapacityPending)
         }
         XCTAssertEqual(nextFactory.lastWriter?.appendCount, 0)
         XCTAssertEqual(nextFactory.lastWriter?.calls.filter { $0 == .flush }.count, 0)
@@ -1958,6 +1987,216 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertNotNil(retryTicket.committedBoundary)
         XCTAssertEqual(nextFactory.configurations.count, 1)
         XCTAssertEqual(next.usage.liveInputCount, 1)
+    }
+
+    func testEncodedVideoCapacityRecoveryReusesPendingOutputAfterLastNativeAliasRelease() async throws {
+        let harness = try await Task17VideoCapacityHarness.make(mode: .encoded, seed: 81_300)
+        defer { harness.close() }
+        let pending = try XCTUnwrap(harness.encodedOutput)
+        let identity = try SegmentBoundaryCoordinator.videoIdentity(pending)
+        let before = harness.writer.usage
+        let boundaryBefore = harness.boundary.usage
+        let completed = Task17LockedBool()
+        let append = Task {
+            defer { completed.setTrue() }
+            try await harness.appendPending()
+        }
+        defer { append.cancel() }
+        await harness.awaitCapacityWait()
+        XCTAssertNil(harness.predecessor.value)
+        XCTAssertEqual(harness.writer.usage, before)
+        XCTAssertEqual(harness.boundary.usage, boundaryBefore)
+        XCTAssertEqual(harness.successorFactory.configurations.count, 1)
+        XCTAssertEqual(harness.native.appendCount, 0)
+        XCTAssertEqual(harness.native.cancelCount, 0)
+        let revision = harness.wakeup.currentRevision
+        harness.aliases.releaseAll()
+        XCTAssertEqual(harness.wakeup.currentRevision, revision,
+            "Dropping one reference must not credit the still-live native backing")
+        XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
+        XCTAssertEqual(harness.native.appendCount, 0)
+        harness.lastAliases.releaseAll()
+        try await task17AwaitVideoCapacityResult(append, completed: completed, clock: harness.clock)
+        XCTAssertGreaterThan(harness.wakeup.currentRevision, revision)
+        XCTAssertEqual(try SegmentBoundaryCoordinator.videoIdentity(pending), identity)
+        XCTAssertEqual(harness.native.appendCount, 1)
+        XCTAssertEqual(harness.native.capturedPayloads, [harness.payload])
+        XCTAssertEqual(harness.writer.usage.inputAllocationCount, before.inputAllocationCount + 1)
+        XCTAssertEqual(harness.writer.usage.liveInputCount, 1)
+        XCTAssertEqual(harness.successorFactory.configurations.count, 1)
+        XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+    }
+
+    func testRealPredecessorReleaseBeforeWaiterInstallationIsNotLost() async throws {
+        for mode in Task17VideoCapacityHarness.Mode.allCases {
+            let harness = try await Task17VideoCapacityHarness.make(mode: mode, seed: 81_350 + mode.rawValue)
+            defer { harness.close() }
+            let revision = harness.wakeup.currentRevision
+            if let attempt = harness.attempt {
+                let ticket = try harness.boundary.issueRemuxVideoAppend(for: attempt)
+                XCTAssertThrowsError(try harness.writer.appendRemuxVideo(attempt, ticket: ticket)) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .predecessorInputCapacityPending)
+                }
+                XCTAssertNil(ticket.committedBoundary)
+            } else {
+                let output = try XCTUnwrap(harness.encodedOutput)
+                let ticket = try harness.boundary.issueVideoAppend(for: output, writerBinding: harness.writer.binding)
+                XCTAssertThrowsError(try harness.writer.appendVideo(output, ticket: ticket)) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .predecessorInputCapacityPending)
+                }
+                XCTAssertNil(ticket.committedBoundary)
+            }
+            XCTAssertFalse(harness.wakeup.isWaitingForTesting)
+            XCTAssertEqual(harness.native.appendCount, 0)
+            harness.aliases.releaseAll()
+            harness.lastAliases.releaseAll()
+            XCTAssertGreaterThan(harness.wakeup.currentRevision, revision)
+            let completed = Task17LockedBool()
+            let wait = Task {
+                defer { completed.setTrue() }
+                return try await harness.wakeup.wait(after: revision, until: harness.wakeup.makeDeadline())
+            }
+            let changed = try await task17AwaitVideoCapacityResult(
+                wait, completed: completed, clock: harness.clock)
+            XCTAssertTrue(changed, "A real native release between preflight and waiter registration must remain visible")
+            XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+            if let pending = harness.pending {
+                let retry = try pending.claimWriterAttempt(binding: harness.writer.binding)
+                try await harness.writer.appendRemuxVideoAwaitingPredecessorCapacity(
+                    retry, boundary: harness.boundary, wakeup: harness.wakeup)
+                XCTAssertEqual(retry.pendingIdentity, ObjectIdentifier(pending))
+            } else {
+                try await harness.appendPending()
+            }
+            XCTAssertEqual(harness.native.appendCount, 1)
+            XCTAssertEqual(harness.successorFactory.configurations.count, 1)
+            XCTAssertNil(harness.predecessor.value)
+        }
+    }
+
+    func testVideoCapacityCancellationPreservesNativeOccupancyUntilFinalAliasRelease() async throws {
+        for mode in Task17VideoCapacityHarness.Mode.allCases {
+            let harness = try await Task17VideoCapacityHarness.make(mode: mode, seed: 81_310 + mode.rawValue)
+            defer { harness.close() }
+            let before = harness.writer.usage
+            let append = Task { try await harness.appendPending() }
+            await harness.awaitCapacityWait()
+            XCTAssertNil(harness.predecessor.value)
+            append.cancel()
+            await assertWriterThrowsError(try await append.value) { XCTAssertTrue($0 is CancellationError) }
+            _ = harness.writer.cancel()
+            XCTAssertFalse(harness.wakeup.isWaitingForTesting)
+            XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+            XCTAssertEqual(harness.writer.usage.liveInputCount, before.liveInputCount)
+            XCTAssertEqual(harness.writer.usage.liveInputBytes, before.liveInputBytes)
+            XCTAssertEqual(harness.writer.usage.inputAllocationCount, before.inputAllocationCount)
+            XCTAssertEqual(harness.native.appendCount, 0)
+            harness.aliases.releaseAll()
+            XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
+            harness.lastAliases.releaseAll()
+            XCTAssertEqual(harness.writer.usage.liveInputCount, 0)
+            XCTAssertEqual(harness.writer.usage.liveInputBytes, 0)
+            XCTAssertEqual(harness.writer.usage.inputAllocationCount, harness.writer.usage.inputReleaseCount)
+        }
+    }
+
+    func testVideoCapacityRetryKeepsOriginalFiveSecondDeadlineAcrossWakeups() async throws {
+        for mode in Task17VideoCapacityHarness.Mode.allCases {
+            let harness = try await Task17VideoCapacityHarness.make(mode: mode, seed: 81_320 + mode.rawValue)
+            defer { harness.close() }
+            let before = harness.writer.usage
+            let completed = Task17LockedBool()
+            let append = Task {
+                defer { completed.setTrue() }
+                try await harness.appendPending()
+            }
+            defer { append.cancel() }
+            await harness.awaitCapacityWait()
+            harness.clock.set(4_000_000_000)
+            // A coalesced/spurious signal prompts a new attempt, never a new budget.
+            harness.wakeup.signal()
+            await harness.awaitCapacityWait()
+            XCTAssertFalse(completed.value)
+            XCTAssertEqual(harness.writer.usage, before)
+            XCTAssertEqual(harness.native.appendCount, 0)
+            harness.clock.set(5_000_000_000)
+            let limit = Date().addingTimeInterval(2)
+            while !completed.value && Date() < limit { await Task.yield() }
+            XCTAssertTrue(completed.value, "A retry must not extend the original five-second deadline")
+            if !completed.value { append.cancel() }
+            await assertWriterThrowsError(try await append.value) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .predecessorInputCapacityPending)
+            }
+            XCTAssertEqual(harness.clock.deadlineTimerDeliveryCount, 1)
+            XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+            XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
+            XCTAssertEqual(harness.writer.usage.liveInputBytes, before.liveInputBytes)
+            XCTAssertEqual(harness.successorFactory.configurations.count, 1)
+            XCTAssertNil(harness.predecessor.value)
+            _ = harness.writer.cancel()
+            harness.aliases.releaseAll()
+            XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
+            harness.lastAliases.releaseAll()
+            XCTAssertEqual(harness.writer.usage.liveInputCount, 0)
+            XCTAssertEqual(harness.writer.usage.liveInputBytes, 0)
+        }
+    }
+
+    func testVideoCapacityRejectsImpossibleEmptyReserveWithoutInstallingWaiter() async throws {
+        for mode in Task17VideoCapacityHarness.Mode.allCases {
+            for keepsPredecessorAlias in [true, false] {
+                let scenario: UInt64 = keepsPredecessorAlias ? 0 : 1
+                let harness = try await Task17VideoCapacityHarness.make(
+                    mode: mode, seed: 81_330 + mode.rawValue * 2 + scenario, predecessorCapacity: 2)
+                defer { harness.close() }
+                XCTAssertEqual(harness.native.calls.filter { $0 == .start }.count, 1,
+                    "Reach the started successor, not a rejected predecessor configuration")
+                XCTAssertEqual(harness.writer.usage.liveInputCount, 1)
+                XCTAssertEqual(harness.aliases.count, 1)
+                XCTAssertEqual(harness.lastAliases.count, 1)
+                if !keepsPredecessorAlias {
+                    harness.aliases.releaseAll()
+                    XCTAssertEqual(harness.writer.usage.liveInputCount, 1)
+                    harness.lastAliases.releaseAll()
+                    XCTAssertEqual(harness.writer.usage.liveInputCount, 0)
+                    XCTAssertEqual(harness.writer.usage.liveInputBytes, 0)
+                }
+                // The successor needs three slots but inherits capacity two.
+                // A live predecessor must not misclassify this as retryable;
+                // releasing every real alias must not make it admissible either.
+                let before = harness.writer.usage
+                await assertWriterThrowsError(try await harness.appendPendingWithoutCapacityWait()) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+                }
+                XCTAssertFalse(harness.wakeup.isWaitingForTesting)
+                XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+                XCTAssertEqual(harness.native.appendCount, 0)
+                XCTAssertEqual(harness.writer.usage, before)
+                XCTAssertEqual(harness.successorFactory.configurations.count, 1)
+            }
+        }
+    }
+
+    func testRemuxCapacityRejectsOversizedPendingInputWithoutInstallingWaiter() async throws {
+        // Larger than even the admitted maximum 81.6 Mbit/s three-frame reserve.
+        let harness = try await Task17VideoCapacityHarness.make(
+            mode: .remux, seed: 81_340, pendingPayloadByteCount: 32 * 1_024 * 1_024)
+        defer { harness.close() }
+        let before = harness.writer.usage
+        let pending = try XCTUnwrap(harness.pending)
+        let budget = try WriterRemuxByteBudget(segmentInputCount: 1,
+            declaredBitsPerSecond: pending.admission.bitrateEnvelope.declaredBitsPerSecond,
+            frameDuration: pending.duration)
+        XCTAssertGreaterThan(pending.remuxPayloadByteCount + 64, budget.maximumSegmentBytes)
+        XCTAssertLessThan(pending.remuxPayloadByteCount, AnnexBScanner.maximumAccessUnitBytes)
+        await assertWriterThrowsError(try await harness.appendPendingWithoutCapacityWait()) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+        }
+        XCTAssertFalse(harness.wakeup.isWaitingForTesting)
+        XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
+        XCTAssertEqual(harness.native.appendCount, 0)
+        XCTAssertEqual(harness.writer.usage, before)
+        XCTAssertEqual(harness.successorFactory.configurations.count, 1)
     }
 
     func testCompressedLive384EnvelopeSurvivesPredecessorFinishDeinitAndRejects385th() async throws {
@@ -9415,6 +9654,175 @@ private final class Task17WeakSystemWriter: @unchecked Sendable {
 }
 
 #if DEBUG
+/// Give failed notification regressions a bounded failure rather than a frozen manual-clock task.
+private func task17AwaitVideoCapacityResult<Value: Sendable>(
+    _ task: Task<Value, Error>, completed: Task17LockedBool, clock: ManualPlaybackClock,
+    file: StaticString = #filePath, line: UInt = #line
+) async throws -> Value {
+    let limit = Date().addingTimeInterval(2)
+    while !completed.value && Date() < limit { await Task.yield() }
+    XCTAssertTrue(completed.value, "The pending operation did not resume after native credit release", file: file, line: line)
+    if !completed.value { clock.set(5_000_000_000); task.cancel() }
+    return try await task.value
+}
+
+/// Real predecessor drain and native aliases; only the successor append endpoint is fake.
+private final class Task17VideoCapacityHarness: @unchecked Sendable {
+    enum Mode: UInt64, CaseIterable { case remux, encoded }
+    let boundary: SegmentBoundaryCoordinator
+    let writer: SegmentedFMP4Writer
+    let successorFactory: Task17FakeSystemWriterFactory
+    let native: Task17FakeSystemWriter
+    let predecessor: TestWeakReference<SegmentedFMP4Writer>
+    let aliases: Task17RetainedNativeInputAliases
+    let lastAliases: Task17RetainedNativeInputAliases
+    let wakeup: WriterCapacityWakeup
+    let clock: ManualPlaybackClock
+    let pending: HLSVideoRemuxSubmission?
+    let attempt: HLSVideoRemuxWriterAttempt?
+    let encodedOutput: HLSVideoEncodedOutput?
+    let payload: Data
+
+    private init(boundary: SegmentBoundaryCoordinator, writer: SegmentedFMP4Writer,
+                 successorFactory: Task17FakeSystemWriterFactory,
+                 predecessor: TestWeakReference<SegmentedFMP4Writer>,
+                 aliases: Task17RetainedNativeInputAliases, lastAliases: Task17RetainedNativeInputAliases,
+                 wakeup: WriterCapacityWakeup, clock: ManualPlaybackClock,
+                 pending: HLSVideoRemuxSubmission?, attempt: HLSVideoRemuxWriterAttempt?,
+                 encodedOutput: HLSVideoEncodedOutput?, payload: Data) throws {
+        self.boundary = boundary; self.writer = writer; self.successorFactory = successorFactory
+        native = try XCTUnwrap(successorFactory.lastWriter)
+        self.predecessor = predecessor; self.aliases = aliases; self.lastAliases = lastAliases
+        self.wakeup = wakeup; self.clock = clock; self.pending = pending; self.attempt = attempt
+        self.encodedOutput = encodedOutput; self.payload = payload
+    }
+
+    static func make(mode: Mode, seed: UInt64, predecessorCapacity: Int = 4,
+                     pendingPayloadByteCount: Int? = nil) async throws -> Task17VideoCapacityHarness {
+        precondition(predecessorCapacity >= 2)
+        // Every predecessor is a valid native writer: its rollover threshold
+        // must be strictly below capacity. The capacity-two negative fixture
+        // therefore finishes after one input; normal recovery still retains two.
+        let predecessorInputCount = min(2, predecessorCapacity - 1)
+        let seconds = 10...(10 + predecessorInputCount)
+        let nativeVideo = try Task17NativeRetentionFixtures.h264()
+        let naturalPayloadCount = nativeVideo.idr.count + 4
+        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: seed,
+            frames: seconds.map { .init(pts: Int64($0), dts: Int64($0), isIDR: true) },
+            frameDuration: CMTime(value: 1, timescale: 1), frameTimestampTimescale: 1,
+            parameterSetsOverride: nativeVideo.parameterSets, idrOverride: nativeVideo.idr,
+            payloadByteCounts: pendingPayloadByteCount.map {
+                Array(repeating: naturalPayloadCount, count: predecessorInputCount) + [$0]
+            },
+            minimumPassthroughInterval: CMTime(value: 1, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: 1, timescale: 1))
+        var nalLength = UInt32(nativeVideo.idr.count).bigEndian
+        let payload = withUnsafeBytes(of: &nalLength) { Data($0) } + nativeVideo.idr
+        let outputs: [HLSVideoEncodedOutput] = try seconds.map { second in
+            let sample = try Task17Fixtures.sampleBuffer(format: fixture.builder.formatDescription,
+                payload: payload, presentationTimeStamp: CMTime(value: Int64(second), timescale: 1),
+                duration: CMTime(value: 1, timescale: 1))
+            return Task17Fixtures.videoOutput(fixture: .init(format: fixture.builder.formatDescription, sample: sample),
+                generation: 1, accessUnitID: UInt64(second), sequenceNumber: UInt64(second))
+        }
+        let clock = ManualPlaybackClock(0)
+        let wakeup = try WriterCapacityWakeup.make(clock: clock)
+        let aliases = Task17RetainedNativeInputAliases(capacity: predecessorInputCount)
+        let lastAliases = Task17RetainedNativeInputAliases(capacity: predecessorInputCount)
+        var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: seed, kind: .video,
+            writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary,
+            ownershipLimits: .init(rolloverThreshold: predecessorInputCount, hardCapacity: predecessorCapacity),
+            releaseTransfersImmediately: true)
+        let predecessor = TestWeakReference(first)
+        try first!.installVideoCapacityWakeup(wakeup)
+        try first!.observeNativeInputAliasesForTesting { block in
+            aliases.retainReference(to: block); lastAliases.retainReference(to: block)
+        }
+        try first!.start(at: CMTime(value: 10, timescale: 1))
+        for index in 0..<predecessorInputCount {
+            if mode == .remux {
+                let input = try fixture.builder.makeSubmission(for: fixture.timed[index], admission: fixture.admissions[index])
+                try await first!.appendRemuxVideoAwaitingReadiness(input,
+                    ticket: fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: first!.binding))
+            } else {
+                try await first!.appendVideoAwaitingReadiness(outputs[index],
+                    ticket: fixture.boundary.issueVideoAppend(for: outputs[index], writerBinding: first!.binding))
+            }
+        }
+        let pending = mode == .remux
+            ? try fixture.builder.makeSubmission(for: fixture.timed[predecessorInputCount],
+                admission: fixture.admissions[predecessorInputCount]) : nil
+        do {
+            if let pending {
+                try await first!.appendRemuxVideoAwaitingReadiness(pending,
+                    ticket: fixture.boundary.issueRemuxVideoAppend(for: pending, writerBinding: first!.binding))
+            } else {
+                try await first!.appendVideoAwaitingReadiness(outputs[predecessorInputCount],
+                    ticket: fixture.boundary.issueVideoAppend(for: outputs[predecessorInputCount], writerBinding: first!.binding))
+            }
+            XCTFail("Expected a genuine predecessor rollover")
+            throw SegmentedFMP4WriterFailure.illegalState
+        } catch SegmentedFMP4WriterFailure.rolloverRequired {}
+        let continuation = try await first!.finishWriterWindow()
+        XCTAssertEqual(first!.terminalReceipt?.terminalReason, .finished)
+        XCTAssertEqual(first!.terminalReceipt?.inputCount, predecessorInputCount)
+        first = nil
+        XCTAssertNil(predecessor.value)
+        XCTAssertEqual(aliases.count, predecessorInputCount)
+        XCTAssertEqual(lastAliases.count, predecessorInputCount)
+        let binding = Task17Fixtures.rolloverBinding(from: fixture.binding, writerIdentity: .init(rawValue: seed + 100))
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: seed + 100, kind: .video,
+            writerBinding: binding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary, factory: factory, ownershipLimits: nil,
+            writerWindowContinuation: continuation, releaseTransfersImmediately: true)
+        try writer.installVideoCapacityWakeup(wakeup)
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let attempt = try pending?.claimWriterAttempt(binding: binding,
+            admission: XCTUnwrap(writer.writerWindowAdmission))
+        XCTAssertEqual(writer.usage.liveInputCount, predecessorInputCount)
+        return try .init(boundary: fixture.boundary, writer: writer, successorFactory: factory,
+            predecessor: predecessor, aliases: aliases, lastAliases: lastAliases, wakeup: wakeup, clock: clock,
+            pending: pending, attempt: attempt,
+            encodedOutput: mode == .encoded ? outputs[predecessorInputCount] : nil, payload: payload)
+    }
+
+    func appendPending() async throws {
+        if let attempt {
+            try await writer.appendRemuxVideoAwaitingPredecessorCapacity(attempt, boundary: boundary, wakeup: wakeup)
+        } else {
+            try await writer.appendVideoAwaitingPredecessorCapacity(
+                XCTUnwrap(encodedOutput), boundary: boundary, wakeup: wakeup)
+        }
+    }
+
+    func appendPendingWithoutCapacityWait() async throws {
+        let completed = Task17LockedBool()
+        let task = Task {
+            defer { completed.setTrue() }
+            try await self.appendPending()
+        }
+        let limit = Date().addingTimeInterval(2)
+        while !completed.value && !wakeup.isWaitingForTesting && Date() < limit { await Task.yield() }
+        XCTAssertFalse(wakeup.isWaitingForTesting, "Permanent refusal must not enter a release-driven retry")
+        XCTAssertFalse(clock.hasScheduledDeadlineTimer)
+        if !completed.value { task.cancel() }
+        try await task.value
+    }
+
+    func awaitCapacityWait() async {
+        let limit = Date().addingTimeInterval(2)
+        while !wakeup.isWaitingForTesting && Date() < limit { await Task.yield() }
+        XCTAssertTrue(wakeup.isWaitingForTesting)
+        XCTAssertTrue(clock.hasScheduledDeadlineTimer)
+    }
+
+    func close() {
+        wakeup.cancel(); _ = writer.cancel(); aliases.releaseAll(); lastAliases.releaseAll()
+    }
+}
+
 private enum Task17NativeRetentionFixtures {
     static func largeH264Samples(count: Int) async throws -> (parameterSets: [Data], samples: [[Data]]) {
         let asset = AVURLAsset(url: try FixtureLoader.url("Video/homepod-large-idr-h264-1080p30-aac44100.mp4"))

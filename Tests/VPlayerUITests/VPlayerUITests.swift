@@ -618,6 +618,10 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
     private func captureStableSnapshot(app: XCUIApplication, progress: CardFocusProgress) throws -> CardFocusSnapshot {
         let started = Date()
         let deadline = started.addingTimeInterval(12)
+        // Remote presses can return before the native focus/scroll transition
+        // finishes. Avoid paying for an immediate transitional screenshot, but
+        // still require two complete matching samples within the same deadline.
+        progress.settleAfterNavigation()
         var previous: CardFocusSnapshot?
         var lastScreenshot: XCUIScreenshot?
         var lastReason = "Rendered focus/scroll state never stabilized"
@@ -625,6 +629,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
         while Date() < deadline {
             samples += 1
             progress.sample = samples
+            let sampleStarted = ProcessInfo.processInfo.systemUptime
             // Capture the hierarchy once. Live index-bound XCUIElement proxies
             // can change identity or disappear as LazyVGrid realizes/removes rows;
             // querying each attribute also used to cost 10+ seconds per checkpoint.
@@ -633,6 +638,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                 hierarchy = try progress.measure(.ax) { try app.snapshot() }
             } catch {
                 lastReason = "Could not capture the AX hierarchy: \(error)"
+                progress.sampleOutcome(.axUnavailable, started: sampleStarted)
                 previous = nil
                 Thread.sleep(forTimeInterval: 0.15)
                 continue
@@ -648,6 +654,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             let raster = try CardFocusRaster(image: image, screenFrame: screenFrame)
             var observations: [CardFocusObservation] = []
             var incompleteReason: String?
+            var incompleteOutcome: CardFocusSampleOutcome?
             for candidate in candidates {
                 let frame = candidate.frame
                 // Clip-edge cards have no complete visual oracle. Fully visible
@@ -659,6 +666,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                       frame.maxY <= screenFrame.maxY - 10 else { continue }
                 guard let width = raster.markerWidth(near: frame) else {
                     incompleteReason = "No marker for \(candidate.identifier), AX frame=\(frame)"
+                    incompleteOutcome = .missingMarker
                     break
                 }
                 observations.append(CardFocusObservation(
@@ -672,20 +680,27 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             )
             if incompleteReason == nil {
                 do { _ = try current.focusedIndex() }
-                catch { incompleteReason = String(describing: error) }
+                catch {
+                    incompleteReason = String(describing: error)
+                    incompleteOutcome = .invalidFocus
+                }
             }
             progress.end(.raster, started: rasterStarted)
             if let incompleteReason {
                 // Screenshots and AX attributes cannot be captured atomically.
                 // A scroll can move between those reads, so retry the whole sample.
                 lastReason = incompleteReason
+                progress.sampleOutcome(incompleteOutcome ?? .invalidFocus, started: sampleStarted)
                 previous = nil
             } else {
                 if let previous, current.isStable(comparedTo: previous) {
+                    progress.sampleOutcome(.stablePair, started: sampleStarted)
                     print("CARD_FOCUS_CAPTURE elapsed=\(Date().timeIntervalSince(started)) "
                         + "samples=\(samples) candidates=\(candidates.count) visible=\(observations.count)")
                     return current
                 }
+                progress.sampleOutcome(previous.map { current.mismatchOutcome(comparedTo: $0) }
+                    ?? .firstComplete, started: sampleStarted)
                 lastReason = "Rendered geometry is changing: \(current.summary)"
                 previous = current
             }
@@ -774,8 +789,26 @@ private final class CardFocusProgress {
     private var captures = 0
     private var sequence = 0
     private var cumulativeMilliseconds: [Stage: Int] = [:]
+    private var lastNavigationEnd: TimeInterval?
 
     init(testCase: TestCase) { self.testCase = testCase }
+
+    func settleAfterNavigation() {
+        guard let lastNavigationEnd else { return }
+        let age = max(0, ProcessInfo.processInfo.systemUptime - lastNavigationEnd)
+        let delay = max(0, 0.5 - age)
+        if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+        print("CARD_FOCUS_SETTLE case=\(testCase.rawValue) cycle=\(cycle) step=\(step) "
+            + "direction=\(direction.rawValue) captures=\(captures) "
+            + "navigation_age_ms=\(Int(age * 1_000)) delay_ms=\(Int(delay * 1_000))")
+    }
+
+    func sampleOutcome(_ outcome: CardFocusSampleOutcome, started: TimeInterval) {
+        let navigationAge = lastNavigationEnd.map { max(0, Int((started - $0) * 1_000)) } ?? -1
+        print("CARD_FOCUS_SAMPLE_OUTCOME case=\(testCase.rawValue) cycle=\(cycle) step=\(step) "
+            + "direction=\(direction.rawValue) captures=\(captures) "
+            + "sample=\(sample) outcome=\(outcome.rawValue) navigation_age_ms=\(navigationAge)")
+    }
 
     func measure<T>(_ stage: Stage, _ operation: () throws -> T) rethrows -> T {
         let operationStarted = begin(stage)
@@ -804,6 +837,7 @@ private final class CardFocusProgress {
         let now = ProcessInfo.processInfo.systemUptime
         let elapsed = max(0, Int((now - started) * 1_000))
         cumulativeMilliseconds[stage, default: 0] += elapsed
+        if stage == .navigation && event == .end { lastNavigationEnd = now }
         if stage == .capture && event == .end { captures += 1 }
         emit(stage, event: event, operationMilliseconds: elapsed, now: now)
     }
@@ -856,6 +890,11 @@ private struct CardFocusObservation {
     var accessibilityWidth: CGFloat { accessibilityFrame.width }
 }
 
+private enum CardFocusSampleOutcome: String {
+    case axUnavailable, missingMarker, invalidFocus, firstComplete, stablePair
+    case peerCount, identifiers, focus, renderedWidth, position, otherChange
+}
+
 private struct CardFocusSnapshot {
     let observations: [CardFocusObservation]
     let screenshot: XCUIScreenshot
@@ -892,6 +931,22 @@ private struct CardFocusSnapshot {
                 && abs(lhs.accessibilityFrame.minX - rhs.accessibilityFrame.minX) <= 1
                 && abs(lhs.accessibilityFrame.minY - rhs.accessibilityFrame.minY) <= 1
         }
+    }
+
+    // Failure categories use only the already captured values. They do not
+    // participate in the acceptance predicate or add automation round trips.
+    func mismatchOutcome(comparedTo previous: Self) -> CardFocusSampleOutcome {
+        guard observations.count >= 2,
+              observations.count == previous.observations.count else { return .peerCount }
+        let pairs = Array(zip(observations, previous.observations))
+        if pairs.contains(where: { $0.0.identifier != $0.1.identifier }) { return .identifiers }
+        if pairs.contains(where: { $0.0.hasFocus != $0.1.hasFocus }) { return .focus }
+        if pairs.contains(where: { abs($0.0.visualWidth - $0.1.visualWidth) > 1 }) { return .renderedWidth }
+        if pairs.contains(where: {
+            abs($0.0.accessibilityFrame.minX - $0.1.accessibilityFrame.minX) > 1
+                || abs($0.0.accessibilityFrame.minY - $0.1.accessibilityFrame.minY) > 1
+        }) { return .position }
+        return .otherChange
     }
 }
 

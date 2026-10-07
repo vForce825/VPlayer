@@ -97,6 +97,13 @@ final class WriterInputAdmission: @unchecked Sendable {
         lock.withLock { .init(count: liveCount, bytes: liveBytes, cancelled: cancelled) }
     }
 
+    /// Structural admission only. A predecessor release cannot repair an
+    /// oversized payload/header; global metadata admission remains authoritative.
+    func fitsEmptyCapacity(bytes: Int, sampleCount: Int) -> Bool {
+        Self.nativeHeaderArraysFitReservation && capacity > 0
+            && bytes > 0 && bytes <= maximumBytes && (1...64).contains(sampleCount)
+    }
+
     func admit(bytes: Int, sampleCount: Int = 1,
                release: @escaping @Sendable () -> Void = {}) throws -> WriterInputLifetime {
         let admittedInput = try lock.withLock { () throws -> (HLSDataPlaneAdmission.Lease, ContinuousClock.Instant?) in

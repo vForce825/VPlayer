@@ -147,6 +147,15 @@ struct HLSNativeSourceDependencies: Sendable {
             diagnostics?.begin(.probe)
             let facts = try await inspect(source, retainingFacts: factsCharge, diagnostics: diagnostics)
             try validate(invocation)
+            // Route-only metadata carries no guessed video facts for masters,
+            // audio-only sources or ambiguous tracks. Final audio-only stays nil.
+            let sourceInformation = (Self.probedMediaInformation(source: source, facts: facts)
+                ?? .init(sourceWidth: 0, sourceHeight: 0, scanMode: nil, sourceFrameRate: nil))
+                .withSourceRouting(category: Self.sourceCategory(for: source), transport: nil)
+            // Stay on the paid, joined prepare task. The receiver retains only
+            // scalars; source/facts charges outlive these awaited notifications.
+            await invocation.deliverProbedSourceMediaInformation(sourceInformation, source: source)
+            try validate(invocation)
             diagnostics?.begin(.capabilities)
             let capabilities = await capabilities(facts, invocation.currentPreparationRoute())
             try validate(invocation)
@@ -169,10 +178,50 @@ struct HLSNativeSourceDependencies: Sendable {
                     compressedAudioAdmissionCandidate: plan.compressedAudioAdmissionCandidate)
             }
             try validate(invocation)
+            await invocation.deliverProbedSourceMediaInformation(sourceInformation.withSourceRouting(
+                category: Self.sourceCategory(for: source), transport: plan.transport), source: source)
+            try validate(invocation)
             guard source.withCurrentResolution(owner: owner, generation: source.generation, operation: { true }) == true else { throw HLSSourceError.staleResolution }
             return .init(source: source, facts: facts, plan: plan, resolver: resolver, sourceCharge: sourceCharge, factsCharge: factsCharge)
         } catch { await resolver.invalidate(); throw error }
     }
+    static func sourceCategory(for source: ResolvedPlaybackSource) -> PlaybackSourceCategory? {
+        switch source.topology {
+        case .media: return .direct
+        case let .hls(graph):
+            guard let root = graph.document(for: graph.rootURL) else { return nil }
+            return root.kind == .master ? .hlsMaster : .hlsMedia
+        }
+    }
+
+    /// A source snapshot is not a selected AVPlayer variant or prepared output.
+    /// Masters keep detecting until native selection provides exact metadata.
+    static func probedMediaInformation(source: ResolvedPlaybackSource,
+                                      facts: HLSCompatibilityFacts) -> PlaybackMediaInformation? {
+        guard let owner = source.context.owner, facts.owner == owner,
+              facts.resolutionGeneration == source.generation, facts.complete,
+              facts.inspectedBytes > 0, facts.inspectedBytes <= HLSCompatibilityProbe.maximumBytes,
+              facts.media.count == 1, let media = facts.media.first, !media.hasUnsupportedTracks,
+              let video = media.video, video.parameterSetsValidated,
+              video.scan != .contradictory,
+              source.withCurrentResolution(owner: owner, generation: source.generation, operation: { true }) == true else { return nil }
+        switch source.topology {
+        case .media:
+            guard media.url == source.responseURL else { return nil }
+        case let .hls(graph):
+            guard graph.documents.count == 1, let root = graph.document(for: graph.rootURL),
+                  root.kind == .media, media.url == root.responseURL else { return nil }
+        }
+        let scan: PlaybackScanMode?
+        switch video.scan {
+        case .progressive: scan = .progressive
+        case .interlaced: scan = .interlaced
+        case .unknown, .contradictory: scan = nil
+        }
+        return .init(sourceWidth: video.width, sourceHeight: video.height,
+            scanMode: scan, sourceFrameRate: video.frameRate)
+    }
+
     private func validate(_ invocation: ControlTaskRegistry.BackendPrepareInvocation) throws {
         try Task.checkCancellation()
         guard invocation.revalidateCurrentPreparation() else { throw CancellationError() }
