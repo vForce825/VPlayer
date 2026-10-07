@@ -13,6 +13,82 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testReaderFixtureVideoCursorRecognizesOnlyBoundedPayloadFreeMarkers() throws {
+        typealias Snapshot = HLSFixtureVideoReaderCursor.Snapshot
+        let marker = Snapshot(count: 0, contentType: .markerOnly, duration: .zero)
+        let compressed = Snapshot(count: 1, contentType: .dataBuffer,
+            duration: CMTime(value: 1, timescale: 30), totalSize: 4, blockSize: 4, hasFormat: true)
+        let decoded = Snapshot(count: 1, contentType: .pixelBuffer, duration: .invalid,
+            totalSize: 4, hasImage: true, hasFormat: true)
+        for kind in [HLSFixtureVideoReaderCursor.Kind.compressed, .decoded] {
+            var cursor = HLSFixtureVideoReaderCursor(kind: kind)
+            let nativeMarker = CMReadySampleBuffer<Never>(markerAt: .zero, duration: .zero)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(nativeMarker)))
+            let untimedMarker = CMReadySampleBuffer<Never>(markerAt: .invalid)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(untimedMarker)))
+            let mediaGap = CMReadySampleBuffer<Never>(markerAt: .zero,
+                duration: CMTime(value: 1, timescale: 30))
+            XCTAssertThrowsError(try cursor.consumesMedia(CMReadySampleBuffer(mediaGap)))
+            XCTAssertTrue(try cursor.consumesMedia(kind == .compressed ? compressed : decoded))
+            XCTAssertEqual(cursor.mediaSamples, 1)
+            XCTAssertEqual(cursor.consecutiveMarkers, 0)
+            for _ in 0..<HLSFixtureVideoReaderCursor.maximumConsecutiveMarkers {
+                XCTAssertFalse(try cursor.consumesMedia(marker))
+            }
+            XCTAssertThrowsError(try cursor.consumesMedia(marker))
+            XCTAssertEqual(cursor.mediaSamples, 1, "Markers must not consume a frame ordinal")
+            XCTAssertTrue(try cursor.consumesMedia(kind == .compressed ? compressed : decoded),
+                "An extra media sample after trailing markers must remain visible")
+            XCTAssertFalse(try cursor.consumesMedia(marker))
+            XCTAssertEqual(cursor.mediaSamples, 2)
+        }
+
+        var faults: [Snapshot] = []
+        for duration in [CMTime(value: 1, timescale: 30), CMTime(value: -1, timescale: 30),
+                         .indefinite, .positiveInfinity,
+                         CMTime(value: 0, timescale: 1, flags: .valid, epoch: 1)] {
+            var bad = marker; bad.duration = duration; faults.append(bad)
+        }
+        for type in [CMSampleBuffer.ContentType.dataBuffer, .pixelBuffer, .sampleReference, .taggedBuffers] {
+            var bad = marker; bad.contentType = type; faults.append(bad)
+        }
+        var bad = marker; bad.blockSize = 0; faults.append(bad)
+        bad = marker; bad.hasImage = true; faults.append(bad)
+        bad = marker; bad.hasFormat = true; faults.append(bad)
+        bad = marker; bad.totalSize = 1; faults.append(bad)
+        bad = marker; bad.valid = false; faults.append(bad)
+        bad = marker; bad.ready = false; faults.append(bad)
+        for kind in [HLSFixtureVideoReaderCursor.Kind.compressed, .decoded] {
+            for fault in faults {
+                var cursor = HLSFixtureVideoReaderCursor(kind: kind)
+                XCTAssertThrowsError(try cursor.consumesMedia(fault))
+                XCTAssertEqual(cursor.skippedMarkers, 0, "Malformed buffers must fail, never disappear")
+            }
+        }
+        var cursor = HLSFixtureVideoReaderCursor(kind: .compressed)
+        for count in [-1, 2] {
+            bad = compressed; bad.count = count
+            XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        }
+        for blockSize in [nil, 0, 3] as [Int?] {
+            bad = compressed; bad.blockSize = blockSize
+            XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        }
+        bad = compressed; bad.hasFormat = false
+        XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        bad = compressed; bad.totalSize = 0
+        XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        XCTAssertThrowsError(try cursor.consumesMedia(decoded))
+        bad = compressed; bad.blockSize = 5
+        XCTAssertTrue(try cursor.consumesMedia(bad), "Extra backing is permitted, with the exact sample size preserved")
+        var imageCursor = HLSFixtureVideoReaderCursor(kind: .decoded)
+        bad = decoded; bad.hasImage = false
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        bad = decoded; bad.blockSize = 4
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        XCTAssertThrowsError(try imageCursor.consumesMedia(compressed))
+    }
+
     func testDiagnosedSystemFailureNeverClaimsCodecUnsupported() {
         let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("ordinary-fixture", status: -1)
         XCTAssertEqual(failure, .systemFailure)
@@ -9351,9 +9427,12 @@ private enum Task17NativeRetentionFixtures {
         defer { if reader.status == .reading { reader.cancelReading() } }
         var parameterSets: [Data] = []
         var samples: [[Data]] = []
-        for _ in 0..<count {
+        var cursor = HLSFixtureVideoReaderCursor(kind: .compressed)
+        while samples.count < count {
             let next = try await provider.next()
-            let sample = try makeOwnedReaderFixtureSample(copying: XCTUnwrap(next))
+            let ready = try XCTUnwrap(next, "Expected \(count) media samples, read \(cursor.mediaSamples)")
+            guard try cursor.consumesMedia(ready) else { continue }
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
             if parameterSets.isEmpty {
                 let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
                 var parameterCount = 0, headerLength: Int32 = 0
@@ -9377,6 +9456,8 @@ private enum Task17NativeRetentionFixtures {
             try Task17Fixtures.check(status)
             samples.append(try Task17Fixtures.lengthPrefixedNALUnits(bytes))
         }
+        XCTAssertEqual(cursor.mediaSamples, count)
+        print("LARGE_IDR_ROLLOVER_READER frames=\(cursor.mediaSamples) markers=\(cursor.skippedMarkers)")
         XCTAssertGreaterThan(try XCTUnwrap(samples.first).reduce(0) { $0 + $1.count + 4 }, 600_000)
         return (parameterSets, samples)
     }

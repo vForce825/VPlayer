@@ -401,6 +401,7 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow \
             --only-testing VPlayerTests/HLSResourceTransportTests \
             --only-testing VPlayerTests/AACPassthroughTests \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testReaderFixtureVideoCursorRecognizesOnlyBoundedPayloadFreeMarkers \
             --only-testing VPlayerTests/SegmentedFMP4WriterTests/testUnboundInspectionWriterCannotSignWriterWindowContinuation \
             --only-testing VPlayerTests/SegmentedFMP4WriterTests/testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease \
             --only-testing VPlayerTests/PlaybackSourceResolverTests \
@@ -440,6 +441,7 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100 \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \

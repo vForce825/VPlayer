@@ -3,6 +3,7 @@
 
 import AVFoundation
 import AudioToolbox
+import CryptoKit
 import XCTest
 import Network
 import VPlayerCore
@@ -2201,17 +2202,60 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(firstAudio.decodeTime), timescale: audioTimescale), nativeStart), 0)
             XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(lastAudio.decodeTime + lastAudio.sampleCount * 1_024),
                 timescale: audioTimescale), nativeAudioEnd), 0)
-            // Decode the original source with the same Apple reader. This admits
-            // only actual decoder behavior shared by source and output, not a
-            // broad duration tolerance that could hide a missing head or tail.
+            // The MP4 oracle has elst + roll sample groups; Apple-HLS output
+            // has different container priming semantics. Compare original AUs
+            // and naturally drained raw PCM, never subtract an assumed delay.
+            let audioInit = try XCTUnwrap(audioRecords.first { $0.kind == .initialization }).bytes
+            var rawAudio: [SyntheticAACRawSample] = []
+            let audioInspectionLedger = HLSDeliveryApplicationChargeLedger()
+            for record in audioMedia {
+                let inspection = try FMP4CompressedAudioInspection.sourceAACFragment(
+                    initialization: audioInit, media: record.bytes, configuration: sourceAAC.configuration,
+                    expectedDuration: ExactMediaTime(try XCTUnwrap(record.duration)),
+                    applicationLedger: audioInspectionLedger)
+                let mdat = try XCTUnwrap(SyntheticAACFragmentInspector.boxes(record.bytes).first { $0.type == "mdat" })
+                var payloadEnd = mdat.payload
+                for index in 0..<inspection.sampleCount {
+                    let sample = try XCTUnwrap(inspection.sample(at: index))
+                    let expectedPTS = try ExactMediaTime(nativeStart).adding(
+                        .init(value: Int64(rawAudio.count) * 1_024, timescale: audioRate))
+                    guard rawAudio.count < 1_024, Int(sample.decodeOrdinal) == index,
+                          sample.presentationRange.start == expectedPTS,
+                          sample.presentationRange.duration == ExactMediaTime(value: 1_024, timescale: audioRate),
+                          sample.byteSpan.lowerBound == payloadEnd, !sample.byteSpan.isEmpty,
+                          sample.byteSpan.upperBound <= mdat.end else { throw AACRenditionFailure.invalidInput }
+                    let payload = record.bytes.subdata(in: sample.byteSpan)
+                    rawAudio.append(.init(start: sample.presentationRange.start,
+                        duration: sample.presentationRange.duration, size: payload.count,
+                        digest: Data(SHA256.hash(data: payload))))
+                    payloadEnd = sample.byteSpan.upperBound
+                }
+                guard payloadEnd == mdat.end else { throw AACRenditionFailure.invalidInput }
+            }
+            XCTAssertEqual(audioInspectionLedger.chargedBytes, 0)
+            XCTAssertEqual(rawAudio.count, Int(sourceAudioSamples / 1_024))
+            try printSyntheticAACInitialization(audioInit)
+            let originalRaw = try await inspectSyntheticAACRawPCM(file, sampleRate: audioRate, rawSamples: rawAudio)
+            let decodedRaw = try await inspectSyntheticAACRawPCM(audioOutput, sampleRate: audioRate, rawSamples: rawAudio)
+            XCTAssertEqual(originalRaw.statistics.frames, Int(sourceAudioSamples))
+            XCTAssertEqual(decodedRaw.statistics.frames, Int(sourceAudioSamples))
+            XCTAssertEqual(decodedRaw.format, originalRaw.format,
+                "Raw decoding must preserve the original AAC stream description")
+            XCTAssertEqual(decodedRaw.pcmSHA256, originalRaw.pcmSHA256,
+                "Every original AAC AU must produce the identical complete raw PCM sequence")
+            XCTAssertEqual(decodedRaw.statistics.silentWindows, 0)
+            // Standalone container decoding remains observable, but is not an
+            // HLS playback or physical HomePod audible-endpoint oracle.
             let original = try await inspectSyntheticAACPCM(file, sampleRate: audioRate)
             let decoded = try await inspectSyntheticAACPCM(audioOutput, sampleRate: audioRate)
+            print("LARGE_IDR_AAC_CONTAINER_DIAGNOSTIC rate=\(audioRate) " +
+                "oracleFrames=\(original.frames) nativeFrames=\(decoded.frames) " +
+                "oracleFirst=\(String(describing: original.firstPresentationTime)) " +
+                "oracleEnd=\(String(describing: original.endPresentationTime)) " +
+                "nativeFirst=\(String(describing: decoded.firstPresentationTime)) " +
+                "nativeEnd=\(String(describing: decoded.endPresentationTime)) physicalAudibleEndpointVerified=false")
             XCTAssertGreaterThan(original.frames, 0)
-            XCTAssertEqual(decoded.frames, original.frames)
-            XCTAssertEqual(CMTimeCompare(try XCTUnwrap(decoded.firstPresentationTime),
-                CMTimeAdd(try XCTUnwrap(original.firstPresentationTime), nativeStart)), 0)
-            XCTAssertEqual(CMTimeCompare(try XCTUnwrap(decoded.endPresentationTime),
-                CMTimeAdd(try XCTUnwrap(original.endPresentationTime), nativeStart)), 0)
+            XCTAssertGreaterThan(decoded.frames, 0)
             XCTAssertLessThanOrEqual(decoded.maximumGapSamples, 1)
             XCTAssertEqual(decoded.silentWindows, 0)
             print("LARGE_IDR_NATIVE codec=\(codec) frameRate=\(frameRate) gops=\(videoMedia.count) " +
@@ -2370,6 +2414,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let track = try XCTUnwrap(tracks.first)
         let timescale = try await track.load(.naturalTimeScale)
         XCTAssertEqual(timescale % frameRate, 0)
+        let trackRange = try await track.load(.timeRange)
+        print("LARGE_IDR_VIDEO_TRACK scale=\(timescale) start=\(hlsFixtureTimeDescription(trackRange.start)) " +
+            "duration=\(hlsFixtureTimeDescription(trackRange.duration)) expectedStart=\(hlsFixtureTimeDescription(expectedStart)) " +
+            "expectedEnd=\(hlsFixtureTimeDescription(expectedEnd))")
         let firstFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.first), label: "LARGE_IDR_VIDEO_START")
         let lastFragment = try SyntheticAACFragmentInspector.inspect(try XCTUnwrap(media.last), label: "LARGE_IDR_VIDEO_END")
         XCTAssertEqual(CMTimeCompare(CMTime(value: Int64(firstFragment.decodeTime), timescale: timescale), expectedStart), 0)
@@ -2382,11 +2430,32 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         defer { if compressed.status == .reading { compressed.cancelReading() } }
         var count = 0
         var compressedEnd: CMTime?
+        var compressedCursor = HLSFixtureVideoReaderCursor(kind: .compressed)
+        var mismatchReports = 0
         while let ready = try await compressedProvider.next() {
+            guard try compressedCursor.consumesMedia(ready) else {
+                if compressedCursor.skippedMarkers <= 8 {
+                    let markerPTS = ready.withUnsafeSampleBuffer { CMSampleBufferGetPresentationTimeStamp($0) }
+                    print("LARGE_IDR_VIDEO_MARKER ordinal=\(count) pts=\(hlsFixtureTimeDescription(markerPTS))")
+                }
+                continue
+            }
             let sample = try makeOwnedReaderFixtureSample(copying: ready)
             let expectedPTS = CMTimeAdd(expectedStart, CMTime(value: Int64(count), timescale: frameRate))
-            XCTAssertEqual(CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(sample), expectedPTS), 0)
-            compressedEnd = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sample), CMSampleBufferGetDuration(sample))
+            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+            let duration = CMSampleBufferGetDuration(sample)
+            let comparison = CMTimeCompare(pts, expectedPTS)
+            if comparison != 0, mismatchReports < 8 {
+                let exactExpected = try ExactMediaTime(expectedStart)
+                    .adding(ExactMediaTime(value: Int64(count), timescale: frameRate)).cmTime
+                let originalPTS = ready.withUnsafeSampleBuffer { CMSampleBufferGetPresentationTimeStamp($0) }
+                print("LARGE_IDR_VIDEO_TIME ordinal=\(count) copied=\(hlsFixtureTimeDescription(pts)) " +
+                    "borrowed=\(hlsFixtureTimeDescription(originalPTS)) duration=\(hlsFixtureTimeDescription(duration)) " +
+                    "\(largeIDRTimeEvidence(actual: pts, expected: expectedPTS, exactExpected: exactExpected))")
+                mismatchReports += 1
+            }
+            XCTAssertEqual(comparison, 0, "Compressed media ordinal \(count)")
+            compressedEnd = CMTimeAdd(pts, duration)
             if count % Int(frameRate * 5) == 0 {
                 let bytes = CMSampleBufferGetTotalSampleSize(sample)
                 XCTAssertGreaterThanOrEqual(bytes, minimumIDRBytes,
@@ -2398,6 +2467,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
         XCTAssertEqual(compressed.status, .completed, String(describing: compressed.error))
         XCTAssertEqual(count, Int(frameRate * 15))
+        XCTAssertEqual(compressedCursor.mediaSamples, count)
+        print("LARGE_IDR_VIDEO_COMPRESSED frames=\(count) markers=\(compressedCursor.skippedMarkers) " +
+            "end=\(hlsFixtureTimeDescription(try XCTUnwrap(compressedEnd)))")
         XCTAssertEqual(CMTimeCompare(try XCTUnwrap(compressedEnd), expectedEnd), 0)
 
         let reader = try AVAssetReader(asset: asset)
@@ -2408,7 +2480,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         defer { if reader.status == .reading { reader.cancelReading() } }
         var frames = 0
         var previousPTS: CMTime?
+        var decodedCursor = HLSFixtureVideoReaderCursor(kind: .decoded)
         while let ready = try await provider.next() {
+            guard try decodedCursor.consumesMedia(ready) else { continue }
             let sample = try makeOwnedReaderFixtureSample(copying: ready)
             let image = try XCTUnwrap(CMSampleBufferGetImageBuffer(sample))
             XCTAssertEqual(CVPixelBufferGetWidth(image), width)
@@ -2424,8 +2498,30 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
         XCTAssertEqual(reader.status, .completed, String(describing: reader.error))
         XCTAssertEqual(frames, Int(frameRate * 15), "Decode every original output frame, including the final GOP")
-        XCTAssertEqual(CMTimeCompare(CMTimeAdd(try XCTUnwrap(previousPTS), CMTime(value: 1, timescale: frameRate)),
-            expectedEnd), 0, "The final decoded frame must reach the original video endpoint")
+        XCTAssertEqual(decodedCursor.mediaSamples, frames)
+        let finalPTS = try XCTUnwrap(previousPTS)
+        let decodedEnd = CMTimeAdd(finalPTS, CMTime(value: 1, timescale: frameRate))
+        let exactDecodedEnd = try ExactMediaTime(finalPTS)
+            .adding(ExactMediaTime(value: 1, timescale: frameRate)).cmTime
+        print("LARGE_IDR_VIDEO_DECODED frames=\(frames) markers=\(decodedCursor.skippedMarkers) " +
+            "lastPTS=\(hlsFixtureTimeDescription(finalPTS)) exactEnd=\(hlsFixtureTimeDescription(exactDecodedEnd)) " +
+            "\(largeIDRTimeEvidence(actual: decodedEnd, expected: expectedEnd, exactExpected: expectedEnd))")
+        XCTAssertEqual(CMTimeCompare(decodedEnd, expectedEnd), 0,
+            "The final decoded frame must reach the original video endpoint")
+    }
+
+    /// Keep the native assertion and an independent integer-domain diagnostic.
+    /// CMTimeAdd may round when its LCM scale or value overflows; seconds alone
+    /// cannot distinguish that from changed media timestamps or reader coordinates.
+    /// https://developer.apple.com/documentation/coremedia/cmtimeadd(_:_:)
+    private func largeIDRTimeEvidence(actual: CMTime, expected: CMTime, exactExpected: CMTime) -> String {
+        let exactActual = try? ExactMediaTime(actual)
+        let exactTarget = try? ExactMediaTime(exactExpected)
+        let delta = exactActual.flatMap { value in exactTarget.flatMap { try? value.subtracting($0) } }
+        let deltaText = delta.map { hlsFixtureTimeDescription($0.cmTime) } ?? "non-exact"
+        return "actual=\(hlsFixtureTimeDescription(actual)) expected=\(hlsFixtureTimeDescription(expected)) " +
+            "exactExpected=\(hlsFixtureTimeDescription(exactExpected)) exactDelta=\(deltaText) " +
+            "compare=\(CMTimeCompare(actual, expected))"
     }
 
     private func assertLargeIDRNativeOwnersRetired(_ probe: HLSWriterAcceptanceProbe) async throws {
@@ -2440,6 +2536,40 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(retired.acceptedInputCount, retired.releasedInputCount)
         XCTAssertEqual(retired.evidenceCount, 0)
         XCTAssertEqual(retired.pendingCallbacks, 0)
+    }
+
+    func testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift() throws {
+        let duration = ExactMediaTime(value: 1_024, timescale: 44_100)
+        let first = SyntheticAACRawSample(start: .init(value: 10, timescale: 1), duration: duration,
+            size: 1, digest: Data(SHA256.hash(data: Data([0x21]))))
+        let second = SyntheticAACRawSample(start: try first.start.adding(duration), duration: duration,
+            size: 1, digest: Data(SHA256.hash(data: Data([0x22]))))
+        func reader(_ sample: SyntheticAACRawSample, pts: ExactMediaTime) -> SyntheticAACByteTiming.ReaderSample {
+            .init(size: sample.size, digest: sample.digest, pts: pts.cmTime, duration: sample.duration.cmTime)
+        }
+        var exact = SyntheticAACByteTiming()
+        try exact.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
+        try exact.observe(raw: second, reader: reader(second, pts: duration))
+        XCTAssertEqual(exact.frames, 2, "The complete reader may use a different constant time origin")
+        var changedPayload = SyntheticAACByteTiming()
+        XCTAssertThrowsError(try changedPayload.observe(raw: first,
+            reader: reader(second, pts: .init(value: 0, timescale: 1))))
+        var droppedHead = SyntheticAACByteTiming()
+        XCTAssertThrowsError(try droppedHead.observe(raw: first, reader: reader(second, pts: duration)))
+        var shifted = SyntheticAACByteTiming()
+        try shifted.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
+        XCTAssertThrowsError(try shifted.observe(raw: second, reader: reader(second,
+            pts: duration.adding(.init(value: 1, timescale: 44_100)))))
+        var duplicate = SyntheticAACByteTiming()
+        try duplicate.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
+        XCTAssertThrowsError(try duplicate.observe(raw: second, reader: reader(first, pts: duration)))
+        let repeatedPayload = SyntheticAACRawSample(start: second.start, duration: duration,
+            size: first.size, digest: first.digest)
+        var repeatedTiming = SyntheticAACByteTiming()
+        try repeatedTiming.observe(raw: first, reader: reader(first, pts: .init(value: 0, timescale: 1)))
+        XCTAssertThrowsError(try repeatedTiming.observe(raw: repeatedPayload,
+            reader: reader(first, pts: .init(value: 0, timescale: 1))),
+            "Identical payloads cannot select a different sample ordinal or conceal repeated PTS")
     }
 
     func testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute() throws {
@@ -2542,6 +2672,148 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertTrue(retired, "Diagnostic failure must still retire the real graph")
             throw error
         }
+    }
+
+    private func printSyntheticAACInitialization(_ bytes: Data) throws {
+        // Diagnostic bytes only: no inferred delay or reader offset enters assertions.
+        var metadata: [String: String] = [:]
+        func visit(_ start: Int, _ end: Int, path: String, depth: Int) throws {
+            guard depth <= 6 else { throw AACRenditionFailure.capacityExceeded }
+            for box in try SyntheticAACFragmentInspector.boxes(bytes, from: start, through: end) {
+                let name = path + "/" + box.type
+                if ["mvhd", "mdhd", "elst", "sgpd", "sbgp"].contains(box.type) {
+                    guard box.end - box.payload <= 4_096, metadata[name] == nil else {
+                        throw AACRenditionFailure.invalidInput
+                    }
+                    metadata[name] = bytes[box.payload..<box.end].map { String(format: "%02x", $0) }.joined()
+                }
+                if ["moov", "trak", "mdia", "minf", "stbl", "edts"].contains(box.type) {
+                    try visit(box.payload, box.end, path: name, depth: depth + 1)
+                }
+            }
+        }
+        try visit(0, bytes.count, path: "", depth: 0)
+        let data = try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
+        print("LARGE_IDR_AAC_NATIVE_INIT \(String(decoding: data, as: UTF8.self))")
+    }
+
+    private func inspectSyntheticAACRawPCM(_ url: URL, sampleRate: Int32,
+        rawSamples: [SyntheticAACRawSample]) async throws -> SyntheticAACRawPCM {
+        guard !rawSamples.isEmpty, rawSamples.count <= 1_024 else { throw AACRenditionFailure.capacityExceeded }
+        let expectedFrames = rawSamples.count * 1_024
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        let track = try XCTUnwrap(tracks.first)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+        guard reader.canAdd(output) else { throw AACRenditionFailure.invalidInput }
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        let input = SyntheticAACPacketInput(rawSamples: rawSamples, sampleRate: sampleRate)
+        var decoder: AudioConverterRef?
+        defer { if let decoder { AudioConverterDispose(decoder) } }
+        var format: CMAudioFormatDescription?
+        var statistics = SyntheticAACPCMStatistics(sampleRate: sampleRate)
+        var pcmHash = SHA256()
+        var decoded = [Float](repeating: 0, count: 4_096 * 2)
+        var naturallyDrained = false
+        defer {
+            print("LARGE_IDR_AAC_RAW_DECODE file=\(url.lastPathComponent) au=\(input.timeline.frames) " +
+                "frames=\(statistics.frames) naturalDrain=\(naturallyDrained) " +
+                "first=\(input.firstDiagnostic) last=\(input.lastDiagnostic) timing=\(input.timeline.diagnostics)")
+        }
+        // Same raw decoder contract as AACSystemLoopback.decodeRaw: original
+        // packets and cookie, no prime-property override, no trim or padded PCM.
+        func pump() throws -> Bool {
+            let converter = try XCTUnwrap(decoder)
+            for _ in 0..<(rawSamples.count + 2) {
+                var frames: UInt32 = 4_096
+                var outputBytes: UInt32 = 0
+                let status = decoded.withUnsafeMutableBytes { bytes in
+                    var list = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: 2,
+                        mDataByteSize: UInt32(bytes.count), mData: bytes.baseAddress))
+                    let status = AudioConverterFillComplexBuffer(converter, syntheticAACPacketInput,
+                        Unmanaged.passUnretained(input).toOpaque(), &frames, &list, nil)
+                    outputBytes = list.mBuffers.mDataByteSize
+                    return status
+                }
+                let paused = status == SyntheticAACPacketInput.needsInputStatus
+                if !paused { try AACRenditionEncoder.check(status) }
+                guard frames <= 4_096, outputBytes == frames * 8,
+                      statistics.frames <= expectedFrames - Int(frames) else {
+                    throw AACRenditionFailure.invalidInput
+                }
+                if frames > 0 {
+                    let bytes = decoded.withUnsafeBytes { Data($0.prefix(Int(outputBytes))) }
+                    pcmHash.update(data: bytes)
+                    // Zero-based raw PCM ordinals are independent of each
+                    // container reader's presentation-time translation.
+                    let sample = try PCMSampleBufferBuilder.make(bytes: bytes, frameCount: Int(frames),
+                        sampleRate: sampleRate, channels: 2, channelOrder: .native, channelLayoutMask: 0x3,
+                        presentationTimeStamp: CMTime(value: Int64(statistics.frames), timescale: sampleRate))
+                    try statistics.consume(sample)
+                }
+                if paused { return false }
+                if frames == 0 {
+                    guard input.ended, input.sawEOS else { throw AACRenditionFailure.invalidInput }
+                    return true
+                }
+            }
+            throw AACRenditionFailure.capacityExceeded
+        }
+        var consecutiveMarkers = 0
+        while let ready = try await provider.next() {
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            let count = CMSampleBufferGetNumSamples(sample)
+            if count == 0 {
+                let duration = CMSampleBufferGetDuration(sample)
+                guard consecutiveMarkers < 8, ready.contentType == .markerOnly,
+                      CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+                      CMSampleBufferGetTotalSampleSize(sample) == 0,
+                      CMSampleBufferGetDataBuffer(sample) == nil, CMSampleBufferGetImageBuffer(sample) == nil,
+                      CMSampleBufferGetFormatDescription(sample) == nil,
+                      !duration.isValid || (duration.isNumeric && duration.epoch == 0 && duration.value == 0) else {
+                    throw AACRenditionFailure.invalidInput
+                }
+                consecutiveMarkers += 1
+                print("LARGE_IDR_AAC_READER_MARKER file=\(url.lastPathComponent) \(SyntheticAACPacketInput.diagnostics(sample))")
+                continue
+            }
+            consecutiveMarkers = 0
+            guard ready.contentType == .dataBuffer, CMSampleBufferIsValid(sample),
+                  CMSampleBufferGetImageBuffer(sample) == nil else { throw AACRenditionFailure.invalidInput }
+            let currentFormat = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+            if let format {
+                guard CMFormatDescriptionEqual(format, otherFormatDescription: currentFormat) else {
+                    throw AACRenditionFailure.invalidInput
+                }
+            } else {
+                var source = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(currentFormat)).pointee
+                guard source.mFormatID == kAudioFormatMPEG4AAC,
+                      source.mFramesPerPacket == 1_024, source.mSampleRate == Double(sampleRate),
+                      source.mChannelsPerFrame == 2 else { throw AACRenditionFailure.invalidInput }
+                var destination = AACRenditionEncoder.pcmFormat(channels: 2)
+                destination.mSampleRate = Double(sampleRate)
+                try AACRenditionEncoder.check(AudioConverterNew(&source, &destination, &decoder))
+                let converter = try XCTUnwrap(decoder)
+                var cookieSize = 0
+                let cookie = try XCTUnwrap(CMAudioFormatDescriptionGetMagicCookie(currentFormat, sizeOut: &cookieSize))
+                guard cookieSize > 0, cookieSize <= 65_536 else { throw AACRenditionFailure.capacityExceeded }
+                try AACRenditionEncoder.check(AudioConverterSetProperty(converter,
+                    kAudioConverterDecompressionMagicCookie, UInt32(cookieSize), cookie))
+                format = currentFormat
+            }
+            try input.install(sample)
+            guard try !pump() else { throw AACRenditionFailure.invalidInput }
+        }
+        guard reader.status == .completed else { throw reader.error ?? AACRenditionFailure.invalidInput }
+        input.ended = true
+        guard try pump(), input.timeline.frames == rawSamples.count,
+              statistics.frames == expectedFrames else { throw AACRenditionFailure.invalidInput }
+        naturallyDrained = true
+        let source = try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(try XCTUnwrap(format))).pointee
+        return SyntheticAACRawPCM(statistics: statistics, pcmSHA256: Data(pcmHash.finalize()), format: AACASBD(source))
     }
 
     private func inspectSyntheticAACPCM(_ url: URL, sampleRate: Int32 = 48_000) async throws -> SyntheticAACPCMStatistics {
@@ -3198,6 +3470,172 @@ private final class SyntheticAACContinuityCapture: @unchecked Sendable {
                 "start=\(record.start?.seconds ?? -1) duration=\(record.duration?.seconds ?? -1) bytes=\(record.bytes.count)")
         }
     }
+}
+
+/// Scalars hashed from each complete, contiguous native mdat payload span.
+private struct SyntheticAACRawSample {
+    let start: ExactMediaTime
+    let duration: ExactMediaTime
+    let size: Int
+    let digest: Data
+}
+
+/// Match every ordinal before deriving a constant reader-time translation.
+/// Neither first-PTS coincidence nor a duration tolerance establishes coverage.
+private struct SyntheticAACByteTiming {
+    struct ReaderSample {
+        let size: Int
+        let digest: Data
+        let pts: CMTime
+        let duration: CMTime
+    }
+    private(set) var frames = 0
+    private var translation: ExactMediaTime?
+    private var rawEnd: ExactMediaTime?
+    private var readerEnd: ExactMediaTime?
+
+    mutating func observe(raw: SyntheticAACRawSample, reader: ReaderSample) throws {
+        guard raw.size > 0, raw.size == reader.size, raw.digest.count == 32,
+              raw.digest == reader.digest else {
+            throw NSError(domain: "SyntheticAACByteTiming", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "AAC payload identity differs at ordinal \(frames)"])
+        }
+        let start = try ExactMediaTime(reader.pts)
+        let duration = try ExactMediaTime(reader.duration)
+        let offset = try start.subtracting(raw.start)
+        guard duration == raw.duration, duration.value > 0,
+              translation == nil || translation == offset,
+              rawEnd == nil || rawEnd == raw.start,
+              readerEnd == nil || readerEnd == start else {
+            throw NSError(domain: "SyntheticAACByteTiming", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "AAC timing differs at ordinal \(frames): raw=\(raw.start) reader=\(start) offset=\(offset)"])
+        }
+        rawEnd = try raw.start.adding(duration)
+        readerEnd = try start.adding(duration)
+        translation = offset
+        frames += 1
+    }
+    var diagnostics: String {
+        "verifiedOrdinals=\(frames) translation=\(String(describing: translation)) " +
+            "rawEnd=\(String(describing: rawEnd)) readerEnd=\(String(describing: readerEnd))"
+    }
+}
+
+private struct SyntheticAACRawPCM {
+    let statistics: SyntheticAACPCMStatistics
+    let pcmSHA256: Data
+    let format: AACASBD
+}
+
+/// Own exactly one compressed reader batch until the synchronous converter asks
+/// for more input. Per-AU identity is checked against original native mdat bytes.
+private final class SyntheticAACPacketInput {
+    static let needsInputStatus: OSStatus = 0x76706E69
+    let rawSamples: [SyntheticAACRawSample]
+    let sampleRate: Int32
+    var timeline: SyntheticAACByteTiming
+    private var retained: CMSampleBuffer?
+    private var pointer: UnsafeMutablePointer<Int8>?
+    private var descriptions: UnsafePointer<AudioStreamPacketDescription>?
+    private var count = 0
+    private var index = 0
+    private let supplied = UnsafeMutablePointer<AudioStreamPacketDescription>.allocate(capacity: 1)
+    var ended = false
+    var sawEOS = false
+    private(set) var firstDiagnostic = ""
+    private(set) var lastDiagnostic = ""
+
+    init(rawSamples: [SyntheticAACRawSample], sampleRate: Int32) {
+        self.rawSamples = rawSamples; self.sampleRate = sampleRate
+        timeline = SyntheticAACByteTiming()
+        supplied.initialize(to: AudioStreamPacketDescription())
+    }
+    deinit { supplied.deinitialize(count: 1); supplied.deallocate() }
+
+    static func diagnostics(_ sample: CMSampleBuffer) -> String {
+        func trim(_ key: CFString) -> String {
+            CMGetAttachment(sample, key: key, attachmentModeOut: nil).map { String(describing: $0) } ?? "absent"
+        }
+        return "count=\(CMSampleBufferGetNumSamples(sample)) " +
+            "pts=\(CMSampleBufferGetPresentationTimeStamp(sample)) duration=\(CMSampleBufferGetDuration(sample)) " +
+            "outputPTS=\(CMSampleBufferGetOutputPresentationTimeStamp(sample)) " +
+            "outputDuration=\(CMSampleBufferGetOutputDuration(sample)) " +
+            "trimStart=\(trim(kCMSampleBufferAttachmentKey_TrimDurationAtStart)) " +
+            "trimEnd=\(trim(kCMSampleBufferAttachmentKey_TrimDurationAtEnd))"
+    }
+
+    func install(_ sample: CMSampleBuffer) throws {
+        guard retained == nil, !ended else { throw AACRenditionFailure.invalidInput }
+        let diagnostic = Self.diagnostics(sample)
+        if firstDiagnostic.isEmpty { firstDiagnostic = diagnostic }
+        lastDiagnostic = diagnostic
+        let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+        let packetCount = CMSampleBufferGetNumSamples(sample)
+        guard packetCount > 0, packetCount <= rawSamples.count - timeline.frames else {
+            throw AACRenditionFailure.capacityExceeded
+        }
+        var descriptionBytes = 0, contiguousBytes = 0, totalBytes = 0
+        try AACRenditionEncoder.check(CMSampleBufferGetAudioStreamPacketDescriptionsPtr(sample,
+            packetDescriptionsPointerOut: &descriptions, sizeOut: &descriptionBytes))
+        try AACRenditionEncoder.check(CMBlockBufferGetDataPointer(block, atOffset: 0,
+            lengthAtOffsetOut: &contiguousBytes, totalLengthOut: &totalBytes, dataPointerOut: &pointer))
+        let expectedBytes = rawSamples[timeline.frames..<(timeline.frames + packetCount)].reduce(0) { $0 + Int($1.size) }
+        guard totalBytes == expectedBytes, contiguousBytes == totalBytes,
+              descriptionBytes == packetCount * MemoryLayout<AudioStreamPacketDescription>.stride,
+              let pointer, let descriptions,
+              CMTimeCompare(CMSampleBufferGetDuration(sample),
+                CMTime(value: Int64(packetCount) * 1_024, timescale: sampleRate)) == 0 else {
+            throw AACRenditionFailure.invalidInput
+        }
+        var offset = 0
+        for position in 0..<packetCount {
+            let description = descriptions[position]
+            let size = Int(description.mDataByteSize)
+            guard description.mStartOffset == Int64(offset), size > 0, size <= totalBytes - offset,
+                  description.mVariableFramesInPacket == 0 || description.mVariableFramesInPacket == 1_024 else {
+                throw AACRenditionFailure.invalidInput
+            }
+            var hash = SHA256()
+            hash.update(bufferPointer: UnsafeRawBufferPointer(start: pointer.advanced(by: offset), count: size))
+            let pts = CMTimeAdd(CMSampleBufferGetPresentationTimeStamp(sample),
+                CMTime(value: Int64(position) * 1_024, timescale: sampleRate))
+            try timeline.observe(raw: rawSamples[timeline.frames], reader: .init(size: size,
+                digest: Data(hash.finalize()), pts: pts, duration: CMTime(value: 1_024, timescale: sampleRate)))
+            offset += size
+        }
+        guard offset == totalBytes else { throw AACRenditionFailure.invalidInput }
+        retained = sample; count = packetCount; index = 0
+    }
+
+    func provide(_ packetCount: UnsafeMutablePointer<UInt32>, data: UnsafeMutablePointer<AudioBufferList>,
+        outputDescriptions: UnsafeMutablePointer<UnsafeMutablePointer<AudioStreamPacketDescription>?>?) -> OSStatus {
+        packetCount.pointee = 0
+        data.pointee = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer())
+        outputDescriptions?.pointee = nil
+        if index == count {
+            retained = nil; pointer = nil; descriptions = nil; count = 0; index = 0
+            if ended { sawEOS = true; return noErr }
+            return Self.needsInputStatus
+        }
+        guard let pointer, let descriptions else { return kAudio_ParamError }
+        let original = descriptions[index]
+        supplied.pointee = original
+        supplied.pointee.mStartOffset = 0
+        packetCount.pointee = 1
+        data.pointee.mBuffers = AudioBuffer(mNumberChannels: 0, mDataByteSize: original.mDataByteSize,
+            mData: UnsafeMutableRawPointer(pointer.advanced(by: Int(original.mStartOffset))))
+        outputDescriptions?.pointee = supplied
+        index += 1
+        return noErr
+    }
+}
+
+private func syntheticAACPacketInput(_ converter: AudioConverterRef, _ packetCount: UnsafeMutablePointer<UInt32>,
+    _ data: UnsafeMutablePointer<AudioBufferList>, _ descriptions: UnsafeMutablePointer<UnsafeMutablePointer<AudioStreamPacketDescription>?>?,
+    _ context: UnsafeMutableRawPointer?) -> OSStatus {
+    guard let context else { packetCount.pointee = 0; return kAudio_ParamError }
+    return Unmanaged<SyntheticAACPacketInput>.fromOpaque(context).takeUnretainedValue().provide(
+        packetCount, data: data, outputDescriptions: descriptions)
 }
 
 private struct SyntheticAACPCMStatistics {
