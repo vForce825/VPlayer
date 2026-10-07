@@ -216,7 +216,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
                 let identity = try XCTUnwrap(factory.backend?.identity)
                 XCTAssertNotEqual(identity, previousBackend)
                 previousBackend = identity
-                weak var originalDriver = factory.backend?.nativeSystemDriverForTesting
+                let originalDriver = NativeSystemDriverWeakObservation(factory.backend?.nativeSystemDriverForTesting)
                 let stopped = NativeTimingWakeCounter()
                 let stop = Task { await controller.stop(); stopped.record() }
                 do { try await wait { stopped.count == 1 } }
@@ -233,7 +233,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
                 await registry.joinOwnedTerminalCleanup()
                 XCTAssertNil(registry.outputResourceContextSnapshot())
                 XCTAssertNil(factory.backend)
-                XCTAssertNil(originalDriver, "The original physical driver and SDK aliases must release")
+                XCTAssertNil(originalDriver.value, "The original physical driver and SDK aliases must release")
                 if failure != nil { break }
             } catch {
                 failure = error
@@ -1033,6 +1033,12 @@ private final class NativeAdapterFixture {
             throw HLSSourceError.deadline
         }
     }
+}
+
+@MainActor
+private final class NativeSystemDriverWeakObservation {
+    weak var value: SystemAVPlayerDriver?
+    init(_ value: SystemAVPlayerDriver?) { self.value = value }
 }
 
 private final class NativeTimingWakeCounter: @unchecked Sendable {
