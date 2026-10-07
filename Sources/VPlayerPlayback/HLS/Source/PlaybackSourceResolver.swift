@@ -101,14 +101,19 @@ private struct SourceGraphLoader: Sendable {
     func load(context: PlaybackSourceContext, generation: UInt64) async throws -> ResolvedPlaybackSource {
         let deadline = HLSMonotonicClock.deadline(seconds: 10)
         let root = try await transport.fetch(.init(url: context.entryURL, headers: context.headers,
-            maximumBytes: HLSManifestGraph.maximumPlaylistBytes, deadline: deadline, mode: .classify))
+            maximumBytes: HLSManifestGraph.maximumPlaylistBytes, deadline: deadline, mode: .classify,
+            maximumTSContinuationBytes: HLSCompatibilityProbe.maximumBytes))
         try Task.checkCancellation()
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
-        guard !root.data.isEmpty, root.data.count <= HLSManifestGraph.maximumPlaylistBytes else { throw HLSSourceError.byteLimit }
+        guard !root.data.isEmpty, root.data.count <= HLSCompatibilityProbe.maximumBytes else { throw HLSSourceError.byteLimit }
+        // Only a raw TS candidate may use the continuation ceiling. This is a
+        // byte bound, not format acceptance; the ordinary probe still proves it.
+        guard root.data.count <= HLSManifestGraph.maximumPlaylistBytes || root.data.first == 0x47 else { throw HLSSourceError.byteLimit }
         if !root.data.starts(with: Data("#EXTM3U".utf8)) {
             return ResolvedPlaybackSource(context: context, responseURL: root.responseURL, generation: generation,
                 topology: .media(root.data), mediaCompleteness: root.completeness == .complete ? .complete : .prefix)
         }
+        guard root.data.count <= HLSManifestGraph.maximumPlaylistBytes else { throw HLSSourceError.byteLimit }
         guard root.completeness == .complete else { throw HLSSourceError.incompleteEvidence }
         let builder = SourceManifestGraphBuilder(transport: transport, context: context, deadline: deadline)
         let graph = try await builder.build(root: root)

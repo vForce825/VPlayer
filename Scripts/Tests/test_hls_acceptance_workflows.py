@@ -97,10 +97,19 @@ class WorkflowContracts(unittest.TestCase):
         # sibling, not a product overwritten by the later incremental build.
         self.assertIn('-derivedDataPath "$RUNNER_TEMP/ReleaseBoundary"',release)
         self.assertIn('-resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult"',startup)
+        # Match the cold build's selected simulator architecture and disable
+        # scheme-level Swift coverage without changing Release optimization.
+        self.assertIn('ONLY_ACTIVE_ARCH=YES',startup)
+        self.assertIn('-enableCodeCoverage NO',startup)
+        self.assertNotIn('ENABLE_TESTABILITY=',startup)
+        self.assertNotIn('SWIFT_OPTIMIZATION_LEVEL=',startup)
         self.assertIn('        timeout-minutes: 15\n',cold)
         self.assertIn('./Scripts/test-release-startup.sh',cold)
         self.assertNotIn('actions/cache',text)
         script=(ROOT/'Scripts/test-release-startup.sh').read_text()
+        self.assertIn('-scheme VPlayerReleaseStartupTests',startup)
+        self.assertIn('-scheme VPlayerReleaseStartupTests',script)
+        self.assertNotIn('-enableCodeCoverage',script)
         self.assertIn('for mode in normal step1; do',script)
         self.assertIn('for attempt in 1 2 3; do',script)
         self.assertLess(script.index('xcodebuild build '),script.index('simctl install'))
@@ -126,7 +135,12 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/HLSAVPlayerBackendTests/testPreparationDiagnosticScopeJoinsBeforeNativeAndReleasesItsOriginalCharge',
             'VPlayerTests/HLSAVPlayerBackendTests/testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText',
             'VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow',
-            'VPlayerTests/HLSResourceTransportTests/testContentEncodingDiagnosticCrossesDelegateBoundaryWithoutRetainingTheScope',
+            'VPlayerTests/HLSResourceTransportTests',
+            'VPlayerTests/AACPassthroughTests',
+            'VPlayerTests/SegmentedFMP4WriterTests/testReaderFixtureVideoCursorRecognizesOnlyBoundedPayloadFreeMarkers',
+            'VPlayerTests/SegmentedFMP4WriterTests/testUnboundInspectionWriterCannotSignWriterWindowContinuation',
+            'VPlayerTests/SegmentedFMP4WriterTests/testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease',
+            'VPlayerTests/PlaybackSourceResolverTests',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterPlannerRejectionStillRequiresExplicitServiceSelection',
@@ -161,6 +175,11 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/VideoRemuxEligibilityTests/testSourceRec601CannotEnterGeneratedRemuxColorContract',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels',
             'VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail',
             'VPlayerTests/HLSTimelineTests',

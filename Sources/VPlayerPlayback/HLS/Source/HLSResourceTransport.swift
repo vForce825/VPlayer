@@ -42,11 +42,15 @@ public struct HLSResourceRequest: Sendable, CustomStringConvertible, CustomRefle
     public let headers: PlaybackSourceHeaders
     public let range: HLSByteRange?
     public let maximumBytes: Int
+    /// Optional same-response TS acquisition ceiling. The original limit still
+    /// applies to manifests and other media. Valid only for classify without a range.
+    public let maximumTSContinuationBytes: Int?
     public let deadline: UInt64
     public let mode: Mode
     public init(url: URL, headers: PlaybackSourceHeaders, range: HLSByteRange? = nil, maximumBytes: Int,
-                deadline: UInt64, mode: Mode = .complete) {
+                deadline: UInt64, mode: Mode = .complete, maximumTSContinuationBytes: Int? = nil) {
         self.url = url; self.headers = headers; self.range = range; self.maximumBytes = maximumBytes; self.deadline = deadline; self.mode = mode
+        self.maximumTSContinuationBytes = maximumTSContinuationBytes
     }
     public var description: String { "HLSResourceRequest(transport=redacted, maximumBytes=\(maximumBytes))" }
     public var customMirror: Mirror { Mirror(self, children: ["transport": "redacted"]) }

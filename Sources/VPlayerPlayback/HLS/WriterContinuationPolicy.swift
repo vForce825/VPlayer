@@ -92,6 +92,58 @@ struct WriterBoundaryReserve: Sendable, Equatable {
             && inputBytes <= inputByteCapacity && pendingOutputCallbacks <= outputCallbackCapacity
     }
 }
+/// Capacity ceiling for authenticated remux input, using the already-declared
+/// payload-plus-overhead rate. This is not a measured-media bitrate assertion.
+/// Count/evidence reserves remain independent of this byte-only calculation.
+struct WriterRemuxByteBudget: Sendable, Equatable {
+    let segmentInputCount: Int
+    let maximumSegmentBytes: Int
+    private let forwardInputCount: Int
+
+    init(segmentInputCount: Int, declaredBitsPerSecond: UInt64,
+         frameDuration: ExactMediaTime) throws {
+        guard segmentInputCount > 0, declaredBitsPerSecond > 0,
+              frameDuration.value > 0 else {
+            throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+        }
+        let forward = segmentInputCount.addingReportingOverflow(2)
+        guard !forward.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
+        let rateFrames = UInt128(declaredBitsPerSecond).multipliedReportingOverflow(by: UInt128(forward.partialValue))
+        let numerator = rateFrames.partialValue.multipliedReportingOverflow(by: UInt128(frameDuration.value))
+        guard !rateFrames.overflow, !numerator.overflow else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
+        }
+        let denominator = UInt128(frameDuration.timescale) * 8
+        let payload = numerator.partialValue / denominator
+            + (numerator.partialValue % denominator == 0 ? 0 : 1)
+        let bytes = payload.addingReportingOverflow(UInt128(forward.partialValue) * 64)
+        guard !bytes.overflow, let maximum = Int(exactly: bytes.partialValue) else {
+            throw SegmentedFMP4WriterFailure.arithmeticOverflow
+        }
+        self.segmentInputCount = segmentInputCount
+        forwardInputCount = forward.partialValue
+        maximumSegmentBytes = maximum
+    }
+
+    /// Committed segment consumption never follows native release. A prospective
+    /// new segment uses zero here; the writer resets its counters only on flush.
+    func forwardBytes(maximumInputBytes: Int, currentSegmentBytes: Int = 0,
+                      currentSegmentInputCount: Int = 0, nextInputBytes: Int = 0) throws -> Int {
+        guard maximumInputBytes > 0, currentSegmentBytes >= 0,
+              currentSegmentInputCount >= 0, currentSegmentInputCount <= segmentInputCount,
+              nextInputBytes >= 0 else {
+            throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+        }
+        let projected = currentSegmentBytes.addingReportingOverflow(nextInputBytes)
+        guard !projected.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
+        guard projected.partialValue <= maximumSegmentBytes else {
+            throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
+        }
+        let observed = UInt128(forwardInputCount - currentSegmentInputCount) * UInt128(maximumInputBytes)
+        return Int(min(observed, UInt128(maximumSegmentBytes - currentSegmentBytes)))
+    }
+}
+
 struct WriterNativeFragmentFacts: Sendable, Equatable {
     let sequence: Int
     let decodeTime: UInt64

@@ -29,12 +29,11 @@
 #define SOURCE_MAX_PACKETS 512
 _Static_assert(VP_SOURCE_DOLBY_PADDING>=AV_INPUT_BUFFER_PADDING_SIZE,"native padding");
 
-typedef struct { unsigned pid; size_t start,bytes,header_size,expected; uint8_t header[6]; int active,withhold; } SourceTail;
 typedef struct {
     const uint8_t *bytes; size_t size,position;
     int64_t deadline;
     VPFFSourceInterrupt interrupt; void *context;
-    SourceTail tails[SOURCE_MAX_TRACKS]; unsigned tail_count;
+    VPSourceTSTails tails;
     int is_ts;
     VPFFSourceDiagnostic *diagnostic;
 } SourceInput;
@@ -43,45 +42,13 @@ static int source_interrupt(void *opaque) {
     return av_gettime_relative()>=i->deadline || (i->interrupt && i->interrupt(i->context));
 }
 static int prepare_ts_tails(SourceInput *input,int prefix) {
-    for (size_t o=0;o<input->size;o+=188) {
-        if (source_interrupt(input)) return AVERROR_EXIT;
-        const uint8_t *p=input->bytes+o; size_t head=4;
-        if (p[3]&0x20) head+=1+p[4];
-        if (!(p[3]&0x10) || head>=188) continue;
-        unsigned pid=((p[1]&31u)<<8)|p[2]; SourceTail *tail=NULL;
-        if (vp_source_ignored_si(pid)) continue;
-        if (input->diagnostic) { input->diagnostic->packet_index=(int32_t)(((size_t)input->diagnostic->inspected_offset+o)/188); input->diagnostic->pid=(int32_t)pid; }
-        for (unsigned j=0;j<input->tail_count;j++) if (input->tails[j].pid==pid) tail=&input->tails[j];
-        if (p[1]&0x40) {
-            size_t available=188-head;
-            int possible=p[head]==0 && (available<2 || p[head+1]==0) && (available<3 || p[head+2]==1);
-            if (!possible) continue;
-            if (tail && tail->active && (tail->header_size<6 || (tail->expected && tail->bytes<tail->expected))) return AVERROR_INVALIDDATA;
-            if (!tail) { if (input->tail_count==SOURCE_MAX_TRACKS) return AVERROR(EFBIG); tail=&input->tails[input->tail_count++]; }
-            *tail=(SourceTail){.pid=pid,.start=o,.active=1};
-        }
-        if (tail && tail->active) {
-            size_t available=188-head, copy=6-tail->header_size;
-            if (copy>available) copy=available;
-            if (copy) { memcpy(tail->header+tail->header_size,p+head,copy); tail->header_size+=copy; }
-            if (tail->header_size>=3 && (tail->header[0] || tail->header[1] || tail->header[2]!=1)) return AVERROR_INVALIDDATA;
-            if (tail->header_size==6) { unsigned length=AV_RB16(tail->header+4); tail->expected=length?length+6:0; }
-            tail->bytes+=available;
-        }
+    VPSourceAdmission view={.packet_offset=SIZE_MAX,.pid=-1};
+    int result=vp_source_prepare_ts_tails(input->bytes,input->size,prefix,source_interrupt,input,&input->tails,&view);
+    if (input->diagnostic && view.packet_offset!=SIZE_MAX) {
+        input->diagnostic->packet_index=(int32_t)(((size_t)input->diagnostic->inspected_offset+view.packet_offset)/188);
+        input->diagnostic->pid=(int32_t)view.pid;
     }
-    for (unsigned j=0;j<input->tail_count;j++) {
-        SourceTail *tail=&input->tails[j];
-        int incomplete=tail->header_size<6 || (tail->expected && tail->bytes<tail->expected);
-        if (incomplete && !prefix) {
-            if (input->diagnostic) {
-                input->diagnostic->packet_index=(int32_t)(((size_t)input->diagnostic->inspected_offset+tail->start)/188);
-                input->diagnostic->pid=(int32_t)tail->pid;
-            }
-            return AVERROR_INVALIDDATA;
-        }
-        tail->withhold=prefix && (incomplete || !tail->expected);
-    }
-    return 0;
+    return result==-ECANCELED?AVERROR_EXIT:result==-EINVAL?AVERROR_INVALIDDATA:result;
 }
 static int source_read(void *opaque,uint8_t *buffer,int capacity) {
     SourceInput *input=opaque;
@@ -96,8 +63,8 @@ static int source_read(void *opaque,uint8_t *buffer,int capacity) {
             if (source_interrupt(input)) return AVERROR_EXIT;
             size_t absolute=input->position+copied, packet=absolute-absolute%188, within=absolute%188;
             size_t amount=188-within; if (amount>count-copied) amount=count-copied;
-            unsigned pid=((input->bytes[packet+1]&31u)<<8)|input->bytes[packet+2]; int withheld=vp_source_ignored_si(pid);
-            for (unsigned j=0;j<input->tail_count;j++) if (input->tails[j].pid==pid && input->tails[j].withhold && packet>=input->tails[j].start) withheld=1;
+            unsigned pid=((input->bytes[packet+1]&31u)<<8)|input->bytes[packet+2];
+            int withheld=vp_source_ts_packet_withheld(&input->tails,pid,packet);
             if (!withheld) memcpy(buffer+copied,input->bytes+absolute,amount);
             else for (size_t j=0;j<amount;j++) { size_t k=within+j; buffer[copied+j]=k==0?0x47:k==1?0x1f:k==2?0xff:k==3?0x10:0xff; }
             copied+=amount;
@@ -650,4 +617,12 @@ done:
     av_frame_free(&frame); av_packet_free(&packet); avcodec_free_context(&codec);
     if (result<0) memset(out,0,sizeof(*out));
     return result;
+}
+
+_Static_assert((int)VP_SOURCE_ACQUISITION_READY==(int)VPFF_SOURCE_ACQUISITION_READY &&
+    (int)VP_SOURCE_ACQUISITION_NEEDS_MORE==(int)VPFF_SOURCE_ACQUISITION_NEEDS_MORE &&
+    (int)VP_SOURCE_ACQUISITION_STOP==(int)VPFF_SOURCE_ACQUISITION_STOP &&
+    (int)VP_SOURCE_ACQUISITION_CANCELLED==(int)VPFF_SOURCE_ACQUISITION_CANCELLED,"acquisition ABI");
+int32_t vp_ffmpeg_source_ts_acquisition_hint(const uint8_t *bytes,size_t size,VPFFSourceInterrupt interrupt,void *context) {
+    return vp_source_ts_acquisition_hint(bytes,size,interrupt,context);
 }

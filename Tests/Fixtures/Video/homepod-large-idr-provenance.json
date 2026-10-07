@@ -1,0 +1,118 @@
+{
+  "audio": "One continuous lavfi sine AAC encode per rate; complete warm-up AUs followed by the exact admitted 15-second oracle suffix; no duplicated priming AUs",
+  "cases": [
+    {
+      "codec": "h264",
+      "crf": 18,
+      "fps": 30,
+      "height": 1080,
+      "minimum_idr": 600000,
+      "name": "homepod-large-idr-h264-1080p30-aac44100.mp4",
+      "pixel_format": "yuv420p",
+      "profile": "High",
+      "rate": 44100,
+      "tile": 2,
+      "transfer": "bt709",
+      "width": 1920
+    },
+    {
+      "codec": "hevc",
+      "crf": 28,
+      "fps": 50,
+      "height": 2160,
+      "minimum_idr": 500000,
+      "name": "homepod-large-idr-hevc-hlg-2160p50-aac48000.mp4",
+      "pixel_format": "yuv420p10le",
+      "profile": "Main 10",
+      "rate": 48000,
+      "tile": 8,
+      "transfer": "arib-std-b67",
+      "width": 3840
+    }
+  ],
+  "duration_seconds": 15,
+  "ffmpeg_version": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "generation": "Scripts/generate-homepod-large-idr-fixtures.py --generate",
+  "gop_seconds": 5,
+  "measurements": {
+    "homepod-large-idr-h264-1080p30-aac44100.mp4": {
+      "audio_duration": "15.000091",
+      "audio_packets": 646,
+      "audio_sample_rate": "44100",
+      "bytes": 2838013,
+      "idr_bytes": [
+        850969,
+        850969,
+        850969
+      ],
+      "largest_p_bytes": 105,
+      "old_six_second_projection_bytes": 308050778,
+      "sha256": "0bf975f0fabbddca7f594178fab95b2f3f1aafa812a447e9d2ed70c0ee0eaf6d",
+      "video_duration": "15.000000",
+      "video_packets": 450
+    },
+    "homepod-large-idr-hevc-hlg-2160p50-aac48000.mp4": {
+      "audio_duration": "15.018667",
+      "audio_packets": 704,
+      "audio_sample_rate": "48000",
+      "bytes": 3125430,
+      "idr_bytes": [
+        912340,
+        912340,
+        912340
+      ],
+      "largest_p_bytes": 4302,
+      "old_six_second_projection_bytes": 549228680,
+      "sha256": "a36070aa4c10c1027a03dc1b97738b49630909bea2564234ceaec8076cd79777",
+      "video_duration": "15.000000",
+      "video_packets": 750
+    }
+  },
+  "pattern_seed": "VPlayer independent large-IDR regression v1",
+  "source": "Independent SHAKE-256 grayscale pattern and lavfi sine; no captured media or headers",
+  "transport_ffmpeg_version": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "transport_generation": "Scripts/generate-homepod-large-idr-fixtures.py --generate-transports",
+  "transport_scope": "Authored aligned-source case: five-second valid acquisition GOP; declared AAC start phase and complete warm-up ending exactly at the eligible IDR. Does not model every broadcast A/V phase.",
+  "transports": {
+    "homepod-large-idr-h264-1080p30-aac44100.ts": {
+      "aac_payload_sequence_sha256": "954477695aea46940fa3459746befd7a90c87513747e20f510ae777d1d7998fa",
+      "admitted_aac_sequence_sha256": "96b958b9736eacee89ec1b14b5ad491184c7e6314f882fd8b5e72fd86ac5b4e1",
+      "admitted_audio_packets": 646,
+      "admitted_origin_seconds": 5,
+      "audio_packets": 842,
+      "audio_start_ticks": 40400,
+      "bytes": 4143708,
+      "idr_bytes": [
+        851016,
+        851016,
+        851016,
+        851016
+      ],
+      "maximum_audio_pts_error_ticks": "4/7",
+      "sha256": "35dd44c8c406902f9bd2a7abc17a87904fb4c62c7c3c23bfba8c91a894461b24",
+      "source_video_seconds": 20,
+      "video_packets": 600,
+      "warmup_audio_packets": 196
+    },
+    "homepod-large-idr-hevc-hlg-2160p50-aac48000.ts": {
+      "aac_payload_sequence_sha256": "48057ba918c66054434e7ac62c55ef468d5b122292ba96aa2831aca213a78289",
+      "admitted_aac_sequence_sha256": "544b58cfc0e1f5b8b72da17e0c79293ab2235bcdcb4199dd289b38cf47ededfe",
+      "admitted_audio_packets": 704,
+      "admitted_origin_seconds": 5,
+      "audio_packets": 938,
+      "audio_start_ticks": 720,
+      "bytes": 4485680,
+      "idr_bytes": [
+        914764,
+        914764,
+        914764,
+        914764
+      ],
+      "maximum_audio_pts_error_ticks": "0",
+      "sha256": "d045c655d9dc28d545d114ee54389446c717e0e1cfb35d109c44aa3d488e958e",
+      "source_video_seconds": 20,
+      "video_packets": 1000,
+      "warmup_audio_packets": 234
+    }
+  }
+}

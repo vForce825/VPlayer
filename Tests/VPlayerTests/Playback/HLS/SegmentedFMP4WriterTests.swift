@@ -13,6 +13,82 @@ import VPlayerCore
 @testable import VPlayerPlayback
 
 final class SegmentedFMP4WriterTests: XCTestCase {
+    func testReaderFixtureVideoCursorRecognizesOnlyBoundedPayloadFreeMarkers() throws {
+        typealias Snapshot = HLSFixtureVideoReaderCursor.Snapshot
+        let marker = Snapshot(count: 0, contentType: .markerOnly, duration: .zero)
+        let compressed = Snapshot(count: 1, contentType: .dataBuffer,
+            duration: CMTime(value: 1, timescale: 30), totalSize: 4, blockSize: 4, hasFormat: true)
+        let decoded = Snapshot(count: 1, contentType: .pixelBuffer, duration: .invalid,
+            totalSize: 4, hasImage: true, hasFormat: true)
+        for kind in [HLSFixtureVideoReaderCursor.Kind.compressed, .decoded] {
+            var cursor = HLSFixtureVideoReaderCursor(kind: kind)
+            let nativeMarker = CMReadySampleBuffer<Never>(markerAt: .zero, duration: .zero)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(nativeMarker)))
+            let untimedMarker = CMReadySampleBuffer<Never>(markerAt: .invalid)
+            XCTAssertFalse(try cursor.consumesMedia(CMReadySampleBuffer(untimedMarker)))
+            let mediaGap = CMReadySampleBuffer<Never>(markerAt: .zero,
+                duration: CMTime(value: 1, timescale: 30))
+            XCTAssertThrowsError(try cursor.consumesMedia(CMReadySampleBuffer(mediaGap)))
+            XCTAssertTrue(try cursor.consumesMedia(kind == .compressed ? compressed : decoded))
+            XCTAssertEqual(cursor.mediaSamples, 1)
+            XCTAssertEqual(cursor.consecutiveMarkers, 0)
+            for _ in 0..<HLSFixtureVideoReaderCursor.maximumConsecutiveMarkers {
+                XCTAssertFalse(try cursor.consumesMedia(marker))
+            }
+            XCTAssertThrowsError(try cursor.consumesMedia(marker))
+            XCTAssertEqual(cursor.mediaSamples, 1, "Markers must not consume a frame ordinal")
+            XCTAssertTrue(try cursor.consumesMedia(kind == .compressed ? compressed : decoded),
+                "An extra media sample after trailing markers must remain visible")
+            XCTAssertFalse(try cursor.consumesMedia(marker))
+            XCTAssertEqual(cursor.mediaSamples, 2)
+        }
+
+        var faults: [Snapshot] = []
+        for duration in [CMTime(value: 1, timescale: 30), CMTime(value: -1, timescale: 30),
+                         .indefinite, .positiveInfinity,
+                         CMTime(value: 0, timescale: 1, flags: .valid, epoch: 1)] {
+            var bad = marker; bad.duration = duration; faults.append(bad)
+        }
+        for type in [CMSampleBuffer.ContentType.dataBuffer, .pixelBuffer, .sampleReference, .taggedBuffers] {
+            var bad = marker; bad.contentType = type; faults.append(bad)
+        }
+        var bad = marker; bad.blockSize = 0; faults.append(bad)
+        bad = marker; bad.hasImage = true; faults.append(bad)
+        bad = marker; bad.hasFormat = true; faults.append(bad)
+        bad = marker; bad.totalSize = 1; faults.append(bad)
+        bad = marker; bad.valid = false; faults.append(bad)
+        bad = marker; bad.ready = false; faults.append(bad)
+        for kind in [HLSFixtureVideoReaderCursor.Kind.compressed, .decoded] {
+            for fault in faults {
+                var cursor = HLSFixtureVideoReaderCursor(kind: kind)
+                XCTAssertThrowsError(try cursor.consumesMedia(fault))
+                XCTAssertEqual(cursor.skippedMarkers, 0, "Malformed buffers must fail, never disappear")
+            }
+        }
+        var cursor = HLSFixtureVideoReaderCursor(kind: .compressed)
+        for count in [-1, 2] {
+            bad = compressed; bad.count = count
+            XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        }
+        for blockSize in [nil, 0, 3] as [Int?] {
+            bad = compressed; bad.blockSize = blockSize
+            XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        }
+        bad = compressed; bad.hasFormat = false
+        XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        bad = compressed; bad.totalSize = 0
+        XCTAssertThrowsError(try cursor.consumesMedia(bad))
+        XCTAssertThrowsError(try cursor.consumesMedia(decoded))
+        bad = compressed; bad.blockSize = 5
+        XCTAssertTrue(try cursor.consumesMedia(bad), "Extra backing is permitted, with the exact sample size preserved")
+        var imageCursor = HLSFixtureVideoReaderCursor(kind: .decoded)
+        bad = decoded; bad.hasImage = false
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        bad = decoded; bad.blockSize = 4
+        XCTAssertThrowsError(try imageCursor.consumesMedia(bad))
+        XCTAssertThrowsError(try imageCursor.consumesMedia(compressed))
+    }
+
     func testDiagnosedSystemFailureNeverClaimsCodecUnsupported() {
         let failure = SegmentedFMP4WriterFailure.diagnosedSystemFailure("ordinary-fixture", status: -1)
         XCTAssertEqual(failure, .systemFailure)
@@ -1498,6 +1574,278 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         for lease in leases { XCTAssertTrue(relay.releaseUnpublishedLogicalSegment(lease)) }
         XCTAssertEqual(relay.usage.unpublishedLogicalSegmentCount, 0)
     }
+
+    func testDefaultRemuxWriterAcceptsLargeIDRThenSmallFramesAndLargerSecondIDR() throws {
+        for codec in [VideoCodec.h264, .hevc] {
+            let sampleEntry: HLSVideoSampleEntry = codec == .h264 ? .avc1 : .hvc1
+            let payloads = (0...210).map { index in
+                index == 0 ? 648_828 : (index == 180 ? 900_000 : (index > 180 ? 90_000 : 128))
+            }
+            let fixture = try Task17Fixtures.remuxFixture(codec: codec, sampleEntry: sampleEntry,
+                seed: codec == .h264 ? 81_000 : 81_001,
+                frames: payloads.indices.map { .init(pts: 300 + Int64($0), dts: 300 + Int64($0),
+                    isIDR: $0 == 0 || $0 == 180) },
+                frameTimestampTimescale: 30, payloadByteCounts: payloads,
+                includeHDRMetadata: false,
+                minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+                maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+            let factory = Task17FakeSystemWriterFactory()
+            let writer = try Task17Fixtures.makeWriter(seed: 81_000, kind: .video,
+                writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+                boundary: fixture.boundary, factory: factory, ownershipLimits: nil,
+                releaseTransfersImmediately: true)
+            defer { _ = writer.cancel() }
+            try writer.start(at: CMTime(value: 10, timescale: 1))
+            let native = try XCTUnwrap(factory.lastWriter)
+            native.setReleasesInputsOnFlush(true)
+            for index in payloads.indices {
+                let input = try fixture.builder.makeSubmission(for: fixture.timed[index], admission: fixture.admissions[index])
+                XCTAssertEqual(input.remuxPayloadByteCount, payloads[index])
+                try writer.appendRemuxVideo(input,
+                    ticket: fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: fixture.binding))
+            }
+            XCTAssertEqual(native.appendCount, payloads.count)
+            XCTAssertEqual(native.calls.filter { $0 == .flush }.count, 1)
+            XCTAssertEqual(factory.configurations.count, 1)
+            XCTAssertEqual(writer.usage.initializationCount, 1)
+            XCTAssertNil(writer.usage.rolloverReason)
+        }
+    }
+
+    func testDefaultRemuxWriterAdmitsExactByteCeilingAndRejectsOneByteMoreBeforeAllocation() throws {
+        let ceiling = 10_840_648
+        for extra in [0, 1] {
+            let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1,
+                seed: UInt64(81_050 + extra), frames: [.init(pts: 300, dts: 300, isIDR: true)],
+                frameTimestampTimescale: 30, payloadByteCounts: [ceiling - 64 + extra],
+                minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+                maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+            let factory = Task17FakeSystemWriterFactory()
+            let writer = try Task17Fixtures.makeWriter(seed: 81_050, kind: .video,
+                writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+                boundary: fixture.boundary, factory: factory, ownershipLimits: nil,
+                releaseTransfersImmediately: true)
+            defer { _ = writer.cancel() }
+            try writer.start(at: CMTime(value: 10, timescale: 1))
+            let input = try fixture.builder.makeSubmission(for: fixture.timed[0], admission: fixture.admissions[0])
+            let ticket = try fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: fixture.binding)
+            let before = writer.usage
+            let boundaryBefore = fixture.boundary.usage
+            if extra == 0 {
+                try writer.appendRemuxVideo(input, ticket: ticket)
+                XCTAssertEqual(writer.usage.liveInputBytes, ceiling)
+                XCTAssertNotNil(ticket.committedBoundary)
+            } else {
+                XCTAssertThrowsError(try writer.appendRemuxVideo(input, ticket: ticket)) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+                }
+                XCTAssertEqual(writer.usage, before)
+                XCTAssertEqual(fixture.boundary.usage, boundaryBefore)
+                XCTAssertEqual(factory.lastWriter?.appendCount, 0)
+                XCTAssertNil(ticket.committedBoundary)
+            }
+        }
+    }
+
+    func testDefaultRemuxSegmentByteCeilingSurvivesNativeReleaseAndRejectsBeforeClaim() throws {
+        // Baseline level 3.1 declares 14.28 Mbit/s, including existing overhead.
+        let ceiling = 10_840_648 // ceil(14_280_000 * 182 / 30 / 8) + 64 * 182
+        let firstCharge = 648_828 + 64
+        // Leave 127 bytes in the cumulative window; the next 128-byte charge
+        // crosses the exact ceiling by one even though native inputs were freed.
+        let payloads = [firstCharge - 64, ceiling - firstCharge - 64 - 127, 64]
+        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 81_100,
+            frames: payloads.indices.map { .init(pts: 300 + Int64($0), dts: 300 + Int64($0), isIDR: $0 == 0) },
+            frameTimestampTimescale: 30, payloadByteCounts: payloads,
+            minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+        XCTAssertEqual(fixture.admissions[0].bitrateEnvelope.declaredBitsPerSecond, 14_280_000)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 81_100, kind: .video,
+            writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary, factory: factory, ownershipLimits: nil,
+            releaseTransfersImmediately: true)
+        defer { _ = writer.cancel() }
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setRetainsInputs(false)
+        for index in 0..<2 {
+            let input = try fixture.builder.makeSubmission(for: fixture.timed[index], admission: fixture.admissions[index])
+            try writer.appendRemuxVideo(input,
+                ticket: fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: fixture.binding))
+            XCTAssertEqual(writer.usage.liveInputBytes, 0)
+        }
+        let pending = try fixture.builder.makeSubmission(for: fixture.timed[2], admission: fixture.admissions[2])
+        let before = writer.usage
+        let boundaryBefore = fixture.boundary.usage
+        for _ in 0..<2 {
+            let attempt = try pending.claimWriterAttempt(binding: fixture.binding)
+            let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
+            XCTAssertThrowsError(try writer.appendRemuxVideo(attempt, ticket: ticket)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+            }
+            XCTAssertNil(ticket.committedBoundary)
+            XCTAssertEqual(writer.usage, before)
+            XCTAssertEqual(fixture.boundary.usage, boundaryBefore)
+            XCTAssertEqual(native.appendCount, 2)
+            XCTAssertEqual(native.cancelCount, 0)
+        }
+    }
+
+    func testUnboundInspectionWriterCannotSignWriterWindowContinuation() async throws {
+        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 81_190,
+            frames: [.init(pts: 10_000, dts: 10_000, isIDR: true),
+                     .init(pts: 11_000, dts: 11_000, isIDR: true)],
+            frameDuration: CMTime(value: 1, timescale: 1))
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 81_190, kind: .video,
+            writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary, factory: factory,
+            ownershipLimits: .init(rolloverThreshold: 1, hardCapacity: 2),
+            releaseTransfersImmediately: true)
+        defer { _ = writer.cancel() }
+        try writer.start(at: CMTime(value: 10, timescale: 1))
+        let accepted = try fixture.builder.makeSubmission(for: fixture.timed[0], admission: fixture.admissions[0])
+        try writer.appendRemuxVideo(accepted,
+            ticket: fixture.boundary.issueRemuxVideoAppend(for: accepted, writerBinding: fixture.binding))
+        let pending = try fixture.builder.makeSubmission(for: fixture.timed[1], admission: fixture.admissions[1])
+        XCTAssertThrowsError(try writer.appendRemuxVideo(pending,
+            ticket: fixture.boundary.issueRemuxVideoAppend(for: pending, writerBinding: fixture.binding))) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
+        }
+        // Inspection callbacks can finish, but only a real native adapter can
+        // bind the publication source and obtain its private drain receipt.
+        await assertWriterThrowsError(try await writer.finishWriterWindow()) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .systemFailure)
+        }
+        XCTAssertEqual(writer.terminalReceipt?.terminalReason, .finished)
+        XCTAssertEqual(writer.terminalReceipt?.inputCount, 1)
+        XCTAssertEqual(writer.usage.mediaCallbackCount, 1)
+        XCTAssertEqual(writer.usage.liveInputCount, 0)
+    }
+
+#if DEBUG
+    func testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease() async throws {
+        let retainedIDRCount = 7
+        let nativeVideo = try await Task17NativeRetentionFixtures.largeH264Samples(count: 174)
+        var parameterSets = nativeVideo.parameterSets
+        parameterSets[0][3] = 51 // Admit the existing picture at the bounded 81.6 Mbit/s envelope.
+        let idr = try XCTUnwrap(nativeVideo.samples.first)
+        XCTAssertTrue(idr.contains { $0.first.map { $0 & 0x1F == 5 } ?? false })
+        // Repeat genuine independently decodable IDRs, then preserve the real
+        // following samples. No padded slice is submitted to the native writer.
+        let samples = Array(repeating: idr, count: retainedIDRCount)
+            + Array(nativeVideo.samples.dropFirst()) + [idr]
+        let fixture = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 81_200,
+            frames: samples.indices.map { index in .init(pts: 300 + Int64(index), dts: 300 + Int64(index),
+                isIDR: samples[index].contains { $0.first.map { $0 & 0x1F == 5 } ?? false }) },
+            frameTimestampTimescale: 30, parameterSetsOverride: parameterSets,
+            frameNALUnitsOverride: samples,
+            minimumPassthroughInterval: CMTime(value: 6, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: 6, timescale: 1))
+        XCTAssertEqual(fixture.admissions[0].bitrateEnvelope.declaredBitsPerSecond, 81_600_000)
+        var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: 81_200, kind: .video,
+            writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary, ownershipLimits: nil,
+            releaseTransfersImmediately: true)
+        defer { _ = first?.cancel() }
+        let weakFirst = TestWeakReference(first)
+        let aliases = Task17RetainedNativeInputAliases(capacity: retainedIDRCount)
+        let lastAliases = Task17RetainedNativeInputAliases(capacity: retainedIDRCount)
+        defer { aliases.releaseAll(); lastAliases.releaseAll() }
+        try first!.observeNativeInputAliasesForTesting { block in
+            if aliases.count < retainedIDRCount {
+                aliases.retainReference(to: block)
+                lastAliases.retainReference(to: block)
+            }
+        }
+        try first!.start(at: CMTime(value: 10, timescale: 1))
+        var retainedBytes = 0
+        for index in 0..<180 {
+            let input = try fixture.builder.makeSubmission(for: fixture.timed[index], admission: fixture.admissions[index])
+            if index < retainedIDRCount { retainedBytes += input.remuxPayloadByteCount + 64 }
+            try await first!.appendRemuxVideoAwaitingReadiness(input,
+                ticket: fixture.boundary.issueRemuxVideoAppend(for: input, writerBinding: fixture.binding))
+        }
+        XCTAssertEqual(aliases.count, retainedIDRCount)
+        XCTAssertEqual(lastAliases.count, retainedIDRCount)
+        let budget = try WriterRemuxByteBudget(segmentInputCount: 180,
+            declaredBitsPerSecond: fixture.admissions[0].bitrateEnvelope.declaredBitsPerSecond,
+            frameDuration: .init(value: 1, timescale: 30))
+        XCTAssertEqual(FMP4WriterLimits.video.writerHardByteCount, 64 * 1_024 * 1_024)
+        XCTAssertEqual(budget.maximumSegmentBytes, 61_891_648)
+        XCTAssertGreaterThan(retainedBytes + budget.maximumSegmentBytes, FMP4WriterLimits.video.writerHardByteCount)
+        let pending = try fixture.builder.makeSubmission(for: fixture.timed[180], admission: fixture.admissions[180])
+        await assertWriterThrowsError(try await first!.appendRemuxVideoAwaitingReadiness(pending,
+            ticket: fixture.boundary.issueRemuxVideoAppend(for: pending, writerBinding: fixture.binding))) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
+        }
+        let continuation = try await first!.finishWriterWindow()
+        XCTAssertEqual(first!.terminalReceipt?.terminalReason, .finished)
+        XCTAssertEqual(first!.terminalReceipt?.inputCount, 180)
+        XCTAssertEqual(first!.usage.mediaCallbackCount, 1)
+        XCTAssertEqual(first!.usage.lastNativeFragment?.sequence, 1)
+        XCTAssertEqual(first!.usage.segmentEvidenceCount, 0)
+        XCTAssertGreaterThanOrEqual(first!.usage.liveInputCount, retainedIDRCount)
+        XCTAssertGreaterThanOrEqual(first!.usage.liveInputBytes, retainedBytes)
+        first = nil
+        XCTAssertNil(weakFirst.value)
+        let nextBinding = Task17Fixtures.rolloverBinding(from: fixture.binding, writerIdentity: .init(rawValue: 81_201))
+        let nextFactory = Task17FakeSystemWriterFactory()
+        let next = try Task17Fixtures.makeWriter(seed: 81_201, kind: .video,
+            writerBinding: nextBinding, sourceFormatHint: fixture.builder.formatDescription,
+            boundary: fixture.boundary, factory: nextFactory, ownershipLimits: nil,
+            writerWindowContinuation: continuation, releaseTransfersImmediately: true)
+        defer { _ = next.cancel() }
+        try next.start(at: CMTime(value: 10, timescale: 1))
+        XCTAssertEqual(nextFactory.configurations.first?.initialMovieFragmentSequenceNumber, 2)
+        XCTAssertEqual(next.usage.liveInputCount, retainedIDRCount)
+        XCTAssertEqual(next.usage.liveInputBytes, retainedBytes)
+        // Same parameters, timing and admitted rate are insufficient: capacity
+        // evidence must remain bound to the actual predecessor format authority.
+        let foreignBuilder = try HLSVideoRemuxSubmissionBuilder(reference: fixture.timed[180],
+            admission: fixture.admissions[180], writerBinding: nextBinding)
+        let foreign = try foreignBuilder.makeSubmission(for: fixture.timed[180], admission: fixture.admissions[180])
+        let foreignTicket = try fixture.boundary.issueRemuxVideoAppend(for: foreign, writerBinding: nextBinding)
+        let beforeForeign = next.usage
+        XCTAssertThrowsError(try next.appendRemuxVideo(foreign, ticket: foreignTicket)) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+        }
+        XCTAssertEqual(next.usage, beforeForeign)
+        XCTAssertNil(foreignTicket.committedBoundary)
+        var attempt = try pending.claimWriterAttempt(binding: nextBinding,
+            admission: XCTUnwrap(next.writerWindowAdmission))
+        for index in 0..<2 {
+            let before = next.usage
+            let boundaryBefore = fixture.boundary.usage
+            let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
+            XCTAssertThrowsError(try next.appendRemuxVideo(attempt, ticket: ticket)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+            }
+            XCTAssertEqual(next.usage, before)
+            XCTAssertEqual(fixture.boundary.usage, boundaryBefore)
+            XCTAssertNil(ticket.committedBoundary)
+            XCTAssertEqual(nextFactory.lastWriter?.appendCount, 0)
+            XCTAssertEqual(nextFactory.lastWriter?.cancelCount, 0)
+            XCTAssertEqual(lastAliases.count, retainedIDRCount)
+            if index == 0 { aliases.releaseAll() }
+            XCTAssertEqual(next.usage.liveInputCount, retainedIDRCount)
+            XCTAssertEqual(next.usage.liveInputBytes, retainedBytes)
+            attempt = try pending.claimWriterAttempt(binding: nextBinding)
+        }
+        lastAliases.releaseAll()
+        XCTAssertEqual(next.usage.liveInputBytes, 0)
+        let ticket = try fixture.boundary.issueRemuxVideoAppend(for: attempt)
+        try next.appendRemuxVideo(attempt, ticket: ticket)
+        XCTAssertNotNil(ticket.committedBoundary)
+        XCTAssertEqual(nextFactory.configurations.count, 1)
+        XCTAssertEqual(nextFactory.lastWriter?.appendCount, 1)
+        XCTAssertEqual(next.usage.liveInputCount, 1)
+        _ = next.cancel()
+        XCTAssertEqual(next.usage.liveInputBytes, 0)
+        XCTAssertEqual(next.usage.inputAllocationCount, next.usage.inputReleaseCount)
+    }
+#endif
 
     func testDefaultNativeInputObservationDoesNotRetainPaidBacking() throws {
         let factory = Task17FakeSystemWriterFactory()
@@ -9068,6 +9416,52 @@ private final class Task17WeakSystemWriter: @unchecked Sendable {
 
 #if DEBUG
 private enum Task17NativeRetentionFixtures {
+    static func largeH264Samples(count: Int) async throws -> (parameterSets: [Data], samples: [[Data]]) {
+        let asset = AVURLAsset(url: try FixtureLoader.url("Video/homepod-large-idr-h264-1080p30-aac44100.mp4"))
+        let tracks = try await asset.loadTracks(withMediaType: .video)
+        let reader = try AVAssetReader(asset: asset)
+        let output = AVAssetReaderTrackOutput(track: try XCTUnwrap(tracks.first), outputSettings: nil)
+        guard reader.canAdd(output) else { throw SegmentedFMP4WriterFailure.invalidSystemConfiguration }
+        let provider = reader.outputProvider(for: output)
+        try reader.start()
+        defer { if reader.status == .reading { reader.cancelReading() } }
+        var parameterSets: [Data] = []
+        var samples: [[Data]] = []
+        var cursor = HLSFixtureVideoReaderCursor(kind: .compressed)
+        while samples.count < count {
+            let next = try await provider.next()
+            let ready = try XCTUnwrap(next, "Expected \(count) media samples, read \(cursor.mediaSamples)")
+            guard try cursor.consumesMedia(ready) else { continue }
+            let sample = try makeOwnedReaderFixtureSample(copying: ready)
+            if parameterSets.isEmpty {
+                let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+                var parameterCount = 0, headerLength: Int32 = 0
+                for index in 0..<2 {
+                    var pointer: UnsafePointer<UInt8>?, length = 0
+                    try Task17Fixtures.check(CMVideoFormatDescriptionGetH264ParameterSetAtIndex(format,
+                        parameterSetIndex: index, parameterSetPointerOut: &pointer,
+                        parameterSetSizeOut: &length, parameterSetCountOut: &parameterCount,
+                        nalUnitHeaderLengthOut: &headerLength))
+                    parameterSets.append(Data(bytes: try XCTUnwrap(pointer), count: length))
+                }
+                XCTAssertEqual(parameterCount, 2)
+                XCTAssertEqual(headerLength, 4)
+            }
+            let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(sample))
+            var bytes = Data(count: CMBlockBufferGetDataLength(block))
+            let status = bytes.withUnsafeMutableBytes {
+                CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count,
+                    destination: $0.baseAddress!)
+            }
+            try Task17Fixtures.check(status)
+            samples.append(try Task17Fixtures.lengthPrefixedNALUnits(bytes))
+        }
+        XCTAssertEqual(cursor.mediaSamples, count)
+        print("LARGE_IDR_ROLLOVER_READER frames=\(cursor.mediaSamples) markers=\(cursor.skippedMarkers)")
+        XCTAssertGreaterThan(try XCTUnwrap(samples.first).reduce(0) { $0 + $1.count + 4 }, 600_000)
+        return (parameterSets, samples)
+    }
+
     static func h264() throws -> (parameterSets: [Data], idr: Data) {
         let bytes = try FixtureLoader.data("Video/h264-yuv420p-one-frame.h264")
         let scan = try AnnexBScanner.scan(bytes, codec: .h264)
@@ -9877,6 +10271,8 @@ private enum Task17Fixtures {
         frameTimestampTimescale: CMTimeScale = 1_000,
         parameterSetsOverride: [Data]? = nil,
         idrOverride: Data? = nil,
+        frameNALUnitsOverride: [[Data]]? = nil,
+        payloadByteCounts: [Int]? = nil,
         inBandParameterSetsOverride: [Data]? = nil,
         includeHDRMetadata: Bool = true,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .shared,
@@ -9885,6 +10281,8 @@ private enum Task17Fixtures {
         maximumPassthroughInterval: CMTime? = nil
     ) throws -> RemuxFixture {
         precondition(frames.first?.isIDR == true)
+        precondition(frameNALUnitsOverride == nil || frameNALUnitsOverride?.count == frames.count)
+        precondition(frameNALUnitsOverride == nil || payloadByteCounts == nil)
         let parameterSets: [Data]
         let metadataNALUnits: [Data]
         let idr: Data
@@ -9950,10 +10348,22 @@ private enum Task17Fixtures {
             )))
         }
         var timed: [HLSTimedVideoAccessUnit] = []
-        for frame in frames {
+        for (index, frame) in frames.enumerated() {
+            var slice = frame.isIDR ? idr : nonIDR
+            if let payloadByteCounts {
+                // Synthetic structural fixture for the fake native adapter. Do
+                // not use padding as a substitute for a decodable native asset.
+                let nonSliceBytes = frame.isIDR && (sampleEntry == .avc3 || sampleEntry == .hev1)
+                    ? (inBandParameterSetsOverride ?? parameterSets).reduce(0) { $0 + $1.count + 4 } : 0
+                let metadataBytes = frame.isIDR ? metadataNALUnits.reduce(0) { $0 + $1.count + 4 } : 0
+                let padding = payloadByteCounts[index] - nonSliceBytes - metadataBytes - 4 - slice.count
+                precondition(padding >= 0)
+                slice.append(Data(repeating: 0xFF, count: padding))
+            }
+            let sampleNALUnits = frameNALUnitsOverride?[index] ?? [slice]
             let nals = frame.isIDR
-                ? (inBandParameterSetsOverride ?? parameterSets) + metadataNALUnits + [idr]
-                : [nonIDR]
+                ? (inBandParameterSetsOverride ?? parameterSets) + metadataNALUnits + sampleNALUnits
+                : sampleNALUnits
             let output = try timeline.consume(.packet(DemuxPacket(
                 streamIndex: 7,
                 codec: .video(codec),

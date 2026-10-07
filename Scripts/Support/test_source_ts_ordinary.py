@@ -35,6 +35,7 @@ class Diagnostic(c.Structure):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--ffmpeg-root', type=Path, required=True)
+    parser.add_argument('--baseline-library', type=Path, help='Optional prior inspector ABI library for identical facts/diagnostics')
     args = parser.parse_args()
     ffmpeg = args.ffmpeg_root.resolve()
     revision = subprocess.check_output(['git', '-C', str(ffmpeg), 'rev-parse', 'HEAD'], text=True).strip()
@@ -50,6 +51,22 @@ int ordinary_source_read(const uint8_t *bytes,size_t size,uint8_t *out,int chunk
     SourceInput input={.bytes=bytes,.size=size,.deadline=INT64_MAX,.is_ts=1};
     size_t offset=0;
     while (offset<size) {
+        int count=source_read(&input,out+offset,chunk);
+        if (count<=0) return count;
+        offset+=(size_t)count;
+    }
+    return (int)offset;
+}
+int ordinary_source_prefix_read(const uint8_t *bytes,size_t size,uint8_t *out,size_t *start,int chunk) {
+    int32_t kind=0; size_t usable=0; VPSourceAdmission view={0};
+    SourceInput input={.bytes=bytes,.size=size,.deadline=INT64_MAX};
+    int result=vp_source_admit_container_with_view(bytes,size,1,&kind,&usable,NULL,NULL,&view);
+    if (result<0 || kind!=1) return -1;
+    *start=view.start_offset;
+    input.bytes=bytes+view.start_offset; input.size=usable-view.start_offset; input.is_ts=1;
+    if ((result=prepare_ts_tails(&input,1))<0) return result;
+    size_t offset=0;
+    while (offset<input.size) {
         int count=source_read(&input,out+offset,chunk);
         if (count<=0) return count;
         offset+=(size_t)count;
@@ -73,11 +90,15 @@ int ordinary_source_read(const uint8_t *bytes,size_t size,uint8_t *out,int chunk
         old = lib.vp_ffmpeg_inspect_source_bytes_with_completeness
         new = lib.vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics
         old.argtypes, new.argtypes = arguments, arguments + [c.POINTER(Diagnostic)]
+        baseline = c.CDLL(str(args.baseline_library.resolve())) if args.baseline_library else None
+        if baseline:
+            baseline.vp_ffmpeg_inspect_source_bytes_with_completeness.argtypes = arguments
+            baseline.vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics.argtypes = arguments + [c.POINTER(Diagnostic)]
         @interrupt_type
         def running(_):
             return 0
 
-        def inspect(data, prefix=0, enhanced=True, interrupt=running):
+        def inspect(data, prefix=0, enhanced=True, interrupt=running, baseline_call=False):
             facts = []
             @callback_type
             def collect(_, pointer):
@@ -88,7 +109,9 @@ int ordinary_source_read(const uint8_t *bytes,size_t size,uint8_t *out,int chunk
                 facts.append(snapshot)
             buffer, kind, diagnostic = c.create_string_buffer(data), c.c_int32(), Diagnostic()
             args = [buffer, len(data), prefix, 10_000_000, interrupt, collect, None, c.byref(kind)]
-            result = new(*args, c.byref(diagnostic)) if enhanced else old(*args)
+            detailed = baseline.vp_ffmpeg_inspect_source_bytes_with_completeness_and_diagnostics if baseline_call else new
+            legacy = baseline.vp_ffmpeg_inspect_source_bytes_with_completeness if baseline_call else old
+            result = detailed(*args, c.byref(diagnostic)) if enhanced else legacy(*args)
             assert c.string_at(buffer, len(data)) == data, 'private read view mutated source bytes'
             if enhanced:
                 assert diagnostic.native_result == result
@@ -99,7 +122,13 @@ int ordinary_source_read(const uint8_t *bytes,size_t size,uint8_t *out,int chunk
                 assert -1 <= diagnostic.packet_index <= 8388608 // 188
                 assert -1 <= diagnostic.pid <= 8191 and -1 <= diagnostic.stream_index < 8
                 assert 0 <= diagnostic.stream_count <= 9
-            return (result, kind.value, facts), diagnostic
+            actual = (result, kind.value, facts)
+            if baseline and not baseline_call:
+                previous, previous_diagnostic = inspect(data, prefix, enhanced, interrupt, baseline_call=True)
+                assert actual == previous, 'native refactor changed return/classification/callback facts'
+                if enhanced:
+                    assert bytes(diagnostic) == bytes(previous_diagnostic), 'native refactor changed diagnostic coordinates/reason'
+            return actual, diagnostic
 
         data = (ROOT / 'Tests/VPlayerTests/Fixtures/Media/progressive-h264-aac.ts').read_bytes()
         control, diagnostic = inspect(data)
@@ -155,6 +184,30 @@ int ordinary_source_read(const uint8_t *bytes,size_t size,uint8_t *out,int chunk
             assert read(source, len(sample), output, chunk) == len(sample)
             assert output.raw == expected and c.string_at(source, len(sample)) == sample
         print('Private reader: no-tail path and cross-packet reads suppress only the three SI PIDs')
+        prefix_read = lib.ordinary_source_prefix_read
+        prefix_read.argtypes = [c.c_void_p, c.c_size_t, c.c_void_p, c.POINTER(c.c_size_t), c.c_int]
+        hint = lib.vp_ffmpeg_source_ts_acquisition_hint
+        hint.argtypes = [c.c_void_p, c.c_size_t, interrupt_type, c.c_void_p]
+        tables = fixtures.acquisition_tables()
+        ready = fixtures.acquisition_pes(fixtures.ACQUISITION_HEVC)
+        unbounded = fixtures.acquisition_pes(fixtures.ACQUISITION_HEVC, zero=True)
+        incomplete = fixtures.acquisition_pes(fixtures.ACQUISITION_HEVC + b'x' * 300)[:188]
+        orphan = fixtures.acquisition_pes(b'x')
+        for tail in [unbounded, incomplete]:
+            sample = orphan + tables + ready + si[0] + tail + tail[:17]
+            expected = tables + ready + null + null
+            for chunk in [1, 187, 188, 189, 32768]:
+                source, output, start = c.create_string_buffer(sample), c.create_string_buffer(len(sample)), c.c_size_t()
+                count = prefix_read(source, len(sample), output, c.byref(start), chunk)
+                assert start.value == len(orphan) and count == len(expected)
+                assert output.raw[:count] == expected and c.string_at(source, len(sample)) == sample
+                assert hint(source, len(sample), running, None) == 0
+        assert hint(c.create_string_buffer(tables + unbounded), len(tables + unbounded), running, None) == 1
+        assert hint(c.create_string_buffer(data), len(data), cancelled, None) == 3
+        print('Private reader: shared finite/zero-length tail withholding preserves admitted bytes and public hint ABI')
+        if baseline:
+            print('Prior native library: every tested return, callback byte/scalar, and diagnostic remains identical')
+
         print('Ordinary pinned source bridge checks PASS:', revision, 'Linux host build; no tvOS/device claim')
 
 

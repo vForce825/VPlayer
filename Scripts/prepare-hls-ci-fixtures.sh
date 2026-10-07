@@ -24,6 +24,9 @@ else
   done
   git diff --exit-code HEAD -- Tests/Fixtures/SourcePlanning
 fi
+# Genuine large-IDR controls are committed, bounded inputs. Verify the exact
+# reviewed bytes in every gate; do not regenerate them during acceptance.
+python3 Scripts/generate-homepod-large-idr-fixtures.py --verify
 # Mandatory short diagnostic is always runner-local, not a committed source family.
 python3 Scripts/Support/run-bounded-generation.py python3 Scripts/generate-homepod-audio-diagnostic-fixture.py --output Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
 if [[ "$mode" == --acceptance ]]; then

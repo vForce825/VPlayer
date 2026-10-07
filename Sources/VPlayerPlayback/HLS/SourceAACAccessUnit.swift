@@ -76,6 +76,8 @@ struct SourceAACWriterConfiguration: @unchecked Sendable {
     let sourceFormatHint: CMAudioFormatDescription
     let format: SystemCompressedAudioFormat
     let firstPresentationTime: ExactMediaTime
+    let firstCanonicalSourceTime: ExactMediaTime
+    let sourceTimeBase: MediaRational
     let timelineIdentity: UUID
     let origin: MediaOriginReceipt
 
@@ -106,6 +108,8 @@ struct SourceAACWriterConfiguration: @unchecked Sendable {
         audioSpecificConfig = source.decoderConfiguration; priming = source.priming
         sourceFormatHint = proof.formatDescription; format = proof.format
         firstPresentationTime = first.timing.presentationTimeStamp
+        firstCanonicalSourceTime = proof.canonicalPresentationTimeStamp
+        sourceTimeBase = proof.sourceTimeBase
         self.timelineIdentity = timelineIdentity; self.origin = origin
     }
 
@@ -114,6 +118,7 @@ struct SourceAACWriterConfiguration: @unchecked Sendable {
               proof.stream === authority.stream, authority.stream.acceptsRendition(authority.identity),
               unit.sourceTimelineIdentity == timelineIdentity, unit.sourceOriginReceipt == origin,
               proof.format == format, proof.decoderConfiguration == audioSpecificConfig,
+              proof.sourceTimeBase == sourceTimeBase,
               proof.sourceLayout.channelCount == channelCount,
               proof.sourceLayout.nativeMask == channelMask else { return false }
         return true
@@ -142,7 +147,13 @@ struct SourceAACAccessUnit: Sendable {
               let duration = timed.timing.duration else { throw SourceAACFailure.sourceMismatch }
         self.timed = timed; self.configuration = configuration; self.binding = binding
         payload = timed.source.payload; payloadSHA256 = proof.payloadSHA256
-        presentationStart = timed.timing.presentationTimeStamp; self.duration = duration
+        // Pair the first admitted raw timeline origin with its authenticated
+        // canonical source clock. Earlier pre-origin AUs need not share raw and
+        // canonical coordinates; they must not shift the first writer input.
+        let canonicalDelta = try proof.canonicalPresentationTimeStamp.subtracting(configuration.firstCanonicalSourceTime)
+        guard canonicalDelta.value >= 0 else { throw SourceAACFailure.timelineMismatch }
+        presentationStart = try configuration.firstPresentationTime.adding(canonicalDelta)
+        self.duration = duration
         sourceID = timed.source.id; self.proof = proof
     }
     func validates() -> Bool {

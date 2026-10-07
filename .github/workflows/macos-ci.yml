@@ -146,7 +146,7 @@ jobs:
         timeout-minutes: 15
         run: |
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
-            -configuration Release \
+            -configuration Release ONLY_ACTIVE_ARCH=YES -enableCodeCoverage NO \
             -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
             -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
@@ -399,7 +399,12 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testPreparationDiagnosticScopeJoinsBeforeNativeAndReleasesItsOriginalCharge \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow \
-            --only-testing VPlayerTests/HLSResourceTransportTests/testContentEncodingDiagnosticCrossesDelegateBoundaryWithoutRetainingTheScope \
+            --only-testing VPlayerTests/HLSResourceTransportTests \
+            --only-testing VPlayerTests/AACPassthroughTests \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testReaderFixtureVideoCursorRecognizesOnlyBoundedPayloadFreeMarkers \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testUnboundInspectionWriterCannotSignWriterWindowContinuation \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease \
+            --only-testing VPlayerTests/PlaybackSourceResolverTests \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterPlannerRejectionStillRequiresExplicitServiceSelection \
@@ -434,6 +439,11 @@ jobs:
             --only-testing VPlayerTests/VideoRemuxEligibilityTests/testSourceRec601CannotEnterGeneratedRemuxColorContract \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionAudioOnlyGraphPublishesDirectPlaylistNaturalEOFAndPreservesChannels \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionFactoryStartsAudioOnlyAirPlayAndStopRetiresRealOutput \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeH264IDRsPreserveThreeGOPsAndSourceAAC44100 \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionDefaultLargeHEVCMain10HLGIDRsPreserveThreeGOPs \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \
