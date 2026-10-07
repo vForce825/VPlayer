@@ -78,12 +78,14 @@ jobs:
           # This is the entire existing VPlayer unit/UI scheme.
           # Conditional unsupported output capability is separate from pass/failure.
           # Item-clock observations do not prove decoded PCM output.
+          set -o pipefail
           ./Scripts/test.sh -configuration Debug \
             -derivedDataPath "$RUNNER_TEMP/Complete-Debug" \
             -resultBundlePath "$RUNNER_TEMP/Complete-Debug.xcresult" \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300
+            -maximum-test-execution-time-allowance 300 2>&1 | \
+            python3 Scripts/report-card-focus-progress.py --candidate "$CANDIDATE_SHA"
       - name: Report complete test failures
         if: ${{ always() }}
         timeout-minutes: 3
@@ -315,11 +317,13 @@ jobs:
         timeout-minutes: 5
         run: |
           python3 Scripts/Tests/test_xcresult_failure_report.py
+          python3 Scripts/Tests/test_card_focus_progress_report.py
           python3 Scripts/Tests/test_release_startup_diagnostics.py
           python3 Scripts/Tests/test_persistent_hls_acceptance.py
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
           python3 Scripts/Tests/test_hls_acceptance_configurator.py
           python3 Scripts/Tests/test_hls_acceptance_fixture.py
+          python3 Scripts/Tests/test_homepod_audio_fixture.py
           python3 Scripts/Tests/test_hls_generation_readback.py
           python3 Scripts/Tests/test_hls_fixture_provisioning.py
           python3 Scripts/Tests/test_hls_fixture_preparation.py
@@ -444,6 +448,13 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimeTracksSuccessiveAcceptedAccessUnitStarts \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimeKeepsAcceptedStartsAsTheWindowSlides \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimePreservesOldEpochCoordinatesAfterWriterReplacement \
+            --only-testing VPlayerTests/HLSPublisherTests/testFrozenDeclarationsAndPDTStayStableAcrossSlidingAndNewItemChangesURI \
+            --only-testing VPlayerTests/SourceAACPublicationTests/testSourceAACProgramDateTimeUsesAcceptedCallbackCoordinatesInTheAnchorDomain \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \

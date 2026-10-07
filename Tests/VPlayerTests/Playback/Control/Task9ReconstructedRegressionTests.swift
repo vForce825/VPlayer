@@ -642,6 +642,12 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
                 XCTAssertEqual(snapshot?.contextNonce, original.contextNonce)
                 XCTAssertTrue(snapshot?.poisoned == true, "第33条返回前必须同步撤权原准确Authority")
                 XCTAssertEqual(snapshot?.disposition, .releaseAfterTeardown)
+                XCTAssertTrue(snapshot?.relayClosing == true)
+                XCTAssertTrue(snapshot?.teardownRequested == true)
+                XCTAssertNil(registry.registeredOutputDrainProof())
+                let output = registry.executor.safetyIngress.snapshot.output
+                XCTAssertFalse(output.outputPermitPresent)
+                XCTAssertFalse(output.readinessOpen)
                 XCTAssertEqual(slots?.compactMap { $0 }.count, 1, "溢出只能保留原槽中的唯一terminal")
             } else {
                 XCTAssertEqual(slots?.compactMap { $0 }, expected.snapshot)
@@ -665,11 +671,20 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         }
         if let receiverExitGate {
             await receiverExitGate.waitUntilEntered()
+            // 同步撤权已在bind前验证；receiver进入不代表异步cleanup已经领取join。
+            // 保持receiver阻塞，等原cleanup真正请求取消后再验证它不能提前退休。
+            for _ in 0..<500 {
+                if registry.executor.sync({ owned.joining }) { break }
+                try await Task.sleep(nanoseconds: 2_000_000)
+            }
             registry.executor.sync {
                 XCTAssertTrue(eventDrainRunnerIsolated(registry, ticket: drain) === owned,
                     "receiver返回前原record必须仍强持同一runner")
+                XCTAssertTrue(owned.joining, "原生产cleanup必须开始join仍被阻塞的receiver")
+                XCTAssertNotNil(owned.task, "真实receiver返回前不得丢弃原Task")
                 XCTAssertEqual(registry.phase(of: drain), .cancelRequested,
                     "终态cleanup可先请求取消，但receiver返回前不得冒充已退休")
+                XCTAssertFalse(registry.complete(drain), "通用complete不能冒充真实receiver返回")
             }
             await receiverExitGate.release()
         } else {

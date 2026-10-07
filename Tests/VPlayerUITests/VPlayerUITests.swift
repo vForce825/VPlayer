@@ -412,68 +412,74 @@ final class VPlayerUITests: XCTestCase {
 final class ChannelCardFocusDiagnosticTests: XCTestCase {
     @MainActor
     func testFlatPlaylistCardsLoseVisualFocusAfterScrolling() throws {
-        try exerciseFocusAndScroll(grouping: "playlistOrder")
+        try exerciseFocusAndScroll(grouping: "playlistOrder", testCase: .flat)
     }
 
     @MainActor
     func testGroupedPlaylistCardsLoseVisualFocusAfterScrolling() throws {
-        try exerciseFocusAndScroll(grouping: "playlistGroups")
+        try exerciseFocusAndScroll(grouping: "playlistGroups", testCase: .grouped)
     }
 
     @MainActor
-    private func exerciseFocusAndScroll(grouping: String) throws {
+    private func exerciseFocusAndScroll(grouping: String, testCase: CardFocusProgress.TestCase) throws {
         continueAfterFailure = false
-        executionTimeAllowance = 600
+        executionTimeAllowance = 300
+        let progress = CardFocusProgress(testCase: testCase)
         let app = XCUIApplication()
         app.launchArguments = [
             "-ui-fixture", "seeded", "-uiTestResetPlaybackSettings",
             "-ui-card-focus-diagnostics", "-channels.grouping", grouping,
             "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryL"
         ]
-        app.launch()
-        defer { app.terminate() }
+        progress.measure(.launch) { app.launch() }
+        defer { progress.measure(.terminate) { app.terminate() } }
         let first = app.buttons["channel.focus-probe.000"]
         let second = app.buttons["channel.focus-probe.001"]
-        XCTAssertTrue(first.waitForExistence(timeout: 10))
-        try enterChannelGrid(app: app, first: first)
+        XCTAssertTrue(progress.measure(.focusWait) { first.waitForExistence(timeout: 10) })
+        try progress.measure(.entry) { try enterChannelGrid(app: app, first: first, progress: progress) }
 
         // Calibrate on rendered pixels before asserting anything about residual
         // scale. AX frame widths are logged only, never used as the visual oracle.
-        let initial = try stableSnapshot(app: app)
+        let initial = try stableSnapshot(app: app, progress: progress)
         let firstFocused = try initial.observation("channel.focus-probe.000")
         let secondUnfocused = try initial.observation("channel.focus-probe.001")
         let baseline = secondUnfocused.visualWidth
         let focusDelta = firstFocused.visualWidth - baseline
         guard firstFocused.hasFocus, !secondUnfocused.hasFocus,
               focusDelta >= 3, focusDelta < baseline * 0.3 else {
-            attach(initial, name: "focus-calibration-unavailable-\(grouping)")
+            attach(initial, name: "focus-calibration-unavailable-\(grouping)", progress: progress)
             throw CardFocusProbeError.unavailable(
                 "Initial rendered focus expansion could not be calibrated: \(initial.summary)"
             )
         }
         print("CARD_FOCUS_CALIBRATION grouping=\(grouping) baseline=\(baseline) "
             + "focusDelta=\(focusDelta) \(initial.summary)")
-        attach(initial, name: "focus-calibration-initial-\(grouping)")
+        attach(initial, name: "focus-calibration-initial-\(grouping)", progress: progress)
 
-        XCUIRemote.shared.press(.right)
-        XCTAssertTrue(second.wait(for: \.hasFocus, toEqual: true, timeout: 5))
-        let moved = try stableSnapshot(app: app)
+        progress.direction = .right
+        progress.measure(.navigation) { XCUIRemote.shared.press(.right) }
+        XCTAssertTrue(progress.measure(.focusWait) { second.wait(for: \.hasFocus, toEqual: true, timeout: 5) })
+        let moved = try stableSnapshot(app: app, progress: progress)
         let secondFocused = try moved.observation("channel.focus-probe.001")
         guard secondFocused.visualWidth - baseline >= 3 else {
-            attach(moved, name: "focus-calibration-move-unavailable-\(grouping)")
+            attach(moved, name: "focus-calibration-move-unavailable-\(grouping)", progress: progress)
             throw CardFocusProbeError.unavailable(
                 "Pixels did not measure expansion on the newly focused card: \(moved.summary)"
             )
         }
         let tolerance = max(2, focusDelta * 0.2)
         try assertUnfocusedWidths(moved, baseline: baseline, tolerance: tolerance,
-            label: "\(grouping)-initial-right")
-        attach(moved, name: "focus-calibration-moved-\(grouping)")
-        XCUIRemote.shared.press(.left)
-        XCTAssertTrue(first.wait(for: \.hasFocus, toEqual: true, timeout: 5))
+            label: "\(grouping)-initial-right", progress: progress)
+        attach(moved, name: "focus-calibration-moved-\(grouping)", progress: progress)
+        progress.direction = .left
+        progress.measure(.navigation) { XCUIRemote.shared.press(.left) }
+        XCTAssertTrue(progress.measure(.focusWait) { first.wait(for: \.hasFocus, toEqual: true, timeout: 5) })
 
         for cycle in 0..<2 {
-            var snapshot = try stableSnapshot(app: app)
+            progress.cycle = cycle
+            progress.step = -1
+            progress.direction = .none
+            var snapshot = try stableSnapshot(app: app, progress: progress)
             var reachedBottom = false
             for step in 0..<30 {
                 if try snapshot.focusedIndex() >= 75 {
@@ -481,19 +487,24 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                     break
                 }
                 let index = try snapshot.focusedIndex()
-                if cycle == 1 && index < 60 {
-                    XCUIRemote.shared.press(.down, forDuration: 0.5)
-                } else {
-                    XCUIRemote.shared.press(.down)
+                progress.step = step
+                progress.direction = .down
+                progress.measure(.navigation) {
+                    if cycle == 1 && index < 60 {
+                        XCUIRemote.shared.press(.down, forDuration: 0.5)
+                    } else {
+                        XCUIRemote.shared.press(.down)
+                    }
                 }
-                snapshot = try stableSnapshot(app: app)
+                snapshot = try stableSnapshot(app: app, progress: progress)
                 try assertUnfocusedWidths(snapshot, baseline: baseline, tolerance: tolerance,
-                    label: "\(grouping)-cycle\(cycle)-down\(step)")
+                    label: "\(grouping)-cycle\(cycle)-down\(step)", progress: progress)
             }
             if !reachedBottom { reachedBottom = try snapshot.focusedIndex() >= 75 }
             XCTAssertTrue(reachedBottom, "Coverage failure: did not reach the last fixture rows")
-            XCTAssertFalse(first.isHittable, "Coverage failure: the first card never left the viewport")
-            attach(snapshot, name: "focus-bottom-\(grouping)-\(cycle)")
+            XCTAssertFalse(progress.measure(.viewport) { first.isHittable },
+                "Coverage failure: the first card never left the viewport")
+            attach(snapshot, name: "focus-bottom-\(grouping)-\(cycle)", progress: progress)
 
             var reachedTop = false
             for step in 0..<30 {
@@ -502,81 +513,109 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                     break
                 }
                 let index = try snapshot.focusedIndex()
-                if cycle == 1 && index > 20 {
-                    XCUIRemote.shared.press(.up, forDuration: 0.5)
-                } else {
-                    XCUIRemote.shared.press(.up)
+                progress.step = step
+                progress.direction = .up
+                progress.measure(.navigation) {
+                    if cycle == 1 && index > 20 {
+                        XCUIRemote.shared.press(.up, forDuration: 0.5)
+                    } else {
+                        XCUIRemote.shared.press(.up)
+                    }
                 }
-                snapshot = try stableSnapshot(app: app)
+                snapshot = try stableSnapshot(app: app, progress: progress)
                 try assertUnfocusedWidths(snapshot, baseline: baseline, tolerance: tolerance,
-                    label: "\(grouping)-cycle\(cycle)-up\(step)")
+                    label: "\(grouping)-cycle\(cycle)-up\(step)", progress: progress)
             }
             if !reachedTop { reachedTop = try snapshot.focusedIndex() == 0 }
             XCTAssertTrue(reachedTop, "Coverage failure: did not return to the first fixture card")
-            XCTAssertTrue(first.hasFocus)
-            attach(snapshot, name: "focus-returned-\(grouping)-\(cycle)")
+            XCTAssertTrue(progress.measure(.focusWait) { first.hasFocus })
+            attach(snapshot, name: "focus-returned-\(grouping)-\(cycle)", progress: progress)
         }
         print("CARD_FOCUS_RESULT grouping=\(grouping) calibrated=true cycles=2 residualScale=notObserved")
     }
 
     @MainActor
-    private func enterChannelGrid(app: XCUIApplication, first: XCUIElement) throws {
-        logEntryFocus(app: app, phase: "launch")
-        if first.hasFocus { return }
+    private func enterChannelGrid(app: XCUIApplication, first: XCUIElement, progress: CardFocusProgress) throws {
+        logEntryFocus(app: app, phase: "launch", progress: progress)
+        if progress.measure(.ax, { first.hasFocus }) { return }
 
         // defaultFocus chooses an item when the grid receives focus; it does not
         // promise that a freshly launched TabView has entered that region. Use
         // the same real remote tab-entry flow as the existing application tests.
         let channelTab = app.tabBars.buttons["频道"]
-        for _ in 0..<8 where !app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) {
-            XCUIRemote.shared.press(.up)
+        for _ in 0..<8 where !tabsHaveFocus(app: app, progress: progress) {
+            progress.direction = .up
+            progress.measure(.navigation) { XCUIRemote.shared.press(.up) }
         }
-        guard app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) else {
-            throw entryFailure(app: app, reason: "Could not acquire the tab bar")
+        guard tabsHaveFocus(app: app, progress: progress) else {
+            throw entryFailure(app: app, reason: "Could not acquire the tab bar", progress: progress)
         }
-        for _ in 0..<3 { XCUIRemote.shared.press(.left) }
-        for _ in 0..<4 where !channelTab.hasFocus { XCUIRemote.shared.press(.right) }
-        guard channelTab.hasFocus else {
-            throw entryFailure(app: app, reason: "Could not focus the channels tab")
+        progress.direction = .left
+        for _ in 0..<3 { progress.measure(.navigation) { XCUIRemote.shared.press(.left) } }
+        progress.direction = .right
+        for _ in 0..<4 where !progress.measure(.ax, { channelTab.hasFocus }) {
+            progress.measure(.navigation) { XCUIRemote.shared.press(.right) }
         }
-        XCUIRemote.shared.press(.select)
+        guard progress.measure(.ax, { channelTab.hasFocus }) else {
+            throw entryFailure(app: app, reason: "Could not focus the channels tab", progress: progress)
+        }
+        progress.direction = .select
+        progress.measure(.navigation) { XCUIRemote.shared.press(.select) }
         // Some tvOS configurations retain focus on the selected tab until Down.
         // Never Select a channel here: the experiment must not open playback.
         for _ in 0..<4 {
-            if first.wait(for: \.hasFocus, toEqual: true, timeout: 2) {
-                logEntryFocus(app: app, phase: "entered-grid")
+            if progress.measure(.focusWait, { first.wait(for: \.hasFocus, toEqual: true, timeout: 2) }) {
+                logEntryFocus(app: app, phase: "entered-grid", progress: progress)
                 return
             }
-            XCUIRemote.shared.press(.down)
+            progress.direction = .down
+            progress.measure(.navigation) { XCUIRemote.shared.press(.down) }
         }
-        guard first.wait(for: \.hasFocus, toEqual: true, timeout: 2) else {
-            throw entryFailure(app: app, reason: "Channels tab entry did not focus the first probe card")
+        guard progress.measure(.focusWait, { first.wait(for: \.hasFocus, toEqual: true, timeout: 2) }) else {
+            throw entryFailure(app: app, reason: "Channels tab entry did not focus the first probe card",
+                progress: progress)
         }
-        logEntryFocus(app: app, phase: "entered-grid")
+        logEntryFocus(app: app, phase: "entered-grid", progress: progress)
     }
 
     @MainActor
-    private func logEntryFocus(app: XCUIApplication, phase: String) {
-        let tabs = app.tabBars.buttons.allElementsBoundByIndex.map {
-            "\($0.label):focus=\($0.hasFocus)"
-        }.joined(separator: " ")
-        let first = app.buttons["channel.focus-probe.000"]
-        print("CARD_FOCUS_ENTRY phase=\(phase) firstFocus=\(first.hasFocus) tabs=[\(tabs)]")
+    private func tabsHaveFocus(app: XCUIApplication, progress: CardFocusProgress) -> Bool {
+        progress.measure(.ax) { app.tabBars.buttons.allElementsBoundByIndex.contains(where: \.hasFocus) }
     }
 
     @MainActor
-    private func entryFailure(app: XCUIApplication, reason: String) -> CardFocusProbeError {
-        logEntryFocus(app: app, phase: "failed-entry")
-        print("CARD_FOCUS_ENTRY_HIERARCHY \(app.debugDescription)")
-        let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-        attachment.name = "focus-entry-unavailable"
-        attachment.lifetime = .keepAlways
-        add(attachment)
+    private func logEntryFocus(app: XCUIApplication, phase: String, progress: CardFocusProgress) {
+        progress.measure(.ax) {
+            let tabs = app.tabBars.buttons.allElementsBoundByIndex.map {
+                "\($0.label):focus=\($0.hasFocus)"
+            }.joined(separator: " ")
+            let first = app.buttons["channel.focus-probe.000"]
+            print("CARD_FOCUS_ENTRY phase=\(phase) firstFocus=\(first.hasFocus) tabs=[\(tabs)]")
+        }
+    }
+
+    @MainActor
+    private func entryFailure(app: XCUIApplication, reason: String, progress: CardFocusProgress) -> CardFocusProbeError {
+        logEntryFocus(app: app, phase: "failed-entry", progress: progress)
+        let hierarchy = progress.measure(.ax) { app.debugDescription }
+        print("CARD_FOCUS_ENTRY_HIERARCHY \(hierarchy)")
+        let screenshot = progress.measure(.screenshot) { XCUIScreen.main.screenshot() }
+        progress.measure(.attachment) {
+            let attachment = XCTAttachment(screenshot: screenshot)
+            attachment.name = "focus-entry-unavailable"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
         return .unavailable(reason)
     }
 
     @MainActor
-    private func stableSnapshot(app: XCUIApplication) throws -> CardFocusSnapshot {
+    private func stableSnapshot(app: XCUIApplication, progress: CardFocusProgress) throws -> CardFocusSnapshot {
+        try progress.measure(.capture) { try captureStableSnapshot(app: app, progress: progress) }
+    }
+
+    @MainActor
+    private func captureStableSnapshot(app: XCUIApplication, progress: CardFocusProgress) throws -> CardFocusSnapshot {
         let started = Date()
         let deadline = started.addingTimeInterval(12)
         var previous: CardFocusSnapshot?
@@ -585,12 +624,13 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
         var samples = 0
         while Date() < deadline {
             samples += 1
+            progress.sample = samples
             // Capture the hierarchy once. Live index-bound XCUIElement proxies
             // can change identity or disappear as LazyVGrid realizes/removes rows;
             // querying each attribute also used to cost 10+ seconds per checkpoint.
             let hierarchy: any XCUIElementSnapshot
             do {
-                hierarchy = try app.snapshot()
+                hierarchy = try progress.measure(.ax) { try app.snapshot() }
             } catch {
                 lastReason = "Could not capture the AX hierarchy: \(error)"
                 previous = nil
@@ -598,8 +638,9 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                 continue
             }
             let candidates = probeAttributes(in: hierarchy)
-            let screenshot = XCUIScreen.main.screenshot()
+            let screenshot = progress.measure(.screenshot) { XCUIScreen.main.screenshot() }
             lastScreenshot = screenshot
+            let rasterStarted = progress.begin(.raster)
             let screenFrame = hierarchy.frame
             guard let image = screenshot.image.cgImage else {
                 throw CardFocusProbeError.unavailable("Screenshot has no CGImage")
@@ -633,6 +674,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                 do { _ = try current.focusedIndex() }
                 catch { incompleteReason = String(describing: error) }
             }
+            progress.end(.raster, started: rasterStarted)
             if let incompleteReason {
                 // Screenshots and AX attributes cannot be captured atomically.
                 // A scroll can move between those reads, so retry the whole sample.
@@ -652,10 +694,12 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             Thread.sleep(forTimeInterval: 0.15)
         }
         if let lastScreenshot {
-            let attachment = XCTAttachment(screenshot: lastScreenshot)
-            attachment.name = "focus-measurement-never-settled"
-            attachment.lifetime = .keepAlways
-            add(attachment)
+            progress.measure(.attachment) {
+                let attachment = XCTAttachment(screenshot: lastScreenshot)
+                attachment.name = "focus-measurement-never-settled"
+                attachment.lifetime = .keepAlways
+                add(attachment)
+            }
         }
         throw CardFocusProbeError.unavailable("After 12 seconds: \(lastReason)")
     }
@@ -679,7 +723,8 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
 
     @MainActor
     private func assertUnfocusedWidths(
-        _ snapshot: CardFocusSnapshot, baseline: CGFloat, tolerance: CGFloat, label: String
+        _ snapshot: CardFocusSnapshot, baseline: CGFloat, tolerance: CGFloat, label: String,
+        progress: CardFocusProgress
     ) throws {
         _ = try snapshot.focusedIndex()
         print("CARD_FOCUS_SAMPLE phase=\(label) \(snapshot.summary)")
@@ -687,7 +732,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             !$0.hasFocus && $0.visualWidth > baseline + tolerance
         }
         if !residual.isEmpty {
-            attach(snapshot, name: "residual-focus-scale-\(label)")
+            attach(snapshot, name: "residual-focus-scale-\(label)", progress: progress)
             XCTFail("CARD_FOCUS_RESIDUAL baseline=\(baseline) tolerance=\(tolerance) "
                 + "phase=\(label) \(snapshot.summary)")
             throw CardFocusProbeError.residualScale
@@ -697,11 +742,88 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
     }
 
     @MainActor
-    private func attach(_ snapshot: CardFocusSnapshot, name: String) {
-        let attachment = XCTAttachment(screenshot: snapshot.screenshot)
-        attachment.name = name
-        attachment.lifetime = .keepAlways
-        add(attachment)
+    private func attach(_ snapshot: CardFocusSnapshot, name: String, progress: CardFocusProgress) {
+        progress.measure(.attachment) {
+            let attachment = XCTAttachment(screenshot: snapshot.screenshot)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
+}
+
+/// Fixed scalar vocabulary only. Unbuffered writes preserve the last started
+/// operation when XCTest interrupts a synchronous automation call. The CI relay
+/// retains the last valid and last error record per case; these are not pass verdicts.
+@MainActor
+private final class CardFocusProgress {
+    enum TestCase: String { case flat, grouped }
+    enum Stage: String {
+        case launch, entry, navigation, capture, ax, screenshot, raster, viewport, attachment, terminate
+        case focusWait = "focus_wait"
+    }
+    enum Direction: String { case none, up, down, left, right, select }
+    private enum Event: String { case begin, end, error }
+
+    var cycle = -1
+    var step = -1
+    var sample = 0
+    var direction: Direction = .none
+    private let testCase: TestCase
+    private let started = ProcessInfo.processInfo.systemUptime
+    private var captures = 0
+    private var sequence = 0
+    private var cumulativeMilliseconds: [Stage: Int] = [:]
+
+    init(testCase: TestCase) { self.testCase = testCase }
+
+    func measure<T>(_ stage: Stage, _ operation: () throws -> T) rethrows -> T {
+        let operationStarted = begin(stage)
+        do {
+            let result = try operation()
+            end(stage, started: operationStarted)
+            return result
+        } catch {
+            finish(stage, started: operationStarted, event: .error)
+            throw error
+        }
+    }
+
+    func begin(_ stage: Stage) -> TimeInterval {
+        if stage == .capture { sample = 0 }
+        let now = ProcessInfo.processInfo.systemUptime
+        emit(stage, event: .begin, operationMilliseconds: 0, now: now)
+        return now
+    }
+
+    func end(_ stage: Stage, started: TimeInterval) {
+        finish(stage, started: started, event: .end)
+    }
+
+    private func finish(_ stage: Stage, started: TimeInterval, event: Event) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = max(0, Int((now - started) * 1_000))
+        cumulativeMilliseconds[stage, default: 0] += elapsed
+        if stage == .capture && event == .end { captures += 1 }
+        emit(stage, event: event, operationMilliseconds: elapsed, now: now)
+    }
+
+    private func emit(_ stage: Stage, event: Event, operationMilliseconds: Int, now: TimeInterval) {
+        sequence += 1
+        let record: [String: Any] = [
+            "schema": 1, "case": testCase.rawValue, "stage": stage.rawValue,
+            "event": event.rawValue, "direction": direction.rawValue,
+            "cycle": cycle, "step": step, "sample": sample, "captures": captures,
+            "sequence": sequence, "elapsed_ms": max(0, Int((now - started) * 1_000)),
+            "operation_ms": operationMilliseconds,
+            "stage_ms": cumulativeMilliseconds[stage, default: 0],
+            "capture_ms": cumulativeMilliseconds[.capture, default: 0]
+        ]
+        guard let json = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+        var line = Data("CARD_FOCUS_PROGRESS ".utf8)
+        line.append(json)
+        line.append(0x0A)
+        FileHandle.standardOutput.write(line)
     }
 }
 

@@ -28,7 +28,10 @@ final class WriterInputLifetimeTests: XCTestCase {
     func testLastNativeAliasReleasesInputBudgetExactlyOnce() throws {
         for bytes in [4, 4_033, 8_192, 262_144] {
             let ledger = HLSDeliveryApplicationChargeLedger()
-            let inputs = WriterInputAdmission(capacity: 1, maximumBytes: bytes + 64, applicationLedger: ledger)
+            let clock = WriterInputObservationClock()
+            let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+            let inputs = WriterInputAdmission(capacity: 1, maximumBytes: bytes + 64,
+                applicationLedger: ledger, observation: try observation(probe, rendition: 1, maximumBytes: bytes + 64))
             let blocks = HLSOwnedBlockAdmission(maximumPayloadBytes: bytes, applicationLedger: ledger)
             var original: CMBlockBuffer? = try SampleBufferBuilder.makeHLSOwnedBlockBuffer(
                 copying: Data(repeating: 0x5a, count: bytes), admission: blocks)
@@ -45,12 +48,18 @@ final class WriterInputLifetimeTests: XCTestCase {
             original = nil; source = nil; wrapped = nil
             XCTAssertEqual(inputs.usage.count, 1)
             XCTAssertEqual(blocks.usage.count, 1)
+            clock.advance(by: .milliseconds(1_250))
+            XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 0)
+            XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 0)
             XCTAssertNotNil(alias)
             alias = nil
             XCTAssertEqual(inputs.usage.count, 0)
             XCTAssertEqual(blocks.usage.count, 0)
             XCTAssertEqual(inputs.allocationCount, 1)
             XCTAssertEqual(inputs.releaseCount, 1)
+            XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, inputs.releaseCount)
+            XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 1.25, accuracy: 0.000_001)
+            XCTAssertEqual(clock.readCount, 2, "Only successful admission and actual release read the diagnostic clock")
             XCTAssertEqual(ledger.chargedBytes, 0)
             XCTAssertThrowsError(try inputs.admit(bytes: bytes + 65))
         }
@@ -92,20 +101,109 @@ final class WriterInputLifetimeTests: XCTestCase {
     func testPrepaidConstructionFailureReturnsInputBudgetExactlyOnce() throws {
         for mode in HLSOwnedBlockAdmission.ConstructionMode.allCases where mode != .normal {
             let ledger = HLSDeliveryApplicationChargeLedger()
-            let admission = WriterInputAdmission(capacity: 1, maximumBytes: 8_256, applicationLedger: ledger)
+            let clock = WriterInputObservationClock()
+            let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+            let admission = WriterInputAdmission(capacity: 1, maximumBytes: 8_256,
+                applicationLedger: ledger, observation: try observation(probe, rendition: 1, maximumBytes: 8_256))
             let lifetime = try admission.admit(bytes: 8_256)
+            clock.advance(by: .milliseconds(375))
             XCTAssertThrowsError(try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(length: 8_192,
                 lifetime: lifetime, constructionMode: mode))
             XCTAssertEqual(admission.usage.count, 0)
             XCTAssertEqual(admission.releaseCount, 1)
             XCTAssertEqual(ledger.chargedBytes, 0)
+            XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 1)
+            XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 0.375, accuracy: 0.000_001)
+            clock.advance(by: .seconds(10))
             lifetime.releaseBacking()
             XCTAssertEqual(admission.releaseCount, 1)
+            XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 1)
+            XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 0.375, accuracy: 0.000_001)
+            XCTAssertEqual(clock.readCount, 2, "Repeated release cannot add a residence observation")
         }
     }
 
+    func testResidenceIncludesLateOldAliasAndSeparatesRenditions() throws {
+        let clock = WriterInputObservationClock()
+        let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+        let oldInputs = WriterInputAdmission(capacity: 1, maximumBytes: 8,
+            observation: try observation(probe, rendition: 1, writer: 1))
+        var old: CMBlockBuffer? = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(
+            copying: Data([1, 2, 3, 4]), lifetime: oldInputs.admit(bytes: 4))
+        clock.advance(by: .seconds(10))
+        let successorInputs = WriterInputAdmission(capacity: 1, maximumBytes: 8,
+            observation: try observation(probe, rendition: 1, writer: 2))
+        var successor: CMBlockBuffer? = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(
+            copying: Data([1, 2, 3, 4]), lifetime: successorInputs.admit(bytes: 4))
+        let otherInputs = WriterInputAdmission(capacity: 1, maximumBytes: 8,
+            observation: try observation(probe, rendition: 2))
+        var other: CMBlockBuffer? = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(
+            copying: Data([1, 2, 3, 4]), lifetime: otherInputs.admit(bytes: 4))
+        XCTAssertNotNil(old); XCTAssertNotNil(successor); XCTAssertNotNil(other)
+        clock.advance(by: .seconds(2))
+        successor = nil
+        clock.advance(by: .seconds(1))
+        other = nil
+        let beforeLastRelease = probe.snapshot
+        XCTAssertEqual(beforeLastRelease.liveInputCount, 1)
+        XCTAssertEqual(beforeLastRelease.releasedInputResidenceCount, 2)
+        XCTAssertEqual(beforeLastRelease.maximumReleasedInputResidenceSeconds, 3)
+        oldInputs.cancel()
+        XCTAssertEqual(probe.snapshot, beforeLastRelease, "Cancellation is not a backing release")
+        clock.advance(by: .seconds(300))
+        old = nil
+        let final = probe.snapshot
+        XCTAssertEqual(final.liveInputCount, 0)
+        XCTAssertEqual(final.acceptedInputCount, 3)
+        XCTAssertEqual(final.releasedInputResidenceCount, 3)
+        XCTAssertEqual(final.releasedInputResidenceCount, final.releasedInputCount)
+        XCTAssertEqual(final.maximumReleasedInputResidenceSeconds, 313)
+        let renditions = probe.renditions.sorted { $0.renditionIdentity.rawValue < $1.renditionIdentity.rawValue }
+        XCTAssertEqual(renditions.count, 2)
+        XCTAssertEqual(renditions[0].latestWriterIdentity.rawValue, 2)
+        XCTAssertEqual(renditions[0].usage.releasedInputResidenceCount, 2)
+        XCTAssertEqual(renditions[0].usage.maximumReleasedInputResidenceSeconds, 313)
+        XCTAssertEqual(renditions[1].usage.releasedInputResidenceCount, 1)
+        XCTAssertEqual(renditions[1].usage.maximumReleasedInputResidenceSeconds, 3)
+        XCTAssertEqual(clock.readCount, 6)
+    }
+
+    func testResidenceStopsAtReleaseBodyEntryBeforeDownstreamReleaseWork() throws {
+        let clock = WriterInputObservationClock()
+        let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+        let admission = WriterInputAdmission(capacity: 1, maximumBytes: 8,
+            observation: try observation(probe, rendition: 1))
+        let lifetime = try admission.admit(bytes: 4, release: { clock.advance(by: .seconds(10)) })
+        clock.advance(by: .milliseconds(250))
+        lifetime.releaseBacking()
+        XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 1)
+        XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 0.25)
+        XCTAssertEqual(clock.readCount, 2)
+    }
+
+    func testUnadoptedLifetimeDeinitObservesRollbackAndFitsMetadataEnvelope() throws {
+        let clock = WriterInputObservationClock()
+        let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+        let admission = WriterInputAdmission(capacity: 1, maximumBytes: 8,
+            observation: try observation(probe, rendition: 1))
+        var lifetime: WriterInputLifetime? = try admission.admit(bytes: 4)
+        XCTAssertNotNil(lifetime)
+        clock.advance(by: .milliseconds(500))
+        lifetime = nil
+        XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 1)
+        XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, admission.releaseCount)
+        XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 0.5)
+        XCTAssertEqual(clock.readCount, 2)
+        // The only new per-input capture is an optional value, not an owner/map.
+        // Its ABI-sized storage fits within the existing conservative 8 KiB charge.
+        XCTAssertLessThanOrEqual(MemoryLayout<ContinuousClock.Instant?>.stride, 32)
+        XCTAssertEqual(WriterInputAdmission.metadataBytes, 8_192)
+    }
+
     func testFreeCallbackCannotRetainWriter() throws {
-        var owner: WriterInputTestOwner? = WriterInputTestOwner()
+        let clock = WriterInputObservationClock()
+        let probe = HLSWriterAcceptanceProbe(now: { clock.now })
+        var owner: WriterInputTestOwner? = WriterInputTestOwner(observation: try observation(probe, rendition: 1))
         let weakOwner = TestWeakReference(owner)
         let admission = try XCTUnwrap(owner).admission
         var block: CMBlockBuffer? = try SampleBufferBuilder.makeHLSPrepaidBlockBuffer(
@@ -114,9 +212,12 @@ final class WriterInputLifetimeTests: XCTestCase {
         XCTAssertNil(weakOwner.value)
         XCTAssertEqual(admission.usage.count, 1)
         XCTAssertNotNil(block)
+        clock.advance(by: .seconds(2))
         block = nil
         XCTAssertEqual(admission.usage.count, 0)
         XCTAssertEqual(admission.releaseCount, 1)
+        XCTAssertEqual(probe.snapshot.releasedInputResidenceCount, 1)
+        XCTAssertEqual(probe.snapshot.maximumReleasedInputResidenceSeconds, 2)
     }
 
     func testEvidence320PlusOneAndPrepaidRollback() throws {
@@ -153,8 +254,32 @@ final class WriterInputLifetimeTests: XCTestCase {
             sampleSizeEntryCount: 1, sampleSizeArray: &size, sampleBufferOut: &sample), noErr)
         return try XCTUnwrap(sample)
     }
+
+    private func observation(_ probe: HLSWriterAcceptanceProbe, rendition: UInt64,
+                             writer: UInt64 = 1, maximumBytes: Int = 8) throws -> HLSWriterAcceptanceProbe.Rendition {
+        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
+        let binding = FMP4WriterBinding(outputLifecycleEpoch: .init(backendIdentity:
+            .init(sessionIdentity: session, backendGeneration: 1), outputNonce: 1),
+            itemGeneration: .init(rawValue: 1), mediaEpoch: .init(rawValue: 1),
+            publicationParticipantID: .init(rawValue: 1), renditionIdentity: .init(rawValue: rendition),
+            writerIdentity: .init(rawValue: writer))
+        return try XCTUnwrap(probe.register(binding: binding, hardInputCount: 1,
+            hardInputBytes: maximumBytes, hardEvidenceCount: 1, hardCallbackCount: 1))
+    }
+}
+
+private final class WriterInputObservationClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var instant = ContinuousClock.now
+    private var reads = 0
+    var now: ContinuousClock.Instant { lock.withLock { reads += 1; return instant } }
+    var readCount: Int { lock.withLock { reads } }
+    func advance(by duration: Duration) { lock.withLock { instant = instant.advanced(by: duration) } }
 }
 
 private final class WriterInputTestOwner {
-    let admission = WriterInputAdmission(capacity: 1, maximumBytes: 8)
+    let admission: WriterInputAdmission
+    init(observation: HLSWriterAcceptanceProbe.Rendition) {
+        admission = WriterInputAdmission(capacity: 1, maximumBytes: 8, observation: observation)
+    }
 }

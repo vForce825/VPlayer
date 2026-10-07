@@ -419,6 +419,13 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             try validateBoundary(boundaryStart, common: boundary.commonStart,
                 unit: boundary.accessUnitDuration, first: boundary.commonStart == boundary.epochStart,
                 isVideoWithEvidence: isVideoWithEvidence)
+            // PDT names the first media timestamp, including AAC encoder leading
+            // frames. Boundary admission above deliberately uses effective time
+            // for that first AAC report; it is not the playlist date coordinate.
+            let programDateOffset = evidence.sourceAAC?.timelineOffset
+                ?? participant.aacTerminalBinding?.timelineMappingReceipt?.offset
+                ?? HLSChecked.zero
+            let programDateStart = try receipt.presentationRange.start.subtracting(programDateOffset)
             let existing = records[id] ?? []
             let expected = try existing.last.map { try HLSChecked.increment($0.receipt.logicalSequence) } ?? nextLogicalSequence
             guard object.logicalSequence == expected else { throw HLSPublicationFailure.invalidSequence }
@@ -507,6 +514,7 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
             records[id, default: []].append(HLSValidatedSegment(key: key, initializationKey: initializationKeys[id]!,
                 proof: participant.proof, receipt: receipt,
                 objectIdentity: try FMP4ObjectIdentity(object), bodyBytes: object.bytes.count, commonStart: commonStart,
+                programDateStart: programDateStart,
                 commonDuration: participant.proof.mediaType == .video ? duration : HLSChecked.one,
                 discontinuity: discontinuityAt == object.logicalSequence, boundary: boundary))
             if sequence == 0 { return try publish(ticket: ticket, now: now) }
@@ -638,7 +646,8 @@ final class HLSPublicationCoordinator: @unchecked Sendable {
                         initializationKey: try store.authenticatedKey(segment.initializationKey, authority: preparation),
                         proof: segment.proof, receipt: segment.receipt,
                         objectIdentity: segment.objectIdentity, bodyBytes: segment.bodyBytes,
-                        commonStart: segment.commonStart, commonDuration: segment.commonDuration,
+                        commonStart: segment.commonStart, programDateStart: segment.programDateStart,
+                        commonDuration: segment.commonDuration,
                         discontinuity: segment.discontinuity, boundary: segment.boundary)
                 } }
                 let writesEndList = eofLastSequence == lastSequence
