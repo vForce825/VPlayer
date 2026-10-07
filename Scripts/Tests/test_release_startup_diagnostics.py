@@ -99,7 +99,29 @@ xcodebuild() {
             '-scheme', 'VPlayer', '-configuration', 'Release', '-sdk', 'appletvsimulator',
             '-destination', 'platform=tvOS Simulator,id=build-test-udid', '-derivedDataPath'])
         self.assertTrue(args[12].endswith('/ReleaseStartup'))
-        self.assertEqual(args[13:], ['CLANG_ENABLE_CODE_COVERAGE=NO', 'CODE_SIGNING_ALLOWED=NO'])
+        self.assertEqual(args[13:], [
+            '-enableCodeCoverage', 'NO', 'ONLY_ACTIVE_ARCH=YES',
+            'CLANG_ENABLE_CODE_COVERAGE=NO', 'CODE_SIGNING_ALLOWED=NO'])
+
+    def test_fresh_build_uses_selected_architecture_without_swift_coverage(self):
+        status, output, stderr, _ = self.run_build(
+            r'''printf 'BUILD_ARG=%s\n' "$@"; return 0''')
+        self.assertEqual(status, 0, stderr)
+        args = [line.removeprefix('BUILD_ARG=') for line in output.splitlines()
+                if line.startswith('BUILD_ARG=')]
+        self.assertEqual(args[args.index('-configuration') + 1], 'Release')
+        self.assertEqual(args[args.index('-destination') + 1],
+                         'platform=tvOS Simulator,id=build-test-udid')
+        self.assertIn('ONLY_ACTIVE_ARCH=YES', args)
+        # CLANG_ENABLE_CODE_COVERAGE alone leaves Swift coverage enabled by the
+        # VPlayer scheme, changing the production product and forcing a rebuild.
+        self.assertIn('-enableCodeCoverage', args)
+        self.assertEqual(args[args.index('-enableCodeCoverage') + 1], 'NO')
+        self.assertFalse(any(arg.startswith(('ENABLE_TESTABILITY=',
+                                            'SWIFT_OPTIMIZATION_LEVEL=',
+                                            'SWIFT_COMPILATION_MODE=', 'ARCHS='))
+                             for arg in args))
+        self.assertIn('BUILD_STAGE_COMPLETE', output)
 
     def test_build_failure_is_not_masked_by_successful_log_forwarding(self):
         status, output, stderr, saved = self.run_build('return 65')
@@ -120,6 +142,79 @@ xcodebuild() {
         self.assertEqual(status, 1)
         self.assertIn('模拟器构建失败', stderr)
         self.assertNotIn('BUILD_STAGE_COMPLETE', output)
+
+    def test_six_cold_launches_keep_both_modes_and_four_liveness_checks(self):
+        # Execute the real trial loop and cleanup. Only simulator/process tools
+        # are replaced; their calls are the observable contract of this script.
+        source = SCRIPT.read_text()
+        preamble = source.split("printf '证据目录：%s\\n构建日志：%s/build.log\\n'")[0]
+        trials = 'for mode in normal step1; do' + source.split(
+            'for mode in normal step1; do', 1)[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary)
+            runner = fixture / 'runner.sh'
+            runner.write_text(preamble + r'''
+simulator_udid=verified-test-udid
+bundle_id=example.exact.test.app
+simulator_data_path="$evidence/simulator"
+probe="$evidence/probe.dylib"
+xcrun() {
+    [[ "$1" == simctl ]] || return 90
+    shift
+    case "$1" in
+        terminate)
+            printf 'terminate:%s:%s\n' "$2" "$3" >> "$TRIAL_CALLS"
+            ;;
+        launch)
+            printf 'launch:%s:%s:%s:%s\n' "$4" "$5" "$mode" "${SIMCTL_CHILD_DYLD_INSERT_LIBRARIES-}" >> "$TRIAL_CALLS"
+            [[ "$2" == --stdout=* && "$3" == --stderr=* ]] || return 91
+            mkdir -p "$(dirname "$simulator_data_path${2#--stdout=}")"
+            printf 'app stdout\n' > "$simulator_data_path${2#--stdout=}"
+            if [[ "${SIMCTL_CHILD_DYLD_INSERT_LIBRARIES-}" == "$probe" ]]; then
+                printf '仅模拟 tvOS xzone step1 计费取整\n' > "$simulator_data_path${3#--stderr=}"
+            else
+                : > "$simulator_data_path${3#--stderr=}"
+            fi
+            printf '%s: 123\n' "$5"
+            ;;
+        spawn)
+            [[ "$3 $4" == 'launchctl list' ]] || return 92
+            printf 'service:%s\n' "$2" >> "$TRIAL_CALLS"
+            printf '123 0 UIKitApplication:%s[123]\n' "$bundle_id"
+            ;;
+        *) return 93 ;;
+    esac
+}
+sleep() { printf 'sleep:%s\n' "$*" >> "$TRIAL_CALLS"; }
+kill() { printf 'kill:%s\n' "$*" >> "$TRIAL_CALLS"; }
+ps() {
+    printf 'ps:%s\n' "$*" >> "$TRIAL_CALLS"
+    if [[ "$4" == stat= ]]; then printf 'S\n'; else printf '123 S 00:01 VPlayer\n'; fi
+}
+''' + trials)
+            calls = fixture / 'calls.log'
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith('SIMCTL_CHILD_')}
+            result = subprocess.run(['bash', str(runner)],
+                                    env={**env, 'TMPDIR': temporary, 'TRIAL_CALLS': str(calls)},
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            entries = calls.read_text().splitlines()
+            launches = [line for line in entries if line.startswith('launch:')]
+            self.assertEqual(len(launches), 6)
+            self.assertEqual(launches[:3], [
+                'launch:verified-test-udid:example.exact.test.app:normal:'] * 3)
+            for launch in launches[3:]:
+                self.assertTrue(launch.startswith(
+                    'launch:verified-test-udid:example.exact.test.app:step1:'))
+                self.assertTrue(launch.endswith('/probe.dylib'))
+            self.assertEqual(entries.count(
+                'terminate:verified-test-udid:example.exact.test.app'), 7)
+            self.assertEqual(entries.count('sleep:1'), 24)
+            self.assertEqual(entries.count('kill:-0 123'), 24)
+            self.assertEqual(entries.count('ps:-p 123 -o stat='), 24)
+            self.assertEqual(entries.count('service:verified-test-udid'), 24)
+            self.assertIn('通过：六次冷启动均持续存活', result.stdout)
 
     def test_live_startup_establishes_add_focus_before_selecting(self):
         source = (ROOT / 'Tests/VPlayerUITests/LiveStartupUITests.swift').read_text()

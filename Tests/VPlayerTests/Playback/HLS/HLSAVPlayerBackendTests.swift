@@ -2061,9 +2061,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         minimumIDRBytes: Int) async throws -> HLSWriterAcceptanceProbe {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: name, withExtension: nil, subdirectory: "Video"))
-        // The raw TS wrapper follows the same acquisition path as the broadcast
-        // regressions. Keep the unchanged MP4 only as an Apple decoding oracle;
-        // a >1 MiB progressive MP4 classification prefix is correctly rejected.
+        // This authored aligned-source fixture has one genuine acquisition GOP
+        // before its three output GOPs. Its declared AAC phase puts a complete AU
+        // on the eligible IDR; it does not model every broadcast's A/V phase. The
+        // MP4 is the exact admitted-AU decoding oracle, not a direct source prefix.
         let transport = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: (name as NSString).deletingPathExtension + ".ts",
             withExtension: nil, subdirectory: "Video"))
@@ -2073,8 +2074,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         let probe = HLSWriterAcceptanceProbe()
         var assembler: HLSMediaGraphAssembler?
         var failure: (any Error)?
-        var stage = "resolve"
+        var stage = "fixture-timeline"
         do {
+            try assertLargeIDRAcquisitionTimeline(sourceURL: origin.url("source.ts"),
+                frameRate: frameRate, audioRate: audioRate)
+            stage = "resolve"
             // Keep the original paid, inspected source owner. Real source AAC
             // must pass through at 44.1/48 kHz without compatibility calibration.
             let context = try sourceContext(url: origin.url("source.ts"))
@@ -2143,8 +2147,11 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let sourceAAC = try XCTUnwrap(publication.sourceAACTerminalBindings.values.first)
             let seal = try XCTUnwrap(sourceAAC.finalSeal)
             let sourceStart = ExactMediaTime(value: 10, timescale: 1)
+            XCTAssertEqual(sourceAAC.configuration.origin.sourceTime, .init(value: 5, timescale: 1),
+                "The publishing graph itself must choose the post-validation source IDR")
+            XCTAssertEqual(sourceAAC.configuration.origin.source, .videoIDR)
             XCTAssertEqual(sourceAAC.configuration.firstPresentationTime, sourceStart,
-                "The real timeline must map this zero-based fixture to the production 10-second origin")
+                "The real timeline must map the source's eligible 5-second IDR to the production 10-second origin")
             XCTAssertEqual(try seal.writtenStart.subtracting(seal.timelineOffset), sourceStart)
             let nativeStart = seal.writtenStart.cmTime
             let sourceAudioSamples = Int64((15 * audioRate + 1_023) / 1_024) * 1_024
@@ -2222,6 +2229,100 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         await origin.close()
         if let failure { throw failure }
         return probe
+    }
+
+    private func joinedLargeIDRFixtureEvents(sourceURL: URL) throws -> [DemuxEvent] {
+        let recorder = DemuxEventRecorder()
+        let io = DispatchQueue(label: "org.vplayer.tests.large-idr-prepass-io")
+        let callbacks = PlaybackSerialExecutor(label: "org.vplayer.tests.large-idr-prepass-callbacks")
+        let demuxer = FFmpegDemuxer(executor: callbacks, timeoutUS: 5_000_000, ioQueue: io)
+        var startFailure: (any Error)?
+        do {
+            try demuxer.start(url: sourceURL, sink: recorder.record)
+            _ = recorder.waitForTerminal(timeout: 10)
+        } catch { startFailure = error }
+        demuxer.cancel()
+        // A terminal callback precedes runReturned/handle.destroy. Join that
+        // original IO tail first, then the final callback's return, on all paths.
+        let ioTail = DispatchSemaphore(value: 0)
+        io.async { ioTail.signal() }
+        let ioJoined = ioTail.wait(timeout: .now() + 10) == .success
+        let observed = recorder.waitForTerminal(timeout: startFailure == nil ? 5 : 0)
+        let terminalObserved = observed.contains { event in
+            switch event { case .endOfStream, .cancelled, .failure: true; default: false }
+        }
+        let callbackTail = DispatchSemaphore(value: 0)
+        callbacks.submit { callbackTail.signal() }
+        let callbacksJoined = callbackTail.wait(timeout: .now() + 5) == .success
+        XCTAssertTrue(ioJoined, "Prepass native run/destroy must finish before any production graph starts")
+        XCTAssertTrue(callbacksJoined, "Prepass terminal callback and queued event aliases must finish")
+        guard ioJoined, callbacksJoined, startFailure != nil || terminalObserved else {
+            throw HLSSourceError.deadline
+        }
+        if let startFailure { throw startFailure }
+        return recorder.events
+    }
+
+    private func assertLargeIDRAcquisitionTimeline(sourceURL: URL,
+        frameRate: Int32, audioRate: Int32) throws {
+        var events = try joinedLargeIDRFixtureEvents(sourceURL: sourceURL)
+        defer { events.removeAll(keepingCapacity: false) }
+        XCTAssertTrue(events.contains { if case .endOfStream = $0 { true } else { false } })
+        var videoPacketCount = 0
+        var inputIDRs = 0
+        for event in events {
+            if case .packet(let packet) = event, case .video = packet.codec {
+                videoPacketCount += 1
+                if packet.isKey { inputIDRs += 1 }
+            }
+        }
+        XCTAssertEqual(videoPacketCount, Int(frameRate * 20))
+        XCTAssertEqual(inputIDRs, 4)
+        let timeline = HLSTimelineCoordinator()
+        defer { timeline.retireCompressedGeneration() }
+        var origins: [MediaOriginReceipt] = []
+        var terminal: [HLSTimelineTerminal] = []
+        var firstAudio: (decision: HLSAudioBoundaryDecision, start: ExactMediaTime, duration: ExactMediaTime?)?
+        var audioCount = 0
+        var videoCount = 0
+        var selectedIDRs = 0
+        var videoEnd = ExactMediaTime(value: 0, timescale: 1)
+        for event in events {
+            for emission in try timeline.consume(event) {
+                switch emission {
+                case .originEstablished(let origin): origins.append(origin)
+                case .terminal(let value): terminal.append(value)
+                case .audioSample(let sample):
+                    if firstAudio == nil {
+                        firstAudio = (sample.boundaryDecision, sample.timing.presentationTimeStamp, sample.timing.duration)
+                    }
+                    audioCount += 1
+                case .videoSample(let sample):
+                    videoCount += 1
+                    if sample.source.randomAccessKind == .h264IDR || sample.source.randomAccessKind == .hevcIDR {
+                        selectedIDRs += 1
+                    }
+                    videoEnd = try sample.timing.presentationTimeStamp.adding(XCTUnwrap(sample.timing.duration))
+                default: break
+                }
+            }
+        }
+        XCTAssertEqual(origins.count, 1)
+        XCTAssertEqual(origins.first?.sourceTime, .init(value: 5, timescale: 1))
+        XCTAssertEqual(origins.first?.effectiveStart, .init(value: 10, timescale: 1))
+        XCTAssertEqual(videoCount, Int(frameRate * 15))
+        XCTAssertEqual(selectedIDRs, 3)
+        XCTAssertEqual(videoEnd, .init(value: 25, timescale: 1))
+        XCTAssertEqual(audioCount, Int((15 * audioRate + 1_023) / 1_024))
+        let first = try XCTUnwrap(firstAudio)
+        XCTAssertEqual(first.decision, .unchanged,
+            "A crossing AAC AU would legitimately select compatibility conversion, outside this aligned-source control")
+        XCTAssertEqual(first.start, .init(value: 10, timescale: 1))
+        XCTAssertEqual(first.duration, .init(value: 1_024, timescale: audioRate))
+        XCTAssertEqual(terminal, [.endOfStream])
+        print("LARGE_IDR_TIMELINE sourceOrigin=\(origins.first?.sourceTime.cmTime.seconds ?? -1) " +
+            "effectiveOrigin=\(origins.first?.effectiveStart.cmTime.seconds ?? -1) admittedVideoFrames=\(videoCount) " +
+            "admittedIDRs=\(selectedIDRs) admittedAudioAUs=\(audioCount) firstAACUntrimmed=\(first.decision == .unchanged)")
     }
 
     private func assertLargeIDRFragmentSequence(_ records: [SyntheticAACContinuityCapture.Record],

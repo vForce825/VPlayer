@@ -77,10 +77,13 @@ printf '模拟器 UDID：%s；构建配置：%s；增量构建目录：%s\n' "$s
 for variable in ${!SIMCTL_CHILD_@}; do unset "$variable"; done
 # 构建输出同时进入 CI 日志与本地证据；超时终止前也能看到最后的编译进展。
 # 保留 pipefail，避免 tee 成功掩盖构建失败。
+# 与前置 Release UI 构建保持一致：只编译选定模拟器的架构，并关闭 scheme 的
+# Swift 覆盖率；单独关闭 CLANG_ENABLE_CODE_COVERAGE 仍会触发带覆盖率的整包重编译。
 xcodebuild build -project "$repository_root/VPlayer.xcodeproj" -scheme VPlayer \
     -configuration "$configuration" -sdk appletvsimulator \
     -destination "platform=tvOS Simulator,id=$simulator_udid" \
-    -derivedDataPath "$derived_data" CLANG_ENABLE_CODE_COVERAGE=NO \
+    -derivedDataPath "$derived_data" -enableCodeCoverage NO ONLY_ACTIVE_ARCH=YES \
+    CLANG_ENABLE_CODE_COVERAGE=NO \
     CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$evidence/build.log" || fail '模拟器构建失败'
 app="$derived_data/Build/Products/$configuration-appletvsimulator/VPlayer.app"
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"

@@ -29,6 +29,10 @@ CASES = (
          width=3840, height=2160, fps=50, tile=8, crf=28, rate=48000, minimum_idr=500000,
          transfer="arib-std-b67", pixel_format="yuv420p10le"),
 )
+# Authored aligned-source controls, not a claim about arbitrary broadcast A/V
+# phase. One real five-second video GOP supplies scan/format acquisition. The
+# complete AAC warm-up ends exactly at the next IDR in both PCM and TS clocks.
+TRANSPORT_WARMUP = {44100: (196, 40400), 48000: (234, 720)}
 
 
 def tool(name):
@@ -97,9 +101,9 @@ def inspect(path, case, decode=False):
                 audio_packets=len(audio_packets), audio_duration=audio["duration"])
 
 
-def aac_payload_fingerprints(path, adts=False):
+def aac_payload_fingerprints(path, adts=False, media="a"):
     command = [tool("ffmpeg"), "-hide_banner", "-v", "error", "-i", str(path),
-               "-map", "0:a:0", "-c", "copy"]
+               "-map", f"0:{media}:0", "-c", "copy"]
     if adts:
         command += ["-bsf:a", "aac_adtstoasc"]
     output = subprocess.check_output(command + ["-f", "framehash", "-hash", "sha256", "-"], text=True)
@@ -119,18 +123,23 @@ def inspect_transport(path, oracle, case, decode=False):
             case["transfer"], "aac", case["rate"], 2):
         raise ValueError("TS wrapper changed the original source format")
     tick = Fraction(1, 90000)
+    warmup_aac, audio_start_ticks = TRANSPORT_WARMUP[case["rate"]]
+    audio_start = audio_start_ticks * tick
+    if audio_start + warmup_aac * Fraction(1024, case["rate"]) != 5:
+        raise ValueError("Acquisition prelude must end on the exact five-second audio/video origin")
     groups = []
     maximum_audio_error = Fraction(0)
-    for stream, count, step in [(video, case["fps"] * 15, Fraction(1, case["fps"])),
-                               (audio, (15 * case["rate"] + 1023) // 1024, Fraction(1024, case["rate"]))]:
+    for stream, count, step in [(video, case["fps"] * 20, Fraction(1, case["fps"])),
+                               (audio, warmup_aac + (15 * case["rate"] + 1023) // 1024, Fraction(1024, case["rate"]))]:
         packets = [p for p in facts["packets"] if p["stream_index"] == stream["index"]]
         if len(packets) != count or Fraction(stream["time_base"]) != tick:
             raise ValueError("TS wrapper lost packets or changed the transport time base")
-        if int(packets[0]["pts"]) != 0:
+        start = audio_start if stream == audio else 0
+        if int(packets[0]["pts"]) * tick != start:
             raise ValueError("TS wrapper shifted the source origin")
         for index, packet in enumerate(packets):
             limit = tick if stream == audio else 0
-            errors = [abs(int(packet[field]) * tick - index * step) for field in ("pts", "dts")]
+            errors = [abs(int(packet[field]) * tick - (start + index * step)) for field in ("pts", "dts")]
             if max(errors) > limit or abs(int(packet["duration"]) * tick - step) > limit:
                 raise ValueError("TS timestamp exceeds its representable transport quantization")
             if stream == audio:
@@ -141,18 +150,43 @@ def inspect_transport(path, oracle, case, decode=False):
     video_packets, audio_packets = groups
     keys = [p for p in video_packets if "K" in p["flags"]]
     sizes = [int(p["size"]) for p in keys]
-    if [int(p["pts"]) * tick for p in keys] != [0, 5, 10] or min(sizes) < case["minimum_idr"] or max(sizes) > 1024 * 1024:
-        raise ValueError("TS wrapper must preserve three genuine large-IDR GOPs below the per-AU cap")
+    if [int(p["pts"]) * tick for p in keys] != [0, 5, 10, 15] or min(sizes) < case["minimum_idr"] or max(sizes) > 1024 * 1024:
+        raise ValueError("TS wrapper needs one acquisition GOP and three genuine large-IDR output GOPs")
+    if int(audio_packets[warmup_aac]["pts"]) * tick != 5:
+        raise ValueError("First admitted AAC AU must start exactly on the eligible IDR")
+    last_warmup = audio_packets[warmup_aac - 1]
+    if int(last_warmup["pts"]) * tick + Fraction(1024, case["rate"]) > 5:
+        raise ValueError("No quantized warm-up AU may cross the eligible origin")
     payloads = aac_payload_fingerprints(path, adts=True)
-    if len(payloads) != len(audio_packets) or payloads != aac_payload_fingerprints(oracle):
+    original = aac_payload_fingerprints(oracle)
+    if len(payloads) != len(audio_packets) or payloads[warmup_aac:] != original:
         raise ValueError("TS AAC payloads differ from the original MP4 decoding oracle")
     if decode:
         run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-xerror", "-threads", "1",
             "-i", str(path), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-")
     return dict(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                 video_packets=len(video_packets), audio_packets=len(audio_packets), idr_bytes=sizes,
+                source_video_seconds=20, admitted_origin_seconds=5, warmup_audio_packets=warmup_aac,
+                audio_start_ticks=audio_start_ticks, admitted_audio_packets=len(original),
+                admitted_aac_sequence_sha256=hashlib.sha256(json.dumps(payloads[warmup_aac:]).encode()).hexdigest(),
                 maximum_audio_pts_error_ticks=str(maximum_audio_error / tick),
                 aac_payload_sequence_sha256=hashlib.sha256(json.dumps(payloads).encode()).hexdigest())
+
+
+def adts_access_units(data):
+    """Split a generated single AAC encode only at complete, original AU boundaries."""
+    result = []
+    offset = 0
+    while offset < len(data):
+        header = data[offset:offset + 7]
+        if len(header) != 7 or header[0] != 255 or header[1] & 0xF6 != 0xF0 or header[6] & 3:
+            raise ValueError("Expected complete single-block ADTS AAC access units")
+        size = ((header[3] & 3) << 11) | (header[4] << 3) | (header[5] >> 5)
+        if size < (7 if header[1] & 1 else 9) or offset + size > len(data):
+            raise ValueError("Truncated generated AAC access unit")
+        result.append(data[offset:offset + size])
+        offset += size
+    return result
 
 
 def generate_transports(directory):
@@ -162,13 +196,43 @@ def generate_transports(directory):
         oracle = directory / case["name"]
         if inspect(oracle, case) != manifest["measurements"][case["name"]]:
             raise ValueError("Transport generation must use the unchanged committed decoding oracle")
+        original_video = aac_payload_fingerprints(oracle, media="v")
         output = oracle.with_suffix(".ts")
-        run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-copyts", "-i", str(oracle),
-            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-mpegts_copyts", "1",
-            "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", str(output))
+        warmup_aac, audio_start_ticks = TRANSPORT_WARMUP[case["rate"]]
+        with tempfile.TemporaryDirectory(prefix="vplayer-large-idr-acquisition-") as temporary:
+            temporary = Path(temporary)
+            video = temporary / "one-gop.mp4"
+            continuous = temporary / "continuous.aac"
+            body = temporary / "body.aac"
+            audio = temporary / "source.aac"
+            run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-i", str(oracle),
+                "-map", "0:v:0", "-c", "copy", "-frames:v", str(case["fps"] * 5), str(video))
+            run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
+                f'sine=frequency=997:sample_rate={case["rate"]}:duration=20',
+                "-c:a", "aac", "-b:a", "128k", "-ar", str(case["rate"]), "-ac", "2", "-f", "adts", str(continuous))
+            units = adts_access_units(continuous.read_bytes())
+            admitted = (15 * case["rate"] + 1023) // 1024
+            if len(units) < warmup_aac + admitted:
+                raise ValueError("Continuous encode does not cover the complete source endpoint")
+            audio.write_bytes(b"".join(units[:warmup_aac + admitted]))
+            body.write_bytes(b"".join(units[warmup_aac:warmup_aac + admitted]))
+            # The oracle is exactly the admitted suffix of one continuous encode,
+            # with no repeated AAC priming AU. Its genuine large video is copied.
+            run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-stream_loop", "2", "-i", str(video),
+                "-i", str(body), "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+                "-movflags", "+faststart", str(oracle))
+            if aac_payload_fingerprints(oracle, media="v") != original_video:
+                raise ValueError("Acquisition generation must preserve every genuine compressed video payload")
+            manifest["measurements"][case["name"]] = inspect(oracle, case, decode=True)
+            run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-copyts", "-stream_loop", "3",
+                "-i", str(video), "-itsoffset", f"{audio_start_ticks / 90000:.12f}", "-i", str(audio),
+                "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-mpegts_copyts", "1",
+                "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", str(output))
         transports[output.name] = inspect_transport(output, oracle, case, decode=True)
     manifest["transport_ffmpeg_version"] = subprocess.check_output([tool("ffmpeg"), "-version"], text=True).splitlines()[0]
     manifest["transport_generation"] = "Scripts/generate-homepod-large-idr-fixtures.py --generate-transports"
+    manifest["audio"] = "One continuous lavfi sine AAC encode per rate; complete warm-up AUs followed by the exact admitted 15-second oracle suffix; no duplicated priming AUs"
+    manifest["transport_scope"] = "Authored aligned-source case: five-second valid acquisition GOP; declared AAC start phase and complete warm-up ending exactly at the eligible IDR. Does not model every broadcast A/V phase."
     manifest["transports"] = transports
     (directory / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 

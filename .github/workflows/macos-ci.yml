@@ -146,7 +146,7 @@ jobs:
         timeout-minutes: 15
         run: |
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
-            -configuration Release \
+            -configuration Release ONLY_ACTIVE_ARCH=YES -enableCodeCoverage NO \
             -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
             -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
@@ -401,6 +401,8 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow \
             --only-testing VPlayerTests/HLSResourceTransportTests \
             --only-testing VPlayerTests/AACPassthroughTests \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testUnboundInspectionWriterCannotSignWriterWindowContinuation \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testDefaultLargeRemuxReservationKeepsRealAliasesAcrossRolloverAndRetriesAfterLastRelease \
             --only-testing VPlayerTests/PlaybackSourceResolverTests \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence \
