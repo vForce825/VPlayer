@@ -447,6 +447,11 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimeTracksSuccessiveAcceptedAccessUnitStarts \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimeKeepsAcceptedStartsAsTheWindowSlides \
+            --only-testing VPlayerTests/HLSPublisherTests/testAudioProgramDateTimePreservesOldEpochCoordinatesAfterWriterReplacement \
+            --only-testing VPlayerTests/HLSPublisherTests/testFrozenDeclarationsAndPDTStayStableAcrossSlidingAndNewItemChangesURI \
+            --only-testing VPlayerTests/SourceAACPublicationTests/testSourceAACProgramDateTimeUsesAcceptedCallbackCoordinatesInTheAnchorDomain \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \

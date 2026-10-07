@@ -54,6 +54,33 @@ final class SourceAACPublicationTests: XCTestCase {
         XCTAssertFalse(fixture.root.isCurrent)
         XCTAssertNil(fixture.store.sourceAACProof(for: HLSResourceKey(last.object)))
     }
+
+    func testSourceAACProgramDateTimeUsesAcceptedCallbackCoordinatesInTheAnchorDomain() async throws {
+        let fixture = try await SourceAACPublicationFixture.make()
+        defer { fixture.close() }
+        let snapshot = try XCTUnwrap(fixture.publisher.visible)
+        let playlist = try XCTUnwrap(snapshot.media[2])
+        var starts: [UInt64: ExactMediaTime] = [:]
+        for resource in playlist.resources {
+            let packet = try XCTUnwrap(fixture.packets.first {
+                $0.receipt.logicalSequence == resource.logicalSequence
+                    && $0.object.binding.mediaEpoch.rawValue == resource.mediaEpoch
+            })
+            let evidence = try XCTUnwrap(packet.object.publicationEvidence?.sourceAAC)
+            XCTAssertTrue(evidence.matches(packet.object))
+            XCTAssertTrue(packet.receipt.matches(media: packet.object, proof: fixture.proof))
+            XCTAssertEqual(evidence.writtenRange, packet.receipt.presentationRange)
+            // Only this callback's authenticated writer offset converts the
+            // native receipt back to the anchor domain. AVAssetReader's output
+            // translation is not evidence for this offset, which may be zero.
+            let offset = try XCTUnwrap(evidence.timelineOffset)
+            starts[resource.logicalSequence] = try packet.receipt.presentationRange.start.subtracting(offset)
+        }
+        XCTAssertGreaterThan(starts.count, 3)
+        XCTAssertEqual(try XCTUnwrap(starts[0]), fixture.root.configuration.firstPresentationTime)
+        try Task19ProgramDateTimeChecks.assertDates(snapshot, participantID: 2, starts: starts)
+    }
+
     func testPhysicalWindowFinishDoesNotAuthorizeSourceEOF() async throws {
         let fixture = try await SourceAACPublicationFixture.make(finishSource: false)
         defer { fixture.close() }

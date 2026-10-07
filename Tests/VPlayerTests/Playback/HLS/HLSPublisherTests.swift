@@ -1351,6 +1351,85 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertThrowsError(try HLSPlaylistSerializer.validateAudioReferences(["missing"], groups: ["aac-2"]))
     }
 
+    func testAudioProgramDateTimeTracksSuccessiveAcceptedAccessUnitStarts() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
+        let snapshot = try XCTUnwrap(h.publisher.visible)
+        let audio = try XCTUnwrap(snapshot.coverage.participants.first { $0.participantID == 2 })
+        XCTAssertEqual(snapshot.coverage.logicalSequences, Array(0...5))
+        XCTAssertEqual(Array(audio.ranges.prefix(4).map(\.start)),
+            [0, 48_128, 96_256, 144_384].map { Task19.time(Int64($0), 48_000) })
+        let mapping = try XCTUnwrap(snapshot.aacTimelineMappings[2])
+        XCTAssertEqual(mapping.writtenPhysicalBase, mapping.writtenEffectiveBase,
+            "This regression uses the existing zero-prime fixture")
+
+        // RFC 8216 section 4.3.2.6 associates PDT with the first media timestamp.
+        // The real audio receipts diverge from the 1/2/3-second video cuts.
+        for id: UInt64 in [1, 2] {
+            let starts = try Task19ProgramDateTimeChecks.acceptedStarts(snapshot, participantID: id)
+            try Task19ProgramDateTimeChecks.assertDates(snapshot, participantID: id, starts: starts)
+        }
+    }
+
+    func testAudioProgramDateTimeKeepsAcceptedStartsAsTheWindowSlides() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
+        let initial = try XCTUnwrap(h.publisher.visible)
+        var starts = try Task19ProgramDateTimeChecks.acceptedStarts(initial, participantID: 2)
+        var previousDates = try Task19ProgramDateTimeChecks.dates(try XCTUnwrap(initial.media[2]))
+        for index in 1...8 {
+            try await h.offerBoth(count: 1, now: Int64(index - 1) * Task19.second)
+            XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket,
+                now: Int64(index) * Task19.second), .published)
+            let snapshot = try XCTUnwrap(h.publisher.visible)
+            starts.merge(try Task19ProgramDateTimeChecks.acceptedStarts(snapshot, participantID: 2)) {
+                original, _ in original
+            }
+            let dates = try Task19ProgramDateTimeChecks.dates(try XCTUnwrap(snapshot.media[2]))
+            for (sequence, previous) in previousDates where dates[sequence] != nil {
+                XCTAssertEqual(dates[sequence], previous,
+                    "Sliding must not change a retained segment's date: sequence \(sequence)")
+            }
+            try Task19ProgramDateTimeChecks.assertDates(snapshot, participantID: 2, starts: starts)
+            previousDates = dates
+        }
+        let final = try XCTUnwrap(h.publisher.visible)
+        XCTAssertGreaterThan(try XCTUnwrap(final.coverage.publishedWindow.first), 0)
+        XCTAssertEqual(final.coverage.publishedWindow.count, 7)
+    }
+
+    func testAudioProgramDateTimePreservesOldEpochCoordinatesAfterWriterReplacement() async throws {
+        let h = try await Task19Harness()
+        try await h.initial()
+        let initial = try XCTUnwrap(h.publisher.visible)
+        let oldMapping = try XCTUnwrap(initial.aacTimelineMappings[2])
+        let oldDates = try Task19ProgramDateTimeChecks.dates(try XCTUnwrap(initial.media[2]))
+        var starts = try Task19ProgramDateTimeChecks.acceptedStarts(initial, participantID: 2)
+        try await h.beginEpoch(2)
+        try await h.offerBoth(count: 1)
+        XCTAssertEqual(try h.publisher.publish(ticket: h.publisher.ticket, now: Task19.second), .published)
+
+        let mixed = try XCTUnwrap(h.publisher.visible)
+        let audio = try XCTUnwrap(mixed.media[2])
+        XCTAssertEqual(Set(audio.resources.map(\.mediaEpoch)), Set([UInt64(1), 2]))
+        XCTAssertTrue(audio.text.contains("#EXT-X-DISCONTINUITY\n#EXT-X-MAP:"))
+        let newMapping = try XCTUnwrap(mixed.aacTimelineMappings[2])
+        XCTAssertNotEqual(newMapping.binding.writerIdentity, oldMapping.binding.writerIdentity)
+        XCTAssertNotEqual(newMapping.inputPhysicalBase, oldMapping.inputPhysicalBase)
+        XCTAssertEqual(mixed.coverage.anchor, initial.coverage.anchor)
+        starts.merge(try Task19ProgramDateTimeChecks.acceptedStarts(mixed, participantID: 2)) {
+            original, _ in original
+        }
+        let dates = try Task19ProgramDateTimeChecks.dates(audio)
+        let retainedOldSegments = audio.resources.filter { $0.mediaEpoch == 1 }
+        XCTAssertFalse(retainedOldSegments.isEmpty)
+        for resource in retainedOldSegments {
+            XCTAssertEqual(dates[resource.logicalSequence], try XCTUnwrap(oldDates[resource.logicalSequence]),
+                "Replacing the active writer must preserve each old segment's original date")
+        }
+        try Task19ProgramDateTimeChecks.assertDates(mixed, participantID: 2, starts: starts)
+    }
+
     func testFrozenDeclarationsAndPDTStayStableAcrossSlidingAndNewItemChangesURI() async throws {
         let h = try await Task19Harness()
         try await h.initial()
@@ -1443,6 +1522,53 @@ final class HLSPublisherTests: XCTestCase {
         XCTAssertEqual(harness.publisher.visible?.publicationSequence,
                        prior.publicationSequence,
                        "缺少 endpoint authority 时不得推进 ENDLIST publication")
+    }
+}
+
+/// Reads protocol output and compares it with already-accepted receipt coordinates.
+/// No proposed production field or serializer date calculation supplies the oracle.
+enum Task19ProgramDateTimeChecks {
+    static func acceptedStarts(_ snapshot: HLSPublishedSnapshot, participantID: UInt64,
+                               file: StaticString = #filePath, line: UInt = #line) throws -> [UInt64: ExactMediaTime] {
+        let coverage = try XCTUnwrap(snapshot.coverage.participants.first { $0.participantID == participantID },
+            file: file, line: line)
+        XCTAssertEqual(coverage.ranges.count, snapshot.coverage.logicalSequences.count, file: file, line: line)
+        return Dictionary(uniqueKeysWithValues: zip(snapshot.coverage.logicalSequences, coverage.ranges.map(\.start)))
+    }
+
+    static func dates(_ playlist: HLSPlaylistSnapshot,
+                      file: StaticString = #filePath, line: UInt = #line) throws -> [UInt64: Date] {
+        let prefix = "#EXT-X-PROGRAM-DATE-TIME:"
+        let values = playlist.text.split(separator: "\n").filter { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+        XCTAssertEqual(values.count, playlist.resources.count, file: file, line: line)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var result: [UInt64: Date] = [:]
+        for (resource, value) in zip(playlist.resources, values) {
+            XCTAssertNotNil(value.range(of: #"\.\d{3}Z$"#, options: .regularExpression),
+                "PDT must retain millisecond precision: \(value)", file: file, line: line)
+            result[resource.logicalSequence] = try XCTUnwrap(formatter.date(from: value), file: file, line: line)
+        }
+        return result
+    }
+
+    static func assertDates(_ snapshot: HLSPublishedSnapshot, participantID: UInt64,
+                            starts: [UInt64: ExactMediaTime],
+                            file: StaticString = #filePath, line: UInt = #line) throws {
+        let playlist = try XCTUnwrap(snapshot.media[participantID], file: file, line: line)
+        let dates = try dates(playlist, file: file, line: line)
+        let anchor = snapshot.coverage.anchor
+        for resource in playlist.resources {
+            let start = try XCTUnwrap(starts[resource.logicalSequence], file: file, line: line)
+            let date = try XCTUnwrap(dates[resource.logicalSequence], file: file, line: line)
+            let actualSeconds = date.timeIntervalSince1970 - Double(anchor.utcMilliseconds) / 1_000
+            let expectedSeconds = CMTimeGetSeconds(start.cmTime) - CMTimeGetSeconds(anchor.mediaOrigin.cmTime)
+            XCTAssertEqual(actualSeconds, expectedSeconds, accuracy: 0.001,
+                "Participant \(participantID), epoch \(resource.mediaEpoch), sequence \(resource.logicalSequence): "
+                    + "PDT must describe the accepted first media timestamp, within one millisecond",
+                file: file, line: line)
+        }
     }
 }
 

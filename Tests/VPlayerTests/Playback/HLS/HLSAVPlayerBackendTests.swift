@@ -2836,7 +2836,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let records = try capture.snapshot()
             let media = records.filter { $0.kind == .media }.sorted { $0.sequence < $1.sequence }
             let initial = try XCTUnwrap(records.first { $0.kind == .initialization })
-            try printSyntheticAACInitialization(initial.bytes, label: "AC3_AAC_NATIVE_INIT")
+            try printSyntheticAACInitialization(initial.bytes, label: "AC3_AAC_NATIVE_INIT", requireUneditedAAC: true)
             let fragments = try media.map { try SyntheticAACFragmentInspector.inspect($0) }
             XCTAssertGreaterThanOrEqual(media.count, 60)
             XCTAssertEqual(Set(media.map(\.writer)).count, 1,
@@ -2950,6 +2950,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 "physicalEnd=\(final.terminalPhysicalEnd) effectiveEnd=\(final.lastEffectiveEnd) " +
                 "writerFinal=true playbackEndpointIssued=\(rendition.endpointAuthority != nil)")
             XCTAssertEqual(try XCTUnwrap(rawAudio.first).start, mapping.writtenPhysicalBase)
+            XCTAssertGreaterThan(final.leadingFrames, 0,
+                "This native regression must exercise a primed first AAC segment")
+            XCTAssertEqual(try mapping.writtenPhysicalBase.adding(
+                .init(value: Int64(final.leadingFrames), timescale: final.sampleRate)), mapping.writtenEffectiveBase)
             let lastRaw = try XCTUnwrap(rawAudio.last)
             XCTAssertEqual(try lastRaw.start.adding(lastRaw.duration), final.terminalPhysicalEnd)
             XCTAssertEqual(Int64(rawAudio.count) * 1_024, final.totalDecodedFrames,
@@ -3065,6 +3069,17 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         for participant in snapshot.coverage.participants {
             let kind = snapshot.aacTerminalBindings[participant.participantID] == nil ? "video" : "aac"
             let playlist = try XCTUnwrap(snapshot.media[participant.participantID])
+            let dates = try Task19ProgramDateTimeChecks.dates(playlist)
+            let offset = snapshot.aacTimelineMappings[participant.participantID]?.offset ?? HLSChecked.zero
+            let anchor = snapshot.coverage.anchor
+            XCTAssertEqual(snapshot.coverage.logicalSequences.count, participant.ranges.count)
+            for (sequence, range) in zip(snapshot.coverage.logicalSequences, participant.ranges) {
+                let start = try range.start.subtracting(offset)
+                let date = try XCTUnwrap(dates[sequence])
+                XCTAssertEqual(date.timeIntervalSince1970 - Double(anchor.utcMilliseconds) / 1_000,
+                    CMTimeGetSeconds(start.cmTime) - CMTimeGetSeconds(anchor.mediaOrigin.cmTime), accuracy: 0.001,
+                    "PDT must preserve the actual first AAC timestamp, including initial priming and later AU phase")
+            }
             // Allowlist scalar timing tags. Never print loopback authentication or resource URIs.
             let tags = playlist.text.split(separator: "\n").filter {
                 $0.hasPrefix("#EXT-X-PROGRAM-DATE-TIME:") || $0.hasPrefix("#EXTINF:")
@@ -3075,7 +3090,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
-    private func printSyntheticAACInitialization(_ bytes: Data, label: String = "LARGE_IDR_AAC_NATIVE_INIT") throws {
+    private func printSyntheticAACInitialization(_ bytes: Data, label: String = "LARGE_IDR_AAC_NATIVE_INIT",
+        requireUneditedAAC: Bool = false) throws {
         // Diagnostic bytes only: no inferred delay or reader offset enters assertions.
         var metadata: [String: String] = [:]
         func visit(_ start: Int, _ end: Int, path: String, depth: Int) throws {
@@ -3094,6 +3110,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             }
         }
         try visit(0, bytes.count, path: "", depth: 0)
+        if requireUneditedAAC {
+            XCTAssertFalse(metadata.keys.contains { $0.hasSuffix("/elst") },
+                "The native Apple-HLS AAC coordinate proof requires its original unedited track timeline")
+        }
         let data = try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys])
         print("\(label) \(String(decoding: data, as: UTF8.self))")
     }

@@ -88,6 +88,10 @@ struct HLSValidatedSegment: Sendable {
     let objectIdentity: FMP4ObjectIdentity
     let bodyBytes: Int
     let commonStart: ExactMediaTime
+    /// First physical media PTS in the anchor's clock, frozen at admission.
+    /// Encoder pre-roll remains part of this coordinate; a later epoch must not
+    /// reinterpret a retained segment using its replacement writer's mapping.
+    let programDateStart: ExactMediaTime
     let commonDuration: ExactMediaTime
     let discontinuity: Bool
     let boundary: SegmentCommittedBoundary

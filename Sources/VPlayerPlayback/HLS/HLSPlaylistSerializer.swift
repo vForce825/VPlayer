@@ -154,7 +154,7 @@ enum HLSPlaylistSerializer {
                 text += "#EXT-X-MAP:URI=\"\(try declaration.resourceURI(segment.initializationKey))\"\n"
                 previousMap = segment.initializationKey
             }
-            text += "#EXT-X-PROGRAM-DATE-TIME:\(try pdt(segment.commonStart, anchor: anchor))\n"
+            text += "#EXT-X-PROGRAM-DATE-TIME:\(try pdt(segment.programDateStart, anchor: anchor))\n"
             text += "#EXTINF:\(try duration(segment.receipt.presentationRange.duration)),\n"
             text += try declaration.resourceURI(segment.key) + "\n"
         }
