@@ -11,6 +11,91 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class LoopbackHTTPServerTests: XCTestCase {
+    func testCancellationBeforeStartupProbeStartsJoinsListenerAndProbeAndReleasesOwner() async throws {
+        try await checkStartupCancellationJoinsOwnedTails(holdBeforeStart: true, cancelBeforeHandoff: true)
+    }
+
+    func testCancellationWaitsForStartedProbeTerminalTailBeforeReturning() async throws {
+        // The same accepted-peer tail gates both cancellation and normal handoff.
+        for cancel in [true, false] {
+            try await checkStartupCancellationJoinsOwnedTails(holdBeforeStart: false, cancelBeforeHandoff: cancel)
+        }
+    }
+
+    private func checkStartupCancellationJoinsOwnedTails(holdBeforeStart: Bool, cancelBeforeHandoff: Bool) async throws {
+        try await LoopbackHTTPTestingCapability.withCapability { capability in
+            let baseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
+            let gate = LoopbackStartupTailTestGate(holdBeforeStart: holdBeforeStart)
+            let hooks = LoopbackHTTPStartupTestHooks(capability: capability,
+                beforeProbeStart: { server, probe, start in gate.install(server: server, probe: probe, start: start) },
+                beforeProbeTerminalTail: { finish in finish() },
+                listenerTerminal: { gate.listenerTerminated() },
+                beforeStartupConnectionTerminalTail: { finish in gate.installTerminalTail(finish) },
+                probeStarted: { gate.probeStarted() })
+            let finished = LockedInts()
+            var startup: Task<Task20HTTPFixture, any Error>? = Task {
+                defer { finished.append(1) }
+                return try await LoopbackHTTPStartupTestHooks.$current.withValue(hooks) {
+                    try await Task20HTTPFixture.start()
+                }
+            }
+            defer { gate.releaseAll(); startup?.cancel() }
+            let entered = await startupCondition {
+                holdBeforeStart ? gate.hasDeferredStart : gate.hasDeferredTerminalTail && gate.probeDidStart
+            }
+            XCTAssertTrue(entered, "Wait at the actual owned Network.framework startup boundary")
+            if cancelBeforeHandoff {
+                startup?.cancel()
+                let listenerStopped = await startupCondition { gate.listenerDidTerminate }
+                XCTAssertTrue(listenerStopped, "The listener must report its real canceled callback")
+            }
+            XCTAssertTrue(finished.values.isEmpty,
+                "Startup cannot return while the original probe start/server-side terminal tail is held")
+            XCTAssertTrue(gate.serverAlive)
+            if !holdBeforeStart {
+                XCTAssertGreaterThan(gate.serverConnectionCount, 0)
+                XCTAssertGreaterThanOrEqual(gate.retainedParserBytes, LoopbackStorageLayout.current.parserAllocationBytes,
+                    "The actual accepted peer still owns its parser allocation until its terminal marker exits")
+            }
+            XCTAssertGreaterThan(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline,
+                "The original server's aliases still own their real ledger charges")
+            gate.releaseAll()
+            do {
+                if let fixture = try await startup?.value {
+                    if !cancelBeforeHandoff {
+                        XCTAssertEqual(try rawRequest(port: fixture.server.port, method: "HEAD",
+                            target: fixture.server.masterPath).status, 200)
+                    }
+                    fixture.shutdown()
+                    if cancelBeforeHandoff { XCTFail("Cancellation before handoff cannot return a usable server") }
+                }
+            } catch {
+                XCTAssertTrue(cancelBeforeHandoff && error is CancellationError, "\(error)")
+            }
+            startup = nil
+            let released = await startupCondition {
+                !gate.serverAlive && !gate.probeAlive
+                    && HLSDeliveryApplicationChargeLedger.shared.chargedBytes <= baseline
+            }
+            XCTAssertTrue(released, "Only physical owner/callback release may restore the ledger")
+
+            var successor: Task20HTTPFixture? = try await Task20HTTPFixture.start()
+            let next = try XCTUnwrap(successor)
+            XCTAssertEqual(try rawRequest(port: next.server.port, method: "HEAD",
+                target: next.server.masterPath).status, 200)
+            next.shutdown()
+            successor = nil
+        }
+    }
+
+    private func startupCondition(_ predicate: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(3)
+        while !predicate(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return predicate()
+    }
+
     func testCurrentFinalProjectionRequiresCommittedFinalAndExactCompletedBodies() async throws {
         let fixture = try await Task20HTTPFixture.start(terminalLogicalSequence: 5)
         defer { fixture.shutdown() }
@@ -6692,6 +6777,57 @@ private final class LockedHarness: @unchecked Sendable {
     var value: Task19Harness? {
         get { lock.withLock { storage } }
         set { lock.withLock { storage = newValue } }
+    }
+}
+
+private final class LoopbackStartupTailTestGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let holdBeforeStart: Bool
+    private weak var server: LoopbackHTTPServer?
+    private weak var probe: NWConnection?
+    private var start: (@Sendable () -> Void)?
+    private var terminal: (@Sendable () -> Void)?
+    private var released = false, listenerStopped = false, probeStartedValue = false
+    init(holdBeforeStart: Bool) { self.holdBeforeStart = holdBeforeStart }
+    var hasDeferredStart: Bool { lock.withLock { start != nil } }
+    var hasDeferredTerminalTail: Bool { lock.withLock { terminal != nil } }
+    var listenerDidTerminate: Bool { lock.withLock { listenerStopped } }
+    var probeDidStart: Bool { lock.withLock { probeStartedValue } }
+    var serverAlive: Bool { lock.withLock { server != nil } }
+    var probeAlive: Bool { lock.withLock { probe != nil } }
+    var serverConnectionCount: Int {
+        let original = lock.withLock { server }
+        return original?.usage.connections ?? 0
+    }
+    var retainedParserBytes: Int {
+        let original = lock.withLock { server }
+        return original?.usage.parserAndStagingBytes ?? 0
+    }
+    func listenerTerminated() { lock.withLock { listenerStopped = true } }
+    func probeStarted() { lock.withLock { probeStartedValue = true } }
+    func install(server: LoopbackHTTPServer, probe: NWConnection, start: @escaping @Sendable () -> Void) {
+        let immediate = lock.withLock {
+            self.server = server; self.probe = probe
+            guard holdBeforeStart, !released else { return true }
+            self.start = start; return false
+        }
+        if immediate { start() }
+    }
+    func installTerminalTail(_ finish: @escaping @Sendable () -> Void) {
+        let immediate = lock.withLock {
+            guard !holdBeforeStart, !released, terminal == nil else { return true }
+            terminal = finish; return false
+        }
+        if immediate { finish() }
+    }
+    func releaseAll() {
+        let pending = lock.withLock {
+            released = true
+            let result = (start, terminal)
+            start = nil; terminal = nil
+            return result
+        }
+        pending.0?(); pending.1?()
     }
 }
 
