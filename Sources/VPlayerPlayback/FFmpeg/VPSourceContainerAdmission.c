@@ -277,7 +277,8 @@ static int ts_single_section(const uint8_t *q,size_t head,uint8_t table,const ui
     for (size_t i=head+*length;i<188;i++) if (q[i]!=0xff) return -EINVAL;
     *section=q+head; return 0;
 }
-static int ts_admit(const uint8_t *p,size_t n,int prefix,int (*interrupt)(void *),void *context,VPSourceAdmission *view) {
+typedef struct { unsigned pid,type; } TSVideo;
+static int ts_admit(const uint8_t *p,size_t n,int prefix,int (*interrupt)(void *),void *context,VPSourceAdmission *view,TSVideo *selected) {
     unsigned pmt=8192, program=0, streams=0, video=0, observed_count=0;
     uint8_t pat_copy[184],pmt_copy[184]; size_t pat_size=0,pmt_size=0;
     unsigned stream_pids[8]={0},observed_pids[8]={0};
@@ -340,7 +341,10 @@ static int ts_admit(const uint8_t *p,size_t n,int prefix,int (*interrupt)(void *
                         return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                     for (unsigned j=0;j<streams;j++) if (stream_pids[j]==stream) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
                     stream_pids[streams++]=stream;
-                    if ((type==0x1b || type==0x24) && ++video>1) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+                    if (type==0x1b || type==0x24) {
+                        if (++video>1) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
+                        if (selected) *selected=(TSVideo){.pid=stream,.type=type};
+                    }
                     k+=extra;
                 }
                 if (!streams) return ts_failure(view,VP_SOURCE_ADMISSION_TOPOLOGY,-EINVAL);
@@ -379,7 +383,7 @@ int vp_source_admit_container_with_view(const uint8_t *bytes,size_t size,int is_
         if (!is_prefix && size%188) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
         *usable_size=size-size%188;
         if (*usable_size<188*2) return ts_failure(view,VP_SOURCE_ADMISSION_STRUCTURE,-EINVAL);
-        int result=ts_admit(bytes,*usable_size,!!is_prefix,interrupt,context,view);
+        int result=ts_admit(bytes,*usable_size,!!is_prefix,interrupt,context,view,NULL);
         if (result<0) return result;
         *kind=1; return 0;
     }
@@ -399,4 +403,124 @@ int vp_source_admit_container_with_interrupt(const uint8_t *bytes,size_t size,in
 }
 int vp_source_admit_container(const uint8_t *bytes,size_t size,int is_prefix,int32_t *kind,size_t *usable_size) {
     return vp_source_admit_container_with_interrupt(bytes,size,is_prefix,kind,usable_size,NULL,NULL);
+}
+
+int vp_source_prepare_ts_tails(const uint8_t *bytes,size_t size,int prefix,
+    int (*interrupt)(void *),void *context,VPSourceTSTails *tails,VPSourceAdmission *view) {
+    for (size_t o=0;o<size;o+=188) {
+        if (interrupt && interrupt(context)) return -ECANCELED;
+        const uint8_t *p=bytes+o; size_t head=4;
+        if (p[3]&0x20) head+=1+p[4];
+        if (!(p[3]&0x10) || head>=188) continue;
+        unsigned pid=((p[1]&31u)<<8)|p[2]; VPSourceTSTail *tail=NULL;
+        if (vp_source_ignored_si(pid)) continue;
+        if (view) { view->packet_offset=o; view->pid=(int)pid; }
+        for (unsigned j=0;j<tails->count;j++) if (tails->tails[j].pid==pid) tail=&tails->tails[j];
+        if (p[1]&0x40) {
+            size_t available=188-head;
+            int possible=p[head]==0 && (available<2 || p[head+1]==0) && (available<3 || p[head+2]==1);
+            if (!possible) continue;
+            if (tail && tail->active && (tail->header_size<6 || (tail->expected && tail->bytes<tail->expected))) return -EINVAL;
+            if (!tail) { if (tails->count==VP_SOURCE_TS_MAX_TAILS) return -EFBIG; tail=&tails->tails[tails->count++]; }
+            *tail=(VPSourceTSTail){.pid=pid,.start=o,.active=1};
+        }
+        if (tail && tail->active) {
+            size_t available=188-head, copy=6-tail->header_size;
+            if (copy>available) copy=available;
+            if (copy) { memcpy(tail->header+tail->header_size,p+head,copy); tail->header_size+=copy; }
+            if (tail->header_size>=3 && (tail->header[0] || tail->header[1] || tail->header[2]!=1)) return -EINVAL;
+            if (tail->header_size==6) { unsigned length=be16(tail->header+4); tail->expected=length?length+6:0; }
+            tail->bytes+=available;
+        }
+    }
+    for (unsigned j=0;j<tails->count;j++) {
+        VPSourceTSTail *tail=&tails->tails[j];
+        int incomplete=tail->header_size<6 || (tail->expected && tail->bytes<tail->expected);
+        if (incomplete && !prefix) {
+            if (view) { view->packet_offset=tail->start; view->pid=(int)tail->pid; }
+            return -EINVAL;
+        }
+        tail->withhold=prefix && (incomplete || !tail->expected);
+    }
+    return 0;
+}
+int vp_source_ts_packet_withheld(const VPSourceTSTails *tails,unsigned pid,size_t packet) {
+    if (vp_source_ignored_si(pid)) return 1;
+    for (unsigned j=0;j<tails->count;j++)
+        if (tails->tails[j].pid==pid && tails->tails[j].withhold && packet>=tails->tails[j].start) return 1;
+    return 0;
+}
+
+/* Candidate presence only. The actual parser/format proof remains native.
+ * Retain scalar Annex B state across packets and PES without copying media. */
+typedef struct {
+    size_t zeros,bytes;
+    unsigned candidate,seen;
+    int active,valid,hevc;
+} TSParameters;
+static int ts_parameter_byte(TSParameters *s,uint8_t byte) {
+    if (!byte) { s->zeros++; return 0; }
+    if (byte==1 && s->zeros>=2) {
+        if (s->active && s->valid && s->bytes>(s->hevc?2u:1u)) s->seen|=s->candidate;
+        s->active=1; s->valid=1; s->bytes=0; s->candidate=0; s->zeros=0;
+        return 0;
+    }
+    if (s->active) {
+        if (!s->bytes) {
+            unsigned type=s->hevc?(byte>>1)&63:byte&31;
+            s->valid=!s->zeros && !(byte&0x80);
+            s->candidate=s->hevc?(type>=32 && type<=34?1u<<(type-32):0):
+                type==7?1u:type==8?2u:0;
+        }
+        if (s->hevc && s->bytes<=1 && s->bytes+s->zeros>=1)
+            s->valid=s->valid && s->bytes+s->zeros==1 && (byte&7);
+        s->bytes+=s->zeros+1;
+        if (s->candidate && s->bytes>64u*1024u) return -EFBIG;
+    }
+    s->zeros=0; return 0;
+}
+int32_t vp_source_ts_acquisition_hint(const uint8_t *bytes,size_t size,int (*interrupt)(void *),void *context) {
+    if (interrupt && interrupt(context)) return VP_SOURCE_ACQUISITION_CANCELLED;
+    if (!bytes || !size || size>MAX_BYTES || bytes[0]!=0x47) return VP_SOURCE_ACQUISITION_STOP;
+    size_t usable=size-size%188;
+    VPSourceAdmission view={.pid=-1}; TSVideo video={0};
+    int result=ts_admit(bytes,usable,1,interrupt,context,&view,&video);
+    if (result<0) {
+        if (view.reason==VP_SOURCE_ADMISSION_CANCELLED) return VP_SOURCE_ACQUISITION_CANCELLED;
+        return view.reason==VP_SOURCE_ADMISSION_MISSING_PAT || view.reason==VP_SOURCE_ADMISSION_MISSING_PMT ||
+            view.reason==VP_SOURCE_ADMISSION_ACQUISITION?VP_SOURCE_ACQUISITION_NEEDS_MORE:VP_SOURCE_ACQUISITION_STOP;
+    }
+    if (!video.type) return VP_SOURCE_ACQUISITION_STOP;
+    bytes+=view.start_offset; usable-=view.start_offset;
+    VPSourceTSTails tails={0};
+    result=vp_source_prepare_ts_tails(bytes,usable,1,interrupt,context,&tails,NULL);
+    if (result<0) return result==-ECANCELED?VP_SOURCE_ACQUISITION_CANCELLED:VP_SOURCE_ACQUISITION_STOP;
+    TSParameters parameters={.hevc=video.type==0x24};
+    size_t position=0,expected=0,header=9; unsigned length=0; int active=0;
+    for (size_t o=0;o<usable;o+=188) {
+        if (interrupt && interrupt(context)) return VP_SOURCE_ACQUISITION_CANCELLED;
+        const uint8_t *q=bytes+o; size_t head; unsigned pid;
+        int payload=ts_payload(q,&head,&pid);
+        if (!payload || pid!=video.pid || vp_source_ts_packet_withheld(&tails,pid,o)) continue;
+        if (q[1]&0x40) { active=1; position=0; expected=0; length=0; header=9; }
+        if (!active) continue; /* Orphan continuation before the first PES. */
+        for (;head<188;head++) {
+            uint8_t byte=q[head];
+            if (expected && position>=expected) break;
+            if (position<9) {
+                if ((position<2 && byte) || (position==2 && byte!=1) ||
+                    (position==3 && (byte&0xf0)!=0xe0) || (position==6 && (byte&0xc0)!=0x80))
+                    return VP_SOURCE_ACQUISITION_STOP;
+                if (position==4) length=(unsigned)byte<<8;
+                if (position==5) {
+                    length|=byte;
+                    if (length && length<3) return VP_SOURCE_ACQUISITION_STOP;
+                    expected=length?length+6:0;
+                }
+                if (position==8) { header=9+byte; if (expected && header>expected) return VP_SOURCE_ACQUISITION_STOP; }
+            } else if (position>=header && ts_parameter_byte(&parameters,byte)<0) return VP_SOURCE_ACQUISITION_STOP;
+            position++;
+        }
+    }
+    return parameters.seen==(parameters.hevc?7u:3u)?VP_SOURCE_ACQUISITION_READY:VP_SOURCE_ACQUISITION_NEEDS_MORE;
 }

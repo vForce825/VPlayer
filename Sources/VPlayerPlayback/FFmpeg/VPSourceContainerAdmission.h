@@ -28,3 +28,22 @@ typedef struct {
 static inline int vp_source_ignored_si(unsigned pid) { return pid==0x10 || pid==0x12 || pid==0x14; }
 int vp_source_admit_container_with_view(const uint8_t *,size_t,int,int32_t *,size_t *,
     int (*)(void *),void *,VPSourceAdmission *);
+
+/* Fixed borrowed-input tail view, shared by native AVIO and acquisition only.
+ * Offsets are relative to the admitted byte view. Call after TS admission. */
+#define VP_SOURCE_TS_MAX_TAILS 8u
+typedef struct {
+    unsigned pid;
+    size_t start,bytes,header_size,expected;
+    uint8_t header[6];
+    int active,withhold;
+} VPSourceTSTail;
+typedef struct { VPSourceTSTail tails[VP_SOURCE_TS_MAX_TAILS]; unsigned count; } VPSourceTSTails;
+int vp_source_prepare_ts_tails(const uint8_t *,size_t,int,int (*)(void *),void *,
+    VPSourceTSTails *,VPSourceAdmission *);
+int vp_source_ts_packet_withheld(const VPSourceTSTails *,unsigned,size_t);
+enum {
+    VP_SOURCE_ACQUISITION_READY=0, VP_SOURCE_ACQUISITION_NEEDS_MORE=1,
+    VP_SOURCE_ACQUISITION_STOP=2, VP_SOURCE_ACQUISITION_CANCELLED=3
+};
+int32_t vp_source_ts_acquisition_hint(const uint8_t *,size_t,int (*)(void *),void *);

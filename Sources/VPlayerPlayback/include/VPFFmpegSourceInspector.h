@@ -38,6 +38,15 @@ typedef struct {
 typedef void (*VPFFSourceTrackCallback)(void *, const VPFFSourceTrack *);
 typedef int32_t (*VPFFSourceInterrupt)(void *);
 enum {
+    VPFF_SOURCE_ACQUISITION_READY=0, VPFF_SOURCE_ACQUISITION_NEEDS_MORE=1,
+    VPFF_SOURCE_ACQUISITION_STOP=2, VPFF_SOURCE_ACQUISITION_CANCELLED=3
+};
+/* Allocation-free TS prefix hint, <=8 MiB borrowed input. READY only reports
+ * complete candidate parameter NALs in the admitted native byte view; it is
+ * never codec/format proof. NEEDS_MORE is limited to missing tables, acquisition
+ * or eligible video headers. Audio-only and unsupported video return STOP. */
+int32_t vp_ffmpeg_source_ts_acquisition_hint(const uint8_t *,size_t,VPFFSourceInterrupt,void *);
+enum {
     VPFF_SOURCE_STAGE_NONE=0, VPFF_SOURCE_STAGE_ARGUMENT=1, VPFF_SOURCE_STAGE_CONTAINER=2,
     VPFF_SOURCE_STAGE_PES_TAIL=3, VPFF_SOURCE_STAGE_DEMUX_OPEN=4, VPFF_SOURCE_STAGE_TRACK=5,
     VPFF_SOURCE_STAGE_PACKET=6, VPFF_SOURCE_STAGE_FINAL=7, VPFF_SOURCE_STAGE_COMPLETE=8

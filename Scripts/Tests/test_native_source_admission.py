@@ -48,6 +48,49 @@ def ordinary_si_packets():
     eit = crc_section(bytes.fromhex('4E B0 0F 00 01 C1 00 00 00 01 00 01 00 4E'))
     tdt = bytes.fromhex('70 70 05 EA 60 12 34 56')
     return [psi_packet(0x10, nit), psi_packet(0x12, eit), psi_packet(0x14, tdt)]
+
+def acquisition_tables(video_type=0x24, version=0):
+    """One authored program with optional video PID 256 and AAC PID 257."""
+    def section(table_id, body):
+        header = bytes([0, 1, 0xc1 | (version << 1), 0, 0])
+        length = len(header) + len(body) + 4
+        return crc_section(bytes([table_id, 0xb0 | (length >> 8), length & 255]) + header + body)
+    pat = psi_packet(0, section(0, bytes.fromhex('00 01 F0 00')))
+    streams = (bytes([video_type, 0xe1, 0, 0xf0, 0]) if video_type else b'')
+    streams += bytes.fromhex('0F E1 01 F0 00')
+    pcr = bytes.fromhex('E1 00' if video_type else 'E1 01')
+    pmt = psi_packet(4096, section(2, pcr + bytes.fromhex('F0 00') + streams))
+    return pat + pmt
+
+
+def acquisition_packet(payload, pid=256, start=False, counter=0):
+    """Use adaptation stuffing so only the supplied bytes are media payload."""
+    assert 0 < len(payload) <= 184
+    head = bytes([0x47, (0x40 if start else 0) | (pid >> 8), pid & 255])
+    if len(payload) == 184:
+        return head + bytes([0x10 | (counter & 15)]) + payload
+    padding = 183 - len(payload)
+    adaptation = bytes([padding]) + (bytes([0]) + bytes([255]) * (padding - 1) if padding else b'')
+    return head + bytes([0x30 | (counter & 15)]) + adaptation + payload
+
+
+def acquisition_pes(payload, pid=256, zero=False, split=None, extra=b''):
+    length = 3 + len(extra) + len(payload)
+    assert length <= 65535 and len(extra) <= 255
+    pes = bytes.fromhex('00 00 01 E0') + (0 if zero else length).to_bytes(2, 'big')
+    pes += bytes([0x80, 0, len(extra)]) + extra + payload
+    packets, offset, counter = [], 0, 0
+    while offset < len(pes):
+        amount = split if offset == 0 and split else 184
+        packets.append(acquisition_packet(pes[offset:offset + amount], pid, offset == 0, counter))
+        offset += amount
+        counter += 1
+    return b''.join(packets)
+
+
+ACQUISITION_HEVC = bytes.fromhex('00 00 01 40 01 80 00 00 01 42 01 80 00 00 01 44 01 80 00 00 01 02 01 80')
+ACQUISITION_AVC = bytes.fromhex('00 00 01 67 64 00 1F 80 00 00 01 68 EE 3C 80 00 00 01 65 80')
+
 NATIVE_INITIALIZATION = base64.b64decode(
     'AAAAHGZ0eXBpc281AAAAAWlzb21pc281aGxzZgAAAqZtb292AAAAbG12aGQAAAAA5umzrebps60AAAJYAAAAAAAB'
     'AAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAA'
@@ -268,6 +311,117 @@ int inspect_native_initialization(const uint8_t *bytes, size_t size) {
         length = 3 + ((pat[6] & 15) << 8) + pat[7]
         section = pat[5:5 + length]
         self.assertEqual(self.admission(psi_packet(0, section + section) + pmt)[0], -errno.EINVAL)
+
+    def acquisition_hint(self, data, interrupt=None):
+        hint = getattr(self.library, 'vp_source_ts_acquisition_hint', None)
+        self.assertIsNotNone(hint, 'bounded TS acquisition hint is not implemented')
+        hint.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p]
+        hint.restype = ctypes.c_int32
+        source = ctypes.create_string_buffer(data)
+        callback = ctypes.cast(interrupt, ctypes.c_void_p) if interrupt else None
+        result = hint(source, len(data), callback, None)
+        self.assertEqual(source.raw[:len(data)], data, 'acquisition must preserve borrowed bytes')
+        return result
+
+    def test_acquisition_delayed_headers_need_more_until_complete_selected_nals(self):
+        tables = acquisition_tables()
+        initial = tables + acquisition_pes(bytes.fromhex('00 00 01 02 01 80'))
+        self.assertEqual(self.acquisition_hint(initial), 1)
+        self.assertEqual(self.acquisition_hint(initial + acquisition_pes(ACQUISITION_HEVC)), 0)
+        self.assertEqual(self.acquisition_hint(acquisition_tables(0x1b) + acquisition_pes(ACQUISITION_AVC)), 0)
+
+    def test_acquisition_requires_next_start_code_and_more_than_type_bytes(self):
+        tables = acquisition_tables()
+        for payload in [ACQUISITION_HEVC[:-6], bytes.fromhex('00 00 01 40 00 00 01 42 00 00 01 44 00 00 01 02'),
+                        bytes.fromhex('00 00 01 40 01 00 00 01 42 01 00 00 01 44 01 00 00 01 02')]:
+            self.assertEqual(self.acquisition_hint(tables + acquisition_pes(payload)), 1)
+        avc_types = bytes.fromhex('00 00 01 67 00 00 01 68 00 00 01 65')
+        self.assertEqual(self.acquisition_hint(acquisition_tables(0x1b) + acquisition_pes(avc_types)), 1)
+
+    def test_acquisition_tables_can_arrive_later_but_changed_tables_stop(self):
+        tables = acquisition_tables()
+        media = acquisition_pes(ACQUISITION_HEVC)
+        self.assertEqual(self.acquisition_hint(media * 2), 1)
+        self.assertEqual(self.acquisition_hint(tables[:188] + media), 1)
+        self.assertEqual(self.acquisition_hint(media + tables + media), 0)
+        self.assertEqual(self.acquisition_hint(tables + media + acquisition_tables(version=1)), 2)
+        self.assertEqual(self.acquisition_hint(tables + media + acquisition_tables(0x1b)[188:]), 2)
+        far_pmt = tables[:188] + acquisition_packet(b'x', pid=8191) * 174 + tables[188:]
+        self.assertEqual(self.acquisition_hint(far_pmt), 1)
+        self.assertEqual(self.acquisition_hint(far_pmt + tables + media), 0)
+
+    def test_acquisition_ignores_headers_before_admission_and_on_other_pids(self):
+        tables = acquisition_tables()
+        self.assertEqual(self.acquisition_hint(acquisition_pes(ACQUISITION_HEVC) + tables), 1)
+        self.assertEqual(self.acquisition_hint(tables + acquisition_pes(ACQUISITION_HEVC, pid=257)), 1)
+        self.assertEqual(self.acquisition_hint(tables + acquisition_pes(ACQUISITION_HEVC, pid=258)), 2)
+        for si in ordinary_si_packets():
+            self.assertEqual(self.acquisition_hint(tables + si + acquisition_pes(ACQUISITION_HEVC)), 0)
+
+    def test_acquisition_audio_only_unsupported_video_and_non_ts_stop(self):
+        for source in [acquisition_tables(None), acquisition_tables(0x02), NATIVE_INITIALIZATION]:
+            self.assertEqual(self.acquisition_hint(source), 2)
+
+    def test_acquisition_skips_split_pes_and_optional_headers(self):
+        tables = acquisition_tables()
+        for split in range(1, 13):
+            self.assertEqual(self.acquisition_hint(tables + acquisition_pes(ACQUISITION_HEVC, split=split, extra=b'x' * 200)), 0)
+        # Parameter patterns in the PES optional header must never count.
+        self.assertEqual(self.acquisition_hint(tables + acquisition_pes(b'x', extra=ACQUISITION_HEVC)), 1)
+
+    def test_acquisition_annex_b_state_crosses_ts_and_pes_boundaries(self):
+        tables = acquisition_tables()
+        for split in range(1, len(ACQUISITION_HEVC)):
+            payload = acquisition_pes(ACQUISITION_HEVC[:split]) + acquisition_pes(ACQUISITION_HEVC[split:])
+            self.assertEqual(self.acquisition_hint(tables + payload), 0)
+        for padding in range(160, 190):
+            self.assertEqual(self.acquisition_hint(tables + acquisition_pes(b'x' * padding + ACQUISITION_HEVC)), 0)
+
+    def test_acquisition_withholds_last_zero_length_or_incomplete_finite_pes(self):
+        tables = acquisition_tables()
+        zero = acquisition_pes(ACQUISITION_HEVC, zero=True)
+        self.assertEqual(self.acquisition_hint(tables + zero), 1)
+        self.assertEqual(self.acquisition_hint(tables + zero + acquisition_pes(b'x')), 0)
+        finite = acquisition_pes(ACQUISITION_HEVC + b'x' * 300)
+        self.assertEqual(self.acquisition_hint(tables + finite[:188]), 1)
+        self.assertEqual(self.acquisition_hint(tables + finite), 0)
+        self.assertEqual(self.acquisition_hint(tables + acquisition_pes(ACQUISITION_HEVC) + zero), 0)
+
+    def test_acquisition_partial_packet_adaptation_and_input_bounds(self):
+        tables = acquisition_tables()
+        media = acquisition_pes(ACQUISITION_HEVC)
+        self.assertEqual(self.acquisition_hint(tables + media[:-1]), 1)
+        self.assertEqual(self.acquisition_hint(tables + media + media[:17]), 0)
+        adaptation = bytes.fromhex('47 01 00 20 B7 00') + bytes([255]) * 182
+        self.assertEqual(self.acquisition_hint(tables + adaptation + media), 0)
+        self.assertEqual(self.acquisition_hint(b'G'), 1)
+        self.assertEqual(self.acquisition_hint(b''), 2)
+        self.assertEqual(self.acquisition_hint(b'x' * (8 * 1024 * 1024 + 1)), 2)
+        # A large ordinary VCL span is not mistaken for a parameter NAL bound.
+        span = acquisition_pes(bytes.fromhex('00 00 01 02 01') + b'x' * 59995)
+        self.assertEqual(self.acquisition_hint(tables + span * 90), 1)
+        self.assertEqual(self.acquisition_hint(tables + span * 90 + media), 0)
+
+    def test_acquisition_complete_pes_must_have_room_for_optional_header_length(self):
+        # MPEG-2 video PES needs the three fixed bytes after packet_length.
+        for length in [1, 2]:
+            short = bytes.fromhex('00 00 01 E0') + length.to_bytes(2, 'big') + b'\x80' * length
+            source = acquisition_tables() + acquisition_packet(short, start=True)
+            self.assertEqual(self.acquisition_hint(source), 2)
+
+    def test_acquisition_each_bounded_pass_can_cancel(self):
+        source = acquisition_tables() + acquisition_pes(ACQUISITION_HEVC)
+        callback_type = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+        packets = len(source) // 188
+        for stop_at in [1, packets + 2, 2 * packets + 2, 3 * packets + 2]:
+            calls = 0
+            @callback_type
+            def interrupt(_):
+                nonlocal calls
+                calls += 1
+                return calls >= stop_at
+            self.assertEqual(self.acquisition_hint(source, interrupt), 3)
+            self.assertEqual(calls, stop_at)
 
 
 if __name__ == '__main__':
