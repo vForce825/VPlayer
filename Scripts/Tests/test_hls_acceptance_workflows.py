@@ -180,6 +180,8 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift',
             'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint',
             'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',
+            'VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints',
             'VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail',
             'VPlayerTests/HLSTimelineTests',

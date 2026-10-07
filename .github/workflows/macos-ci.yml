@@ -320,6 +320,7 @@ jobs:
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
           python3 Scripts/Tests/test_hls_acceptance_configurator.py
           python3 Scripts/Tests/test_hls_acceptance_fixture.py
+          python3 Scripts/Tests/test_homepod_audio_fixture.py
           python3 Scripts/Tests/test_hls_generation_readback.py
           python3 Scripts/Tests/test_hls_fixture_provisioning.py
           python3 Scripts/Tests/test_hls_fixture_preparation.py
@@ -444,6 +445,8 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACRawOrdinalsRejectChangedPayloadAndClockDrift \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoCoordinateProofRequiresEveryRawOrdinalAndEndpoint \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticVideoFragmentSamplesRequireExactDurationsOffsetsAndPayloadCoverage \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testSyntheticAACSilenceMeterDetectsOffsetTwentyOneMillisecondMute \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCAllocationAdmissionReservesBeforeNativeCopiesAndReleasesAtFreePoints \
             --only-testing VPlayerTests/AudioRenderPipelineTests/testTask22FCNativeAllocationFailureAndFailedPushCannotMasqueradeAsEOFTail \
             --only-testing VPlayerTests/HLSTimelineTests \

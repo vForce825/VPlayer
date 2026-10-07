@@ -1020,10 +1020,23 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         selectedCompressedAudio = codec
     }
 
-    private func fallBackBeforeCompressedAppend() async throws {
+    private func fallBackBeforeCompressedAppend(_ timed: HLSTimedAudioAccessUnit) async throws {
         guard sourceAACBranch == nil, dolbyBranch == nil, let saved = audioConfiguration else {
             throw SegmentedFMP4WriterFailure.compressedAudioCompatibilityRequired
         }
+        #if DEBUG
+        let observed = CompressedAudioFallbackObservation(codec: selectedCompressedAudio,
+            hadDolbyProducer: dolbyProducer != nil, producerWasCurrent: dolbyProducer?.isCurrent == true,
+            sourcePresentationTime: timed.source.presentationTimeStamp,
+            sourceDuration: timed.source.duration, normalizedStart: timed.timing.presentationTimeStamp,
+            boundaryDecision: timed.boundaryDecision, origin: timed.sourceOriginReceipt)
+        condition.withLock {
+            // One fixed scalar snapshot; a second attempt is enough to disprove
+            // a single in-place transition. No source payload or owner is retained.
+            compressedAudioFallbackCount = min(2, compressedAudioFallbackCount + 1)
+            if firstCompressedAudioFallback == nil { firstCompressedAudioFallback = observed }
+        }
+        #endif
         try timeline.useCompatibleAudioBeforeSourceAppend()
         dolbyProducer?.invalidateSourceInput(); dolbyProducer = nil
         selectedCompressedAudio = nil; compressedAudioBinding = nil
@@ -1044,7 +1057,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
               let binding = compressedAudioBinding, let boundary else { throw AACRenditionFailure.invalidInput }
         if sourceAACBranch == nil, dolbyBranch == nil,
            (timed.boundaryDecision != .unchanged || timed.sourceOriginReceipt?.effectiveStart != timed.timing.presentationTimeStamp) {
-            try await fallBackBeforeCompressedAppend()
+            try await fallBackBeforeCompressedAppend(timed)
             try await appendAudio(timed)
             return
         }
@@ -1058,7 +1071,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 do {
                     configuration = try .init(first: timed, source: facts, binding: binding, applicationLedger: ledger)
                 } catch let error as SourceAACFailure where error == .unsupportedSource || error == .timelineMismatch || error == .sourceMismatch {
-                    try await fallBackBeforeCompressedAppend()
+                    try await fallBackBeforeCompressedAppend(timed)
                     try await appendAudio(timed)
                     return
                 }
@@ -1086,7 +1099,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             if dolbyBranch == nil {
                 guard let plan = timeline.makeCompressedAudioCandidatePlan(for: timed),
                       let authorization = producer.coordinator.authorizeCompressedCandidate(plan) else {
-                    try await fallBackBeforeCompressedAppend()
+                    try await fallBackBeforeCompressedAppend(timed)
                     try await appendAudio(timed)
                     return
                 }
@@ -2389,6 +2402,21 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     }
 
     #if DEBUG
+    struct CompressedAudioFallbackObservation: Sendable {
+        let codec: AudioCodec?
+        let hadDolbyProducer: Bool
+        let producerWasCurrent: Bool
+        let sourcePresentationTime: CMTime
+        let sourceDuration: CMTime
+        let normalizedStart: ExactMediaTime
+        let boundaryDecision: HLSAudioBoundaryDecision
+        let origin: MediaOriginReceipt?
+    }
+    private var compressedAudioFallbackCount = 0
+    private var firstCompressedAudioFallback: CompressedAudioFallbackObservation?
+    var compressedAudioFallbackForTesting: (count: Int, first: CompressedAudioFallbackObservation?) {
+        condition.withLock { (compressedAudioFallbackCount, firstCompressedAudioFallback) }
+    }
     // 只读测试接点：测试必须继续使用同一真实 publication 图和系统 callback。
     var publicationForTesting: SystemHLSPublicationGraph { publication }
     var prefixPreparationInFlightForTesting: Bool { condition.withLock { prefixPreparationInFlight } }
