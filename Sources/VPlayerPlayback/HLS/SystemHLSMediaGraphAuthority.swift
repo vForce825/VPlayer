@@ -250,6 +250,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         private let expectedVideoStart: CMTime
         private let outputSemaphore: DispatchSemaphore
         private let inputCapacityWakeup: HLSVideoInputCapacityWakeup
+        private let writerCapacityWakeup: WriterCapacityWakeup
         private weak var authority: SystemHLSMediaGraphAuthority?
         private var writer: SegmentedFMP4Writer?
         private var lastWrittenPTS: CMTime?
@@ -275,6 +276,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
              boundary: SegmentBoundaryCoordinator, expectedVideoStart: CMTime,
              outputSemaphore: DispatchSemaphore,
              inputCapacityWakeup: HLSVideoInputCapacityWakeup,
+             writerCapacityWakeup: WriterCapacityWakeup,
              authority: SystemHLSMediaGraphAuthority) {
             self.publication = publication
             self.binding = binding
@@ -282,6 +284,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             self.expectedVideoStart = expectedVideoStart
             self.outputSemaphore = outputSemaphore
             self.inputCapacityWakeup = inputCapacityWakeup
+            self.writerCapacityWakeup = writerCapacityWakeup
             self.authority = authority
             boundary.installAudioBoundaryAdvanceSink { [weak self] in
                 guard let self else { return }
@@ -366,7 +369,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 processTask = Task { [self, envelope, active, output, ticket] in
                     let result: Result<Void, Error>
                     do {
-                        try await active.appendVideoAwaitingReadiness(output, ticket: ticket)
+                        try await active.appendVideoAwaitingPredecessorCapacity(
+                            output, initialTicket: ticket, boundary: boundary,
+                            wakeup: writerCapacityWakeup)
                         result = .success(())
                     } catch { result = .failure(error) }
                     writerQueue.async { [self, envelope, active, output] in
@@ -564,6 +569,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
                     writerWindowContinuation: continuation, acceptanceProbe: acceptanceProbe)
             }
+            try created.installVideoCapacityWakeup(writerCapacityWakeup)
             try created.start(at: startTime)
             writer = created
             return created
@@ -670,6 +676,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 cancelled = true
                 audioFlushActive = false
             }
+            writerCapacityWakeup.cancel()
             writerQueue.async { [self] in
                 if let continuation = audioFlushContinuation {
                     audioFlushContinuation = nil
@@ -733,6 +740,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
     private var mediaEpoch: AudioMediaEpochIdentity?
     private var videoBinding: FMP4WriterBinding?
     private var videoWriter: SegmentedFMP4Writer?
+    private var videoCapacityWakeup: WriterCapacityWakeup?
     private var interlacedVideoBranch: HLSVideoBranch?
     private var interlacedVideoOutput: InterlacedVideoOutput?
     private var interlacedInputWakeup: HLSVideoInputCapacityWakeup?
@@ -1301,6 +1309,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             try await appendInterlacedVideo(timed, track: track, inspection: proof)
             return
         }
+        let writerCapacityWakeup = try requireVideoCapacityWakeup()
         if !videoFrameRateConfigured {
             try publication.configureVideo(frameRate: track.frameRate)
             condition.withLock {
@@ -1341,23 +1350,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
                     acceptanceProbe: acceptanceProbe)
             }
+            try writer.installVideoCapacityWakeup(writerCapacityWakeup)
             try writer.start(at: timed.timing.presentationTimeStamp.cmTime)
             videoBinding = binding
             videoBuilder = builder
             condition.withLock { videoWriter = writer }
         }
+        var currentWriter = condition.withLock { videoWriter }
         guard duration.value > 0, let builder = videoBuilder,
-              let writer = videoWriter, let boundary, let binding = videoBinding else {
+              currentWriter != nil, let boundary, let binding = videoBinding else {
             throw HLSVideoRemuxSubmissionFailure.writerAttemptMismatch
         }
         let submission = try builder.makeSubmission(for: timed, admission: admission)
         do {
-            try await writer.appendRemuxVideoAwaitingReadiness(
+            try await currentWriter!.appendRemuxVideoAwaitingReadiness(
                 submission,
                 ticket: try boundary.issueRemuxVideoAppend(
                     for: submission, writerBinding: binding))
         } catch SegmentedFMP4WriterFailure.rolloverRequired {
-            let continuation = try await writer.finishWriterWindow()
+            let continuation = try await currentWriter!.finishWriterWindow()
+            try Task.checkCancellation()
             let nextBinding = FMP4WriterBinding(
                 outputLifecycleEpoch: binding.outputLifecycleEpoch,
                 itemGeneration: binding.itemGeneration,
@@ -1383,16 +1395,40 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     resuming: builder, binding: nextBinding, admission: admission)
                 let attempt = try submission.claimWriterAttempt(
                     binding: nextBinding, admission: admission)
+                try nextWriter.installVideoCapacityWakeup(writerCapacityWakeup)
                 try nextWriter.start(at: .zero)
-                try await nextWriter.appendRemuxVideoAwaitingReadiness(
-                    attempt, ticket: try boundary.issueRemuxVideoAppend(for: attempt))
-                videoBinding = nextBinding
-                videoBuilder = nextBuilder
-                condition.withLock { videoWriter = nextWriter }
+                try condition.withLock {
+                    guard !Task.isCancelled, state != .retiring, state != .retired,
+                          state != .failed, state != .failing,
+                          videoWriter === currentWriter else { throw CancellationError() }
+                    videoBinding = nextBinding
+                    videoBuilder = nextBuilder
+                    videoWriter = nextWriter
+                }
+                // A terminal predecessor can still hold native aliases. Drop
+                // both active-owner references before the successor awaits their
+                // real release; continuation metadata does not retain the writer.
+                currentWriter = nil
+                try await nextWriter.appendRemuxVideoAwaitingPredecessorCapacity(
+                    attempt, boundary: boundary, wakeup: writerCapacityWakeup)
             } catch {
                 _ = await nextWriter.cancelAwaitingCompletion()
                 throw error
             }
+        }
+    }
+
+    /// Audio-only graphs retain their existing fixed charge. The media worker
+    /// creates this once, before the first video native input; retirement and
+    /// creation share the same lifecycle fence.
+    private func requireVideoCapacityWakeup() throws -> WriterCapacityWakeup {
+        try condition.withLock {
+            guard !Task.isCancelled, state != .retiring, state != .retired,
+                  state != .failed, state != .failing else { throw CancellationError() }
+            if let videoCapacityWakeup { return videoCapacityWakeup }
+            let wakeup = try WriterCapacityWakeup.make(ledger: sourceApplicationLedger)
+            videoCapacityWakeup = wakeup
+            return wakeup
         }
     }
 
@@ -1462,10 +1498,12 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 frameRate: outputFrameRate,
                 bitrate: bitrate, maximumPendingFrameCount: 8))
             let inputWakeup = HLSVideoInputCapacityWakeup()
+            let writerCapacityWakeup = try requireVideoCapacityWakeup()
             let output = InterlacedVideoOutput(
                 publication: publication, binding: binding, boundary: boundary,
                 expectedVideoStart: start, outputSemaphore: interlacedOutputSemaphore,
                 inputCapacityWakeup: inputWakeup,
+                writerCapacityWakeup: writerCapacityWakeup,
                 authority: self)
             let transcode = HLSVideoTranscodeBranch(
                 generation: timed.source.generation, inputFormat: input,
@@ -2282,8 +2320,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         publication.cancelLivePublication()
         worker.cancel()
         let targets = condition.withLock {
-            (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup)
+            (audioBranch, interlacedVideoOutput, videoWriter, interlacedInputWakeup, videoCapacityWakeup)
         }
+        targets.4?.cancel()
         targets.0?.cancel()
         targets.1?.cancel()
         targets.2?.requestCancellation()

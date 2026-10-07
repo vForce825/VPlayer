@@ -393,6 +393,13 @@ jobs:
             --only-testing VPlayerTests/SampleBufferBuilderTests \
             --only-testing VPlayerTests/HLSManagedDemuxSmokeTests \
             --only-testing VPlayerTests/HLSProxyBackpressureTests \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testEncodedVideoCapacityRecoveryReusesPendingOutputAfterLastNativeAliasRelease \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testRealPredecessorReleaseBeforeWaiterInstallationIsNotLost \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testVideoCapacityCancellationPreservesNativeOccupancyUntilFinalAliasRelease \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testVideoCapacityRetryKeepsOriginalFiveSecondDeadlineAcrossWakeups \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testVideoCapacityRejectsImpossibleEmptyReserveWithoutInstallingWaiter \
+            --only-testing VPlayerTests/SegmentedFMP4WriterTests/testRemuxCapacityRejectsOversizedPendingInputWithoutInstallingWaiter \
+            --only-testing VPlayerTests/GeneratedAudioFailureFenceTests/testPaidCopyOwnerOutlivesGraphUntilItsOwnLastAlias \
             --only-testing VPlayerTests/LoopbackHTTPServerTests/testCancellationBeforeStartupProbeStartsJoinsListenerAndProbeAndReleasesOwner \
             --only-testing VPlayerTests/LoopbackHTTPServerTests/testCancellationWaitsForStartedProbeTerminalTailBeforeReturning \
             --only-testing VPlayerTests/PlaybackErrorMappingTests/testInterlacedWriterCauseSurvivesRuntimeSnapshotAndPresentation \
