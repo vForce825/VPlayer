@@ -74,6 +74,8 @@ final class CompressedAudioSourceProof: @unchecked Sendable {
     let generation: MediaGeneration
     let presentationTimeStamp: CMTime
     let duration: CMTime
+    let sourceTimeBase: MediaRational
+    let canonicalPresentationTimeStamp: ExactMediaTime
     let sourceLayout: AudioChannelLayout
     let decoderConfiguration: Data
     let format: SystemCompressedAudioFormat
@@ -89,12 +91,15 @@ final class CompressedAudioSourceProof: @unchecked Sendable {
     fileprivate init(id: UInt64, stream: CompressedAudioSourceStream,
                      descriptor: AudioTrackDescriptor, generation: MediaGeneration,
                      presentationTimeStamp: CMTime, duration: CMTime,
+                     canonicalPresentationTimeStamp: ExactMediaTime,
                      inspected: InspectedCompressedAudioFrame,
                      formatDescription: CMAudioFormatDescription,
                      copyOwnership: HLSAudioCopyOwnership,
                      payloadTail: HLSAudioCopyTail, metadataTail: HLSAudioCopyTail) {
         self.id = id; self.stream = stream; self.generation = generation
         self.presentationTimeStamp = presentationTimeStamp; self.duration = duration
+        sourceTimeBase = descriptor.timeBase
+        self.canonicalPresentationTimeStamp = canonicalPresentationTimeStamp
         sourceLayout = descriptor.channelLayout; decoderConfiguration = inspected.decoderExtradata
         format = inspected.systemFormat; self.formatDescription = formatDescription
         payloadSHA256 = Data(SHA256.hash(data: inspected.payload))
@@ -120,6 +125,63 @@ final class CompressedAudioSourceProof: @unchecked Sendable {
     }
 }
 
+/// One producer's exact AAC sample cadence. The raw frame/timeline clock is
+/// deliberately unchanged: only opaque source-AAC writer proofs use this clock.
+/// Fixed phase bounds retain O(1) state and never restart at a rounded packet PTS.
+private struct SourceAACCadenceClock {
+    let generation: MediaGeneration
+    let format: SystemCompressedAudioFormat
+    let sourceTimeBase: MediaRational
+    let allowsQuantization: Bool
+    private var nextStart: ExactMediaTime?
+    private var lastID: UInt64?
+    private var minimumResidual = ExactMediaTime(value: 0, timescale: 1)
+    private var maximumResidual = ExactMediaTime(value: 0, timescale: 1)
+
+    init(generation: MediaGeneration, format: SystemCompressedAudioFormat,
+         sourceTimeBase: MediaRational, framing: CompressedAudioFramingKind) {
+        self.generation = generation; self.format = format; self.sourceTimeBase = sourceTimeBase
+        // Only the observed transport/profile combination is admitted for a
+        // nonexact representation correction. Other exact source clocks stay valid.
+        allowsQuantization = framing == .adts && format.profileID == .aacLC
+            && format.sampleRate == 44_100 && sourceTimeBase.num == 1 && sourceTimeBase.den == 90_000
+    }
+
+    mutating func accept(id: UInt64, generation: MediaGeneration,
+                         format: SystemCompressedAudioFormat, rawStart: ExactMediaTime) throws -> ExactMediaTime {
+        guard generation == self.generation, format == self.format,
+              format.profileID == .aacLC, format.framesPerPacket == 1_024 else {
+            throw SourceAACFailure.sourceMismatch
+        }
+        if let lastID {
+            let nextID = lastID.addingReportingOverflow(1)
+            guard !nextID.overflow, id == nextID.partialValue else { throw SourceAACFailure.sourceMismatch }
+        }
+        let canonical = nextStart ?? rawStart
+        let residual = try rawStart.subtracting(canonical)
+        let quantum = ExactMediaTime(value: Int64(sourceTimeBase.num), timescale: sourceTimeBase.den)
+        if residual.value != 0 {
+            let twiceQuantum = try quantum.adding(quantum)
+            let sample = ExactMediaTime(value: 1, timescale: format.sampleRate)
+            // Two quantization cells must not conceal a whole PCM-sample shift.
+            guard allowsQuantization, try twiceQuantum.subtracting(sample).value <= 0 else {
+                throw SourceAACFailure.timelineMismatch
+            }
+        }
+        let minimum = try residual.subtracting(minimumResidual).value < 0 ? residual : minimumResidual
+        let maximum = try residual.subtracting(maximumResidual).value > 0 ? residual : maximumResidual
+        let span = try maximum.subtracting(minimum)
+        // A shared unknown quantization phase must exist for every accepted AU.
+        // Some sub-tick changes are indistinguishable until later observations;
+        // this does not authorize independent per-AU epsilon adjustments.
+        guard try span.subtracting(quantum).value < 0 else { throw SourceAACFailure.timelineMismatch }
+        let following = try canonical.adding(.init(value: 1_024, timescale: format.sampleRate))
+        minimumResidual = minimum; maximumResidual = maximum
+        nextStart = following; lastID = id
+        return canonical
+    }
+}
+
 final class CompressedAudioAssembler {
     static let invalidInputErrorCode: Int32 = -1_448_208_897
     static let idExhaustedErrorCode: Int32 = -1_448_208_899
@@ -134,6 +196,7 @@ final class CompressedAudioAssembler {
     private let hlsCopyOwnership: HLSAudioCopyOwnership?
     let sourceStream: CompressedAudioSourceStream?
     private var sourceAACProofEnabled = true
+    private var sourceAACClock: SourceAACCadenceClock?
     private var dolbyProducer: DolbyAudioSourceProducer?
     private var didDrainSource = false
     private var framer: (any CompressedAudioFramingStrategy)?
@@ -190,6 +253,7 @@ final class CompressedAudioAssembler {
         dolbyProducer?.invalidateSourceInput()
         dolbyProducer = nil
         sourceAACProofEnabled = false
+        sourceAACClock = nil
     }
 
     func push(_ packet: DemuxPacket) throws {
@@ -229,10 +293,10 @@ final class CompressedAudioAssembler {
             dolbyProducer?.invalidateSourceInput()
             throw error
         } catch let error as HLSAudioCopyAdmissionFailure {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw error
         } catch is CancellationError {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
@@ -260,10 +324,10 @@ final class CompressedAudioAssembler {
             dolbyProducer?.invalidateSourceInput()
             throw error
         } catch let error as HLSAudioCopyAdmissionFailure {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw error
         } catch is CancellationError {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
@@ -323,7 +387,7 @@ final class CompressedAudioAssembler {
     private func ensureFramerIsCurrent() throws {
         let operationID = try currentOperationID()
         guard framerOperationID != operationID else { return }
-        sourceStream?.invalidate()
+        invalidateSourceAAC()
         dolbyProducer?.invalidateSourceInput()
         framer?.destroy()
         framer = nil
@@ -384,15 +448,19 @@ final class CompressedAudioAssembler {
                     presentationTimeStamp: framed.presentationTimeStamp, duration: duration,
                     frameSampleCount: inspected.sampleCount, dolbyProof: proof)))
             } else if sourceAACProofEnabled, inspected.systemFormat.profileID == .aacLC, inspected.sampleCount == 1_024,
-               let hlsCopyOwnership, let sourceStream {
+               let hlsCopyOwnership, let sourceStream,
+               let cadence = sourceAACCadence(id: id, generation: generation, framed: framed, inspected: inspected) {
                 guard let ownedPayload = payloadTail ?? framed.hlsCopyTail else { throw Self.validationError() }
                 let proofLease = try hlsCopyOwnership.admitSourceProofWithoutWaiting(bytes: 2_048)
                 let metadataTail = HLSAudioCopyTail(proofLease)
                 try sourceStream.issued(id)
                 let proof = CompressedAudioSourceProof(id: id, stream: sourceStream, descriptor: descriptor,
                     generation: generation, presentationTimeStamp: framed.presentationTimeStamp,
-                    duration: duration, inspected: inspected, formatDescription: formatDescription,
+                    duration: duration, canonicalPresentationTimeStamp: cadence.start,
+                    inspected: inspected, formatDescription: formatDescription,
                     copyOwnership: hlsCopyOwnership, payloadTail: ownedPayload, metadataTail: metadataTail)
+                // Commit only after proof ownership and stream issuance succeed.
+                sourceAACClock = cadence.clock
                 eventSink(.frame(CompressedAudioFrame(id: id, payload: inspected.payload,
                     codec: descriptor.codec, generation: generation,
                     presentationTimeStamp: framed.presentationTimeStamp, duration: duration,
@@ -408,10 +476,10 @@ final class CompressedAudioAssembler {
             dolbyProducer?.invalidateSourceInput()
             throw error
         } catch let error as HLSAudioCopyAdmissionFailure {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw error
         } catch is CancellationError {
-            sourceStream?.invalidate()
+            invalidateSourceAAC()
             throw CancellationError()
         } catch let error as PlaybackCoreError
             where error == .audioFallbackDecode(Self.idExhaustedErrorCode) {
@@ -419,6 +487,30 @@ final class CompressedAudioAssembler {
         } catch {
             throw AudioUnitRejection(reason: .invalidFrame)
         }
+    }
+
+    private func sourceAACCadence(id: UInt64, generation: MediaGeneration,
+                                  framed: FramedCompressedAudioFrame, inspected: InspectedCompressedAudioFrame)
+        -> (clock: SourceAACCadenceClock, start: ExactMediaTime)? {
+        guard sourceStream?.isCurrent == true else { return nil }
+        var clock = sourceAACClock ?? SourceAACCadenceClock(generation: generation,
+            format: inspected.systemFormat, sourceTimeBase: descriptor.timeBase, framing: profile.framing)
+        do {
+            let start = try clock.accept(id: id, generation: generation, format: inspected.systemFormat,
+                rawStart: ExactMediaTime(framed.presentationTimeStamp))
+            return (clock, start)
+        } catch {
+            // Fail closed for source AAC, but keep this AU's original bytes/PTS
+            // available to the existing pre-append compatibility selection.
+            // An already bound source writer rejects the now-invalid stream.
+            invalidateSourceAAC()
+            return nil
+        }
+    }
+
+    private func invalidateSourceAAC() {
+        sourceAACClock = nil
+        sourceStream?.invalidate()
     }
 
     private func install(_ newFormat: SystemCompressedAudioFormat) throws {
@@ -431,7 +523,7 @@ final class CompressedAudioAssembler {
     }
 
     private func rejectCurrentUnit(reason: AudioDecodeBreakReason) throws {
-        sourceStream?.invalidate()
+        invalidateSourceAAC()
         if let dolbyProducer {
             // A rejected final AU cannot disappear into decodeBreak and leave a
             // seemingly successful prefix that can later receive natural EOF.

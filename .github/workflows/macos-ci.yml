@@ -400,6 +400,7 @@ jobs:
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText \
             --only-testing VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow \
             --only-testing VPlayerTests/HLSResourceTransportTests \
+            --only-testing VPlayerTests/AACPassthroughTests \
             --only-testing VPlayerTests/PlaybackSourceResolverTests \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence \

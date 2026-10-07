@@ -127,6 +127,7 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/HLSAVPlayerBackendTests/testContainerDiagnosticDistinguishesAdmissionFromNativeInspectionWithinFixedText',
             'VPlayerTests/HLSAVPlayerBackendTests/testManifestPreflightAnnotatesWithoutChangingTheOriginalTypedThrow',
             'VPlayerTests/HLSResourceTransportTests',
+            'VPlayerTests/AACPassthroughTests',
             'VPlayerTests/PlaybackSourceResolverTests',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testUnsupportedProbeRetainsSourceStageAndOriginalFailureFamily',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testSingleMediaUnknownScanFailsAtPlannerWithoutBorrowingNativeOrGeneratedEvidence',
