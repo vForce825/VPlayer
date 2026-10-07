@@ -227,6 +227,29 @@ final class HLSPlaybackPlanTests: XCTestCase {
         }
     }
 
+    func testSourceCategoryUsesResolvedTopologyRatherThanURLSuffix() throws {
+        XCTAssertEqual(HLSNativeSourceDependencies.sourceCategory(for: try source(raw: true)), .direct)
+        XCTAssertEqual(HLSNativeSourceDependencies.sourceCategory(for: try source()), .hlsMedia)
+        XCTAssertEqual(HLSNativeSourceDependencies.sourceCategory(for: try source(master: true)), .hlsMaster)
+    }
+
+    func testRouteEnrichmentPreservesSourceAndOutputFactsAndFixedPayload() {
+        let source = PlaybackMediaInformation(sourceWidth: 1_920, sourceHeight: 1_080,
+            scanMode: nil, sourceFrameRate: nil).withSourceRouting(category: .direct, transport: .generated)
+        XCTAssertTrue(source.isSourceProbe)
+        XCTAssertNil(source.scanMode)
+        XCTAssertNil(source.outputFrameRate)
+        XCTAssertFalse(source.isSmoothMotionEnhanced)
+        let output = PlaybackMediaInformation(width: 1_920, height: 1_080, scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 50,
+            isSmoothMotionEnhanced: true).withSourceRouting(category: .direct, transport: .generated)
+        XCTAssertFalse(output.isSourceProbe)
+        XCTAssertEqual(output.outputFrameRate, 50)
+        XCTAssertTrue(output.isSmoothMotionEnhanced)
+        XCTAssertLessThanOrEqual(MemoryLayout<PlaybackMediaInformation?>.stride, 40)
+        XCTAssertLessThanOrEqual(MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride, 48)
+    }
+
     func testProbeMetadataStillFitsExistingFixedEventPayload() {
         XCTAssertLessThanOrEqual(MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride,
             PlaybackPipelineEventStorage.payloadStride)

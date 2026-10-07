@@ -30,6 +30,30 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         XCTAssertEqual(unknownSize.visualText, "源视频分辨率检测中… · 29.97 fps")
     }
 
+    func testSourceAndPlannedPathAreExplicitWithoutReadinessClaims() {
+        let probed = PlaybackMediaInformation(sourceWidth: 1_920, sourceHeight: 1_080,
+            scanMode: .interlaced, sourceFrameRate: MediaRational(num: 25, den: 1))
+        let pending = PlaybackMediaInformationPresentation(information: probed.withSourceRouting(
+            category: .direct, transport: nil))
+        XCTAssertEqual(pending.sourceRoutingText, "来源：直接媒体 · 路径规划中…")
+        let generated = PlaybackMediaInformationPresentation(information: probed.withSourceRouting(
+            category: .hlsMedia, transport: .generated))
+        XCTAssertEqual(generated.sourceRoutingText, "来源：HLS 媒体列表 · 规划路径：生成 HLS")
+        XCTAssertEqual(generated.visualFrameRateText, "25 fps")
+        XCTAssertFalse(generated.showsEnhancedFrameRateHighlight)
+        let selected = mediaInformationForRouteTest().withSourceRouting(category: .hlsMaster, transport: .native)
+        let final = PlaybackMediaInformationPresentation(information: selected)
+        XCTAssertEqual(final.sourceRoutingText, "来源：HLS 主列表 · 当前路径：原生播放")
+        XCTAssertEqual(final.visualFrameRateText, "25 → 50 fps")
+        XCTAssertNil(PlaybackMediaInformationPresentation(information: mediaInformationForRouteTest()).sourceRoutingText,
+            "Legacy routing has no inferred source or transport")
+    }
+
+    private func mediaInformationForRouteTest() -> PlaybackMediaInformation {
+        .init(width: 1_920, height: 1_080, scanMode: .interlaced,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 50, isSmoothMotionEnhanced: true)
+    }
+
     func testFormatsInterlacedDoubleRateWithCompactVisualHighlight() {
         let subject = PlaybackMediaInformationPresentation(
             information: PlaybackMediaInformation(

@@ -33,6 +33,27 @@ struct PlaybackMediaInformationPresentation: Sendable {
         visualParts.highlightsFrameRate
     }
 
+    var sourceRoutingText: String? {
+        guard let information, let category = information.sourceCategory else { return nil }
+        let source: String
+        switch category {
+        case .direct: source = "直接媒体"
+        case .hlsMedia: source = "HLS 媒体列表"
+        case .hlsMaster: source = "HLS 主列表"
+        }
+        guard let transport = information.plannedTransport else {
+            return "来源：\(source) · 路径规划中…"
+        }
+        let path: String
+        switch transport {
+        case .native: path = "原生播放"
+        case .proxy: path = "代理 HLS"
+        case .generated: path = "生成 HLS"
+        }
+        let phase = information.isSourceProbe ? "规划路径" : "当前路径"
+        return "来源：\(source) · \(phase)：\(path)"
+    }
+
     var visualText: String {
         guard information != nil else { return Self.detectingText }
 

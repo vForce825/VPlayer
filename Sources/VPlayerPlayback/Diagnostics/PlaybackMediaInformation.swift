@@ -12,6 +12,13 @@ public enum PlaybackScanMode: Sendable, Equatable {
     case interlaced
 }
 
+/// Resolved container/manifest category, independent of the selected output path.
+public enum PlaybackSourceCategory: String, Sendable, Equatable {
+    case direct
+    case hlsMedia = "hls-media"
+    case hlsMaster = "hls-master"
+}
+
 /// Stable media facts suitable for presentation to a viewer.
 public struct PlaybackMediaInformation: Sendable, Equatable {
     public let width: Int32
@@ -23,6 +30,9 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
     /// Probe facts describe the source before an output graph exists. They grant
     /// no readiness/activation authority and never claim a transformed frame rate.
     public let isSourceProbe: Bool
+    public private(set) var sourceCategory: PlaybackSourceCategory?
+    /// The actual planner result; neither readiness nor an output-codec claim.
+    public private(set) var plannedTransport: HLSPlaybackPlan.Transport?
 
     public init(
         width: Int32,
@@ -39,6 +49,8 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
         self.outputFrameRate = outputFrameRate
         self.isSmoothMotionEnhanced = isSmoothMotionEnhanced
         self.isSourceProbe = false
+        self.sourceCategory = nil
+        self.plannedTransport = nil
     }
 
     public init(sourceWidth: Int32, sourceHeight: Int32, scanMode: PlaybackScanMode?,
@@ -50,6 +62,15 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
         self.outputFrameRate = nil
         self.isSmoothMotionEnhanced = false
         self.isSourceProbe = true
+        self.sourceCategory = nil
+        self.plannedTransport = nil
+    }
+
+    func withSourceRouting(category: PlaybackSourceCategory?, transport: HLSPlaybackPlan.Transport?) -> Self {
+        var value = self
+        value.sourceCategory = category
+        value.plannedTransport = transport
+        return value
     }
 }
 

@@ -147,12 +147,15 @@ struct HLSNativeSourceDependencies: Sendable {
             diagnostics?.begin(.probe)
             let facts = try await inspect(source, retainingFacts: factsCharge, diagnostics: diagnostics)
             try validate(invocation)
-            if let information = Self.probedMediaInformation(source: source, facts: facts) {
-                // Stay on the paid, joined prepare task. The receiver retains only
-                // scalars; source/facts charges outlive this awaited notification.
-                await invocation.deliverProbedSourceMediaInformation(information, source: source)
-                try validate(invocation)
-            }
+            // Route-only metadata carries no guessed video facts for masters,
+            // audio-only sources or ambiguous tracks. Final audio-only stays nil.
+            let sourceInformation = (Self.probedMediaInformation(source: source, facts: facts)
+                ?? .init(sourceWidth: 0, sourceHeight: 0, scanMode: nil, sourceFrameRate: nil))
+                .withSourceRouting(category: Self.sourceCategory(for: source), transport: nil)
+            // Stay on the paid, joined prepare task. The receiver retains only
+            // scalars; source/facts charges outlive these awaited notifications.
+            await invocation.deliverProbedSourceMediaInformation(sourceInformation, source: source)
+            try validate(invocation)
             diagnostics?.begin(.capabilities)
             let capabilities = await capabilities(facts, invocation.currentPreparationRoute())
             try validate(invocation)
@@ -175,10 +178,22 @@ struct HLSNativeSourceDependencies: Sendable {
                     compressedAudioAdmissionCandidate: plan.compressedAudioAdmissionCandidate)
             }
             try validate(invocation)
+            await invocation.deliverProbedSourceMediaInformation(sourceInformation.withSourceRouting(
+                category: Self.sourceCategory(for: source), transport: plan.transport), source: source)
+            try validate(invocation)
             guard source.withCurrentResolution(owner: owner, generation: source.generation, operation: { true }) == true else { throw HLSSourceError.staleResolution }
             return .init(source: source, facts: facts, plan: plan, resolver: resolver, sourceCharge: sourceCharge, factsCharge: factsCharge)
         } catch { await resolver.invalidate(); throw error }
     }
+    static func sourceCategory(for source: ResolvedPlaybackSource) -> PlaybackSourceCategory? {
+        switch source.topology {
+        case .media: return .direct
+        case let .hls(graph):
+            guard let root = graph.document(for: graph.rootURL) else { return nil }
+            return root.kind == .master ? .hlsMaster : .hlsMedia
+        }
+    }
+
     /// A source snapshot is not a selected AVPlayer variant or prepared output.
     /// Masters keep detecting until native selection provides exact metadata.
     static func probedMediaInformation(source: ResolvedPlaybackSource,
