@@ -69,5 +69,35 @@
     }
   },
   "pattern_seed": "VPlayer independent large-IDR regression v1",
-  "source": "Independent SHAKE-256 grayscale pattern and lavfi sine; no captured media or headers"
+  "source": "Independent SHAKE-256 grayscale pattern and lavfi sine; no captured media or headers",
+  "transport_ffmpeg_version": "ffmpeg version 7.1.5-0+deb13u1 Copyright (c) 2000-2026 the FFmpeg developers",
+  "transport_generation": "Scripts/generate-homepod-large-idr-fixtures.py --generate-transports",
+  "transports": {
+    "homepod-large-idr-h264-1080p30-aac44100.ts": {
+      "aac_payload_sequence_sha256": "f50064f748c2557493d0787e54e531dd01c3236f9ea0779647819e3145767f87",
+      "audio_packets": 646,
+      "bytes": 3117040,
+      "idr_bytes": [
+        851016,
+        851016,
+        851016
+      ],
+      "maximum_audio_pts_error_ticks": "24/49",
+      "sha256": "025af3d42ae10aeb1b8e5f69658fb41ba178448da489376945409cecc1af0856",
+      "video_packets": 450
+    },
+    "homepod-large-idr-hevc-hlg-2160p50-aac48000.ts": {
+      "aac_payload_sequence_sha256": "054f61b1dc408430c88d8ea1f17e6e208c5840a6a98b712852064fd1899cf81c",
+      "audio_packets": 704,
+      "bytes": 3363508,
+      "idr_bytes": [
+        914764,
+        914764,
+        914764
+      ],
+      "maximum_audio_pts_error_ticks": "0",
+      "sha256": "96aa4c3fc5650cabd7bf248b3b235e716d46a9abfe407b4c29e26458d30e192a",
+      "video_packets": 750
+    }
+  }
 }

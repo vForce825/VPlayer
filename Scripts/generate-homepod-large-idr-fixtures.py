@@ -97,6 +97,82 @@ def inspect(path, case, decode=False):
                 audio_packets=len(audio_packets), audio_duration=audio["duration"])
 
 
+def aac_payload_fingerprints(path, adts=False):
+    command = [tool("ffmpeg"), "-hide_banner", "-v", "error", "-i", str(path),
+               "-map", "0:a:0", "-c", "copy"]
+    if adts:
+        command += ["-bsf:a", "aac_adtstoasc"]
+    output = subprocess.check_output(command + ["-f", "framehash", "-hash", "sha256", "-"], text=True)
+    # Fields after the sixth describe side data, including TS stream IDs and
+    # extracted ASC. Compare the original compressed payload's size/hash only.
+    return [tuple(part.strip() for part in line.split(",")[4:6])
+            for line in output.splitlines() if line and not line.startswith("#")]
+
+
+def inspect_transport(path, oracle, case, decode=False):
+    facts = probe(path)
+    video = next(s for s in facts["streams"] if s["codec_type"] == "video")
+    audio = next(s for s in facts["streams"] if s["codec_type"] == "audio")
+    if (video["codec_name"], video["profile"], video["width"], video["height"], video["pix_fmt"],
+            video["color_transfer"], audio["codec_name"], int(audio["sample_rate"]), audio["channels"]) != (
+            case["codec"], case["profile"], case["width"], case["height"], case["pixel_format"],
+            case["transfer"], "aac", case["rate"], 2):
+        raise ValueError("TS wrapper changed the original source format")
+    tick = Fraction(1, 90000)
+    groups = []
+    maximum_audio_error = Fraction(0)
+    for stream, count, step in [(video, case["fps"] * 15, Fraction(1, case["fps"])),
+                               (audio, (15 * case["rate"] + 1023) // 1024, Fraction(1024, case["rate"]))]:
+        packets = [p for p in facts["packets"] if p["stream_index"] == stream["index"]]
+        if len(packets) != count or Fraction(stream["time_base"]) != tick:
+            raise ValueError("TS wrapper lost packets or changed the transport time base")
+        if int(packets[0]["pts"]) != 0:
+            raise ValueError("TS wrapper shifted the source origin")
+        for index, packet in enumerate(packets):
+            limit = tick if stream == audio else 0
+            errors = [abs(int(packet[field]) * tick - index * step) for field in ("pts", "dts")]
+            if max(errors) > limit or abs(int(packet["duration"]) * tick - step) > limit:
+                raise ValueError("TS timestamp exceeds its representable transport quantization")
+            if stream == audio:
+                maximum_audio_error = max(maximum_audio_error, *errors)
+            if any(s.get("side_data_type") != "MPEGTS Stream ID" for s in packet.get("side_data_list", [])):
+                raise ValueError("Unexpected skip/trim or other transport packet side data")
+        groups.append(packets)
+    video_packets, audio_packets = groups
+    keys = [p for p in video_packets if "K" in p["flags"]]
+    sizes = [int(p["size"]) for p in keys]
+    if [int(p["pts"]) * tick for p in keys] != [0, 5, 10] or min(sizes) < case["minimum_idr"] or max(sizes) > 1024 * 1024:
+        raise ValueError("TS wrapper must preserve three genuine large-IDR GOPs below the per-AU cap")
+    payloads = aac_payload_fingerprints(path, adts=True)
+    if len(payloads) != len(audio_packets) or payloads != aac_payload_fingerprints(oracle):
+        raise ValueError("TS AAC payloads differ from the original MP4 decoding oracle")
+    if decode:
+        run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-xerror", "-threads", "1",
+            "-i", str(path), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-")
+    return dict(bytes=path.stat().st_size, sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                video_packets=len(video_packets), audio_packets=len(audio_packets), idr_bytes=sizes,
+                maximum_audio_pts_error_ticks=str(maximum_audio_error / tick),
+                aac_payload_sequence_sha256=hashlib.sha256(json.dumps(payloads).encode()).hexdigest())
+
+
+def generate_transports(directory):
+    manifest = json.loads((directory / MANIFEST).read_text())
+    transports = {}
+    for case in CASES:
+        oracle = directory / case["name"]
+        if inspect(oracle, case) != manifest["measurements"][case["name"]]:
+            raise ValueError("Transport generation must use the unchanged committed decoding oracle")
+        output = oracle.with_suffix(".ts")
+        run(tool("ffmpeg"), "-hide_banner", "-v", "error", "-y", "-copyts", "-i", str(oracle),
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-mpegts_copyts", "1",
+            "-muxdelay", "0", "-muxpreload", "0", "-f", "mpegts", str(output))
+        transports[output.name] = inspect_transport(output, oracle, case, decode=True)
+    manifest["transport_ffmpeg_version"] = subprocess.check_output([tool("ffmpeg"), "-version"], text=True).splitlines()[0]
+    manifest["transport_generation"] = "Scripts/generate-homepod-large-idr-fixtures.py --generate-transports"
+    manifest["transports"] = transports
+    (directory / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+
+
 def generate(directory):
     directory.mkdir(parents=True, exist_ok=True)
     measurements = {}
@@ -144,6 +220,7 @@ def generate(directory):
                     gop_seconds=5, generation="Scripts/generate-homepod-large-idr-fixtures.py --generate",
                     cases=list(CASES), measurements=measurements)
     (directory / MANIFEST).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    generate_transports(directory)
 
 
 def verify(directory, decode=False):
@@ -155,16 +232,24 @@ def verify(directory, decode=False):
         if actual != manifest["measurements"][case["name"]]:
             raise ValueError(f'Committed fixture differs from provenance: {case["name"]}')
         print("HOMEPOD_LARGE_IDR=" + json.dumps({"name": case["name"], **actual}, sort_keys=True))
+        transport = (directory / case["name"]).with_suffix(".ts")
+        transported = inspect_transport(transport, directory / case["name"], case, decode=decode)
+        if transported != manifest["transports"][transport.name]:
+            raise ValueError(f"Committed transport differs from provenance: {transport.name}")
+        print("HOMEPOD_LARGE_IDR_TS=" + json.dumps({"name": transport.name, **transported}, sort_keys=True))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--generate", action="store_true")
+    modes.add_argument("--generate-transports", action="store_true")
     modes.add_argument("--verify", action="store_true")
     parser.add_argument("--decode", action="store_true", help="Also decode every original video/audio packet")
     parser.add_argument("--directory", type=Path, default=DIRECTORY)
     args = parser.parse_args()
     if args.generate:
         generate(args.directory)
+    elif args.generate_transports:
+        generate_transports(args.directory)
     verify(args.directory, decode=args.decode)

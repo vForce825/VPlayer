@@ -2061,21 +2061,31 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         minimumIDRBytes: Int) async throws -> HLSWriterAcceptanceProbe {
         let file = try XCTUnwrap(Bundle(for: Self.self).url(
             forResource: name, withExtension: nil, subdirectory: "Video"))
+        // The raw TS wrapper follows the same acquisition path as the broadcast
+        // regressions. Keep the unchanged MP4 only as an Apple decoding oracle;
+        // a >1 MiB progressive MP4 classification prefix is correctly rejected.
+        let transport = try XCTUnwrap(Bundle(for: Self.self).url(
+            forResource: (name as NSString).deletingPathExtension + ".ts",
+            withExtension: nil, subdirectory: "Video"))
         let origin = try NativeHLSHTTPFixture(resources: [
-            "/source.mp4": .init(data: Data(contentsOf: file), contentType: "video/mp4")])
+            "/source.ts": .init(data: Data(contentsOf: transport), contentType: "video/mp2t")])
         let resolver = URLSessionPlaybackSourceResolver()
         let probe = HLSWriterAcceptanceProbe()
         var assembler: HLSMediaGraphAssembler?
         var failure: (any Error)?
+        var stage = "resolve"
         do {
             // Keep the original paid, inspected source owner. Real source AAC
             // must pass through at 44.1/48 kHz without compatibility calibration.
-            let context = try sourceContext(url: origin.url("source.mp4"))
+            let context = try sourceContext(url: origin.url("source.ts"))
             let sourceCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.sourceRetention)
             let source = try await resolver.resolve(context, reason: .initial)
+            stage = "probe"
             let factsCharge = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.factsRetention)
             let facts = try await HLSCompatibilityProbe().inspect(source, retainingFacts: factsCharge)
             let videoFacts = try XCTUnwrap(facts.media.first?.video)
+            print("LARGE_IDR_PREFLIGHT codec=\(codec) bytes=\(facts.inspectedBytes) scan=\(videoFacts.scan) " +
+                "parameterSetsValidated=\(videoFacts.parameterSetsValidated) profile=\(videoFacts.profile)")
             XCTAssertEqual(videoFacts.codec, codec)
             XCTAssertEqual(videoFacts.width, Int32(width))
             XCTAssertEqual(videoFacts.height, Int32(height))
@@ -2085,6 +2095,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 XCTAssertEqual(videoFacts.colorPrimaries, .bt2020)
             }
             XCTAssertEqual(facts.media.first?.audio.first?.sampleRate, audioRate)
+            stage = "plan"
             let plan = try HLSPlaybackPlanner.makePlan(source: source, facts: facts,
                 capabilities: .init(videoProfiles: [codec: [codec == .h264 ? 100 : 2]],
                     compressedAudioCodecs: [.aac], supportsGenerated: true))
@@ -2106,7 +2117,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             authority.publicationForTesting.installBeforeReceiveForTesting {
                 video.receive($0); audio.receive($0)
             }
-            let graph = HLSMediaGraphAssembler(sourceURL: origin.url("source.mp4"),
+            stage = "graph"
+            let graph = HLSMediaGraphAssembler(sourceURL: origin.url("source.ts"),
                 applicationLedger: HLSDeliveryApplicationChargeLedger(),
                 graph: SystemHLSDeliveryGraph(authority: authority))
             assembler = graph
@@ -2164,6 +2176,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             // Preserve the native mfhd/tfdt/trun and sole canonical init exactly.
             let videoOutput = try writeOriginal(videoRecords, media: videoMedia, name: "original-video.mp4")
             let audioOutput = try writeOriginal(audioRecords, media: audioMedia, name: "original-audio.mp4")
+            stage = "output-decode"
             try await inspectLargeIDRVideo(videoOutput, width: width, height: height,
                 frameRate: frameRate, minimumIDRBytes: minimumIDRBytes,
                 media: videoMedia, expectedStart: nativeStart, expectedEnd: nativeVideoEnd)
@@ -2196,7 +2209,10 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertEqual(decoded.silentWindows, 0)
             print("LARGE_IDR_NATIVE codec=\(codec) frameRate=\(frameRate) gops=\(videoMedia.count) " +
                 "sourceAACRate=\(audioRate) originalBytes=true physicalHomePodVerified=false")
-        } catch { failure = error }
+        } catch {
+            print("LARGE_IDR_FAILURE codec=\(codec) phase=\(stage) error=\(error)")
+            failure = error
+        }
         if let assembler {
             let retired = await assembler.retireAndAwaitReceipt()
             XCTAssertTrue(retired, "Even a first-append rejection must join the real graph's cleanup")

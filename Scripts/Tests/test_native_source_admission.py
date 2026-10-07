@@ -164,6 +164,22 @@ int inspect_native_initialization(const uint8_t *bytes, size_t size) {
                 self.assertEqual(kind.value, expected)
                 self.assertEqual(usable.value, len(data))
 
+    def test_large_idr_transport_prefixes_reach_real_acquisition_without_relaxing_mp4(self):
+        root = ROOT / 'Tests/Fixtures/Video'
+        for name in ['homepod-large-idr-h264-1080p30-aac44100',
+                     'homepod-large-idr-hevc-hlg-2160p50-aac48000']:
+            with self.subTest(fixture=name):
+                mp4 = (root / (name + '.mp4')).read_bytes()
+                self.assertGreater(len(mp4), 1_048_576)
+                self.assertEqual(self.admission(mp4)[0:2], (0, 3))
+                self.assertNotEqual(self.admission(mp4[:1_048_576], prefix=1)[0], 0,
+                    'A truncated progressive mdat must retain the strict source rejection')
+                transport = (root / (name + '.ts')).read_bytes()
+                prefix = transport[:1_048_576]
+                self.assertEqual(self.acquisition_hint(prefix), 0)
+                self.assertEqual(self.admission(prefix, prefix=1), (0, 1, len(prefix) // 188 * 188))
+                self.assertEqual(self.admission(transport), (0, 1, len(transport)))
+
     @staticmethod
     def ordinary_ts():
         return (ROOT / 'Tests/VPlayerTests/Fixtures/Media/progressive-h264-aac.ts').read_bytes()
