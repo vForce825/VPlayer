@@ -393,6 +393,12 @@ jobs:
             --only-testing VPlayerTests/SampleBufferBuilderTests \
             --only-testing VPlayerTests/HLSManagedDemuxSmokeTests \
             --only-testing VPlayerTests/HLSProxyBackpressureTests \
+            --only-testing VPlayerTests/LoopbackHTTPServerTests/testCancellationBeforeStartupProbeStartsJoinsListenerAndProbeAndReleasesOwner \
+            --only-testing VPlayerTests/LoopbackHTTPServerTests/testCancellationWaitsForStartedProbeTerminalTailBeforeReturning \
+            --only-testing VPlayerTests/PlaybackErrorMappingTests/testInterlacedWriterCauseSurvivesRuntimeSnapshotAndPresentation \
+            --only-testing VPlayerTests/PlaybackErrorMappingTests/testInterlacedTimingKeepsExactValuesAndTimescalesThroughPrivacyRedaction \
+            --only-testing VPlayerTests/PlaybackErrorMappingTests/testInterlacedSystemWriterErrorPreservesOriginalDomainAndCode \
+            --only-testing VPlayerTests/PlaybackErrorMappingTests/testInterlacedUnknownCauseKeepsPrivacyAndUTF8Bounds \
             --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testSourceMetadataAppearsAtCurrentResetBoundaryWhileStartAndRetryAreStillPreparing \
             --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testReplayedTerminalStateCannotLoseEarlyMetadataSubscription \
             --only-testing VPlayerTests/FullScreenPlayerViewModelTests/testLateMediaResetBoundaryCannotResubscribeAfterStop \
