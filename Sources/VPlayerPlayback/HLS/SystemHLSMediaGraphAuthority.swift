@@ -176,6 +176,48 @@ enum HLSInterlacedYADIFPolicy {
     }
 }
 
+/// Keep the failure ahead of optional timing context in the fixed 256-byte snapshot.
+enum HLSInterlacedOutputDiagnostic {
+    static func message(stage: String, error: any Error, pts: CMTime,
+                        expectedVideoStart: CMTime, context: String) -> String {
+        "task22.interlaced.output stage=\(stage) underlying=\(boundedCause(error)) " +
+            "pts=\(time(pts)) initialStart=\(time(expectedVideoStart)) context=\(context)"
+    }
+
+    /// Exact CMTime value@timescale; '/' is intentionally avoided because it is a path delimiter.
+    static func time(_ value: CMTime) -> String { "\(value.value)@\(value.timescale)" }
+
+    private static func boundedCause(_ error: any Error) -> String {
+        let cause: String
+        switch error {
+        case let failure as SegmentedFMP4WriterFailure:
+            if case .systemError(let diagnostic) = failure {
+                cause = "writer.systemError \(diagnostic.summary)"
+            } else {
+                cause = "writer.\(failure)"
+            }
+        case let failure as SegmentBoundaryFailure:
+            cause = "boundary.\(failure)"
+        case let failure as HLSVideoRemuxSubmissionFailure:
+            cause = "submission.\(failure)"
+        case is CancellationError:
+            cause = "CancellationError"
+        default:
+            // Unknown errors must pass through the existing privacy filter before clipping.
+            cause = PlaybackErrorDiagnostics.snapshot(error).summary
+        }
+        var result = ""
+        var byteCount = 0
+        for scalar in cause.unicodeScalars {
+            let text = String(scalar)
+            guard byteCount + text.utf8.count <= 128 else { break }
+            result += text
+            byteCount += text.utf8.count
+        }
+        return result
+    }
+}
+
 /// 单 source item 的生产媒体图 owner。demux callback 只移交带 admission tail 的事件；
 /// 唯一 worker 顺序执行 timeline、音视频 writer、publisher 与自然 EOF。
 final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unchecked Sendable {
@@ -441,11 +483,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
                 authority?.fail(PlaybackCoreError.videoSampleBuffer(
-                    "task22.interlaced.output pts=\(pts.value)/\(pts.timescale) " +
-                    "expected=\(expectedVideoStart.value)/\(expectedVideoStart.timescale) " +
-                    "stage=\(stage) " +
-                    "context=\(failureContext(output)) " +
-                    "underlying=\(String(reflecting: error))"))
+                    HLSInterlacedOutputDiagnostic.message(
+                        stage: stage, error: error, pts: pts,
+                        expectedVideoStart: expectedVideoStart, context: failureContext(output))))
             }
             completeCurrentEnvelope()
         }
@@ -463,11 +503,9 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 let pts = CMSampleBufferGetPresentationTimeStamp(output.sampleBuffer)
                 let stage = lock.withLock { diagnosticStage }
                 authority?.fail(PlaybackCoreError.videoSampleBuffer(
-                    "task22.interlaced.output pts=\(pts.value)/\(pts.timescale) " +
-                    "expected=\(expectedVideoStart.value)/\(expectedVideoStart.timescale) " +
-                    "stage=\(stage) " +
-                    "context=\(failureContext(output)) " +
-                    "underlying=\(String(reflecting: error))"))
+                    HLSInterlacedOutputDiagnostic.message(
+                        stage: stage, error: error, pts: pts,
+                        expectedVideoStart: expectedVideoStart, context: failureContext(output))))
             }
         }
 
@@ -490,14 +528,14 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 false
             }
             let dimensions = format.map { CMVideoFormatDescriptionGetDimensions($0) }
-            let lastPTS = snapshot.0.map { "\($0.value)/\($0.timescale)" } ?? "nil"
-            let lastDuration = snapshot.1.map { "\($0.value)/\($0.timescale)" } ?? "nil"
+            let lastPTS = snapshot.0.map(HLSInterlacedOutputDiagnostic.time) ?? "nil"
+            let lastDuration = snapshot.1.map(HLSInterlacedOutputDiagnostic.time) ?? "nil"
             let dimensionsText = dimensions.map { "\($0.width)x\($0.height)" } ?? "nil"
             let lastSource = snapshot.4.map {
                 "au\($0.accessUnitID)-seq\($0.sequenceNumber)-g\($0.generation.rawValue)"
             } ?? "nil"
             let currentSource = output.sourceIdentity
-            return "duration=\(duration.value)/\(duration.timescale) " +
+            return "duration=\(HLSInterlacedOutputDiagnostic.time(duration)) " +
                 "lastPTS=\(lastPTS) " +
                 "lastDuration=\(lastDuration) " +
                 "formatMatchesFirst=\(formatMatches) " +
