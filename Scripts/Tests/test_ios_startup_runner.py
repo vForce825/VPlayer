@@ -5,11 +5,14 @@
 import importlib.util
 import os
 import signal
+import subprocess
 import time
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
 ROOT=Path(__file__).resolve().parents[2]
 class IOSStartupRunnerTests(unittest.TestCase):
     def module(self):
@@ -44,7 +47,9 @@ class IOSStartupRunnerTests(unittest.TestCase):
                 proc=Path('/proc')/str(pid)/'stat'
                 if proc.exists():self.assertEqual(proc.read_text().split()[2],'Z')
                 else:
-                    with self.assertRaises(ProcessLookupError):os.kill(pid,0)
+                    state=subprocess.run(['ps','-p',str(pid),'-o','stat='],capture_output=True,text=True,check=False)
+                    if state.returncode==0:self.assertTrue(state.stdout.strip().startswith('Z'))
+                    else:self.assertEqual(state.returncode,1)
             finally:
                 if pid is None and pidfile.exists():pid=int(pidfile.read_text())
                 if pid:
@@ -89,6 +94,32 @@ class IOSStartupRunnerTests(unittest.TestCase):
                 0.2,Path(directory),lambda:None)
             self.assertEqual(code,124)
             with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
+    def test_darwin_zombie_only_group_is_not_executing_but_live_member_is(self):
+        module=self.module()
+        for output,expected in [('10 100 Z\n11 100 Z+\n12 101 S\n',False),('10 100 S\n',True),('10 100 Z\n11 100 T\n',True),('12 101 S\n',False)]:
+            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout=output)):
+                self.assertEqual(module.group_has_executing_members(100),expected)
+        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='ambiguous')):
+            with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
+    def test_unreadable_inventory_and_live_survivor_fail_cleanup(self):
+        module=self.module()
+        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='')):
+            with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
+        with patch.object(module.subprocess,'run',side_effect=subprocess.CalledProcessError(1,['ps'])):
+            with self.assertRaises(subprocess.CalledProcessError):module.group_has_executing_members(100)
+        process=SimpleNamespace(pid=100,poll=lambda:0,wait=lambda timeout:0)
+        with patch.object(module,'signal_group_or_retired',return_value=True), patch.object(module,'group_has_executing_members',return_value=True):
+            with self.assertRaisesRegex(RuntimeError,'executing descendants'):
+                module.retire_owned_group(process,graces=[(signal.SIGKILL,0)])
+    def test_zero_signal_permission_error_requires_verified_group_retirement(self):
+        module=self.module()
+        with patch.object(module.os,'killpg',side_effect=PermissionError('synthetic Darwin group')):
+            with patch.object(module,'group_has_executing_members',return_value=False) as check:
+                self.assertFalse(module.signal_group_or_retired(100,0));check.assert_called_once_with(100)
+            with patch.object(module,'group_has_executing_members',return_value=True):
+                with self.assertRaises(PermissionError):module.signal_group_or_retired(100,0)
+            with patch.object(module,'group_has_executing_members',side_effect=RuntimeError('unreadable')):
+                with self.assertRaises(RuntimeError):module.signal_group_or_retired(100,0)
     def test_artifact_projection_excludes_environment_and_only_reports_allowed_keys(self):
         module=self.module()
         value={'EnvironmentVariables':{'TOKEN':'private'},'TestTargets':[{'UITargetAppPath':'app','OnlyTestIdentifiers':['test'], 'Secret':'private'}]}

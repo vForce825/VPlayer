@@ -59,7 +59,7 @@ def owned_process_rows(listing,pid,derived_data):
     return owned
 
 def sample_owned_processes(process,directory,command):
-    if sys.platform!='darwin':return
+    if sys.platform!='darwin' or Path(command[0]).name!='xcodebuild':return
     derived_data=Path(command[command.index('-derivedDataPath')+1]) if '-derivedDataPath' in command else None
     listing=subprocess.run(['ps','-axo','pid=,ppid=,pgid=,pcpu=,etime=,rss=,command='],
         capture_output=True,text=True,timeout=5,check=False).stdout
@@ -72,6 +72,42 @@ def sample_owned_processes(process,directory,command):
             stdout=subprocess.DEVNULL,stderr=subprocess.STDOUT,timeout=8,check=False)
         except subprocess.TimeoutExpired:continue
         if sample.exists():print(bounded_log(sample).decode('utf-8','replace'),flush=True)
+
+def group_has_executing_members(pgid):
+    result=subprocess.run(['ps','-axo','pid=,pgid=,stat='],capture_output=True,text=True,timeout=3,check=True)
+    if not result.stdout.strip():raise RuntimeError('Empty process-group inventory')
+    states=[]
+    for line in result.stdout.splitlines():
+        if not line.strip():continue
+        fields=line.split()
+        if len(fields)!=3 or not fields[0].isdigit() or not fields[1].isdigit():raise RuntimeError('Ambiguous process-group inventory')
+        if fields[1]==str(pgid):states.append(fields[2])
+    print('IOS_STARTUP_GROUP_STATES='+json.dumps({'pgid':pgid,'states':states}),flush=True)
+    return any(not state.startswith('Z') for state in states)
+
+def signal_group_or_retired(pgid,sig):
+    try:os.killpg(pgid,sig);return True
+    except ProcessLookupError:return False
+    except PermissionError:
+        # Darwin killpg1 skips zombies and may return EPERM for a zombie-only
+        # group. Never equate EPERM with retirement without fresh OS evidence.
+        if not group_has_executing_members(pgid):return False
+        raise
+
+def retire_owned_group(process,graces=((signal.SIGINT,10),(signal.SIGTERM,5),(signal.SIGKILL,5))):
+    for sig,grace in graces:
+        if not signal_group_or_retired(process.pid,sig):break
+        # Reap the leader without mistaking its exit for group retirement.
+        deadline=time.monotonic()+grace
+        while time.monotonic()<deadline:
+            process.poll()
+            if not signal_group_or_retired(process.pid,0):break
+            time.sleep(0.05)
+        else:continue
+        break
+    process.wait(timeout=5)
+    if group_has_executing_members(process.pid):
+        raise RuntimeError('Owned process group still has executing descendants')
 
 def run_command(label,command,timeout,directory,diagnostics):
     path=directory/(label+'.log')
@@ -92,20 +128,7 @@ def run_command(label,command,timeout,directory,diagnostics):
             except Exception as error:
                 print('IOS_STARTUP_DIAGNOSTIC_FAILED='+type(error).__name__,flush=True)
             finally:
-                for sig,grace in [(signal.SIGINT,10),(signal.SIGTERM,5),(signal.SIGKILL,5)]:
-                    try:os.killpg(process.pid,sig)
-                    except ProcessLookupError:break
-                    # Reap the leader, but never confuse its exit with retirement
-                    # of the complete group we created (xcodebuild descendants).
-                    deadline=time.monotonic()+grace
-                    while time.monotonic()<deadline:
-                        process.poll()
-                        try:os.killpg(process.pid,0)
-                        except ProcessLookupError:break
-                        time.sleep(0.05)
-                    else:continue
-                    break
-                process.wait(timeout=5)
+                retire_owned_group(process)
             code=124
     markers=bytearray()
     with path.open('rb') as source:
