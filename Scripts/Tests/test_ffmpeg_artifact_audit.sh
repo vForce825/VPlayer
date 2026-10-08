@@ -6,7 +6,17 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
-artifact="$vendor/Artifacts/FFmpeg.xcframework"
+source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
+selected_platform=tvos
+if [[ $# -ne 0 ]]; then
+  [[ $# -eq 2 && "$1" == --platform ]] || exit 64
+  selected_platform="$2"
+fi
+ffmpeg_select_platform "$selected_platform"
+artifact="$vendor/$ffmpeg_artifact_directory/FFmpeg.xcframework"
+build_work="$vendor/Work$ffmpeg_work_suffix"
+installs=(install-device install-sim-arm64)
+if [[ "$selected_platform" == tvos ]]; then installs+=(install-sim-x86_64); fi
 source="$vendor/Work/source"
 
 missing_artifact() {
@@ -15,8 +25,8 @@ missing_artifact() {
 }
 
 [[ -d "$artifact" && -f "$artifact/Info.plist" && -d "$source/.git" ]] || missing_artifact
-for install in install-device install-sim-arm64 install-sim-x86_64; do
-  [[ -d "$vendor/Work/$install" ]] || missing_artifact
+for install in "${installs[@]}"; do
+  [[ -d "$build_work/$install" ]] || missing_artifact
 done
 
 tmp="$(mktemp -d)"
@@ -28,8 +38,10 @@ cleanup() {
 trap cleanup EXIT
 
 base="$tmp/base"
-mkdir -p "$base/Scripts" "$base/Vendor/FFmpeg/Artifacts" "$base/Vendor/FFmpeg/Work"
+mkdir -p "$base/Scripts" "$base/Vendor/FFmpeg/$ffmpeg_artifact_directory" "$base/Vendor/FFmpeg/Work$ffmpeg_work_suffix"
 cp "$root/Scripts/audit-ffmpeg.sh" "$base/Scripts/"
+mkdir -p "$base/Scripts/Support"
+cp "$root/Scripts/Support/ffmpeg-platform-profile.sh" "$base/Scripts/Support/"
 for metadata in \
   LICENSE.md \
   UPSTREAM-LICENSE.md \
@@ -40,10 +52,10 @@ for metadata in \
   system-symbol-allowlist.txt; do
   cp "$vendor/$metadata" "$base/Vendor/FFmpeg/"
 done
-cp -R "$artifact" "$base/Vendor/FFmpeg/Artifacts/"
+cp -R "$artifact" "$base/Vendor/FFmpeg/$ffmpeg_artifact_directory/"
 ln -s "$source" "$base/Vendor/FFmpeg/Work/source"
-for install in install-device install-sim-arm64 install-sim-x86_64; do
-  ln -s "$vendor/Work/$install" "$base/Vendor/FFmpeg/Work/$install"
+for install in "${installs[@]}"; do
+  ln -s "$build_work/$install" "$base/Vendor/FFmpeg/Work$ffmpeg_work_suffix/$install"
 done
 
 /usr/bin/plutil -convert json -o "$tmp/base-info.json" "$artifact/Info.plist"
@@ -59,21 +71,21 @@ new_case() {
 }
 
 device_record() {
-  printf '%s/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/ffmpeg-build.json\n' "$1" "$device_identifier"
+  printf '%s/Vendor/FFmpeg/%s/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/ffmpeg-build.json\n' "$1" "$ffmpeg_artifact_directory" "$device_identifier"
 }
 
 device_config() {
-  printf '%s/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/config.h\n' "$1" "$device_identifier"
+  printf '%s/Vendor/FFmpeg/%s/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/config.h\n' "$1" "$ffmpeg_artifact_directory" "$device_identifier"
 }
 
 device_components() {
-  printf '%s/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/config_components.h\n' "$1" "$device_identifier"
+  printf '%s/Vendor/FFmpeg/%s/FFmpeg.xcframework/%s/Headers/ffmpeg-build/device/config_components.h\n' "$1" "$ffmpeg_artifact_directory" "$device_identifier"
 }
 
 materialize_device_install() {
-  local case_root="$1" destination="$1/Vendor/FFmpeg/Work/install-device"
+  local case_root="$1" destination="$1/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device"
   find "$destination" -maxdepth 0 -type l -delete
-  cp -R "$vendor/Work/install-device" "$destination"
+  cp -R "$build_work/install-device" "$destination"
 }
 
 replace_define() {
@@ -94,8 +106,8 @@ replace_json() {
 assert_rejected() {
   local case_root="$1" expected="$2" description="$3"
   local output="$case_root/audit-output.txt"
-  if "$case_root/Scripts/audit-ffmpeg.sh" \
-    "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" > "$output" 2>&1; then
+  if "$case_root/Scripts/audit-ffmpeg.sh" --platform "$selected_platform" \
+    "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework" > "$output" 2>&1; then
     echo "artifact audit accepted $description" >&2
     exit 1
   fi
@@ -109,17 +121,17 @@ assert_rejected() {
 
 # Reproduce Xcode Cloud's locale: without an explicit POSIX collation,
 # libFFmpeg.a sorts after the lowercase archives and caused a false rejection.
-LC_ALL=en_US.UTF-8 "$base/Scripts/audit-ffmpeg.sh" \
-  "$base/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" >/dev/null
+LC_ALL=en_US.UTF-8 "$base/Scripts/audit-ffmpeg.sh" --platform "$selected_platform" \
+  "$base/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework" >/dev/null
 
 case_root="$(new_case info-platform)"
-/usr/bin/plutil -replace "AvailableLibraries.$device_index.SupportedPlatform" -string ios \
-  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/Info.plist"
+/usr/bin/plutil -replace "AvailableLibraries.$device_index.SupportedPlatform" -string macos \
+  "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework/Info.plist"
 assert_rejected "$case_root" "unexpected XCFramework platform or architecture inventory" "a tampered Info.plist platform"
 
 case_root="$(new_case info-architecture)"
 /usr/bin/plutil -replace "AvailableLibraries.$device_index.SupportedArchitectures" -json '["x86_64"]' \
-  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/Info.plist"
+  "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework/Info.plist"
 assert_rejected "$case_root" "unexpected XCFramework platform or architecture inventory" "a tampered Info.plist architecture"
 
 case_root="$(new_case gpl-config)"
@@ -144,12 +156,12 @@ assert_rejected "$case_root" "invalid build record" "a tampered record commit"
 
 case_root="$(new_case archive-hash)"
 materialize_device_install "$case_root"
-printf 'tamper' >> "$case_root/Vendor/FFmpeg/Work/install-device/lib/libavcodec.a"
+printf 'tamper' >> "$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libavcodec.a"
 assert_rejected "$case_root" "device libavcodec.a differs from recorded build output" "a tampered input archive hash"
 
 case_root="$(new_case archive-inventory)"
 materialize_device_install "$case_root"
-printf 'unexpected' > "$case_root/Vendor/FFmpeg/Work/install-device/lib/libunexpected.a"
+printf 'unexpected' > "$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libunexpected.a"
 assert_rejected "$case_root" "libunexpected.a" "an unexpected installed static library"
 
 case_root="$(new_case lgpl-license)"
@@ -160,26 +172,26 @@ case_root="$(new_case upstream-license-map)"
 printf '\nTampered.\n' >> "$case_root/Vendor/FFmpeg/UPSTREAM-LICENSE.md"
 assert_rejected "$case_root" "UPSTREAM-LICENSE.md differs from upstream LICENSE.md" "a tampered upstream license map"
 
-cc="$(/usr/bin/xcrun --sdk appletvos --find clang)"
+cc="$(/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" --find clang)"
 
 case_root="$(new_case minimum-os)"
 materialize_device_install "$case_root"
 printf 'void vplayer_audit_tvos17_object(void) {}\n' | \
-  "$cc" -target arm64-apple-tvos17.0 -fapplication-extension -x c -c -o "$case_root/tvos17.o" -
-/usr/bin/xcrun --sdk appletvos ar -r \
-  "$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a" "$case_root/tvos17.o"
-/usr/bin/xcrun --sdk appletvos ranlib "$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
-assert_rejected "$case_root" "Mach-O platform or minimum OS differs from tvOS 27.0" "a real tvOS 17 Mach-O member"
+  "$cc" -target arm64-apple-${selected_platform}17.0 -fapplication-extension -x c -c -o "$case_root/tvos17.o" -
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ar -r \
+  "$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libFFmpeg.a" "$case_root/tvos17.o"
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ranlib "$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libFFmpeg.a"
+assert_rejected "$case_root" "Mach-O platform or minimum OS differs from $ffmpeg_display_name 27.0" "a real tvOS 17 Mach-O member"
 
 case_root="$(new_case unexpected-symbol)"
 materialize_device_install "$case_root"
 printf 'extern void vplayer_audit_unexpected_symbol(void); void vplayer_audit_symbol_probe(void) { vplayer_audit_unexpected_symbol(); }\n' | \
-  "$cc" -target arm64-apple-tvos27.0 -fapplication-extension -x c -c -o "$case_root/unexpected.o" -
-device_install_archive="$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
-/usr/bin/xcrun --sdk appletvos ar -r "$device_install_archive" "$case_root/unexpected.o"
-/usr/bin/xcrun --sdk appletvos ranlib "$device_install_archive"
+  "$cc" -target arm64-apple-${selected_platform}27.0 -fapplication-extension -x c -c -o "$case_root/unexpected.o" -
+device_install_archive="$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libFFmpeg.a"
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ar -r "$device_install_archive" "$case_root/unexpected.o"
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ranlib "$device_install_archive"
 cp "$device_install_archive" \
-  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/$device_identifier/libFFmpeg.a"
+  "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework/$device_identifier/libFFmpeg.a"
 combined_sha="$(shasum -a 256 "$device_install_archive" | awk '{print $1}')"
 record="$(device_record "$case_root")"
 jq --arg sha "$combined_sha" '.archives["libFFmpeg.a"] = $sha' "$record" > "$record.new"
@@ -189,18 +201,18 @@ assert_rejected "$case_root" "_vplayer_audit_unexpected_symbol" "an unexpected u
 case_root="$(new_case optional-system-symbol)"
 materialize_device_install "$case_root"
 printf 'extern unsigned long vplayer_test_wcslen(const void *) __asm("_wcslen"); unsigned long vplayer_audit_optional_probe(const void *value) { return vplayer_test_wcslen(value); }\n' | \
-  "$cc" -target arm64-apple-tvos27.0 -fapplication-extension -x c -c -o "$case_root/optional.o" -
-device_install_archive="$case_root/Vendor/FFmpeg/Work/install-device/lib/libFFmpeg.a"
-/usr/bin/xcrun --sdk appletvos ar -r "$device_install_archive" "$case_root/optional.o"
-/usr/bin/xcrun --sdk appletvos ranlib "$device_install_archive"
+  "$cc" -target arm64-apple-${selected_platform}27.0 -fapplication-extension -x c -c -o "$case_root/optional.o" -
+device_install_archive="$case_root/Vendor/FFmpeg/Work$ffmpeg_work_suffix/install-device/lib/libFFmpeg.a"
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ar -r "$device_install_archive" "$case_root/optional.o"
+/usr/bin/xcrun --sdk "$ffmpeg_device_sdk" ranlib "$device_install_archive"
 cp "$device_install_archive" \
-  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/$device_identifier/libFFmpeg.a"
+  "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework/$device_identifier/libFFmpeg.a"
 combined_sha="$(shasum -a 256 "$device_install_archive" | awk '{print $1}')"
 record="$(device_record "$case_root")"
 jq --arg sha "$combined_sha" '.archives["libFFmpeg.a"] = $sha' "$record" > "$record.new"
 mv "$record.new" "$record"
-"$case_root/Scripts/audit-ffmpeg.sh" \
-  "$case_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework" >/dev/null
+"$case_root/Scripts/audit-ffmpeg.sh" --platform "$selected_platform" \
+  "$case_root/Vendor/FFmpeg/$ffmpeg_artifact_directory/FFmpeg.xcframework" >/dev/null
 echo "Artifact audit accepted a reviewed optional system symbol"
 
 case_root="$(new_case overlapping-symbol-allowlists)"

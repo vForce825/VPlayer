@@ -7,19 +7,44 @@ import Darwin
 import Foundation
 import VideoToolbox
 
+enum NativeHLSPlatform: Sendable {
+    case appleTV
+    case iPhone
+
+    static var current: Self {
+        #if os(iOS)
+        .iPhone
+        #else
+        .appleTV
+        #endif
+    }
+}
+
 struct NativeHLSPlatformEvidence: Sendable {
+    let platform: NativeHLSPlatform
     let model: String
     let hardwareH264: Bool
     let hardwareHEVC: Bool
     let hdrEligible: Bool
     let playable: @Sendable (String) -> Bool
+
+    init(platform: NativeHLSPlatform = .appleTV, model: String,
+         hardwareH264: Bool, hardwareHEVC: Bool, hdrEligible: Bool,
+         playable: @escaping @Sendable (String) -> Bool) {
+        self.platform = platform
+        self.model = model
+        self.hardwareH264 = hardwareH264
+        self.hardwareHEVC = hardwareHEVC
+        self.hdrEligible = hdrEligible
+        self.playable = playable
+    }
 }
 
 /// Public system format queries are combined with bounded documented device
 /// limits. These are app playback candidates, not HomePod bit-perfect proof.
 enum NativeHLSCapabilities {
     @MainActor static func current(facts: HLSCompatibilityFacts, route: PlaybackRouteSemanticIdentity?) -> HLSOutputCapabilities {
-        make(facts: facts, route: route, evidence: .init(model: hardwareModel(),
+        make(facts: facts, route: route, evidence: .init(platform: .current, model: hardwareModel(),
             hardwareH264: VTIsHardwareDecodeSupported(kCMVideoCodecType_H264),
             hardwareHEVC: VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC),
             hdrEligible: AVPlayer.eligibleForHDRPlayback,
@@ -27,7 +52,13 @@ enum NativeHLSCapabilities {
     }
 
     static func make(facts: HLSCompatibilityFacts, route: PlaybackRouteSemanticIdentity?, evidence: NativeHLSPlatformEvidence) -> HLSOutputCapabilities {
-        let known4K = ["AppleTV6,2", "AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
+        let known4K = evidence.platform == .appleTV &&
+            ["AppleTV6,2", "AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
+        // iOS uses its own conservative SDR envelope. This identifies a phone,
+        // not a simulator masquerading as one; hardware/MIME/source evidence
+        // below remains mandatory and does not promise measured performance.
+        let knownPhone = evidence.platform == .iPhone &&
+            evidence.model.range(of: "^iPhone[0-9]+,[0-9]+$", options: .regularExpression) != nil
         let modernHDR = ["AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
         // Since tvOS 17 the public API interprets codecs in the MIME container's
         // namespace. A playlist is not a media-data container: qualifying the
@@ -38,14 +69,14 @@ enum NativeHLSCapabilities {
             nativeHLSMediaPlayable($0, evidence: evidence)
         }
         var videoFormats: [HLSVideoCapability] = []
-        var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K
+        var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K || knownPhone
         // Apple HLS authoring 1.3/1.6 and Apple TV 4K technical specifications:
         // https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices
         // https://support.apple.com/en-us/111922
         // https://support.apple.com/en-us/111839
         // Unknown hardware stays outside this device envelope. Exact per-source
         // MIME queries remain necessary even for an allowlisted model.
-        if known4K {
+        if known4K || knownPhone {
             for video in facts.media.compactMap(\.video) {
                 guard let codec = video.codec, let mimeCodec = codecString(video),
                       (codec == .h264 ? evidence.hardwareH264 : evidence.hardwareHEVC),
@@ -53,13 +84,24 @@ enum NativeHLSCapabilities {
                     everyVideoPlayable = false; continue
                 }
                 let ranges: Set<HLSVideoRange>
-                if codec == .h264 { ranges = [.sdr] }
+                if codec == .h264 || knownPhone { ranges = [.sdr] }
                 else { ranges = evidence.hdrEligible ? [.sdr, .pq, .hlg] : [.sdr] }
                 let isHDR = video.videoRange == .pq || video.videoRange == .hlg
-                let capability = HLSVideoCapability(codec: codec, profiles: codec == .h264 ? [66, 77, 100] : [1, 2],
+                let capability: HLSVideoCapability
+                if knownPhone {
+                    capability = HLSVideoCapability(codec: codec,
+                        profiles: codec == .h264 ? [66, 77, 100] : [1, 2],
+                        maximumLevel: codec == .h264 ? 41 : 120,
+                        maximumWidth: 1_920, maximumHeight: 1_080,
+                        maximumFrameRate: MediaRational(num: 30, den: 1)!,
+                        bitDepths: codec == .h264 ? [8] : [8, 10], chromaFormats: [1],
+                        tiers: [.main], videoRanges: [.sdr])
+                } else {
+                    capability = HLSVideoCapability(codec: codec, profiles: codec == .h264 ? [66, 77, 100] : [1, 2],
                     maximumLevel: codec == .h264 ? 52 : 153, maximumWidth: 3_840, maximumHeight: 2_160,
                     maximumFrameRate: MediaRational(num: isHDR && !modernHDR ? 30 : 60, den: 1)!,
                     bitDepths: codec == .h264 ? [8] : [8, 10], chromaFormats: [1], tiers: [.main, .high], videoRanges: ranges)
+                }
                 if capability.matches(video) { videoFormats.append(capability) }
                 else { everyVideoPlayable = false }
             }

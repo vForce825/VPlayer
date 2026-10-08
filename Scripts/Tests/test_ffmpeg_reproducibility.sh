@@ -7,7 +7,17 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 physical_root="$(cd -P "$(dirname "$0")/../.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
-artifact="$vendor/Artifacts/FFmpeg.xcframework"
+source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
+selected_platform=tvos
+if [[ $# -ne 0 ]]; then
+  [[ $# -eq 2 && "$1" == --platform ]] || exit 64
+  selected_platform="$2"
+fi
+ffmpeg_select_platform "$selected_platform"
+artifact="$vendor/$ffmpeg_artifact_directory/FFmpeg.xcframework"
+build_work="$vendor/Work$ffmpeg_work_suffix"
+slices=(device sim-arm64)
+if [[ "$selected_platform" == tvos ]]; then slices+=(sim-x86_64); fi
 virtual_checkout='/VPlayer/FFmpeg/Checkout'
 virtual_source='/VPlayer/FFmpeg/Source'
 virtual_install_base='/VPlayer/FFmpeg/Install'
@@ -66,16 +76,16 @@ assert_normalized_config() {
   grep -Fqx '#define FFMPEG_LICENSE "LGPL version 2.1 or later"' "$config"
 }
 
-for slice in device sim-arm64 sim-x86_64; do
-  assert_archive_omits_root "$vendor/Work/install-$slice/lib/libFFmpeg.a" \
+for slice in "${slices[@]}"; do
+  assert_archive_omits_root "$build_work/install-$slice/lib/libFFmpeg.a" \
     "$slice thin libFFmpeg.a"
-  assert_text_omits_root "$vendor/Work/build-$slice/config.h" \
+  assert_text_omits_root "$build_work/build-$slice/config.h" \
     "$slice generated config.h"
-  assert_text_omits_root "$vendor/Work/install-$slice/include/ffmpeg-build/$slice/config.h" \
+  assert_text_omits_root "$build_work/install-$slice/include/ffmpeg-build/$slice/config.h" \
     "$slice installed config.h"
-  assert_text_omits_root "$vendor/Work/install-$slice/include/ffmpeg-build/$slice/config_components.h" \
+  assert_text_omits_root "$build_work/install-$slice/include/ffmpeg-build/$slice/config_components.h" \
     "$slice installed config_components.h"
-  record="$vendor/Work/install-$slice/include/ffmpeg-build/$slice/ffmpeg-build.json"
+  record="$build_work/install-$slice/include/ffmpeg-build/$slice/ffmpeg-build.json"
   assert_text_omits_root "$record" "$slice build record"
   jq -e \
     --arg checkout "$virtual_checkout" \
@@ -87,11 +97,11 @@ for slice in device sim-arm64 sim-x86_64; do
     }' "$record" >/dev/null
 
   case "$slice" in
-    device) target='arm64-apple-tvos27.0' ;;
-    sim-arm64) target='arm64-apple-tvos27.0-simulator' ;;
+    device) target="arm64-apple-${selected_platform}27.0" ;;
+    sim-arm64) target="arm64-apple-${selected_platform}27.0-simulator" ;;
     sim-x86_64) target='x86_64-apple-tvos27.0-simulator' ;;
   esac
-  assert_normalized_config "$vendor/Work/build-$slice/config.h" "$slice" "$target"
+  assert_normalized_config "$build_work/build-$slice/config.h" "$slice" "$target"
 done
 
 [[ -f "$artifact/Info.plist" ]] || {
@@ -104,11 +114,15 @@ sim_identifier="$(jq -er '.AvailableLibraries[] | select(.SupportedPlatformVaria
 device_archive="$artifact/$device_identifier/libFFmpeg.a"
 sim_archive="$artifact/$sim_identifier/libFFmpeg.a"
 assert_archive_omits_root "$device_archive" "final device thin libFFmpeg.a"
-for arch in arm64 x86_64; do
-  thin="$tmp/final-simulator-$arch.a"
-  /usr/bin/lipo "$sim_archive" -thin "$arch" -output "$thin"
-  assert_archive_omits_root "$thin" "final simulator $arch thin libFFmpeg.a"
-done
+if ffmpeg_archive_needs_thinning simulator; then
+  for arch in arm64 x86_64; do
+    thin="$tmp/final-simulator-$arch.a"
+    /usr/bin/lipo "$sim_archive" -thin "$arch" -output "$thin"
+    assert_archive_omits_root "$thin" "final simulator $arch thin libFFmpeg.a"
+  done
+else
+  assert_archive_omits_root "$sim_archive" "final arm64 simulator libFFmpeg.a"
+fi
 
 while IFS= read -r header; do
   assert_text_omits_root "$header" "final FFmpeg metadata header"

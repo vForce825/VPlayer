@@ -110,3 +110,20 @@ exception does not alter FFmpeg's LGPL terms. Every App Store release must
 pass an App Store release/legal gate that checks the actual distribution
 terms and delivery mechanism against these obligations; this documentation
 does not by itself guarantee App Store acceptance or legal compliance.
+
+
+## Independent iOS 27 build profile
+
+The default `Scripts/build-ffmpeg.sh` remains the audited tvOS 27 artifact
+(arm64 device and arm64/x86_64 simulator). `Scripts/build-ffmpeg.sh --platform ios`
+builds arm64 iOS 27 device and simulator libraries in the separate
+`Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework`. Audit it explicitly with
+`Scripts/audit-ffmpeg.sh --platform ios Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework`.
+Both profiles use the same pinned source, component/license policy and exclusive
+build lock; iOS intermediates live under `Work/ios`. Neither profile removes the
+other profile's artifact. Promotion never infers platform authority from an
+artifact's path or metadata. The iOS simulator archive is thin and is audited
+without a fat-archive extraction step.
+
+`Scripts/build-metal-libraries.sh --platform ios` builds the separate iOS device
+and simulator shader libraries. Its default invocation remains tvOS-only.

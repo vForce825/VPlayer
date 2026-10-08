@@ -7,13 +7,19 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 output_directory="$root/Sources/VPlayerPlayback/Resources"
 
-if [[ "$#" -gt 0 ]]; then
-  if [[ "$#" -ne 2 || "$1" != "--output-directory" ]]; then
-    echo "Usage: Scripts/build-metal-libraries.sh [--output-directory PATH]" >&2
-    exit 64
-  fi
-  output_directory="$2"
-fi
+platform=tvos
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output-directory)
+      [[ $# -ge 2 ]] || { echo 'Missing output directory' >&2; exit 64; }
+      output_directory="$2"; shift 2 ;;
+    --platform)
+      [[ $# -ge 2 ]] || { echo 'Missing platform' >&2; exit 64; }
+      platform="$2"; shift 2 ;;
+    *) echo 'Usage: Scripts/build-metal-libraries.sh [--platform tvos|ios] [--output-directory PATH]' >&2; exit 64 ;;
+  esac
+done
+case "$platform" in tvos|ios) ;; *) echo 'Metal platform must be tvos or ios' >&2; exit 64 ;; esac
 
 temporary="$(mktemp -d)"
 cleanup() {
@@ -53,19 +59,16 @@ compile_library() {
     "$temporary/YADIF-$sdk_name.air"
 }
 
-compile_library \
-  appletvos \
-  air64-apple-tvos27.0 \
-  VPlayerPlayback-tvos.metallib
-compile_library \
-  appletvsimulator \
-  air64-apple-tvos27.0-simulator \
-  VPlayerPlayback-tvsimulator.metallib
-
+if [[ "$platform" == "tvos" ]]; then
+  compile_library appletvos air64-apple-tvos27.0 VPlayerPlayback-tvos.metallib
+  compile_library appletvsimulator air64-apple-tvos27.0-simulator VPlayerPlayback-tvsimulator.metallib
+  libraries=(VPlayerPlayback-tvos.metallib VPlayerPlayback-tvsimulator.metallib)
+else
+  compile_library iphoneos air64-apple-ios27.0 VPlayerPlayback-ios.metallib
+  compile_library iphonesimulator air64-apple-ios27.0-simulator VPlayerPlayback-iphonesimulator.metallib
+  libraries=(VPlayerPlayback-ios.metallib VPlayerPlayback-iphonesimulator.metallib)
+fi
 mkdir -p "$output_directory"
-install -m 0644 \
-  "$temporary/VPlayerPlayback-tvos.metallib" \
-  "$output_directory/VPlayerPlayback-tvos.metallib"
-install -m 0644 \
-  "$temporary/VPlayerPlayback-tvsimulator.metallib" \
-  "$output_directory/VPlayerPlayback-tvsimulator.metallib"
+for library in "${libraries[@]}"; do
+  install -m 0644 "$temporary/$library" "$output_directory/$library"
+done

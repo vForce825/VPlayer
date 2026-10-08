@@ -3,6 +3,7 @@ options:
   bundleIdPrefix: com.vplayer
   deploymentTarget:
     tvOS: "27.0"
+    iOS: "27.0"
   createIntermediateGroups: true
   groupSortPosition: top
   developmentLanguage: zh-Hans
@@ -42,6 +43,9 @@ targets:
         headerVisibility: public
       - path: Sources/VPlayerPlayback/Resources
         buildPhase: resources
+        excludes:
+          - VPlayerPlayback-ios.metallib
+          - VPlayerPlayback-iphonesimulator.metallib
     dependencies:
       - target: VPlayerCore
       - framework: Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
@@ -173,6 +177,158 @@ targets:
         GENERATE_INFOPLIST_FILE: false
         INFOPLIST_FILE: Tests/VPlayerUITests/Info.plist
         TEST_TARGET_NAME: VPlayer
+  VPlayerCoreiOS:
+    type: framework
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayerCore
+    settings:
+      base:
+        PRODUCT_NAME: VPlayerCore
+        PRODUCT_MODULE_NAME: VPlayerCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core.ios
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        DEFINES_MODULE: true
+        GENERATE_INFOPLIST_FILE: true
+  VPlayerPlaybackiOS:
+    type: framework
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayerPlayback
+        excludes:
+          - include
+          - Resources
+          - Deinterlace/YADIF/YADIF.metal
+          - Scan/ScanProbe.metal
+      - path: Sources/VPlayerPlayback/include
+        headerVisibility: public
+      - path: Sources/VPlayerPlayback/Resources
+        buildPhase: resources
+        excludes:
+          - VPlayerPlayback-tvos.metallib
+          - VPlayerPlayback-tvsimulator.metallib
+    dependencies:
+      - target: VPlayerCoreiOS
+      - framework: Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CryptoKit.framework
+      - sdk: CoreVideo.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
+      - sdk: Network.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+    settings:
+      base:
+        PRODUCT_NAME: VPlayerPlayback
+        PRODUCT_MODULE_NAME: VPlayerPlayback
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback.ios
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        DEFINES_MODULE: YES
+        GENERATE_INFOPLIST_FILE: true
+        CLANG_C_LANGUAGE_STANDARD: c11
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        PUBLIC_HEADERS_FOLDER_PATH: "$(CONTENTS_FOLDER_PATH)/Headers"
+        OTHER_LDFLAGS: "$(inherited) -lz"
+  VPlayeriOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayeriOSApp
+        excludes:
+          - Resources/Info.plist
+      - path: Sources/VPlayerApp/AppDependencies.swift
+      - path: Sources/VPlayerApp/AppLaunchConfiguration.swift
+      - path: Sources/VPlayerApp/AppModel.swift
+      - path: Sources/VPlayerApp/ChannelLogoDataLoader.swift
+      - path: Sources/VPlayerApp/ChannelLogoDiskCache.swift
+      - path: Sources/VPlayerApp/ChannelLogoImageDecoder.swift
+      - path: Sources/VPlayerApp/LibraryChangeSignal.swift
+      - path: Sources/VPlayerApp/Lifecycle
+      - path: Sources/VPlayerApp/Player/AcceptancePlaybackStatePresentation.swift
+      - path: Sources/VPlayerApp/Player/FullScreenPlayerViewModel.swift
+      - path: Sources/VPlayerApp/Player/PlaybackMediaInformationPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlaybackNowPlayingCoordinator.swift
+      - path: Sources/VPlayerApp/Player/PlaybackPresentationHost.swift
+      - path: Sources/VPlayerApp/Player/PlayerChannelPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlayerPresentationPolicies.swift
+      - path: Sources/VPlayerApp/Player/UITestPlaybackEngine.swift
+      - path: Sources/VPlayerApp/Settings/ChannelBrowsingSettingsStore.swift
+      - path: Sources/VPlayerApp/Settings/PlaybackSettingsView.swift
+      - path: Sources/VPlayerApp/Views/ChannelEPGMappingView.swift
+      - path: Sources/VPlayerApp/Views/ChannelLogoView.swift
+      - path: Sources/VPlayerApp/Views/ChannelProgrammePresentation.swift
+      - path: Sources/VPlayerApp/Views/ChannelSections.swift
+      - path: Sources/VPlayerApp/Views/EPGCoverageNotice.swift
+      - path: Sources/VPlayerApp/Views/SourceProfilePresentation.swift
+      - path: Sources/VPlayerApp/Views/SourceProfileValidationMessage.swift
+      - path: Sources/VPlayerApp/Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCoreiOS
+      - target: VPlayerPlaybackiOS
+      - sdk: CryptoKit.framework
+      - sdk: NowPlaying.framework
+    settings:
+      base:
+        PRODUCT_NAME: VPlayer
+        PRODUCT_MODULE_NAME: VPlayer
+        PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer.ios
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: false
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+        INFOPLIST_FILE: Sources/VPlayeriOSApp/Resources/Info.plist
+        CODE_SIGN_STYLE: Automatic
+  VPlayeriOSTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayeriOSTests
+      - path: Tests/VPlayerTests/FullScreenPlayerViewModelTests.swift
+      - path: Tests/VPlayerTests/NowPlayingIntegrationTests.swift
+      - path: Tests/VPlayerTests/ChannelSectionsTests.swift
+      - path: Tests/VPlayerTests/ChannelProgrammePresentationTests.swift
+      - path: Tests/VPlayerTests/PlaybackSettingsStoreTests.swift
+      - path: Tests/Fixtures/Video
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/playlists
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCoreiOS
+      - target: VPlayerPlaybackiOS
+      - target: VPlayeriOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests.ios
+        GENERATE_INFOPLIST_FILE: true
+  VPlayeriOSUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayeriOSUITests
+    dependencies:
+      - target: VPlayeriOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests.ios
+        GENERATE_INFOPLIST_FILE: true
+        TEST_TARGET_NAME: VPlayeriOS
 schemes:
   VPlayer:
     build:
@@ -243,3 +399,22 @@ schemes:
       targets:
         - name: VPlayerHLSAcceptanceTests
           parallelizable: false
+  VPlayeriOS:
+    build:
+      targets:
+        VPlayerCoreiOS: all
+        VPlayerPlaybackiOS: all
+        VPlayeriOS: all
+        VPlayeriOSTests: [test]
+        VPlayeriOSUITests: [test]
+    test:
+      gatherCoverageData: true
+      targets:
+        - name: VPlayeriOSTests
+          parallelizable: false
+        - name: VPlayeriOSUITests
+          parallelizable: false
+    run:
+      config: Debug
+    archive:
+      config: Release

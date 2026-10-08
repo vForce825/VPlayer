@@ -118,7 +118,7 @@ final class ProjectConfigurationTests: XCTestCase {
         let configuredFloors = projectYAML.split(separator: "\n")
             .filter { $0.contains("deploymentTarget:") && $0.contains("\"") }
         // Includes the independently built VPlayerHLSAcceptanceTests target.
-        XCTAssertEqual(configuredFloors.count, 7)
+        XCTAssertEqual(configuredFloors.count, 12)
         XCTAssertTrue(configuredFloors.allSatisfy { $0.contains("\"27.0\"") })
         let generatedFloors = generatedProject.split(separator: "\n")
             .filter { $0.contains("TVOS_DEPLOYMENT_TARGET =") }
@@ -581,7 +581,7 @@ final class ProjectConfigurationTests: XCTestCase {
             )
         }
 
-        let launch = try source("Sources/VPlayerApp/VPlayerApp.swift")
+        let launch = try source("Sources/VPlayerApp/AppLaunchConfiguration.swift")
         let root = try source("Sources/VPlayerApp/Views/RootView.swift")
         let profiles = try source("Sources/VPlayerApp/Views/SourceProfilesView.swift")
         let editor = try source("Sources/VPlayerApp/Views/SourceProfileEditorView.swift")

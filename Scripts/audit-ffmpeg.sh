@@ -42,7 +42,16 @@ if [[ "${1:-}" == "--manifest-only" ]]; then
   exit
 fi
 
-[[ $# -eq 1 ]] || fail "usage: $0 <FFmpeg.xcframework>"
+source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
+selected_platform=tvos
+if [[ "${1:-}" == "--platform" ]]; then
+  [[ $# -eq 3 ]] || fail "usage: $0 [--platform tvos|ios] <FFmpeg.xcframework>"
+  selected_platform="$2"
+  shift 2
+fi
+ffmpeg_select_platform "$selected_platform"
+build_work="$work$ffmpeg_work_suffix"
+[[ $# -eq 1 ]] || fail "usage: $0 [--platform tvos|ios] <FFmpeg.xcframework>"
 xcframework="$1"
 [[ -d "$xcframework" ]] || fail "XCFramework not found: $xcframework"
 [[ -f "$xcframework/Info.plist" ]] || fail "Info.plist is missing"
@@ -78,7 +87,7 @@ cleanup() {
 trap cleanup EXIT
 
 /usr/bin/plutil -convert json -o "$tmp/info.json" "$xcframework/Info.plist"
-jq -e '
+jq -e --arg platform "$selected_platform" --arg architectures "$ffmpeg_simulator_architectures" '
   (.AvailableLibraries | length) == 2 and
   ([.AvailableLibraries[] | {
       platform: .SupportedPlatform,
@@ -88,8 +97,8 @@ jq -e '
       headers: .HeadersPath
     }] | sort_by(.platform, .variant)) ==
   ([
-    {platform:"tvos", variant:"", architectures:["arm64"], library:"libFFmpeg.a", headers:"Headers"},
-    {platform:"tvos", variant:"simulator", architectures:["arm64","x86_64"], library:"libFFmpeg.a", headers:"Headers"}
+    {platform:$platform, variant:"", architectures:["arm64"], library:"libFFmpeg.a", headers:"Headers"},
+    {platform:$platform, variant:"simulator", architectures:($architectures | split(",")), library:"libFFmpeg.a", headers:"Headers"}
   ] | sort_by(.platform, .variant))
 ' "$tmp/info.json" >/dev/null || fail "unexpected XCFramework platform or architecture inventory"
 
@@ -188,34 +197,35 @@ audit_build_record() {
   target="$(jq -er '.target' "$record")"
   case "$slice" in
     device)
-      expected_target="arm64-apple-tvos27.0"
-      expected_sdk="appletvos"
-      expected_platform_id="3"
-      expected_platform="tvos"
+      expected_target="arm64-apple-${selected_platform}27.0"
+      expected_sdk="$ffmpeg_device_sdk"
+      expected_platform_id="$ffmpeg_device_platform_id"
+      expected_platform="$selected_platform"
       expected_variant=""
-      prefix="$work/install-device"
+      prefix="$build_work/install-device"
       [[ "$arch" == "arm64" ]] || fail "device record has wrong architecture"
       jq -e '.extraConfigureFlags == []' "$record" >/dev/null || fail "unexpected device-only configure flags"
       require_define "$config" ARCH_AARCH64 1
       ;;
     sim-arm64)
-      expected_target="arm64-apple-tvos27.0-simulator"
-      expected_sdk="appletvsimulator"
-      expected_platform_id="8"
-      expected_platform="tvos"
+      expected_target="arm64-apple-${selected_platform}27.0-simulator"
+      expected_sdk="$ffmpeg_simulator_sdk"
+      expected_platform_id="$ffmpeg_simulator_platform_id"
+      expected_platform="$selected_platform"
       expected_variant="simulator"
-      prefix="$work/install-sim-arm64"
+      prefix="$build_work/install-sim-arm64"
       [[ "$arch" == "arm64" ]] || fail "sim-arm64 record has wrong architecture"
       jq -e '.extraConfigureFlags == []' "$record" >/dev/null || fail "unexpected arm64 simulator configure flags"
       require_define "$config" ARCH_AARCH64 1
       ;;
     sim-x86_64)
+      [[ "$selected_platform" == "tvos" ]] || fail "x86_64 is not in the iOS profile"
       expected_target="x86_64-apple-tvos27.0-simulator"
-      expected_sdk="appletvsimulator"
-      expected_platform_id="8"
-      expected_platform="tvos"
+      expected_sdk="$ffmpeg_simulator_sdk"
+      expected_platform_id="$ffmpeg_simulator_platform_id"
+      expected_platform="$selected_platform"
       expected_variant="simulator"
-      prefix="$work/install-sim-x86_64"
+      prefix="$build_work/install-sim-x86_64"
       [[ "$arch" == "x86_64" ]] || fail "sim-x86_64 record has wrong architecture"
       jq -e '.extraConfigureFlags == ["--disable-x86asm"]' "$record" >/dev/null || fail "x86_64 NASM fallback is not pinned"
       require_define "$config" ARCH_X86_64 1
@@ -253,7 +263,7 @@ audit_build_record() {
   grep -Fqx "#define AVCONV_DATADIR \"$virtual_install_base/$slice/share/ffmpeg\"" "$config" || fail "$slice AVCONV_DATADIR is not normalized"
   load_inventory="$(/usr/bin/otool -l "$prefix/lib/libFFmpeg.a" | awk '/^[[:space:]]*platform / || /^[[:space:]]*minos / {print $1, $2}' | LC_ALL=C sort -u)"
   expected_load_inventory="$(printf 'minos 27.0\nplatform %s' "$expected_platform_id")"
-  [[ "$load_inventory" == "$expected_load_inventory" ]] || fail "$slice Mach-O platform or minimum OS differs from tvOS 27.0"
+  [[ "$load_inventory" == "$expected_load_inventory" ]] || fail "$slice Mach-O platform or minimum OS differs from $ffmpeg_display_name 27.0"
   if grep -q '^#define CONFIG_POSTPROC ' "$config"; then
     require_define "$config" CONFIG_POSTPROC 0
   fi
@@ -291,7 +301,7 @@ ARCHIVES
   done
   [[ "$(jq '.archives | length' "$record")" == "5" ]] || fail "$slice archive inventory contains extra entries"
 
-  if [[ "$variant" == "simulator" ]]; then
+  if ffmpeg_archive_needs_thinning "$variant"; then
     extracted="$tmp/$slice-libFFmpeg.a"
     /usr/bin/lipo "$xc_archive" -thin "$arch" -output "$extracted"
     actual_sha="$(shasum -a 256 "$extracted" | awk '{print $1}')"
@@ -319,7 +329,7 @@ while IFS=$'\t' read -r identifier platform variant; do
   printf '%s\n' "$archive" >> "$tmp/xc-archives.txt"
 
   if [[ "$variant" == "simulator" ]]; then
-    [[ "$(/usr/bin/lipo -archs "$archive" | tr ' ' '\n' | sort | paste -sd, -)" == "arm64,x86_64" ]] || fail "simulator archive is not arm64/x86_64"
+    [[ "$(/usr/bin/lipo -archs "$archive" | tr ' ' '\n' | sort | paste -sd, -)" == "$ffmpeg_simulator_architectures" ]] || fail "simulator archive differs from selected profile"
   else
     [[ "$(/usr/bin/lipo -archs "$archive")" == "arm64" ]] || fail "device archive is not arm64"
   fi
@@ -332,11 +342,13 @@ while IFS=$'\t' read -r identifier platform variant; do
 done < <(jq -r '.AvailableLibraries[] | [.LibraryIdentifier, .SupportedPlatform, (.SupportedPlatformVariant // "")] | @tsv' "$tmp/info.json")
 
 sort "$tmp/seen-slices.txt" > "$tmp/seen-slices-sorted.txt"
-diff -u - "$tmp/seen-slices-sorted.txt" <<'SLICES' >/dev/null || fail "expected exactly three architecture build records"
-device
-sim-arm64
-sim-x86_64
-SLICES
+if [[ "$selected_platform" == "tvos" ]]; then
+  printf 'device\nsim-arm64\nsim-x86_64\n' > "$tmp/expected-slices.txt"
+else
+  printf 'device\nsim-arm64\n' > "$tmp/expected-slices.txt"
+fi
+diff -u "$tmp/expected-slices.txt" "$tmp/seen-slices-sorted.txt" >/dev/null || \
+  fail "architecture build records differ from selected profile"
 
 : > "$tmp/all-unresolved.txt"
 archive_index=0

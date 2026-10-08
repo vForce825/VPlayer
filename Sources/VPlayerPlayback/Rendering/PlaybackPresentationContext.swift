@@ -69,19 +69,25 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
         let outputFrameRate: Float
     }
 
+    typealias DisplayModeFactory = @MainActor @Sendable (
+        UIWindow, any DisplayLinkControlling, any DisplayReadinessControlling
+    ) -> any PlaybackDisplayModeControlling
+    #if os(tvOS)
     typealias DisplayManagerFactory = @MainActor @Sendable (UIWindow) -> any DisplayCriteriaManaging
+    #endif
 
     private let switchStarted: @Sendable () -> Void
     private let switchEnded: @Sendable () -> Void
-    private let displayManagerFactory: DisplayManagerFactory
+    private let displayModeFactory: DisplayModeFactory
 
     @MainActor private var cachedView: SampleBufferVideoView?
     @MainActor private let presentationControl = SystemPresentationControlAdapter()
-    @MainActor private var criteriaController: DisplayCriteriaController?
+    @MainActor private var criteriaController: (any PlaybackDisplayModeControlling)?
     @MainActor private weak var attachedWindow: UIWindow?
     @MainActor private var pendingCriteria: CriteriaRequest?
     @MainActor private var terminal = false
 
+    #if os(tvOS)
     init(
         switchStarted: @escaping @Sendable () -> Void = {},
         switchEnded: @escaping @Sendable () -> Void = {},
@@ -91,8 +97,24 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
     ) {
         self.switchStarted = switchStarted
         self.switchEnded = switchEnded
-        self.displayManagerFactory = displayManagerFactory
+        displayModeFactory = { window, displayLink, readiness in
+            DisplayCriteriaController(manager: displayManagerFactory(window),
+                displayLink: displayLink, readiness: readiness)
+        }
     }
+    #else
+    init(
+        switchStarted: @escaping @Sendable () -> Void = {},
+        switchEnded: @escaping @Sendable () -> Void = {},
+        displayModeFactory: @escaping DisplayModeFactory = { _, _, _ in
+            IOSDisplayModeController()
+        }
+    ) {
+        self.switchStarted = switchStarted
+        self.switchEnded = switchEnded
+        self.displayModeFactory = displayModeFactory
+    }
+    #endif
 
     @MainActor
     public func makeVideoView() -> SampleBufferVideoView {
@@ -128,11 +150,7 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
             switchStarted: switchStarted,
             switchEnded: switchEnded
         )
-        let controller = DisplayCriteriaController(
-            manager: displayManagerFactory(window),
-            displayLink: presentationControl,
-            readiness: readiness
-        )
+        let controller = displayModeFactory(window, presentationControl, readiness)
         criteriaController = controller
         if let pendingCriteria {
             controller.enterFullScreen(
