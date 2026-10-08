@@ -6352,7 +6352,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testStorageRetiredPrepareTokenCannotResolveNewPhase() async throws {
         let slot = AVPlayerPrepareWaitSlot()
-        for phase in [AVPlayerPrepareWaitSlot.Phase.ready, .mapping, .seek, .loaded, .preroll] {
+        for phase in [AVPlayerPrepareWaitSlot.Phase.ready, .mapping, .seek, .loaded, .preroll, .nativeTracks] {
             let old = try slot.begin(phase)
             slot.cancelCurrent()
             slot.retire(old)
@@ -6365,6 +6365,227 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             XCTAssertTrue(result, "旧token不能覆盖新阶段终态")
             slot.retire(current)
         }
+    }
+
+    func testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken() async throws {
+        let slot = AVPlayerPrepareWaitSlot()
+        let token = try slot.begin(.nativeTracks)
+        let probe = NativeTrackWaitKVOProbe()
+        let tracksCallbacks = NativeTrackWaitCallbackCount()
+        let statusCallbacks = NativeTrackWaitCallbackCount()
+        weak var tracksObservation: NSKeyValueObservation?
+        weak var statusObservation: NSKeyValueObservation?
+        // This object tests KVO ownership only; it supplies no media-format proof.
+        autoreleasepool {
+            let tracks = probe.observe(\.value) { _, _ in tracksCallbacks.record() }
+            let status = probe.observe(\.value) { _, _ in statusCallbacks.record() }
+            tracksObservation = tracks
+            statusObservation = status
+            slot.retain(tracks, token: token)
+            slot.retainStatus(status, token: token)
+        }
+        XCTAssertNotNil(tracksObservation)
+        XCTAssertNotNil(statusObservation)
+        probe.value = 1
+        XCTAssertEqual(tracksCallbacks.value, 1)
+        XCTAssertEqual(statusCallbacks.value, 1)
+        slot.cancelCurrent()
+        XCTAssertEqual(slot.activePhase, .nativeTracks)
+        XCTAssertNotNil(tracksObservation, "Logical cancellation cannot erase the physical KVO owner")
+        XCTAssertNotNil(statusObservation)
+        do {
+            _ = try await withCheckedThrowingContinuation { slot.install($0, token: token) }
+            XCTFail("The original native-track token must replay cancellation")
+        } catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+        slot.retire(token)
+        XCTAssertNil(slot.activePhase)
+        XCTAssertNil(tracksObservation)
+        XCTAssertNil(statusObservation, "Retirement must release the fixed second KVO field")
+        probe.value = 2
+        XCTAssertEqual(tracksCallbacks.value, 1)
+        XCTAssertEqual(statusCallbacks.value, 1)
+    }
+
+    func testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes() async throws {
+        for succeeds in [true, false] {
+            let slot = AVPlayerPrepareWaitSlot()
+            let token = try slot.begin(.nativeTracks)
+            let probe = NativeTrackWaitKVOProbe()
+            let tracksCallbacks = NativeTrackWaitCallbackCount()
+            let statusCallbacks = NativeTrackWaitCallbackCount()
+            weak var tracksObservation: NSKeyValueObservation?
+            weak var statusObservation: NSKeyValueObservation?
+            do {
+                let result = try await withCheckedThrowingContinuation { continuation in
+                    slot.install(continuation, token: token)
+                    autoreleasepool {
+                        let tracks = probe.observe(\.value, options: [.initial]) { _, _ in
+                            tracksCallbacks.record()
+                            if succeeds { slot.resolve(.success(true), token: token) }
+                            else { slot.cancelCurrent() }
+                        }
+                        tracksObservation = tracks
+                        slot.retain(tracks, token: token)
+                        // The first synchronous initial callback has already won.
+                        let status = probe.observe(\.value, options: [.initial]) { _, _ in
+                            statusCallbacks.record()
+                            slot.resolve(.success(false), token: token)
+                        }
+                        statusObservation = status
+                        slot.retainStatus(status, token: token)
+                    }
+                }
+                XCTAssertTrue(succeeds)
+                XCTAssertTrue(result, "The second initial callback cannot replace the first terminal result")
+            } catch {
+                XCTAssertFalse(succeeds)
+                XCTAssertTrue(error is CancellationError, "\(error)")
+            }
+            XCTAssertNil(tracksObservation)
+            XCTAssertNil(statusObservation, "Late status registration must invalidate rather than retain")
+            probe.value = 1
+            XCTAssertEqual(tracksCallbacks.value, 1)
+            XCTAssertEqual(statusCallbacks.value, 1)
+            XCTAssertEqual(slot.activePhase, .nativeTracks,
+                           "Even an immediate terminal result must wait for physical token retirement")
+            slot.retire(token)
+            XCTAssertNil(slot.activePhase)
+        }
+    }
+
+    func testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission() async throws {
+        try await withBlockedNativeTrackWaitDriver(outputNonce: 23_277) { driver, item, _ in
+            let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
+            let finished = FinalLockedFlag()
+            let waiter = Task {
+                defer { finished.set() }
+                try await driver.waitForNativeTracks(item: item)
+            }
+            defer { waiter.cancel() }
+            let deadline = ContinuousClock.now + .seconds(5)
+            // Cancellation exercises registered SDK observers, independently of
+            // when AVPlayer decides to issue its first HTTP request.
+            while (driver.prepareWait.activePhase != .nativeTracks
+                   || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline + 2),
+                  !finished.value, ContinuousClock.now < deadline { await Task.yield() }
+            XCTAssertEqual(driver.prepareWait.activePhase, .nativeTracks)
+            XCTAssertEqual(driver.activeWaiterCount, 1)
+            XCTAssertEqual(driver.player.currentItem?.status, .unknown)
+            XCTAssertEqual(driver.player.currentItem?.tracks.count, 0)
+            XCTAssertNil(driver.player.currentItem?.error)
+            XCTAssertEqual(driver.player.rate, 0)
+            XCTAssertEqual(driver.fixedTimerCount, 0)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline + 2)
+            waiter.cancel()
+            let cancellationDeadline = ContinuousClock.now + .seconds(2)
+            while !finished.value, ContinuousClock.now < cancellationDeadline { await Task.yield() }
+            if !finished.value {
+                XCTFail("Task cancellation must end the native-track wait without an SDK event")
+                driver.prepareWait.cancelCurrent()
+            }
+            do { try await waiter.value; XCTFail("Empty native tracks must not succeed") }
+            catch { XCTAssertTrue(error is CancellationError, "\(error)") }
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            XCTAssertNil(driver.prepareWait.activePhase)
+            XCTAssertEqual(driver.player.rate, 0)
+            var retainedKVOCount = 0
+            driver.prepareWait.inspectPreparationAllocations { role, _, _ in
+                if role.contains("KVO wrapper") { retainedKVOCount += 1 }
+            }
+            XCTAssertEqual(retainedKVOCount, 0)
+            let callbackDeadline = ContinuousClock.now + .seconds(2)
+            while AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline,
+                  ContinuousClock.now < callbackDeadline {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.main.async { continuation.resume() }
+                }
+            }
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline)
+        }
+    }
+
+    func testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation() async throws {
+        try await withBlockedNativeTrackWaitDriver(outputNonce: 23_278) { driver, item, _ in
+            var occupied: [AVPlayerSDKCallbackLease] = []
+            for _ in 0..<7 { occupied.append(try driver.reserveSDKCallbackLease(.seek)) }
+            let charged = PlaybackResourceContextLedger.shared.chargedBytes
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 7)
+            let finished = FinalLockedFlag()
+            let waiter = Task {
+                defer { finished.set() }
+                try await driver.waitForNativeTracks(item: item)
+            }
+            let deadline = ContinuousClock.now + .seconds(2)
+            while !finished.value, ContinuousClock.now < deadline { await Task.yield() }
+            if !finished.value {
+                XCTFail("The second callback reservation must fail before installing a waiter")
+                waiter.cancel()
+                driver.prepareWait.cancelCurrent()
+            }
+            do { try await waiter.value; XCTFail("Only one free callback slot cannot admit two observers") }
+            catch { XCTAssertEqual(error as? AVPlayerItemCoordinatorFailure, .capacityExceeded) }
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            XCTAssertNil(driver.prepareWait.activePhase)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 7,
+                           "The first temporary callback lease must be returned on second-credit failure")
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, charged)
+            var retainedKVOCount = 0
+            driver.prepareWait.inspectPreparationAllocations { role, _, _ in
+                if role.contains("KVO wrapper") { retainedKVOCount += 1 }
+            }
+            XCTAssertEqual(retainedKVOCount, 0)
+            var recovered: AVPlayerSDKCallbackLease? = try driver.reserveSDKCallbackLease(.nativeTracks)
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 8)
+            withExtendedLifetime(recovered) {}
+            recovered = nil
+            occupied.removeAll()
+            XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, 0)
+        }
+    }
+
+    private func withBlockedNativeTrackWaitDriver(outputNonce: UInt64,
+        _ body: @MainActor (SystemAVPlayerDriver, AVPlayerItemInstanceIdentity, NativeHLSHTTPFixture) async throws -> Void
+    ) async throws {
+        let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let origin = try NativeHLSHTTPFixture(resources: ["/native-tracks-held.m3u8": .init(
+            data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n".utf8),
+            contentType: "application/vnd.apple.mpegurl", withholdResponse: true)])
+        let item = AVPlayerItemInstanceIdentity(outputLifecycleEpoch:
+            AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce), itemGeneration: 1)
+        var driver: SystemAVPlayerDriver?
+        var failure: (any Error)?
+        do {
+            driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+            try driver!.install(url: origin.url("native-tracks-held.m3u8"), identity: item)
+            try await body(try XCTUnwrap(driver), item, origin)
+        } catch { failure = error }
+        let released = WeakSystemAVPlayerDriverProbe(driver)
+        driver?.pause(item: item)
+        driver?.removeObservers(item: item)
+        driver?.replaceCurrentItemWithNil(item: item)
+        // A broken observer retirement must fail below, not hang this test in
+        // the production physical-tail join waiting for the leaked lease.
+        if AVPlayerSDKCallbackLease.occupiedCount == callbackBaseline {
+            await driver?.joinNativeCallbackTails()
+        }
+        XCTAssertEqual(driver?.activeWaiterCount, 0)
+        driver = nil
+        await origin.close()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (released.value != nil || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline
+               || PlaybackResourceContextLedger.shared.chargedBytes != resourceBaseline),
+              ContinuousClock.now < deadline {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.main.async { continuation.resume() }
+            }
+        }
+        XCTAssertNil(released.value)
+        XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline)
+        if let failure { throw failure }
+        let successor = try SystemAVPlayerDriver.make()
+        withExtendedLifetime(successor) {}
     }
 
     func testPreparationTerminalStoresOnlyFixedFailuresAndReplaysOriginalKnownError() async throws {
@@ -8595,6 +8816,18 @@ private final class Task21FakeEvidenceSource: AVPlayerPreparationEvidenceProvidi
         }
         print("TASK21_TIMELINE_ENDPOINT cachedPublication=\(completed.publicationSequence) participantPresent=\(participant != nil) advertisedMediaCount=\(advertised.count) completedMediaCount=\(participant?.completedMedia.count ?? 0) authorityMediaCount=\(endpointAuthority.media.count) terminalSequence=\(terminal.key.logicalSequence) terminalAdvertised=\(terminalAdvertised) terminalCompleted=\(terminalCompleted) preflight=\(preflight)")
     }
+}
+
+/// A controllable KVO subject for wait-slot ownership tests, not an AVPlayer item.
+private final class NativeTrackWaitKVOProbe: NSObject, @unchecked Sendable {
+    @objc dynamic var value = 0
+}
+
+private final class NativeTrackWaitCallbackCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func record() { lock.withLock { count += 1 } }
 }
 
 private final class FinalLockedFlag: @unchecked Sendable {

@@ -201,14 +201,14 @@ struct PlayerChannelInfoOverlay: View {
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                     .fixedSize(horizontal: false, vertical: true)
 
-                technicalInformation
-                if let routing = PlaybackMediaInformationPresentation(information: mediaInformation).sourceRoutingText {
-                    Text(routing)
+                if mediaInformation?.isAudioOnly != true { technicalInformation }
+                if let output = PlaybackMediaInformationPresentation(information: mediaInformation).airPlayOutputText {
+                    Text(output)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityIdentifier("player-channel-source-routing")
+                        .accessibilityIdentifier("player-channel-airplay-output")
                 }
             }
         }

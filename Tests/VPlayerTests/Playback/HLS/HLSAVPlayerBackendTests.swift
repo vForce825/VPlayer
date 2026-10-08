@@ -1562,6 +1562,12 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertEqual(published.sourceFrameRate, MediaRational(num: 25, den: 1))
             XCTAssertEqual(published.outputFrameRate, 25)
             XCTAssertFalse(published.isSmoothMotionEnhanced)
+            XCTAssertNil(factory.backend?.routedTransportForTesting,
+                "This legacy factory supplies no original source-routing owner")
+            XCTAssertEqual(published.airPlayOutputMode, .audioTranscode,
+                "A valid legacy generated prefix must remain projectable without a source-routing owner")
+            XCTAssertEqual(PlaybackMediaInformationPresentation(information: published).airPlayOutputText,
+                "AirPlay输出方式：音频转码")
             XCTAssertEqual(PlaybackMediaInformationPresentation(information: published).visualText,
                 "1280×720p · 25 fps")
         } catch {
@@ -1718,7 +1724,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
-    func testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyNil() async throws {
+    func testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyOutput() async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
         defer { fixture.server?.stop() }
         let audioFile = try XCTUnwrap(Bundle(for: Self.self).url(
@@ -1754,11 +1760,14 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let audio = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle)
             let snapshot = try XCTUnwrap(registry.preparedHLSMediaInformation(for: audio))
             XCTAssertEqual(snapshot.lifecycle, audio)
-            XCTAssertNil(snapshot.information, "A prepared audio-only nil is distinct from a rejected projection")
+            XCTAssertTrue(snapshot.information?.isAudioOnly == true)
+            XCTAssertEqual(snapshot.information?.airPlayOutputMode, .audioTranscode)
+            XCTAssertNil(snapshot.information?.sourceFrameRate)
+            XCTAssertNil(snapshot.information?.outputFrameRate)
             await controller.refreshPreparedMediaInformation(for: second)
             await controller.invalidatePreparedMediaInformation(for: second)
             let audioInformation = await self.currentMediaInformation(controller)
-            XCTAssertNil(audioInformation)
+            XCTAssertEqual(audioInformation, snapshot.information)
         }
     }
 
@@ -1786,6 +1795,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertTrue(values.snapshot.contains(where: { $0 == nil }), "Route retirement must clear the old facts")
             let local = try XCTUnwrap(values.snapshot.last.flatMap { $0 })
             XCTAssertEqual(local.width, 1_280)
+            XCTAssertNil(local.airPlayOutputMode, "The AirPlay field must clear on the HDMI/sample-buffer path")
             await controller.refreshPreparedMediaInformation(for: old)
             await controller.invalidatePreparedMediaInformation(for: old)
             let afterStaleCallbacks = await self.currentMediaInformation(controller)
@@ -2025,6 +2035,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 let snapshot = try XCTUnwrap(bundle.preparedMediaInformation(for: lifecycle))
                 XCTAssertEqual(snapshot.information?.width, 1_280)
                 XCTAssertEqual(snapshot.information?.sourceFrameRate, MediaRational(num: 25, den: 1))
+                XCTAssertEqual(snapshot.information?.airPlayOutputMode, .audioTranscode)
                 XCTAssertNil(bundle.preparedMediaInformation(for: lifecycle == first ? second : first),
                     "A new graph can restart demux generation zero but cannot reuse an output lifecycle")
                 XCTAssertNil(previous?.preparedMediaInformation(for: first))
@@ -2195,6 +2206,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
                 throw error
             }
             XCTAssertEqual(prefix.mediaInformation?.outputFrameRate, Double(frameRate))
+            XCTAssertEqual(prefix.mediaInformation?.airPlayOutputMode, .remux)
             let complete = await authority.finishAllTracksAtNaturalEOF()
             XCTAssertTrue(complete, authority.failureDescriptionForDiagnostics ?? "Large-IDR source did not reach EOF")
             XCTAssertEqual(authority.audioCalibrationAttemptsForTesting, 0,
@@ -2881,6 +2893,8 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             XCTAssertEqual(prefix.mediaInformation?.width, 3_840)
             XCTAssertEqual(prefix.mediaInformation?.height, 2_160)
             XCTAssertEqual(prefix.mediaInformation?.outputFrameRate, 50)
+            XCTAssertEqual(prefix.mediaInformation?.airPlayOutputMode, .audioTranscode,
+                "The real AAC fallback overrides the still-passthrough plan.audio")
             try printSyntheticAACPublication(try XCTUnwrap(authority.publicationForTesting.publisher?.visible),
                 phase: "prefix")
             let complete = await authority.finishAllTracksAtNaturalEOF()
@@ -3345,7 +3359,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
             width: 1_280, height: 720, scanMode: .progressive,
             sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 25,
-            isSmoothMotionEnhanced: false))
+            isSmoothMotionEnhanced: false).withAirPlayOutputMode(.audioTranscode))
         let reachedNaturalEOF = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             reachedNaturalEOF,
@@ -3421,7 +3435,7 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         XCTAssertEqual(replacement.mediaInformation, PlaybackMediaInformation(
             width: 1_920, height: 1_080, scanMode: .interlaced,
             sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 50,
-            isSmoothMotionEnhanced: true))
+            isSmoothMotionEnhanced: true).withAirPlayOutputMode(.mixedTranscode))
         let finished = await authority.finishAllTracksAtNaturalEOF()
         XCTAssertTrue(
             finished,

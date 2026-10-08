@@ -10,6 +10,83 @@ import XCTest
 
 @MainActor
 final class NativeHLSMasterSmokeTests: XCTestCase {
+    func testRealNativeInitialTrackAvailabilityAndPopulatedFastPathStayPaused() async throws {
+        executionTimeAllowance = 30
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let identity = AVPlayerItemInstanceIdentity(outputLifecycleEpoch:
+            AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_340), itemGeneration: 1)
+        try driver.install(url: origin.url("media.m3u8"), identity: identity)
+        let operation = Task { @MainActor in
+            _ = try await driver.waitUntilReady(item: identity)
+            try await driver.primeMediaData(item: identity)
+            try await driver.waitForNativeTracks(item: identity)
+            let physical = try XCTUnwrap(driver.nativeCurrentItem(identity))
+            XCTAssertFalse(physical.tracks.isEmpty)
+            XCTAssertLessThanOrEqual(physical.tracks.count, 16)
+            XCTAssertEqual(driver.rate, 0)
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            let callbacks = AVPlayerSDKCallbackLease.occupiedCount
+            try await driver.waitForNativeTracks(item: identity)
+            XCTAssertLessThanOrEqual(AVPlayerSDKCallbackLease.occupiedCount, callbacks)
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            XCTAssertEqual(driver.fixedTimerCount, 0)
+            XCTAssertTrue(driver.nativeCurrentItem(identity) === physical)
+            // Raw presence is deliberately weaker than selected-format proof.
+            // Disabling real tracks cannot cause this candidate-only fast path
+            // to manufacture enabled A/V, or start playback to obtain evidence.
+            let enabled = physical.tracks.filter(\.isEnabled)
+            defer { enabled.forEach { $0.isEnabled = true } }
+            enabled.forEach { $0.isEnabled = false }
+            try await driver.waitForNativeTracks(item: identity)
+            XCTAssertTrue(physical.tracks.allSatisfy { !$0.isEnabled })
+            XCTAssertEqual(driver.rate, 0)
+            print("NATIVE_HLS_TRACK_AVAILABILITY sdk-runtime=true raw=\(physical.tracks.count) fast-path=true rate=0 selected-proof=false")
+        }
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            operation.cancel()
+        }
+        var failure: (any Error)?
+        do { try await operation.value } catch { failure = error }
+        timeout.cancel(); await timeout.value
+        driver.replaceCurrentItemWithNil(item: identity)
+        await driver.joinNativeCallbackTails()
+        await origin.close()
+        if let failure { throw failure }
+    }
+
+    func testRealPublicMIMEPlanningPlaysNativeAndManagedMediaWithoutGeneration() async throws {
+        executionTimeAllowance = 120
+        let deadline = ContinuousClock.now + .seconds(90)
+        for managed in [false, true] {
+            let origin = try makeOrigin(bytes: fixtureBytes(), managed: managed)
+            var failure: (any Error)?
+            do {
+                try await withController(deadline: deadline, publicMIMEQueries: true) { [self] controller, registry, factory in
+                    await controller.play(.init(sourceProfileID: UUID(), channelID: "public-mime-media-\(managed)",
+                        streamURL: origin.url("media.m3u8"), title: "Public MIME media",
+                        attributes: managed ? ["Authorization": "ordinary fixture"] : [:]))
+                    try await until(registry: registry, factory: factory, phase: "public-mime-media-startup", managed: managed,
+                        deadline: min(deadline, .now + .seconds(20))) {
+                        guard case .playing = registry.playbackStateSnapshot(),
+                              let backend = factory.backend, let coordinator = backend.nativeCoordinatorForTesting,
+                              coordinator.isPrepared, coordinator.currentActivation != nil,
+                              let player = backend.presentation?.avPlayerForNativeSmoke else { return false }
+                        return player.currentTime().seconds > 0.5
+                    }
+                    let backend = try XCTUnwrap(factory.backend)
+                    let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                    XCTAssertEqual(coordinator.owned.plan.transport, managed ? .proxy : .native)
+                    XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+                    print("NATIVE_HLS_PUBLIC_MIME_PLAYBACK sdk-runtime=true managed=\(managed) progressed=true generated=0")
+                }
+            } catch { failure = error }
+            await origin.close()
+            if let failure { throw failure }
+        }
+    }
+
     func testNativeSDKEndBoundaryControlsKeepSameSource() async throws {
         let bytes = try fixtureBytes()
         // These sequential SDK controls isolate endpoint ordering. They do not
@@ -27,6 +104,168 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertEqual(result.errorCode, -12865)
             }
         }
+    }
+
+    // These independent controls collect SDK facts, not native-adapter acceptance.
+    // The original public-MIME playback test above remains unchanged and failing
+    // until real selected-format evidence can be established by production code.
+    func testPausedSDKTracksMediaEntry() async throws {
+        try await runPausedSDKTrackControl(entry: "media.m3u8")
+    }
+    func testPausedSDKTracksMasterEntry() async throws {
+        try await runPausedSDKTrackControl(entry: "master.m3u8")
+    }
+    func testPausedSDKTracksSingleMasterEntry() async throws {
+        try await runPausedSDKTrackControl(entry: "single-master.m3u8")
+    }
+    func testPausedSDKTracksShortMediaEntry() async throws {
+        try await runPausedSDKTrackControl(entry: "media.m3u8", shortFixture: true)
+    }
+    func testPausedSDKTracksShortMasterEntry() async throws {
+        try await runPausedSDKTrackControl(entry: "master.m3u8", shortFixture: true)
+    }
+    func testPausedAdapterTracksMediaPublic() async throws {
+        try await runPausedAdapterTrackControl(entry: "media.m3u8", publicMIMEQueries: true)
+    }
+    func testPausedAdapterTracksMediaStub() async throws {
+        try await runPausedAdapterTrackControl(entry: "media.m3u8", publicMIMEQueries: false)
+    }
+    func testPausedAdapterTracksMasterPublic() async throws {
+        try await runPausedAdapterTrackControl(entry: "master.m3u8", publicMIMEQueries: true)
+    }
+    func testPausedAdapterTracksMasterStub() async throws {
+        try await runPausedAdapterTrackControl(entry: "master.m3u8", publicMIMEQueries: false)
+    }
+
+    private func runPausedSDKTrackControl(entry: String, shortFixture: Bool = false) async throws {
+        executionTimeAllowance = 30
+        let deadline = ContinuousClock.now + .seconds(15)
+        let origin = try makeOrigin(bytes: shortFixture ? shortTrackFixtureBytes() : fixtureBytes(), managed: false)
+        if shortFixture {
+            origin.replace("/media.m3u8", resource: .init(data: shortTrackFixtureManifest(),
+                contentType: "application/vnd.apple.mpegurl"))
+        }
+        let player = AVPlayer()
+        let item = AVPlayerItem(url: origin.url(entry))
+        item.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(configured: 3)
+        item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
+        player.automaticallyWaitsToMinimizeStalling = true
+        let label = "sdk-\(shortFixture ? "short-" : "")\(entry)"
+        let probe = NativePausedTracksProbe(label: label)
+        let ready = NativeTrackDiagnosticGate<Bool>()
+        let preroll = NativeTrackDiagnosticGate<Bool>()
+        let callbackJoined = NativeTrackDiagnosticGate<Bool>()
+        let observations = [
+            item.observe(\.tracks, options: [.initial, .new]) { observed, _ in
+                probe.offer("tracks-kvo", item: observed, player: player)
+            },
+            item.observe(\.status, options: [.initial, .new]) { observed, _ in
+                probe.offer("item-status-kvo", item: observed, player: player)
+                if observed.status == .failed { ready.resolve(false) }
+                else if observed.status == .readyToPlay, player.status == .readyToPlay { ready.resolve(true) }
+            },
+            player.observe(\.status, options: [.initial, .new]) { observed, _ in
+                probe.offer("player-status-kvo", item: item, player: observed)
+                if observed.status == .failed { ready.resolve(false) }
+                else if observed.status == .readyToPlay, item.status == .readyToPlay { ready.resolve(true) }
+            },
+            player.observe(\.rate, options: [.initial, .new]) { observed, _ in
+                probe.offer("rate-kvo", item: item, player: observed)
+            }
+        ]
+        let timeout = Task { @MainActor in
+            do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+            probe.record("control-deadline", item: item, player: player)
+            ready.resolve(false); preroll.resolve(false); probe.availability.resolve(false)
+            player.cancelPendingPrerolls(); item.asset.cancelLoading()
+        }
+        player.replaceCurrentItem(with: item)
+        var issuedPreroll = false
+        let outcome = await withTaskCancellationHandler {
+            guard await ready.wait(), !Task.isCancelled, ContinuousClock.now < deadline else {
+                if Task.isCancelled { return "control-cancelled" }
+                return item.status == .failed || player.status == .failed ? "sdk-failed-before-ready" : "ready-deadline"
+            }
+            probe.record("ready", item: item, player: player)
+            issuedPreroll = true
+            player.preroll(atRate: 1) { succeeded in
+                probe.offer("preroll-callback", item: item, player: player, prerollResult: succeeded)
+                preroll.resolve(succeeded)
+                callbackJoined.resolve(true)
+            }
+            guard await preroll.wait(), !Task.isCancelled, ContinuousClock.now < deadline else {
+                if Task.isCancelled { return "control-cancelled" }
+                return ContinuousClock.now >= deadline ? "preroll-deadline" : "preroll-failed"
+            }
+            probe.record("preroll-main-return", item: item, player: player)
+            // Exactly one original bounded availability window, no polling,
+            // seeking, repeated preroll, track enabling, or positive rate.
+            let windowDeadline = min(deadline, ContinuousClock.now + .seconds(2))
+            probe.beginAvailabilityWindow(until: windowDeadline)
+            probe.record("window-start", item: item, player: player)
+            let windowTimeout = Task { @MainActor in
+                do { try await ContinuousClock().sleep(until: windowDeadline) } catch { return }
+                probe.endAvailabilityWindow()
+                probe.record("window-deadline", item: item, player: player)
+                probe.availability.resolve(false)
+            }
+            let available = await probe.availability.wait()
+            windowTimeout.cancel(); await windowTimeout.value
+            if Task.isCancelled { return "control-cancelled" }
+            if item.status == .failed || player.status == .failed { return "sdk-failed-in-window" }
+            return available ? "enabled-av-observed-within-window" : "enabled-av-not-observed-before-deadline"
+        } onCancel: {
+            ready.resolve(false); preroll.resolve(false); probe.availability.resolve(false)
+        }
+        probe.record("before-cleanup", item: item, player: player)
+        XCTAssertEqual(player.rate, 0)
+        XCTAssertTrue(probe.rateStayedZero)
+        XCTAssertTrue(player.currentItem === item)
+        print("NATIVE_HLS_PAUSED_TRACK_RESULT case=\(label) outcome=\(outcome) diagnostic-only=true")
+        timeout.cancel(); await timeout.value
+        player.cancelPendingPrerolls(); item.asset.cancelLoading()
+        // Apple documents that cancellation invokes pending preroll callbacks
+        // with false. Join that real callback; never mint a synthetic completion.
+        // The 15 s operation bound excludes this SDK tail. XCTest's 30 s allowance
+        // exposes a broken cancellation contract rather than claiming joined work.
+        if issuedPreroll { _ = await callbackJoined.wait() }
+        for observation in observations { observation.invalidate() }
+        await probe.closeAndJoin()
+        player.replaceCurrentItem(with: nil)
+        await nativeEOSMainQueueTurn()
+        await origin.close()
+    }
+
+    private func runPausedAdapterTrackControl(entry: String, publicMIMEQueries: Bool) async throws {
+        executionTimeAllowance = 30
+        let deadline = ContinuousClock.now + .seconds(15)
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let diagnostic = NativePausedAdapterDiagnostic(label: "adapter-\(entry)-\(publicMIMEQueries ? "public" : "stub")")
+        let timeout = Task {
+            do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+            diagnostic.finished.resolve("control-deadline")
+        }
+        do {
+            try await withController(deadline: deadline, publicMIMEQueries: publicMIMEQueries,
+                pausedTrackDiagnostic: diagnostic) { controller, _, factory in
+                await controller.play(.init(sourceProfileID: UUID(), channelID: "paused-track-control",
+                    streamURL: origin.url(entry), title: "Paused synthetic track control"))
+                let outcome = await withTaskCancellationHandler {
+                    await diagnostic.finished.wait()
+                } onCancel: { diagnostic.finished.resolve("control-cancelled") }
+                if let backend = factory.backend {
+                    XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+                    if let player = backend.presentation?.avPlayerForNativeSmoke { XCTAssertEqual(player.rate, 0) }
+                }
+                print("NATIVE_HLS_PAUSED_TRACK_RESULT case=\(diagnostic.label) outcome=\(outcome) diagnostic-only=true")
+            }
+        } catch {
+            // This companion deliberately stops before preparation can admit
+            // playback. Report the observed outcome; never convert it to proof.
+            print("NATIVE_HLS_PAUSED_TRACK_RESULT case=\(diagnostic.label) outcome=control-ended error-type=\(String(reflecting: type(of: error))) diagnostic-only=true")
+        }
+        timeout.cancel(); await timeout.value
+        await origin.close()
     }
 
     func testRealNativeAndManagedHLSReachVerifiedUntrimmedEOF() async throws {
@@ -861,11 +1100,23 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
     }
     private func makeOrigin(bytes: Data, managed: Bool, disconnectAfterBodyBytes: Int? = nil) throws -> NativeHLSHTTPFixture {
         let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
+        let singleMaster = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n"
         let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
         return try NativeHLSHTTPFixture(resources: [
             "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
+            "/single-master.m3u8": .init(data: Data(singleMaster.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/part.ts": .init(data: bytes, contentType: "video/mp2t", disconnectAfterBodyBytes: disconnectAfterBodyBytes)], credential: managed ? "ordinary fixture" : nil)
+    }
+    private func shortTrackFixtureBytes() throws -> Data {
+        let file = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "progressive-h264-aac", withExtension: "ts"))
+        return try Data(contentsOf: file)
+    }
+    private func shortTrackFixtureManifest() -> Data {
+        // Existing committed 1280x720/25 AVC + AAC fixture, ffprobe duration
+        // 2.026667 s. This changes more than segment duration, so its results
+        // are explicitly a second-fixture control, never a duration-only proof.
+        Data("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.026667,\npart.ts\n#EXT-X-ENDLIST\n".utf8)
     }
     private func runEndpointControl(_ boundary: NativeEndpointControl, bytes: Data, disconnectAfterBodyBytes: Int? = nil) async throws
         -> (progressed: Bool, errorDomain: String?, errorCode: Int?, endedNormally: Bool, sdkFailed: Bool,
@@ -1027,14 +1278,16 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             throw HLSSourceError.deadline
         }
     }
-    private func withController(deadline: ContinuousClock.Instant? = nil, driver: SystemAVPlayerDriver? = nil,
+    private func withController(deadline: ContinuousClock.Instant? = nil, driver: SystemAVPlayerDriver? = nil, publicMIMEQueries: Bool = false,
+        pausedTrackDiagnostic: NativePausedAdapterDiagnostic? = nil,
         _ body: @escaping @MainActor (PlaybackController, ControlTaskRegistry, NativeSmokeFactory) async throws -> Void) async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         let trace = NativeSmokeTrace()
-        let factory = NativeSmokeFactory(trace: trace, driver: driver)
+        let factory = NativeSmokeFactory(trace: trace, driver: driver, publicMIMEQueries: publicMIMEQueries,
+            pausedTrackDiagnostic: pausedTrackDiagnostic)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
         let bodyTask = Task { @MainActor in
@@ -1210,6 +1463,183 @@ private extension PlaybackPresentation {
     }
 }
 
+/// One waiter and one scalar result; callback, timeout, and cancellation race
+/// through the same slot. No callback Tasks or unbounded event history.
+private final class NativeTrackDiagnosticGate<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Value?
+    private var waiter: CheckedContinuation<Value, Never>?
+    func resolve(_ value: Value) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Value, Never>? in
+            guard result == nil else { return nil }
+            result = value
+            let continuation = waiter; waiter = nil
+            return continuation
+        }
+        continuation?.resume(returning: value)
+    }
+    func wait() async -> Value {
+        await withCheckedContinuation { continuation in
+            let value = lock.withLock { () -> Value? in
+                if let result { return result }
+                precondition(waiter == nil)
+                waiter = continuation
+                return nil
+            }
+            if let value { continuation.resume(returning: value) }
+        }
+    }
+}
+
+/// Raw SDK observations are diagnostics only: track presence cannot authorize
+/// playback, and this helper never reads source URLs, media bytes, or formats.
+private final class NativePausedTracksProbe: @unchecked Sendable {
+    private struct Event: Sendable {
+        let stage: String
+        let ticks: UInt64
+        let total: Int
+        let enabled: Int
+        let prerollResult: Bool?
+    }
+    let availability = NativeTrackDiagnosticGate<Bool>()
+    private let lock = NSLock()
+    private let label: String
+    private let started = DispatchTime.now().uptimeNanoseconds
+    private var prerollAt: UInt64?
+    private var firstEnabledAV: UInt64?
+    private var rows = 0
+    private var closed = false, stayedZero = true
+    private var windowDeadline: ContinuousClock.Instant?
+    private var pending: [Event] = []
+    private var dropped = 0
+    private var worker: Task<Void, Never>?
+    init(label: String) { self.label = label }
+    var rateStayedZero: Bool { lock.withLock { stayedZero } }
+    func beginAvailabilityWindow(until deadline: ContinuousClock.Instant) { lock.withLock { windowDeadline = deadline } }
+    func endAvailabilityWindow() { lock.withLock { windowDeadline = nil } }
+    // assetTrack is main-actor isolated in the modern SDK. Callback ingress
+    // captures only explicitly nonisolated scalar properties, then one bounded,
+    // joined worker samples asset/type evidence on MainActor. No Task per event.
+    func offer(_ stage: String, item: AVPlayerItem, player: AVPlayer, prerollResult: Bool? = nil) {
+        let tracks = item.tracks
+        let event = Event(stage: stage, ticks: DispatchTime.now().uptimeNanoseconds,
+            total: tracks.count, enabled: tracks.prefix(16).filter(\.isEnabled).count, prerollResult: prerollResult)
+        lock.withLock {
+            guard !closed else { return }
+            if prerollResult != nil { prerollAt = event.ticks }
+            stayedZero = stayedZero && player.rate == 0
+            if pending.count == 16 {
+                // Preserve the unique preroll callback row under KVO bursts.
+                guard let ordinary = pending.firstIndex(where: { $0.prerollResult == nil }) else { dropped += 1; return }
+                pending.remove(at: ordinary); dropped += 1
+            }
+            pending.append(event)
+            guard worker == nil else { return }
+            worker = Task { @MainActor [self] in
+                while let event = takeEvent() {
+                    record(event.stage, item: item, player: player, ingress: event)
+                }
+            }
+        }
+    }
+    private func takeEvent() -> Event? {
+        lock.withLock {
+            guard !pending.isEmpty else { worker = nil; return nil }
+            return pending.removeFirst()
+        }
+    }
+    @MainActor func closeAndJoin() async {
+        let current = lock.withLock { () -> Task<Void, Never>? in
+            closed = true; windowDeadline = nil; return worker
+        }
+        // Stop new ingress, then drain the bounded accepted callback records.
+        // In particular, keep the actual preroll-callback row through cleanup.
+        await current?.value
+    }
+    @MainActor func record(_ stage: String, item: AVPlayerItem, player: AVPlayer) {
+        record(stage, item: item, player: player, ingress: nil)
+    }
+    @MainActor private func record(_ stage: String, item: AVPlayerItem, player: AVPlayer, ingress: Event?) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let tracks = item.tracks
+        let bounded = tracks.prefix(16)
+        let enabled = bounded.filter(\.isEnabled)
+        let assets = bounded.compactMap(\.assetTrack)
+        let selectedAssets = enabled.compactMap(\.assetTrack)
+        let video = selectedAssets.filter { $0.mediaType == .video }.count
+        let audio = selectedAssets.filter { $0.mediaType == .audio }.count
+        let hasAV = tracks.count <= 16 && video == 1 && audio == 1
+        let rate = player.rate
+        let current = item.currentTime()
+        let error = item.error as NSError?
+        let sampledAt = ContinuousClock.now
+        let signal = lock.withLock { () -> Bool? in
+            stayedZero = stayedZero && rate == 0
+            if hasAV, firstEnabledAV == nil { firstEnabledAV = now }
+            let important = stage == "ready" || stage == "window-start" || stage == "window-deadline"
+                || stage == "control-deadline" || stage == "before-cleanup"
+                || stage.hasPrefix("inspect-") || stage.hasPrefix("preroll-")
+            if rows < 24 || important {
+                rows += 1
+                let elapsed = (now - started) / 1_000
+                let afterPreroll = prerollAt.map { (Int64(now) - Int64($0)) / 1_000 } ?? -1
+                let first = firstEnabledAV.map { ($0 - started) / 1_000 }
+                let ingressTime = ingress.map { ($0.ticks - started) / 1_000 }
+                print("NATIVE_HLS_PAUSED_TRACK case=\(label) stage=\(stage) elapsed-us=\(elapsed) since-preroll-us=\(afterPreroll) " +
+                    "ingress-us=\(ingressTime.map(String.init) ?? "none") ingress-total=\(ingress?.total ?? -1) ingress-enabled=\(ingress?.enabled ?? -1) dropped=\(dropped) " +
+                    "first-av-us=\(first.map(String.init) ?? "none") total=\(tracks.count) enabled=\(enabled.count) assets=\(assets.count) " +
+                    "video=\(video) audio=\(audio) missing=\(enabled.count - selectedAssets.count) capped=\(tracks.count > 16) " +
+                    "item-status=\(item.status.rawValue) player-status=\(player.status.rawValue) rate=\(rate) control=\(player.timeControlStatus.rawValue) " +
+                    "current=\(current.value)/\(current.timescale) primed=\(ingress?.prerollResult.map(String.init) ?? "none") " +
+                    "error=\(String((error?.domain ?? "none").prefix(64))):\(error?.code ?? 0) diagnostic-only=true")
+            }
+            guard let windowDeadline, sampledAt <= windowDeadline else { return nil }
+            if item.status == .failed || player.status == .failed { return false }
+            return hasAV ? true : nil
+        }
+        if let signal { availability.resolve(signal) }
+    }
+}
+
+private final class NativePausedAdapterDiagnostic: @unchecked Sendable {
+    let label: String
+    let probe: NativePausedTracksProbe
+    let finished = NativeTrackDiagnosticGate<String>()
+    init(label: String) { self.label = label; probe = NativePausedTracksProbe(label: label) }
+}
+private enum NativePausedAdapterStop: Error { case completed }
+
+/// Companion controls always stop preparation after the unchanged real inspector
+/// returns or throws. Even a successful snapshot is never returned to the adapter.
+@MainActor
+private final class NativePausedAdapterInspector: NativeHLSAssetInspecting {
+    private let driver: SystemAVPlayerDriver
+    private let base: SystemNativeHLSAssetInspector
+    private let diagnostic: NativePausedAdapterDiagnostic
+    init(driver: SystemAVPlayerDriver, diagnostic: NativePausedAdapterDiagnostic) {
+        self.driver = driver; base = SystemNativeHLSAssetInspector(driver: driver); self.diagnostic = diagnostic
+    }
+    func snapshot(item: AVPlayerItemInstanceIdentity, source: HLSOwnedSourcePlan) async throws -> NativeHLSSelectionSnapshot {
+        guard let physical = driver.nativeCurrentItem(item) else { throw HLSSourceError.staleResolution }
+        diagnostic.probe.record("inspect-start", item: physical, player: driver.player)
+        do {
+            let result = try await base.snapshot(item: item, source: source)
+            diagnostic.probe.record("inspect-success", item: physical, player: driver.player)
+            XCTAssertEqual(driver.player.rate, 0)
+            diagnostic.finished.resolve("selected-format-pass-video-\(result.video != nil)-audio-\(result.audio != nil)")
+        } catch {
+            diagnostic.probe.record("inspect-failure", item: physical, player: driver.player)
+            let reason = (error as? HLSSourceError).map { String(describing: $0) }
+                ?? (error as? AVPlayerItemCoordinatorFailure).map { String(describing: $0) }
+                ?? String(reflecting: type(of: error))
+            diagnostic.finished.resolve("selected-format-failure-\(reason)")
+        }
+        XCTAssertTrue(diagnostic.probe.rateStayedZero)
+        // Never manufacture a snapshot, ignore missing formats, or admit play.
+        throw NativePausedAdapterStop.completed
+    }
+}
+
 private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Sendable {
     private let lock = NSLock()
     private weak var result: HLSAVPlayerPlaybackBackend?
@@ -1220,17 +1650,27 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
     private let factory: SystemPlaybackBackendFactory
     private let sourceDependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies
     private let driver: SystemAVPlayerDriver?
-    init(trace: NativeSmokeTrace, driver: SystemAVPlayerDriver? = nil) {
+    init(trace: NativeSmokeTrace, driver: SystemAVPlayerDriver? = nil, publicMIMEQueries: Bool = false,
+         pausedTrackDiagnostic: NativePausedAdapterDiagnostic? = nil) {
         self.trace = trace
         self.driver = driver
         let dependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies = { context in
             var dependencies = HLSNativeSourceDependencies(context: context)
             dependencies.makeInspector = { driver in
                 guard let system = driver as? SystemAVPlayerDriver else { throw HLSSourceError.incompleteEvidence }
+                if let pausedTrackDiagnostic { return NativePausedAdapterInspector(driver: system, diagnostic: pausedTrackDiagnostic) }
                 return NativeSmokeTracingInspector(driver: system, trace: trace)
             }
-            dependencies.capabilities = { _, _ in
-                .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
+            dependencies.capabilities = { facts, route in
+                if publicMIMEQueries {
+                    // The simulator's hardware identity is deliberately outside
+                    // production admission. Inject only that envelope; use the
+                    // production capability builder and actual SDK MIME answers.
+                    return NativeHLSCapabilities.make(facts: facts, route: route,
+                        evidence: .init(model: "AppleTV14,1", hardwareH264: true, hardwareHEVC: true,
+                            hdrEligible: true, playable: { AVURLAsset.isPlayableExtendedMIMEType($0) }))
+                }
+                return .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
                     maximumWidth: 1_920, maximumHeight: 1_080, maximumFrameRate: MediaRational(num: 60, den: 1)!,
                     bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])], nativeAudioCodecs: [.aac],
                     supportsWebVTT: true, supportsGenerated: false, supportsInBandClosedCaptions: true)

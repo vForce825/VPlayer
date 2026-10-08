@@ -239,10 +239,15 @@ jobs:
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation \
             -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits \
+            -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineAirPlayOutputMetadataFitsAndRoundTripsInExistingFixedSlot \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativeBackendPayloadPreservesScopeAndReleasesItsChargedOwnerAfterMove \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadClearAndDeinitReleaseEachDiagnosticExactlyOnce \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelinePayloadRingWrapsThirtyOneToZeroWithMixedNativeTypesInFIFOOrder \
@@ -321,6 +326,7 @@ jobs:
           python3 Scripts/Tests/test_release_startup_diagnostics.py
           python3 Scripts/Tests/test_persistent_hls_acceptance.py
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
+          python3 Scripts/Tests/test_airplay_output_mode_contract.py
           python3 Scripts/Tests/test_hls_acceptance_configurator.py
           python3 Scripts/Tests/test_hls_acceptance_fixture.py
           python3 Scripts/Tests/test_homepod_audio_fixture.py
@@ -418,6 +424,14 @@ jobs:
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testSourceCategoryUsesResolvedTopologyRatherThanURLSuffix \
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testRouteEnrichmentPreservesSourceAndOutputFactsAndFixedPayload \
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataStillFitsExistingFixedEventPayload \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksBlockInspectionUntilOriginalPreparationContinues \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPausedNativeTrackWaitKeepsPreparationAndFrozenOriginalBudget \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksExpireUnderOriginalStartupDeadline \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeTrackAvailabilityCannotReplaceSelectedFormatProof \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSourceMetadataArrivesBeforeCapabilitiesAndIsReplacedByPreparedMetadata \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testGeneratedSourceMetadataArrivesBeforeGraphConstructionAndClearsOnFailure \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterProbeDoesNotPublishAnArbitraryVariantBeforeSelection \
@@ -430,7 +444,17 @@ jobs:
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testInstalledPreparationAfterSuspendDeadlineStillPhysicallyStopsBeforeChannelReuse \
             --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput \
             --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate \
-            --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testSourceAndPlannedPathAreExplicitWithoutReadinessClaims \
+            --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeAndProxyPublishConfirmedPassthroughForVideoAndAudioOnly \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeOutputProjectionRejectsRetiredSourceGeneration \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSameBackendRecoveryRequiresFreshPhysicalItemAndRejectsLateOldOwner \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeMetadataChangesReachControllerStreamAndPauseInvalidatesSameLifecycle \
+            --only-testing VPlayerTests/Task9RuntimeCapacityTests/testPipelineAirPlayOutputMetadataFitsAndRoundTripsInExistingFixedSlot \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSMediaInformationReplaysWhilePausedAndRejectsStoppedScope \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyOutput \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer \
+            --only-testing VPlayerTests/HLSAVPlayerBackendTests/testProductionInterlacedGraphUsesYADIF2xAndFailsClosedWithoutHardwareEncoder \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests \
             --only-testing VPlayerTests/NativeHLSMasterSmokeTests \
             --only-testing VPlayerTests/NativeOwnedDolbyFallbackSmokeTests \
             --only-testing VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact \

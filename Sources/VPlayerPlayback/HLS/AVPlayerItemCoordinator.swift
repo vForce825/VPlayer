@@ -90,6 +90,8 @@ protocol AVPlayerDriving: AnyObject {
     func joinNativeCallbackTails() async
     func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime
     func waitUntilReady(item: AVPlayerItemInstanceIdentity) async throws -> AVPlayerItemInstanceIdentity
+    /// Initial native preparation only. Raw track presence is not selected-format proof.
+    func waitForNativeTracks(item: AVPlayerItemInstanceIdentity) async throws
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws
     func seek(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity,
@@ -177,6 +179,9 @@ extension AVPlayerDriving {
     var preferredForwardBufferDuration: TimeInterval { 3 }
     func selectAudibleMedia(item: AVPlayerItemInstanceIdentity) async throws {}
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws {}
+    func waitForNativeTracks(item: AVPlayerItemInstanceIdentity) async throws {
+        throw AVPlayerItemCoordinatorFailure.insufficientCoverage
+    }
     func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? { nil }
     func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? { nil }
     func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {

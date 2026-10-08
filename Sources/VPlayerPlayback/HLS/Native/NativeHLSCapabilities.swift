@@ -29,7 +29,16 @@ enum NativeHLSCapabilities {
     static func make(facts: HLSCompatibilityFacts, route: PlaybackRouteSemanticIdentity?, evidence: NativeHLSPlatformEvidence) -> HLSOutputCapabilities {
         let known4K = ["AppleTV6,2", "AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
         let modernHDR = ["AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
+        // Since tvOS 17 the public API interprets codecs in the MIME container's
+        // namespace. A playlist is not a media-data container: qualifying the
+        // HLS MIME with MP4 codec tokens can return false for playable HLS.
+        // Query playlist support separately; never use WebKit's private SPI.
+        let playlistPlayable = evidence.playable("application/vnd.apple.mpegurl")
+        let containersPlayable = !facts.media.isEmpty && facts.media.allSatisfy {
+            nativeHLSMediaPlayable($0, evidence: evidence)
+        }
         var videoFormats: [HLSVideoCapability] = []
+        var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K
         // Apple HLS authoring 1.3/1.6 and Apple TV 4K technical specifications:
         // https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices
         // https://support.apple.com/en-us/111922
@@ -40,8 +49,9 @@ enum NativeHLSCapabilities {
             for video in facts.media.compactMap(\.video) {
                 guard let codec = video.codec, let mimeCodec = codecString(video),
                       (codec == .h264 ? evidence.hardwareH264 : evidence.hardwareHEVC),
-                      evidence.playable("video/mp4; codecs=\"\(mimeCodec)\""),
-                      evidence.playable("application/vnd.apple.mpegurl; codecs=\"\(mimeCodec)\"") else { continue }
+                      evidence.playable("video/mp4; codecs=\"\(mimeCodec)\"") else {
+                    everyVideoPlayable = false; continue
+                }
                 let ranges: Set<HLSVideoRange>
                 if codec == .h264 { ranges = [.sdr] }
                 else { ranges = evidence.hdrEligible ? [.sdr, .pq, .hlg] : [.sdr] }
@@ -51,30 +61,39 @@ enum NativeHLSCapabilities {
                     maximumFrameRate: MediaRational(num: isHDR && !modernHDR ? 30 : 60, den: 1)!,
                     bitDepths: codec == .h264 ? [8] : [8, 10], chromaFormats: [1], tiers: [.main, .high], videoRanges: ranges)
                 if capability.matches(video) { videoFormats.append(capability) }
+                else { everyVideoPlayable = false }
             }
         }
-        var nativeAudio: Set<AudioCodec> = [], generatedAudio: Set<AudioCodec> = [.aac]
+        // Candidates for generated audio depend on validated audio decoder
+        // support, not on an unrelated native video/container rejection.
+        var playableAudio: Set<AudioCodec> = [], generatedAudio: Set<AudioCodec> = [.aac]
         var candidates: [HLSCompressedAudioAdmissionCandidate] = []
         var nativeCandidates: [HLSNativeAudioAdmissionCandidate] = []
         for codec in [AudioCodec.aac, .ac3, .eac3] {
             let audio = facts.media.flatMap(\.audio).filter { $0.codec == codec }
-            guard !audio.isEmpty, audio.allSatisfy({ value in
+            guard playlistPlayable, !audio.isEmpty, audio.allSatisfy({ value in
                 guard value.formatValidated, value.service == .independentMain, value.sampleRate > 0,
                       value.sampleRate <= 96_000, (1...8).contains(value.channelCount), value.channelMask != 0,
                       value.channelMask.nonzeroBitCount == value.channelCount, let token = audioCodecString(value) else { return false }
-                return evidence.playable("audio/mp4; codecs=\"\(token)\"") &&
-                    evidence.playable("application/vnd.apple.mpegurl; codecs=\"\(token)\"")
+                return evidence.playable("audio/mp4; codecs=\"\(token)\"")
             }) else { continue }
-            nativeAudio.insert(codec)
+            playableAudio.insert(codec)
         }
+        // Capabilities are broad envelopes. A passing sibling must not lend its
+        // envelope to a rejected container, codec query or device/HDR format.
+        let nativeGraphPlayable = playlistPlayable && containersPlayable && everyVideoPlayable
+        let nativeAudio: Set<AudioCodec> = nativeGraphPlayable ? playableAudio : []
+        if !nativeGraphPlayable { videoFormats.removeAll() }
         if let owner = facts.owner, facts.complete, route?.backend == .hlsAVPlayer,
            route?.ports.contains(.airPlay) == true, route?.ports.contains(.bluetooth) == false {
             for audio in facts.media.flatMap(\.audio) {
-                guard let codec = audio.codec, codec == .ac3 || codec == .eac3, nativeAudio.contains(codec) else { continue }
+                guard let codec = audio.codec, codec == .ac3 || codec == .eac3, playableAudio.contains(codec) else { continue }
                 let routeScope = "owned-\(owner.backendIdentity.sessionIdentity.sessionID)-\(owner.backendIdentity.backendGeneration)-\(owner.prepareNonce)-\(owner.outputLifecycleNonce)"
-                nativeCandidates.append(.init(owner: owner, codec: codec, profile: audio.profile,
-                    sampleRate: audio.sampleRate, channelCount: audio.channelCount, channelMask: audio.channelMask,
-                    decoderConfiguration: audio.decoderConfiguration, outputRouteIdentifier: routeScope))
+                if nativeAudio.contains(codec) {
+                    nativeCandidates.append(.init(owner: owner, codec: codec, profile: audio.profile,
+                        sampleRate: audio.sampleRate, channelCount: audio.channelCount, channelMask: audio.channelMask,
+                        decoderConfiguration: audio.decoderConfiguration, outputRouteIdentifier: routeScope))
+                }
                 guard audio.sampleRate == 48_000, (1...6).contains(audio.channelCount),
                       audio.priming == .notSignaledPreserveTimestamps,
                       audio.channelMask & ~UInt64(0x7FF) == 0,
@@ -91,6 +110,40 @@ enum NativeHLSCapabilities {
             compressedAudioCodecs: generatedAudio,
             compressedAudioAdmissionCandidates: candidates, supportsWebVTT: true, supportsGenerated: true,
             supportsInBandClosedCaptions: true)
+    }
+
+    private static func nativeHLSMediaPlayable(_ media: HLSMediaFacts, evidence: NativeHLSPlatformEvidence) -> Bool {
+        guard !media.hasUnsupportedTracks, media.audio.count <= 8 else { return false }
+        if media.container == .webVTT { return media.video == nil && media.audio.isEmpty }
+        let mime: String
+        switch media.container {
+        case .mpegTS:
+            // Apple HLS authoring permits AVC in TS. This narrowly admitted
+            // AVC/LC-AAC contract is backed by the byte-fed PAT/PMT/PES probe;
+            // selected AVPlayer tracks must still match before activation.
+            // video/mp2t uses the ISO/IEC 13818-1 codec namespace, so feeding it
+            // avc1/mp4a tokens is not an HLS capability test. Query those tokens
+            // in their BMFF namespace for decoder/format evidence, NOT TS proof.
+            // Other TS combinations retain generated handling until separately
+            // verified; HEVC remains fMP4-only for native HLS.
+            guard media.video == nil || media.video?.codec == .h264,
+                  media.audio.allSatisfy({ $0.formatValidated && $0.service == .independentMain &&
+                      HLSAudioProcessingPolicy.supportsSourceLC($0) }) else { return false }
+            mime = media.video == nil ? "audio/mp4" : "video/mp4"
+        case .fragmentedMP4: mime = media.video == nil ? "audio/mp4" : "video/mp4"
+        case .isoBMFF, .webVTT, .unknown: return false
+        }
+        var codecs: [String] = []
+        if let video = media.video {
+            guard let token = codecString(video) else { return false }
+            codecs.append(token)
+        }
+        for audio in media.audio {
+            guard let token = audioCodecString(audio) else { return false }
+            codecs.append(token)
+        }
+        guard !codecs.isEmpty else { return false }
+        return evidence.playable("\(mime); codecs=\"\(codecs.joined(separator: ","))\"")
     }
 
     static func codecString(_ video: HLSVideoFacts) -> String? {

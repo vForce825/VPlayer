@@ -14,6 +14,21 @@ import unittest
 ROOT=Path(__file__).resolve().parents[2]
 
 class WorkflowContracts(unittest.TestCase):
+    def test_initial_native_track_fence_has_focused_and_sanitizer_coverage(self):
+        text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
+        self.assertIn('--only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksBlockInspectionUntilOriginalPreparationContinues',text)
+        self.assertIn('--only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPausedNativeTrackWaitKeepsPreparationAndFrozenOriginalBudget',text)
+        self.assertIn('--only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksExpireUnderOriginalStartupDeadline',text)
+        self.assertIn('--only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeTrackAvailabilityCannotReplaceSelectedFormatProof',text)
+        self.assertIn('--only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken',text)
+        self.assertIn('-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken',text)
+        self.assertIn('--only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes',text)
+        self.assertIn('-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes',text)
+        self.assertIn('--only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission',text)
+        self.assertIn('-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission',text)
+        self.assertIn('--only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation',text)
+        self.assertIn('-only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation',text)
+
     def test_acceptance_listener_is_configured_before_start_and_smoke_is_selected(self):
         support=(ROOT/'Tests/VPlayerHLSAcceptanceTests/AcceptanceMediaSupport.swift').read_text()
         server=support.split('final class AcceptanceHTTPServer:',1)[1].split('private final class AcceptanceSourceFeed:',1)[0]
@@ -114,6 +129,13 @@ class WorkflowContracts(unittest.TestCase):
         self.assertIn('for attempt in 1 2 3; do',script)
         self.assertLess(script.index('xcodebuild build '),script.index('simctl install'))
 
+    def test_airplay_output_contract_and_fixed_slot_have_ci_coverage(self):
+        text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
+        self.assertIn('python3 Scripts/Tests/test_airplay_output_mode_contract.py',text)
+        sanitizer=text.split('  sanitizer-validation:',1)[1].split('  artifact-validation:',1)[0]
+        self.assertIn('-only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineAirPlayOutputMetadataFitsAndRoundTripsInExistingFixedSlot',sanitizer)
+        self.assertNotIn('testSourceAndPlannedPathAreExplicitWithoutReadinessClaims',text)
+
     def test_strict_http_keeps_fixture_gates_and_adds_bounded_native_smoke_coverage(self):
         text=(ROOT/'.github/workflows/macos-ci.yml').read_text()
         fixture=text.split('  fixture-validation:',1)[1].split('  compiler-controls:',1)[0]
@@ -150,6 +172,14 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/HLSPlaybackPlanTests/testSourceCategoryUsesResolvedTopologyRatherThanURLSuffix',
             'VPlayerTests/HLSPlaybackPlanTests/testRouteEnrichmentPreservesSourceAndOutputFactsAndFixedPayload',
             'VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataStillFitsExistingFixedEventPayload',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksBlockInspectionUntilOriginalPreparationContinues',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testPausedNativeTrackWaitKeepsPreparationAndFrozenOriginalBudget',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksExpireUnderOriginalStartupDeadline',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeTrackAvailabilityCannotReplaceSelectedFormatProof',
+            'VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken',
+            'VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes',
+            'VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission',
+            'VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testSourceMetadataArrivesBeforeCapabilitiesAndIsReplacedByPreparedMetadata',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testGeneratedSourceMetadataArrivesBeforeGraphConstructionAndClearsOnFailure',
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterProbeDoesNotPublishAnArbitraryVariantBeforeSelection',
@@ -162,7 +192,17 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/NativeHLSAdapterLifecycleTests/testInstalledPreparationAfterSuspendDeadlineStillPhysicallyStopsBeforeChannelReuse',
             'VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput',
             'VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate',
-            'VPlayerTests/PlaybackMediaInformationPresentationTests/testSourceAndPlannedPathAreExplicitWithoutReadinessClaims',
+            'VPlayerTests/PlaybackMediaInformationPresentationTests',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeAndProxyPublishConfirmedPassthroughForVideoAndAudioOnly',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeOutputProjectionRejectsRetiredSourceGeneration',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testSameBackendRecoveryRequiresFreshPhysicalItemAndRejectsLateOldOwner',
+            'VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeMetadataChangesReachControllerStreamAndPauseInvalidatesSameLifecycle',
+            'VPlayerTests/Task9RuntimeCapacityTests/testPipelineAirPlayOutputMetadataFitsAndRoundTripsInExistingFixedSlot',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSMediaInformationReplaysWhilePausedAndRejectsStoppedScope',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSChannelReplacementRejectsOldRefreshAndClearThenPublishesAudioOnlyOutput',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer',
+            'VPlayerTests/HLSAVPlayerBackendTests/testProductionInterlacedGraphUsesYADIF2xAndFailsClosedWithoutHardwareEncoder',
+            'VPlayerTests/NativeHLSCapabilitiesTests',
             'VPlayerTests/NativeHLSMasterSmokeTests',
             'VPlayerTests/NativeOwnedDolbyFallbackSmokeTests',
             'VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact',

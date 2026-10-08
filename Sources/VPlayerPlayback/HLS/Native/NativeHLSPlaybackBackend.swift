@@ -148,7 +148,8 @@ struct HLSNativeSourceDependencies: Sendable {
             let facts = try await inspect(source, retainingFacts: factsCharge, diagnostics: diagnostics)
             try validate(invocation)
             // Route-only metadata carries no guessed video facts for masters,
-            // audio-only sources or ambiguous tracks. Final audio-only stays nil.
+            // audio-only sources or ambiguous tracks. Confirmed audio-only output later
+            // carries only its AirPlay processing mode, without video facts.
             let sourceInformation = (Self.probedMediaInformation(source: source, facts: facts)
                 ?? .init(sourceWidth: 0, sourceHeight: 0, scanMode: nil, sourceFrameRate: nil))
                 .withSourceRouting(category: Self.sourceCategory(for: source), transport: nil)

@@ -10,7 +10,7 @@ final class SDKFixedRangeReleaseTests: XCTestCase {
     func testWaitPhaseSnapshotTracksOnlyCurrentToken() throws {
         let slot = AVPlayerPrepareWaitSlot()
         XCTAssertNil(slot.activePhase)
-        for phase in [AVPlayerPrepareWaitSlot.Phase.ready, .mapping, .seek, .loaded, .preroll] {
+        for phase in [AVPlayerPrepareWaitSlot.Phase.ready, .mapping, .seek, .loaded, .preroll, .nativeTracks] {
             let retired = try slot.begin(phase)
             XCTAssertEqual(slot.activePhase, phase)
             slot.cancelCurrent()

@@ -887,7 +887,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                             }
                         }
                     }
-                    tracks = value
+                    condition.withLock { tracks = value }
                     retainedTrackOwner = admitted
                     try prepareAudioSelection(value)
                     #if DEBUG
@@ -2191,6 +2191,26 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         }
     }
 
+    /// Called under condition only after the all-track publication receipt. The
+    /// installed branches include any pre-append AAC fallback; selected codec
+    /// proposals and plan.audio are deliberately not output evidence. Once a
+    /// prefix exists, each selected branch is installed; pre-append fallback is
+    /// no longer possible, and later replacements require a new output lifecycle.
+    private func confirmedAirPlayOutputModeLocked() -> PlaybackAirPlayOutputMode? {
+        guard let tracks else { return nil }
+        let video: PlaybackOutputTrackProcessing?
+        if tracks.video == nil { video = .absent }
+        else if interlacedVideoOutput != nil { video = .transcoded }
+        else if videoWriter != nil { video = .copied }
+        else { video = nil }
+        let audio: PlaybackOutputTrackProcessing?
+        if tracks.audio == nil { audio = .absent }
+        else if audioBranch != nil { audio = .transcoded }
+        else if sourceAACBranch != nil || dolbyBranch != nil { audio = .copied }
+        else { audio = nil }
+        return PlaybackAirPlayOutputMode.generated(video: video, audio: audio)
+    }
+
     func awaitAllTrackPlayablePrefix(minimumSeconds: Int) async
         -> AVPlayerItemReplacementBundle? {
         #if DEBUG
@@ -2259,12 +2279,25 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 // retirement 必须等 prefix preparation 结束；新建 server 仍归同一 owner。
                 loopbackServer = prepared.server
                 while failureDispatchInFlight && state != .retiring && state != .retired { condition.wait() }
-                guard !Task.isCancelled, state != .failed, state != .retiring, state != .retired else { return nil }
+                guard !Task.isCancelled, state != .failed, state != .retiring, state != .retired,
+                      generatedSource?.isCurrent != false else { return nil }
                 state = .playable
+                let information: PlaybackMediaInformation?
+                if let mode = confirmedAirPlayOutputModeLocked() {
+                    if let mediaInformation {
+                        information = mediaInformation.withAirPlayOutputMode(mode)
+                    } else if tracks?.video == nil, tracks?.audio != nil {
+                        information = .init(audioOnlyAirPlayOutputMode: mode)
+                    } else {
+                        information = nil
+                    }
+                } else {
+                    information = mediaInformation
+                }
                 return AVPlayerItemReplacementBundle(
                     request: prepared.replacement.request,
                     evidenceSource: prepared.replacement.evidenceSource,
-                    mediaInformation: mediaInformation)
+                    mediaInformation: information)
             }
         } catch {
             guard !Task.isCancelled else { return nil }

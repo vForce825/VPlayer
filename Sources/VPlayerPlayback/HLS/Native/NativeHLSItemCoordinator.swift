@@ -75,13 +75,32 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         // AVPlayer retains its original default/alternate media selections.
         try await driver.primeMediaData(item: item)
         try validatePrepare()
+        // Item readiness and preroll may precede the SDK's raw track publication.
+        // This one initial wait shares the original preparation deadline; only
+        // the unchanged inspector below can establish selected-format evidence.
+        try await driver.waitForNativeTracks(item: item)
+        try validatePrepare()
         let snapshot = try await selectionSnapshot { try self.validatePrepare() }
         try validatePrepare()
         guard driver.currentItemIdentity == item, driver.rate == 0 else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         selected = snapshot; prepared = true
         diagnose("prepare.selected")
-        metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
+        publishSelectedMediaInformation(snapshot)
     }
+    private func publishSelectedMediaInformation(_ snapshot: NativeHLSSelectionSnapshot) {
+        // Only a successful, current selection can confirm direct application
+        // output. Keep stop/failure nil publications as true invalidations.
+        let information: PlaybackMediaInformation?
+        if let video = snapshot.information?.withAirPlayOutputMode(.passthrough) {
+            information = video
+        } else if snapshot.video == nil, snapshot.audio != nil {
+            information = .init(audioOnlyAirPlayOutputMode: .passthrough)
+        } else {
+            information = nil
+        }
+        metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: information))
+    }
+
     func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
         guard isPrepared, let interval = invocation.currentSnapshot?.interval,
               interval.outputLifecycle == item.outputLifecycleEpoch, interval.itemGeneration == item.itemGeneration,
@@ -102,7 +121,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         if let selected, !snapshot.permitsTransition(from: selected) { throw HLSSourceError.unsupportedMedia }
         selected = snapshot
         if alreadyArmed {
-            metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
+            publishSelectedMediaInformation(snapshot)
             await metadataChanged(invocation.activation)
             try validateActive(invocation)
             return
@@ -150,7 +169,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         if let system = driver as? SystemAVPlayerDriver, let physical = system.nativeCurrentItem(item) {
             monitor = try NativeHLSObservation(item: physical, driver: system) { [weak self] failed in await self?.refresh(failed: failed) }
         }
-        metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: afterPreroll.information))
+        publishSelectedMediaInformation(afterPreroll)
         await metadataChanged(invocation.activation)
         try validateActive(invocation)
         startProgress(invocation)
@@ -210,7 +229,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             try validateActive(invocation)
             if let selected { diagnoseTransition(snapshot, from: selected, stage: "refresh.selected") }
             selected = snapshot
-            metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: snapshot.information))
+            publishSelectedMediaInformation(snapshot)
             await metadataChanged(invocation.activation)
         } catch is CancellationError {} catch {
             if authorization == invocation && invocation.revalidateCurrentAuthority() {

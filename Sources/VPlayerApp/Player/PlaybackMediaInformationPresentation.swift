@@ -33,25 +33,21 @@ struct PlaybackMediaInformationPresentation: Sendable {
         visualParts.highlightsFrameRate
     }
 
-    var sourceRoutingText: String? {
-        guard let information, let category = information.sourceCategory else { return nil }
-        let source: String
-        switch category {
-        case .direct: source = "直接媒体"
-        case .hlsMedia: source = "HLS 媒体列表"
-        case .hlsMaster: source = "HLS 主列表"
+    var airPlayOutputText: String? {
+        // Source routing exists only on the HLS/AirPlay backend. An unresolved
+        // local/HDMI snapshot must not acquire an AirPlay status by inference.
+        guard let information,
+              information.sourceCategory != nil || information.airPlayOutputMode != nil else { return nil }
+        let mode: String
+        switch information.airPlayOutputMode {
+        case .passthrough: mode = "直通"
+        case .remux: mode = "重封装"
+        case .audioTranscode: mode = "音频转码"
+        case .videoTranscode: mode = "视频转码"
+        case .mixedTranscode: mode = "混合转码"
+        case nil: mode = "准备中"
         }
-        guard let transport = information.plannedTransport else {
-            return "来源：\(source) · 路径规划中…"
-        }
-        let path: String
-        switch transport {
-        case .native: path = "原生播放"
-        case .proxy: path = "代理 HLS"
-        case .generated: path = "生成 HLS"
-        }
-        let phase = information.isSourceProbe ? "规划路径" : "当前路径"
-        return "来源：\(source) · \(phase)：\(path)"
+        return "AirPlay输出方式：\(mode)"
     }
 
     var visualText: String {
@@ -64,6 +60,7 @@ struct PlaybackMediaInformationPresentation: Sendable {
 
     var accessibilityText: String {
         guard let information else { return Self.detectingText }
+        guard !information.isAudioOnly else { return "" }
 
         if information.isSourceProbe {
             let resolution = Self.accessibilityResolutionText(for: information) ?? "分辨率检测中"

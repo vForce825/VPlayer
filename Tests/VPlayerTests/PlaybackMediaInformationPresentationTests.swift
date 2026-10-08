@@ -30,23 +30,63 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         XCTAssertEqual(unknownSize.visualText, "源视频分辨率检测中… · 29.97 fps")
     }
 
-    func testSourceAndPlannedPathAreExplicitWithoutReadinessClaims() {
+    func testAirPlayOutputUsesOnlyTheFiveConfirmedUserLabels() {
+        let modes: [(PlaybackAirPlayOutputMode, String)] = [
+            (.passthrough, "直通"), (.remux, "重封装"), (.audioTranscode, "音频转码"),
+            (.videoTranscode, "视频转码"), (.mixedTranscode, "混合转码")]
+        for (mode, label) in modes {
+            let subject = PlaybackMediaInformationPresentation(information:
+                mediaInformationForRouteTest().withAirPlayOutputMode(mode))
+            XCTAssertEqual(subject.airPlayOutputText, "AirPlay输出方式：\(label)")
+            XCTAssertEqual(subject.visualResolutionText, "1920×1080i")
+            XCTAssertEqual(subject.visualFrameRateText, "25 → 50 fps")
+            XCTAssertTrue(subject.showsEnhancedFrameRateHighlight)
+        }
+    }
+
+    func testPlannedAirPlayPathRemainsPreparingUntilActualOutputIsConfirmed() {
         let probed = PlaybackMediaInformation(sourceWidth: 1_920, sourceHeight: 1_080,
             scanMode: .interlaced, sourceFrameRate: MediaRational(num: 25, den: 1))
-        let pending = PlaybackMediaInformationPresentation(information: probed.withSourceRouting(
-            category: .direct, transport: nil))
-        XCTAssertEqual(pending.sourceRoutingText, "来源：直接媒体 · 路径规划中…")
-        let generated = PlaybackMediaInformationPresentation(information: probed.withSourceRouting(
-            category: .hlsMedia, transport: .generated))
-        XCTAssertEqual(generated.sourceRoutingText, "来源：HLS 媒体列表 · 规划路径：生成 HLS")
-        XCTAssertEqual(generated.visualFrameRateText, "25 fps")
-        XCTAssertFalse(generated.showsEnhancedFrameRateHighlight)
-        let selected = mediaInformationForRouteTest().withSourceRouting(category: .hlsMaster, transport: .native)
-        let final = PlaybackMediaInformationPresentation(information: selected)
-        XCTAssertEqual(final.sourceRoutingText, "来源：HLS 主列表 · 当前路径：原生播放")
-        XCTAssertEqual(final.visualFrameRateText, "25 → 50 fps")
-        XCTAssertNil(PlaybackMediaInformationPresentation(information: mediaInformationForRouteTest()).sourceRoutingText,
-            "Legacy routing has no inferred source or transport")
+        for transport: HLSPlaybackPlan.Transport? in [nil, .native, .proxy, .generated] {
+            let subject = PlaybackMediaInformationPresentation(information: probed.withSourceRouting(
+                category: .hlsMedia, transport: transport))
+            XCTAssertEqual(subject.airPlayOutputText, "AirPlay输出方式：准备中")
+            XCTAssertEqual(subject.visualFrameRateText, "25 fps")
+            XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
+        }
+    }
+
+    func testLocalVideoAndUnscopedUnknownMetadataDoNotShowAnAirPlayField() {
+        for information in [nil, mediaInformationForRouteTest()] {
+            XCTAssertNil(PlaybackMediaInformationPresentation(information: information).airPlayOutputText)
+        }
+    }
+
+    func testAudioOnlyOutputHasNoInventedVideoOrAccessibilityFacts() {
+        let information = PlaybackMediaInformation(audioOnlyAirPlayOutputMode: .audioTranscode)
+        let subject = PlaybackMediaInformationPresentation(information: information)
+        XCTAssertTrue(information.isAudioOnly)
+        XCTAssertFalse(information.isSourceProbe)
+        XCTAssertEqual(subject.airPlayOutputText, "AirPlay输出方式：音频转码")
+        XCTAssertNil(subject.visualResolutionText)
+        XCTAssertNil(subject.visualFrameRateText)
+        XCTAssertEqual(subject.visualText, "")
+        XCTAssertEqual(subject.accessibilityText, "")
+        XCTAssertFalse(subject.showsEnhancedFrameRateHighlight)
+    }
+
+    func testGeneratedOutputRequiresActualKnownBranchesAndClassifiesEachCombination() {
+        let expected: [(PlaybackOutputTrackProcessing, PlaybackOutputTrackProcessing, PlaybackAirPlayOutputMode)] = [
+            (.copied, .copied, .remux), (.copied, .transcoded, .audioTranscode),
+            (.transcoded, .copied, .videoTranscode), (.transcoded, .transcoded, .mixedTranscode),
+            (.absent, .copied, .remux), (.absent, .transcoded, .audioTranscode),
+            (.copied, .absent, .remux), (.transcoded, .absent, .videoTranscode)]
+        for (video, audio, result) in expected {
+            XCTAssertEqual(PlaybackAirPlayOutputMode.generated(video: video, audio: audio), result)
+        }
+        XCTAssertNil(PlaybackAirPlayOutputMode.generated(video: nil, audio: .copied))
+        XCTAssertNil(PlaybackAirPlayOutputMode.generated(video: .copied, audio: nil))
+        XCTAssertNil(PlaybackAirPlayOutputMode.generated(video: .absent, audio: .absent))
     }
 
     private func mediaInformationForRouteTest() -> PlaybackMediaInformation {
