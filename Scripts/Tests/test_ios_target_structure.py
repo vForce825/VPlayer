@@ -51,6 +51,17 @@ class IOSTargetStructureTests(unittest.TestCase):
         self.assertEqual(runnable.attrib['BlueprintName'], 'VPlayeriOS')
         self.assertEqual(runnable.attrib['BuildableName'], 'VPlayer.app')
 
+    def test_ios_architectures_match_the_audited_arm64_profile_only(self):
+        for target in ['VPlayerCoreiOS', 'VPlayerPlaybackiOS', 'VPlayeriOS', 'VPlayeriOSTests', 'VPlayeriOSUITests']:
+            self.assertIn('ARCHS: arm64', self.target(target))
+        project=(ROOT/'VPlayer.xcodeproj/project.pbxproj').read_text()
+        configurations=re.findall(r'buildSettings = \{(.*?)\n\t\t\t\};', project, re.S)
+        phone=[c for c in configurations if 'SDKROOT = iphoneos;' in c]
+        self.assertEqual(len(phone), 10)
+        for configuration in phone: self.assertIn('ARCHS = arm64;', configuration)
+        for target in ['VPlayerCore', 'VPlayerPlayback', 'VPlayer', 'VPlayerTests', 'VPlayerUITests']:
+            self.assertNotIn('ARCHS:', self.target(target))
+
     def test_tv_target_identity_remains_unchanged(self):
         app=self.target('VPlayer')
         self.assertIn('platform: tvOS',app)

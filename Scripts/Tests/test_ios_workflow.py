@@ -24,4 +24,11 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertGreater(text.index('name: Fail closed until generated outputs are committed'),
                            text.index('name: Run shared playback and iPhone touch tests'))
         self.assertIn("always() && steps.generated.outputs.needs_refresh == 'true'", text)
+    def test_native_configurations_are_independent_but_still_fail_the_job(self):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        self.assertIn('id: prepare', text)
+        self.assertIn('id: simulator', text)
+        guard="if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'"
+        self.assertEqual(text.count(guard), 2)
+        self.assertNotIn('continue-on-error', text)
 if __name__=='__main__':unittest.main()

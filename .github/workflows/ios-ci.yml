@@ -51,6 +51,7 @@ jobs:
           mint run yonaskolb/XcodeGen@2.44.1 xcodegen generate --spec project.yml --project . --project-root .
           python3 Scripts/emit-generated-ios-inputs.py emit --baseline "$RUNNER_TEMP/generated-before.json"
       - name: Prepare audited iOS dependency profile
+        id: prepare
         timeout-minutes: 40
         run: |
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
@@ -68,6 +69,7 @@ jobs:
           python3 Scripts/Tests/test_ios_pip_contract.py
           python3 Scripts/Tests/test_ios_workflow.py
       - name: Choose an available iOS 27 iPhone simulator
+        id: simulator
         run: |
           device="$(xcrun simctl list devices available -j | jq -r '
             .devices | to_entries[] | select(.key | contains("iOS-27-0")) |
@@ -81,6 +83,7 @@ jobs:
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/iOS-Device" CODE_SIGNING_ALLOWED=NO
       - name: Verify Release simulator cold starts without fixture bypass
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 20
         run: |
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayeriOSReleaseStartup \
@@ -89,6 +92,7 @@ jobs:
             -resultBundlePath "$RUNNER_TEMP/iOS-Release.xcresult" \
             CODE_SIGNING_ALLOWED=NO -parallel-testing-enabled NO
       - name: Run shared playback and iPhone touch tests
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 60
         run: |
           Scripts/test-ios.sh -configuration Debug \

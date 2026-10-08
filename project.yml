@@ -186,6 +186,7 @@ targets:
       - path: Sources/VPlayerCore
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_NAME: VPlayerCore
         PRODUCT_MODULE_NAME: VPlayerCore
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core.ios
@@ -230,6 +231,7 @@ targets:
       - sdk: QuartzCore.framework
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_NAME: VPlayerPlayback
         PRODUCT_MODULE_NAME: VPlayerPlayback
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback.ios
@@ -284,6 +286,7 @@ targets:
       - sdk: NowPlaying.framework
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_NAME: VPlayer
         PRODUCT_MODULE_NAME: VPlayer
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer.ios
@@ -335,6 +338,7 @@ targets:
       - target: VPlayeriOS
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests.ios
         GENERATE_INFOPLIST_FILE: true
   VPlayeriOSUITests:
@@ -347,6 +351,7 @@ targets:
       - target: VPlayeriOS
     settings:
       base:
+        ARCHS: arm64
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests.ios
         GENERATE_INFOPLIST_FILE: true
         TEST_TARGET_NAME: VPlayeriOS
