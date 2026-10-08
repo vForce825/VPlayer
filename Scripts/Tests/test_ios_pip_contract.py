@@ -13,11 +13,18 @@ class IOSPiPContractTests(unittest.TestCase):
         for contract in ['sampleBufferDisplayLayer:', 'playerLayer:', 'requiresLinearPlayback', 'canStartPictureInPictureAutomaticallyFromInline', 'restoreUserInterfaceForPictureInPictureStopWithCompletionHandler']:
             self.assertIn(contract,text)
         self.assertNotIn('setValue(',text)
+        self.assertIn('pending?.0 == identity',text, 'Unmount must cancel the matching queued PiP source')
         self.assertIn('PiPCallbackReference',text, 'Controller identity must remain pinned across actor hops')
     def test_root_retains_session_independently_of_cover_visibility(self):
         text=(ROOT/'Sources/VPlayeriOSApp/IOSRootView.swift').read_text()
         self.assertIn('isFullScreenPresented',text)
         self.assertNotIn('.fullScreenCover(item: $session)',text)
+    def test_remote_stop_retires_root_session_without_using_view_disappearance(self):
+        text=(ROOT/'Sources/VPlayeriOSApp/Player/IOSPlaybackSession.swift').read_text()
+        self.assertIn('if case .stopped = model.state { close(); return }',text)
+        view=(ROOT/'Sources/VPlayeriOSApp/Player/IOSFullScreenPlayerView.swift').read_text()
+        self.assertNotIn('onDisappear { session.close()',view)
+
     def test_lifecycle_closes_gpu_before_background_and_restores_foreground_policy(self):
         path=ROOT/'Sources/VPlayeriOSApp/Player/IOSVideoProcessingLifecycle.swift'
         self.assertTrue(path.exists(),'synchronous visual lifecycle observer is missing')

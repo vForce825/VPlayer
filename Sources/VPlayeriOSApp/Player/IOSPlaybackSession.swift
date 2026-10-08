@@ -55,6 +55,7 @@ final class IOSPlaybackSession: Identifiable {
     }
     private func observePlaybackState() {
         guard !isClosing else { return }
+        if case .stopped = model.state { close(); return }
         withObservationTracking {
             pictureInPicture.update(state: model.state, paused: model.isPaused)
         } onChange: { [weak self] in

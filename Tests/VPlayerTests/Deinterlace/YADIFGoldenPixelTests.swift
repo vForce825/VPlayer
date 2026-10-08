@@ -358,6 +358,37 @@ final class YADIFGoldenPixelTests: XCTestCase {
         try await verifyP010Golden(order: .bottom, stem: "bff")
     }
 
+    #if os(iOS)
+    func testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly() throws {
+        for (format, name, bytesPerFrame) in [
+            (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "nv12", Self.nv12BytesPerFrame),
+            (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, "p010", Self.p010BytesPerFrame),
+        ] {
+            for (order, stem) in [(FieldParity.top, "tff"), (FieldParity.bottom, "bff")] {
+                let inputBytes = try fixture("yadif-\(name)-\(stem)-input.bin")
+                let expected = try fixture("yadif-\(name)-\(stem).bin")
+                let inputs = try (0..<5).map { index in
+                    try makePixelBuffer(pixelFormat: format,
+                        bytes: inputBytes.subdata(in: index * bytesPerFrame..<(index + 1) * bytesPerFrame))
+                }
+                let pool = ProgressiveSurfacePool()
+                var actual = Data()
+                for center in 1...3 {
+                    let outputs = try pool.allocatePair(matching: inputs[center])
+                    try CPUVideoProcessing.yadif(job: YADIFJob(
+                        previous: normalized(inputs[center - 1], id: UInt64(center)),
+                        current: normalized(inputs[center], id: UInt64(center + 1)),
+                        next: normalized(inputs[center + 1], id: UInt64(center + 2)),
+                        order: resolved(order), spatialOnly: false), outputs: outputs)
+                    actual.append(try packedBytes(outputs.first))
+                    actual.append(try packedBytes(outputs.second))
+                }
+                XCTAssertEqual(actual, expected, "\(name) \(stem) CPU adapter")
+            }
+        }
+    }
+    #endif
+
     func testMapperSelectsExactNV12AndP010PlaneFormatsForVideoAndFullRange() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal device unavailable")

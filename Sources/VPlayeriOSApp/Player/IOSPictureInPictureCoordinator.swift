@@ -95,6 +95,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         installPendingIfPossible()
     }
     func retire(identity: PresentationIdentity) {
+        if pending?.0 == identity { pending = nil }
         guard presentationIdentity == identity else { return }
         pending = nil
         retireCurrent()

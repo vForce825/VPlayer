@@ -84,6 +84,8 @@ jobs:
           python3 Scripts/Tests/test_ios_platform_boundaries.py
           python3 Scripts/Tests/test_ios_target_structure.py
           python3 Scripts/Tests/test_cpu_video_processing.py
+          python3 Scripts/Tests/test_ios_pip_contract.py
+          python3 Scripts/Tests/test_ios_workflow.py
       - name: Choose an available iOS 27 iPhone simulator
         run: |
           device="$(xcrun simctl list devices available -j | jq -r '
