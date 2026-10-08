@@ -58,56 +58,153 @@ def owned_process_rows(listing,pid,derived_data):
             owned.append(fields[:6]+[arguments[0]])
     return owned
 
-def sample_owned_processes(process,directory,command):
-    if sys.platform!='darwin' or Path(command[0]).name!='xcodebuild':return
-    derived_data=Path(command[command.index('-derivedDataPath')+1]) if '-derivedDataPath' in command else None
-    listing=subprocess.run(['ps','-axo','pid=,ppid=,pgid=,pcpu=,etime=,rss=,command='],
-        capture_output=True,text=True,timeout=5,check=False).stdout
-    owned=owned_process_rows(listing,process.pid,derived_data)
-    print('IOS_STARTUP_OWNED_PROCESS_STATE='+json.dumps(owned[:24]),flush=True)
-    candidates=[str(process.pid)]+[row[0] for row in owned if 'swift-frontend' in row[6]][:1]
-    for pid in candidates:
-        sample=directory/('owned-sample-'+pid+'.txt')
-        try:subprocess.run(['sample',pid,'2','1','-file',str(sample)],
-            stdout=subprocess.DEVNULL,stderr=subprocess.STDOUT,timeout=8,check=False)
-        except subprocess.TimeoutExpired:continue
-        if sample.exists():print(bounded_log(sample).decode('utf-8','replace'),flush=True)
+def native_ps_environment():
+    # Darwin legacy mode ignores -g; keep the override local to these reads.
+    return dict(os.environ, COMMAND_MODE='unix2003', LC_ALL='C')
 
-def group_has_executing_members(pgid):
-    result=subprocess.run(['ps','-axo','pid=,pgid=,stat='],capture_output=True,text=True,timeout=3,check=True)
-    if not result.stdout.strip():raise RuntimeError('Empty process-group inventory')
+def sample_owned_processes(process,directory,command):
+    if sys.platform!='darwin':return
+    build=Path(command[0]).name=='xcodebuild'
+    boot=(len(command)>2 and Path(command[0]).name=='xcrun'
+          and command[1]=='simctl' and command[2] in {'boot','bootstatus'})
+    if not (build or boot):return
+    def sample_pid(pid):
+        print('IOS_STARTUP_PROCESS_SAMPLE_PID='+str(pid),flush=True)
+        sample=directory/('owned-sample-'+str(pid)+'.txt')
+        diagnostic=directory/('sample-command-'+str(pid)+'.log')
+        with diagnostic.open('wb') as output:
+            try:
+                result=subprocess.run(['sample',str(pid),'2','1','-file',str(sample)],
+                    stdout=output,stderr=subprocess.STDOUT,timeout=8,check=False)
+            except subprocess.TimeoutExpired:
+                print('IOS_STARTUP_PROCESS_SAMPLE_TIMEOUT='+str(pid),flush=True)
+                return
+            except OSError as error:
+                print('IOS_STARTUP_PROCESS_SAMPLE_ERROR='+json.dumps({'pid':pid,'error':type(error).__name__,'errno':error.errno}),flush=True)
+                return
+        if result.returncode:
+            print('IOS_STARTUP_PROCESS_SAMPLE_FAILED='+json.dumps({'pid':pid,'exit':result.returncode}),flush=True)
+            print(bounded_log(diagnostic).decode('utf-8','replace'),flush=True)
+        if sample.exists():print(bounded_log(sample).decode('utf-8','replace'),flush=True)
+    # Obtain the known, owned PID's stack before any process enumeration or
+    # CoreSimulator IPC. This also distinguishes xcrun resolution from simctl.
+    sample_pid(process.pid)
+    if not build:return
+    derived_data=Path(command[command.index('-derivedDataPath')+1]) if '-derivedDataPath' in command else None
+    result=subprocess.run(['/bin/ps','-g',str(process.pid),'-o','pid=,ppid=,pgid=,pcpu=,etime=,rss=,command='],
+        env=native_ps_environment(),capture_output=True,text=True,timeout=5,check=False)
+    if result.returncode or result.stderr:
+        print('IOS_STARTUP_SCOPED_PROCESS_QUERY_FAILED='+json.dumps({'pgid':process.pid,'exit':result.returncode}),flush=True)
+        print(result.stderr[:2048],flush=True)
+        return
+    owned=owned_process_rows(result.stdout,process.pid,derived_data)
+    print('IOS_STARTUP_OWNED_PROCESS_STATE='+json.dumps(owned[:24]),flush=True)
+    # Service-spawned compiler processes outside this owned group are not
+    # enumerated or claimed retired; no global ps dependency in native diagnosis.
+    for row in owned:
+        if 'swift-frontend' in row[6] and row[0]!=str(process.pid):
+            sample_pid(row[0]);break
+
+def group_has_executing_members(pgid,timeout=3,require_leader=False):
+    darwin=sys.platform=='darwin'
+    command=(['/bin/ps','-g',str(pgid),'-o','pid=,pgid=,stat='] if darwin
+             else ['ps','-axo','pid=,pgid=,stat='])
+    try:
+        result=subprocess.run(command,env=native_ps_environment(),capture_output=True,
+            text=True,timeout=timeout,check=False)
+    except (OSError,subprocess.SubprocessError) as error:
+        print('IOS_STARTUP_GROUP_QUERY_FAILED='+json.dumps({'pgid':pgid,'error':type(error).__name__}),flush=True)
+        raise
+    if len(result.stdout)>65536 or len(result.stderr)>8192:
+        raise RuntimeError('Process-group inventory exceeded its bound')
+    # Darwin ps exits 1 when its exact selector matches no processes. A sysctl
+    # error may instead exit 0 with stderr, so neither exit alone proves absence.
+    if darwin and result.returncode==1 and not result.stdout.strip() and not result.stderr.strip():
+        if require_leader:raise RuntimeError('Pinned leader missing from process-group inventory')
+        print('IOS_STARTUP_GROUP_STATES='+json.dumps({'pgid':pgid,'states':[]}),flush=True)
+        return False
+    if result.returncode or result.stderr.strip() or not result.stdout.strip():
+        print('IOS_STARTUP_GROUP_QUERY_FAILED='+json.dumps({'pgid':pgid,'exit':result.returncode,
+            'stderr':result.stderr[:512]}),flush=True)
+        raise RuntimeError('Unverified process-group inventory')
     states=[]
+    pids=set()
+    group_pids=set()
     for line in result.stdout.splitlines():
         if not line.strip():continue
         fields=line.split()
-        if len(fields)!=3 or not fields[0].isdigit() or not fields[1].isdigit():raise RuntimeError('Ambiguous process-group inventory')
-        if fields[1]==str(pgid):states.append(fields[2])
-    print('IOS_STARTUP_GROUP_STATES='+json.dumps({'pgid':pgid,'states':states}),flush=True)
+        if (len(fields)!=3 or not fields[0].isdigit() or not fields[1].isdigit()
+                or not re.fullmatch(r'[IRSDTtUZXPWKH][A-Za-z0-9<>+\-]{0,15}',fields[2])):
+            raise RuntimeError('Ambiguous process-group inventory')
+        if fields[0] in pids:raise RuntimeError('Duplicate PID in process-group inventory')
+        pids.add(fields[0])
+        if darwin and fields[1]!=str(pgid):
+            raise RuntimeError('Scoped process-group inventory returned another group')
+        if fields[2].startswith('Z') and not re.fullmatch(r'Z[<>+AELNSsVWXl]*',fields[2]):
+            raise RuntimeError('Ambiguous zombie process state')
+        if fields[1]==str(pgid):
+            states.append(fields[2]);group_pids.add(fields[0])
+    if require_leader and str(pgid) not in group_pids:
+        raise RuntimeError('Pinned leader missing from process-group inventory')
+    print('IOS_STARTUP_GROUP_STATES='+json.dumps({'pgid':pgid,'states':states[:24],'count':len(states)}),flush=True)
     return any(not state.startswith('Z') for state in states)
 
-def signal_group_or_retired(pgid,sig):
+def signal_group_or_retired(pgid,sig,deadline=None,require_leader=False):
     try:os.killpg(pgid,sig);return True
     except ProcessLookupError:return False
     except PermissionError:
-        # Darwin killpg1 skips zombies and may return EPERM for a zombie-only
-        # group. Never equate EPERM with retirement without fresh OS evidence.
-        if not group_has_executing_members(pgid):return False
-        raise
+        # Darwin may report EPERM for zombies. A scoped Z-only observation is
+        # necessary, but is not atomic: corroborate it with another kernel probe.
+        remaining=3 if deadline is None else min(3,deadline-time.monotonic())
+        if remaining<=0:raise
+        if group_has_executing_members(pgid,timeout=remaining,require_leader=require_leader):raise
+        if deadline is not None and time.monotonic()>=deadline:raise
+        try:os.killpg(pgid,0)
+        except (ProcessLookupError,PermissionError):return False
+        return True
 
 def retire_owned_group(process,graces=((signal.SIGINT,10),(signal.SIGTERM,5),(signal.SIGKILL,5))):
+    if getattr(process,'returncode',None) is not None:
+        raise RuntimeError('Session leader already reaped; group identity is unverified')
+    # Keep the session leader unreaped until the last group observation/signal.
+    # This pins numerical identity during cleanup; do not use Popen.poll here.
+    retired=False
+    uncertainty=None
     for sig,grace in graces:
-        if not signal_group_or_retired(process.pid,sig):break
-        # Reap the leader without mistaking its exit for group retirement.
         deadline=time.monotonic()+grace
-        while time.monotonic()<deadline:
-            process.poll()
-            if not signal_group_or_retired(process.pid,0):break
-            time.sleep(0.05)
-        else:continue
-        break
+        if not signal_group_or_retired(process.pid,sig,deadline=deadline,require_leader=True):
+            retired=True;break
+        while True:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:break
+            if sys.platform=='darwin':
+                # Success indicates signalable members: never let a ps-only
+                # observation override it. EPERM needs corroborated Z evidence.
+                # Permission/unknown evidence propagates without alternate signals.
+                alive=signal_group_or_retired(process.pid,0,deadline=deadline,require_leader=True)
+            else:
+                # Linux killpg(0) also counts zombies; use its separate bounded
+                # process-state observation while the leader's identity is pinned.
+                try:
+                    alive=group_has_executing_members(process.pid,timeout=min(3,remaining),require_leader=True)
+                    uncertainty=None
+                except (OSError,RuntimeError,subprocess.SubprocessError) as error:
+                    uncertainty=error
+                    remaining=deadline-time.monotonic()
+                    if remaining>0:time.sleep(remaining)
+                    break
+            if not alive:
+                retired=True;break
+            remaining=deadline-time.monotonic()
+            if remaining<=0:break
+            time.sleep(min(0.25,remaining))
+        if retired:break
+    if not retired:
+        raise RuntimeError('Owned process-group retirement unverified; executing descendants may remain') from uncertainty
+    # This is bounded observed retirement evidence, not an atomic kernel snapshot
+    # or a supervisor for arbitrary fork/exit chains. Consume it once before reap;
+    # no later PID/PGID query or signal can target a reused numerical identity.
     process.wait(timeout=5)
-    if group_has_executing_members(process.pid):
-        raise RuntimeError('Owned process group still has executing descendants')
 
 def run_command(label,command,timeout,directory,diagnostics):
     path=directory/(label+'.log')
@@ -128,7 +225,12 @@ def run_command(label,command,timeout,directory,diagnostics):
             except Exception as error:
                 print('IOS_STARTUP_DIAGNOSTIC_FAILED='+type(error).__name__,flush=True)
             finally:
-                retire_owned_group(process)
+                try:
+                    retire_owned_group(process)
+                except (OSError,RuntimeError,subprocess.SubprocessError) as error:
+                    print('IOS_STARTUP_CLEANUP_UNVERIFIED='+type(error).__name__,flush=True)
+                else:
+                    print('IOS_STARTUP_CLEANUP_VERIFIED=1',flush=True)
             code=124
     markers=bytearray()
     with path.open('rb') as source:
@@ -152,27 +254,19 @@ def main():
     directory=Path(tempfile.mkdtemp(prefix='vplayer-ios-startup-'))
     def small(command,timeout=15):
         path=directory/'diagnostic.log'
+        succeeded=False
         with path.open('wb') as output:
-            try:subprocess.run(command,stdout=output,stderr=subprocess.STDOUT,timeout=timeout,check=False)
+            try:
+                result=subprocess.run(command,stdout=output,stderr=subprocess.STDOUT,timeout=timeout,check=False)
+                succeeded=result.returncode==0
+                if not succeeded:print('IOS_STARTUP_DIAGNOSTIC_EXIT='+str(result.returncode),flush=True)
             except subprocess.TimeoutExpired:print('IOS_STARTUP_DIAGNOSTIC_TIMEOUT',flush=True)
         with path.open('rb') as source:
             source.seek(max(0,path.stat().st_size-16384))
             print(source.read(16384).decode('utf-8','replace'),flush=True)
+        return succeeded
     def diagnostics():
-        small(['xcrun','simctl','list','devices','booted','-j'])
-        # Only current selected-simulator app/runner processes are sampled.
-        listing=subprocess.run(['ps','-axo','pid=,command='],capture_output=True,text=True,timeout=5).stdout
-        sampled=0
-        for line in listing.splitlines():
-            parts=line.strip().split(None,1)
-            if len(parts)!=2 or args.simulator.lower() not in parts[1].lower():continue
-            if not re.search(r'/(VPlayer|VPlayeriOSUITests-Runner)(?:\s|$)',parts[1]):continue
-            if sampled>=2:break
-            sampled+=1
-            print('IOS_STARTUP_SCOPED_PROCESS_PID='+parts[0],flush=True)
-            sample=directory/('sample-'+parts[0]+'.txt')
-            small(['sample',parts[0],'2','1','-file',str(sample)],timeout=8)
-            if sample.exists():print(sample.read_text(errors='replace')[:16384],flush=True)
+        if not small(['xcrun','simctl','list','devices','booted','-j']):return
         small(['xcrun','simctl','spawn',args.simulator,'log','show','--last','2m','--style','compact',
                '--predicate','process == "VPlayer" OR process == "VPlayeriOSUITests-Runner" OR process == "testmanagerd"'])
     overall_deadline=time.monotonic()+17*60

@@ -66,6 +66,10 @@ struct IOSFullScreenPlayerView: View {
             .foregroundStyle(.white)
         }
         .accessibilityIdentifier("player-full-screen")
+        #if DEBUG
+        .onAppear { IOSPlaybackRouteDiagnostics.record("cover-appeared") }
+        .onDisappear { IOSPlaybackRouteDiagnostics.record("cover-disappeared") }
+        #endif
         .task { session.start() }
         .task(id: controls.key) {
             let key = controls.key

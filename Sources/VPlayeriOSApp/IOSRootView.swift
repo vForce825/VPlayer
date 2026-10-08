@@ -3,6 +3,7 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import SwiftUI
+import UIKit
 import VPlayerCore
 import VPlayerPlayback
 
@@ -67,6 +68,9 @@ struct IOSRootView: View {
                         Label(active.presentation.request.title, systemImage: "play.rectangle")
                             .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                     }
+                    #if DEBUG
+                    .accessibilityIdentifier("player-mini-resume")
+                    #endif
                     Button { active.model.togglePause() } label: {
                         Image(systemName: active.model.isPaused ? "play.fill" : "pause.fill")
                     }.accessibilityLabel(active.model.isPaused ? "播放" : "暂停")
@@ -85,17 +89,47 @@ struct IOSRootView: View {
                 IOSFullScreenPlayerView(session: active) { model.dismissPlayback() }
                     .id(active.id)
                     .interactiveDismissDisabled()
+                    #if DEBUG
+                    .overlay(alignment: .topLeading) { routeProbe }
+                    #endif
             }
         }
+        #if DEBUG
+        .overlay(alignment: .topLeading) { routeProbe }
+        #endif
     }
+    #if DEBUG
+    @ViewBuilder private var routeProbe: some View {
+        if IOSPlaybackRouteDiagnostics.isEnabled {
+            IOSPlaybackRouteProbe {
+                IOSPlaybackRouteDiagnostics.snapshot(request: model.presentedPlaybackRequest,
+                    session: session, isLoading: model.isLoading)
+            }
+            .frame(width: 1, height: 1)
+            .allowsHitTesting(false)
+        }
+    }
+    #endif
     private var fullScreenBinding: Binding<Bool> {
         let owner = session
-        return Binding(get: { owner?.isFullScreenPresented ?? false }, set: { value in
+        return Binding(get: {
+            let value = owner?.isFullScreenPresented ?? false
+            #if DEBUG
+            IOSPlaybackRouteDiagnostics.readBinding(ownerID: owner?.id, value: value)
+            #endif
+            return value
+        }, set: { value in
+            #if DEBUG
+            IOSPlaybackRouteDiagnostics.record("binding-write:\(value):current=\(session?.id == owner?.id)")
+            #endif
             guard session?.id == owner?.id else { return }
             owner?.isFullScreenPresented = value
         })
     }
     private func replaceSession(for request: PlaybackRequest?) {
+        #if DEBUG
+        IOSPlaybackRouteDiagnostics.record("request-change:\(request != nil)")
+        #endif
         guard session?.id != request?.id else { return }
         let previous = session
         if let request {
@@ -105,6 +139,80 @@ struct IOSRootView: View {
                 programmes: model.programmesByChannelID[request.channelID, default: []]),
                 dependencies: dependencies)
         } else { session = nil }
+        #if DEBUG
+        IOSPlaybackRouteDiagnostics.replaceSession(id: session?.id)
+        #endif
         previous?.close()
     }
 }
+
+#if DEBUG
+/// Test-only values, deliberately not observable: inspecting a failed route must
+/// not add SwiftUI dependencies or cause a second presentation attempt.
+@MainActor
+enum IOSPlaybackRouteDiagnostics {
+    static let isEnabled = ProcessInfo.processInfo.arguments.contains("-ui-playback-route-diagnostics") &&
+        AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments).mode == .seededFixture
+    private static var events: [String] = []
+    private static var currentSessionID: UUID?
+    private static var bindingReads = 0
+    private static var staleBindingReads = 0
+    private static var lastBindingValue = false
+    private static var lastBindingOwnerMatches = true
+
+    static func record(_ event: @autoclosure () -> String) {
+        guard isEnabled else { return }
+        events.append(event())
+        if events.count > 12 { events.removeFirst(events.count - 12) }
+    }
+    static func replaceSession(id: UUID?) {
+        guard isEnabled else { return }
+        currentSessionID = id
+        record("session-replaced:\(id != nil)")
+    }
+    static func readBinding(ownerID: UUID?, value: Bool) {
+        guard isEnabled else { return }
+        bindingReads = min(bindingReads + 1, 1_000_000)
+        lastBindingOwnerMatches = ownerID == currentSessionID
+        if !lastBindingOwnerMatches { staleBindingReads = min(staleBindingReads + 1, 1_000_000) }
+        lastBindingValue = value
+    }
+    static func snapshot(request: PlaybackRequest?, session: IOSPlaybackSession?, isLoading: Bool) -> String {
+        "request=\(request != nil) session=\(session != nil) matching=\(request?.id == session?.id) " +
+            "loading=\(isLoading) closing=\(session?.isClosing ?? false) " +
+            "fullScreen=\(session?.isFullScreenPresented ?? false) " +
+            "binding=\(lastBindingValue) ownerMatches=\(lastBindingOwnerMatches) " +
+            "reads=\(bindingReads) staleReads=\(staleBindingReads) " +
+            "events=[\(events.joined(separator: ","))]"
+    }
+}
+
+/// The getter runs only when accessibility queries it, outside SwiftUI's body
+/// evaluation. The closure reads the root's live State storage, not a session
+/// captured while the initial library screen is loading.
+private struct IOSPlaybackRouteProbe: UIViewRepresentable {
+    let snapshot: @MainActor () -> String
+    func makeUIView(context: Context) -> IOSPlaybackRouteProbeView {
+        let view = IOSPlaybackRouteProbeView()
+        view.isAccessibilityElement = true
+        view.accessibilityIdentifier = "ios.playback.route"
+        view.accessibilityLabel = "Playback route diagnostics"
+        view.snapshot = snapshot
+        return view
+    }
+    func updateUIView(_ view: IOSPlaybackRouteProbeView, context: Context) {
+        view.snapshot = snapshot
+    }
+    static func dismantleUIView(_ view: IOSPlaybackRouteProbeView, coordinator: ()) {
+        view.snapshot = nil
+    }
+}
+
+private final class IOSPlaybackRouteProbeView: UIView {
+    var snapshot: (@MainActor () -> String)?
+    override var accessibilityValue: String? {
+        get { snapshot?() }
+        set {}
+    }
+}
+#endif

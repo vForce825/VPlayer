@@ -49,12 +49,20 @@ final class IOSPlaybackSession {
     }
     func start() {
         guard !isClosing, !hasStarted else { return }
+        #if DEBUG
+        IOSPlaybackRouteDiagnostics.record("session-start:stopped=\(model.hasStoppedCurrentRequest)")
+        #endif
         hasStarted = true
         model.start()
         observePlaybackState()
     }
     private func observePlaybackState() {
         guard !isClosing else { return }
+        #if DEBUG
+        if IOSPlaybackRouteDiagnostics.isEnabled, model.hasStoppedCurrentRequest {
+            IOSPlaybackRouteDiagnostics.record("observed-current-stop")
+        }
+        #endif
         if model.hasStoppedCurrentRequest { close(); return }
         withObservationTracking {
             pictureInPicture.update(state: model.state, paused: model.isPaused)
@@ -86,6 +94,9 @@ final class IOSPlaybackSession {
     }
     func close() {
         guard !isClosing else { return }
+        #if DEBUG
+        IOSPlaybackRouteDiagnostics.record("session-close:stopped=\(model.hasStoppedCurrentRequest)")
+        #endif
         isClosing = true
         restoreTask?.cancel()
         restoreTask = nil

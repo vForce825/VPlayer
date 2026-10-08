@@ -17,11 +17,14 @@ import selectors
 import subprocess
 import sys
 import time
+from urllib.parse import unquote, urlsplit
 
 MAX_JSON = 8 * 1024 * 1024
 MAX_OUTPUT = 16 * 1024
 MAX_NODES = 25000
 MAX_DEPTH = 64
+MAX_SKIP_DETAILS = 4
+MAX_DETAILS_JSON = 256 * 1024
 KNOWN_RESULTS = frozenset({'Passed', 'Failed', 'Skipped', 'Expected Failure'})
 
 # Immutable, explicit identities: missing tests remain visible in the report.
@@ -138,7 +141,7 @@ def resolve(document, declaration):
     return declaration
 
 
-def verified_schema(document):
+def schema_properties(document, root_name):
     if not isinstance(document, dict):
         raise ValueError('invalid_schema')
     root = document
@@ -150,10 +153,10 @@ def verified_schema(document):
             definitions = document[namespace]
             if not isinstance(definitions, dict):
                 raise ValueError('invalid_schema_definitions')
-            if 'Tests' in definitions:
-                candidates.append(definitions['Tests'])
-        if 'Tests' in document:
-            candidates.append(document['Tests'])
+            if root_name in definitions:
+                candidates.append(definitions[root_name])
+        if root_name in document:
+            candidates.append(document[root_name])
         if len(candidates) != 1:
             raise ValueError('missing_or_ambiguous_tests_schema')
         root = candidates[0]
@@ -163,7 +166,12 @@ def verified_schema(document):
     root_properties = root.get('properties')
     if not isinstance(root_properties, dict):
         raise ValueError('invalid_schema_properties')
-    array = resolve(document, root_properties.get('testNodes'))
+    return root_properties
+
+
+def verified_schema(document, root_name='Tests', nodes_field='testNodes'):
+    root_properties = schema_properties(document, root_name)
+    array = resolve(document, root_properties.get(nodes_field))
     if array.get('type') != 'array':
         raise ValueError('unsupported_test_nodes_schema')
     node = resolve(document, array.get('items'))
@@ -194,6 +202,18 @@ def short_text(value, limit=512):
     return ''.join(c if c >= ' ' else ' ' for c in value).encode('utf-8')[:limit].decode('utf-8', 'ignore')
 
 
+def matches_test_identifier_url(value, identifier):
+    if not isinstance(value, str) or len(value) > 2048 or any(c < ' ' or c == '\x7f' for c in value):
+        return False
+    try:
+        parts = urlsplit(value)
+        path = unquote(parts.path, errors='strict').removesuffix('()')
+        return (parts.scheme == 'test' and parts.netloc == 'com.apple.xcode'
+                and not parts.query and not parts.fragment and path.endswith('/' + identifier))
+    except ValueError:
+        return False
+
+
 def branch_facts(node):
     reasons, attempts = [], []
     stack = [(child, node.get('result')) for child in node.get('children', [])]
@@ -212,8 +232,19 @@ def branch_facts(node):
     return reasons, attempts
 
 
-def analyze(schema, data, manifest=DEFAULT_TESTS):
+def analyze(schema, data, manifest=DEFAULT_TESTS, detail_ids=None):
     node_types, results = verified_schema(schema)
+    identifier_supported = False
+    if detail_ids is not None:
+        properties = schema_properties(schema, 'Tests')
+        array = resolve(schema, properties['testNodes'])
+        node = resolve(schema, array['items'])
+        declaration = node['properties'].get('nodeIdentifierURL')
+        if declaration is not None:
+            try:
+                identifier_supported = resolve(schema, declaration).get('type') == 'string'
+            except ValueError:
+                pass
     if not isinstance(data, dict) or not isinstance(data.get('testNodes'), list):
         raise ValueError('invalid_test_tree')
     found = {identifier: [] for identifier in manifest}
@@ -263,8 +294,116 @@ def analyze(schema, data, manifest=DEFAULT_TESTS):
                     row['status'] = state
                     if state == 'Skipped':
                         row['reason'] = short_text('; '.join(reasons)) if reasons else 'reason_unavailable'
+                        detail_id = node.get('nodeIdentifierURL')
+                        if identifier_supported and matches_test_identifier_url(detail_id, identifier):
+                            detail_ids[identifier] = detail_id
         rows.append(row)
     return rows
+
+
+def verified_details_schema(schema):
+    fields = schema_properties(schema, 'TestDetails')
+    for name in ('testIdentifier', 'testIdentifierURL', 'testResult'):
+        declaration = resolve(schema, fields.get(name))
+        if declaration.get('type') != 'string':
+            raise ValueError('unsupported_details_scalar_schema')
+        if name == 'testResult' and 'enum' in declaration:
+            values = declaration['enum']
+            if (not isinstance(values, list) or not all(isinstance(value, str) for value in values)
+                    or 'Skipped' not in values):
+                raise ValueError('unsupported_details_result_schema')
+    return verified_schema(schema, 'TestDetails', 'testRuns')
+
+
+def details_skip_reason(schema, data, identifier, detail_id):
+    node_types, results = verified_details_schema(schema)
+    if (not matches_test_identifier_url(detail_id, identifier)
+            or not isinstance(data, dict) or data.get('testIdentifierURL') != detail_id
+            or data.get('testResult') != 'Skipped'
+            or not isinstance(data.get('testIdentifier'), str)
+            or data['testIdentifier'].removesuffix('()') not in {identifier, identifier.split('/', 1)[1]}):
+        raise ValueError('details_identity_or_status_mismatch')
+    if not isinstance(data.get('testRuns'), list):
+        raise ValueError('details_payload_unavailable')
+    reasons, count = [], 0
+    stack = [(node, True, 0) for node in data['testRuns']]
+    while stack:
+        node, skipped_branch, depth = stack.pop()
+        count += 1
+        if (count > MAX_NODES or depth > MAX_DEPTH or not isinstance(node, dict)
+                or not isinstance(node.get('nodeType'), str) or not isinstance(node.get('name'), str)
+                or (node_types is not None and node['nodeType'] not in node_types)
+                or not isinstance(node.get('children', []), list)):
+            raise ValueError('details_payload_unavailable')
+        if 'result' in node:
+            state = node['result']
+            if (not isinstance(state, str) or state not in KNOWN_RESULTS
+                    or (results is not None and state not in results)):
+                raise ValueError('details_payload_unavailable')
+            skipped_branch = skipped_branch and state == 'Skipped'
+        # A nested test belongs to a different identity, even if its result is Skipped.
+        skipped_branch = skipped_branch and node['nodeType'] != 'Test Case'
+        if skipped_branch and node['nodeType'] == 'Failure Message':
+            message = short_text(node['name']).strip()
+            if message and message not in reasons:
+                reasons.append(message)
+        stack.extend((child, skipped_branch, depth + 1) for child in node.get('children', []))
+    return short_text('; '.join(reasons)) if reasons else None
+
+
+def enrich_skip_reasons(bundle, rows, detail_ids):
+    """Query only public metadata in this local bundle; never open logs or URLs."""
+    candidates = []
+    for row in rows:
+        if row['status'] != 'Skipped':
+            continue
+        if row.get('reason') != 'reason_unavailable':
+            row['reason_source'] = 'tests_failure_message'
+            continue
+        row['reason_source'] = 'unavailable'
+        if row['test'] not in detail_ids:
+            row['reason_detail'] = 'details_identifier_unavailable'
+        elif len(candidates) >= MAX_SKIP_DETAILS:
+            row['reason_detail'] = 'details_limit'
+        else:
+            candidates.append(row)
+    if not candidates:
+        return
+    failures = (ValueError, RuntimeError, OSError, RecursionError, subprocess.TimeoutExpired)
+    command = ['xcrun', 'xcresulttool', 'get', 'test-results', 'test-details']
+    diagnostic = 'details_help_unavailable'
+    try:
+        help_text = run_bounded(['xcrun', 'xcresulttool', 'help', 'get', 'test-results', 'test-details'],
+                                timeout=10, limit=MAX_DETAILS_JSON)
+        if any(option not in help_text for option in ('--path', '--schema', '--test-id')):
+            raise ValueError('unsupported_details_options')
+        diagnostic = 'details_schema_unavailable'
+        schema = json.loads(run_bounded(command + ['--schema'], timeout=10, limit=MAX_DETAILS_JSON))
+        verified_details_schema(schema)
+    except failures:
+        for row in candidates:
+            row['reason_detail'] = diagnostic
+        return
+    for row in candidates:
+        detail_id = detail_ids[row['test']]
+        try:
+            data = json.loads(run_bounded(command + ['--path', str(bundle), '--test-id', detail_id],
+                                           timeout=10, limit=MAX_DETAILS_JSON))
+        except failures:
+            row['reason_detail'] = 'details_read_unavailable'
+            continue
+        try:
+            reason = details_skip_reason(schema, data, row['test'], detail_id)
+        except failures as error:
+            row['reason_detail'] = ('details_identity_or_status_mismatch'
+                                    if str(error) == 'details_identity_or_status_mismatch'
+                                    else 'details_payload_unavailable')
+            continue
+        if reason:
+            row['reason'] = reason
+            row['reason_source'] = 'test_details_failure_message'
+        else:
+            row['reason_detail'] = 'details_reason_unavailable'
 
 
 def report_lines(rows, mode, shape=None):
@@ -356,7 +495,9 @@ def main(argv=None):
             shape = schema_shape(schema)
             raise
         data = json.loads(run_bounded(['xcrun', 'xcresulttool', 'get', 'test-results', 'tests', '--path', str(args.bundle)]))
-        rows = analyze(schema, data, manifest)
+        detail_ids = {}
+        rows = analyze(schema, data, manifest, detail_ids=detail_ids)
+        enrich_skip_reasons(args.bundle, rows, detail_ids)
     except (ValueError, RuntimeError, OSError, RecursionError, subprocess.TimeoutExpired) as error:
         # Do not publish stderr, payloads, paths, environment or arbitrary exceptions.
         reason = str(error) if isinstance(error, (ValueError, RuntimeError)) and re_safe(str(error)) else type(error).__name__

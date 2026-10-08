@@ -49,7 +49,15 @@ struct IOSChannelBrowserView: View {
                     ForEach(presentation.sections) { section in
                         Section {
                             ForEach(section.channels) { channel in
-                                Button { model.select(channel: channel) } label: {
+                                Button {
+                                    #if DEBUG
+                                    IOSPlaybackRouteDiagnostics.record("tap:loading=\(model.isLoading):profile=\(model.activeProfile?.id == channel.sourceProfileID):channel=\(model.channels.contains { $0.id == channel.id && $0.sourceProfileID == channel.sourceProfileID })")
+                                    #endif
+                                    model.select(channel: channel)
+                                    #if DEBUG
+                                    IOSPlaybackRouteDiagnostics.record("selected:request=\(model.presentedPlaybackRequest != nil):alert=\(model.alertMessage != nil)")
+                                    #endif
+                                } label: {
                                     IOSChannelRow(channel: channel,
                                         programmes: model.programmesByChannelID[channel.id, default: []])
                                 }

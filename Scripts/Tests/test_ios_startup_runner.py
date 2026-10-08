@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 import importlib.util
+import contextlib
+import io
 import os
 import signal
 import subprocess
@@ -11,7 +13,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 from types import SimpleNamespace
 ROOT=Path(__file__).resolve().parents[2]
 class IOSStartupRunnerTests(unittest.TestCase):
@@ -94,16 +96,16 @@ class IOSStartupRunnerTests(unittest.TestCase):
                 0.2,Path(directory),lambda:None)
             self.assertEqual(code,124)
             with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
-    def test_darwin_zombie_only_group_is_not_executing_but_live_member_is(self):
+    def test_linux_global_inventory_distinguishes_zombies_live_and_other_groups(self):
         module=self.module()
         for output,expected in [('10 100 Z\n11 100 Z+\n12 101 S\n',False),('10 100 S\n',True),('10 100 Z\n11 100 T\n',True),('12 101 S\n',False)]:
-            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout=output)):
+            with patch.object(module.sys,'platform','linux'), patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout=output,stderr="",returncode=0)):
                 self.assertEqual(module.group_has_executing_members(100),expected)
-        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='ambiguous')):
+        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='ambiguous',stderr='',returncode=0)):
             with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
     def test_unreadable_inventory_and_live_survivor_fail_cleanup(self):
         module=self.module()
-        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='')):
+        with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='',stderr='',returncode=0)):
             with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
         with patch.object(module.subprocess,'run',side_effect=subprocess.CalledProcessError(1,['ps'])):
             with self.assertRaises(subprocess.CalledProcessError):module.group_has_executing_members(100)
@@ -115,11 +117,148 @@ class IOSStartupRunnerTests(unittest.TestCase):
         module=self.module()
         with patch.object(module.os,'killpg',side_effect=PermissionError('synthetic Darwin group')):
             with patch.object(module,'group_has_executing_members',return_value=False) as check:
-                self.assertFalse(module.signal_group_or_retired(100,0));check.assert_called_once_with(100)
+                self.assertFalse(module.signal_group_or_retired(100,0));check.assert_called_once_with(100,timeout=3,require_leader=False)
             with patch.object(module,'group_has_executing_members',return_value=True):
                 with self.assertRaises(PermissionError):module.signal_group_or_retired(100,0)
             with patch.object(module,'group_has_executing_members',side_effect=RuntimeError('unreadable')):
                 with self.assertRaises(RuntimeError):module.signal_group_or_retired(100,0)
+    def test_darwin_inventory_is_scoped_and_overrides_legacy_mode(self):
+        module=self.module()
+        reply=SimpleNamespace(stdout='101 100 Z<\n',stderr='',returncode=0)
+        with patch.object(module.sys,'platform','darwin'), patch.dict(module.os.environ,{'COMMAND_MODE':'legacy'}), patch.object(module.subprocess,'run',return_value=reply) as run:
+            self.assertFalse(module.group_has_executing_members(100))
+            self.assertEqual(run.call_args.args[0],['/bin/ps','-g','100','-o','pid=,pgid=,stat='])
+            self.assertEqual(run.call_args.kwargs['env']['COMMAND_MODE'],'unix2003')
+            self.assertEqual(run.call_args.kwargs['env']['LC_ALL'],'C')
+
+    def test_darwin_no_match_requires_exact_exit_and_empty_stderr(self):
+        module=self.module()
+        with patch.object(module.sys,'platform','darwin'):
+            with patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='',stderr='',returncode=1)):
+                self.assertFalse(module.group_has_executing_members(100))
+            for code,out,err in [(0,'',''),(1,'','permission denied'),(2,'',''),(0,'101 100 Z\n','sysctl failed'),(0,'101 999 Z\n',''),(0,'101 100 Zgarbage\n',''),(1,'101 100 Z\n','')]:
+                with self.subTest(code=code,out=out,err=err), patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout=out,stderr=err,returncode=code)):
+                    with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
+
+    def test_terminal_group_proof_precedes_reap_and_is_not_requeried(self):
+        module=self.module();events=[]
+        def reap(timeout):events.append('reap');self.assertEqual(events,['signal','proof','reap']);return 0
+        process=SimpleNamespace(pid=100,poll=lambda: self.fail('leader must remain unreaped'),wait=reap)
+        def signal_group(pgid,sig,**kwargs):events.append('signal');return True
+        def inventory(pgid,**kwargs):events.append('proof');return False
+        with patch.object(module.sys,'platform','linux'), patch.object(module,'signal_group_or_retired',side_effect=signal_group) as send, patch.object(module,'group_has_executing_members',side_effect=inventory) as query:
+            module.retire_owned_group(process,graces=[(signal.SIGINT,0.1)])
+            self.assertEqual(send.call_count,1);self.assertEqual(query.call_count,1)
+
+    def test_esrch_terminal_proof_never_queries_or_signals_again(self):
+        module=self.module();events=[]
+        process=SimpleNamespace(pid=100,poll=lambda:self.fail('unexpected reap'),wait=lambda timeout:events.append('reap'))
+        with patch.object(module,'signal_group_or_retired',return_value=False) as send, patch.object(module,'group_has_executing_members',side_effect=AssertionError('query after terminal proof')):
+            module.retire_owned_group(process,graces=[(signal.SIGINT,0),(signal.SIGKILL,0)])
+            self.assertEqual(send.call_count,1);self.assertEqual(events,['reap'])
+
+    def test_inventory_uncertainty_keeps_owned_escalation_but_never_claims_retired(self):
+        module=self.module();signals=[];clock=[0.0]
+        process=SimpleNamespace(pid=100,poll=lambda:self.fail('premature reap'),wait=lambda timeout:self.fail('no retirement proof'))
+        with patch.object(module.sys,'platform','linux'), patch.object(module.time,'monotonic',side_effect=lambda:clock[0]), patch.object(module.time,'sleep',side_effect=lambda duration:clock.__setitem__(0,clock[0]+duration)), patch.object(module,'signal_group_or_retired',side_effect=lambda pgid,sig,**kwargs:signals.append(sig) or True), patch.object(module,'group_has_executing_members',side_effect=subprocess.TimeoutExpired(['ps'],3)):
+            with self.assertRaisesRegex(RuntimeError,'unverified'):
+                module.retire_owned_group(process,graces=[(signal.SIGINT,0.1),(signal.SIGTERM,0.1),(signal.SIGKILL,0.1)])
+        self.assertEqual(signals,[signal.SIGINT,signal.SIGTERM,signal.SIGKILL])
+
+    def test_cleanup_error_preserves_original_timeout_and_end_marker(self):
+        module=self.module();out=io.StringIO()
+        original=module.retire_owned_group
+        def retire_then_report_unverified(process):
+            original(process)
+            raise subprocess.TimeoutExpired(['ps'],3)
+        with tempfile.TemporaryDirectory() as directory, patch.object(module,'retire_owned_group',side_effect=retire_then_report_unverified), contextlib.redirect_stdout(out):
+            code,_=module.run_command('bootstatus',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda:None)
+        self.assertEqual(code,124)
+        self.assertIn('IOS_STARTUP_PHASE_TIMEOUT=bootstatus',out.getvalue())
+        self.assertIn('IOS_STARTUP_CLEANUP_UNVERIFIED=TimeoutExpired',out.getvalue())
+        self.assertIn('IOS_STARTUP_PHASE_END=bootstatus exit=124 timed_out=True',out.getvalue())
+        self.assertNotIn('subprocess.TimeoutExpired:',out.getvalue())
+
+    def test_bootstatus_samples_exact_owned_pid_before_any_inventory(self):
+        module=self.module();commands=[]
+        def invoke(command,**kwargs):commands.append(command);return SimpleNamespace(stdout='',returncode=1)
+        with tempfile.TemporaryDirectory() as directory, patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',side_effect=invoke):
+            module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcrun','simctl','bootstatus','12345678-1234-1234-1234-123456789012','-b'])
+        self.assertTrue(commands)
+        self.assertEqual(commands[0][0:3],['sample','123','2'])
+        self.assertFalse(any('-axo' in command for command in commands))
+
+    def test_scoped_inventory_permission_error_is_visible_without_fallback(self):
+        module=self.module();out=io.StringIO()
+        with patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='',stderr='Operation not permitted',returncode=1)) as run, contextlib.redirect_stdout(out):
+            with self.assertRaises(RuntimeError):module.group_has_executing_members(100)
+        self.assertEqual(run.call_count,1)
+        self.assertIn('Operation not permitted',out.getvalue())
+        self.assertIn('"pgid": 100',out.getvalue())
+
+    def test_already_reaped_leader_never_receives_group_signal(self):
+        module=self.module()
+        process=SimpleNamespace(pid=100,returncode=0,wait=lambda timeout:0)
+        with patch.object(module.os,'killpg') as send:
+            with self.assertRaisesRegex(RuntimeError,'already reaped'):
+                module.retire_owned_group(process)
+            send.assert_not_called()
+
+    def test_permission_denial_with_live_members_stops_without_further_signals(self):
+        module=self.module()
+        process=SimpleNamespace(pid=100,returncode=None,poll=lambda:self.fail('premature reap'),wait=lambda timeout:self.fail('no proof'))
+        with patch.object(module.os,'killpg',side_effect=PermissionError('denied')) as send, patch.object(module,'group_has_executing_members',return_value=True):
+            with self.assertRaises(PermissionError):module.retire_owned_group(process)
+            self.assertEqual(send.call_count,1)
+
+    def test_expired_grace_never_grants_fresh_inventory_time(self):
+        module=self.module()
+        process=SimpleNamespace(pid=100,returncode=None,wait=Mock())
+        with patch.object(module.time,'monotonic',side_effect=[0.0,1.0]), patch.object(module,'signal_group_or_retired',return_value=True), patch.object(module,'group_has_executing_members',return_value=False) as query:
+            with self.assertRaisesRegex(RuntimeError,'unverified'):
+                module.retire_owned_group(process,graces=[(signal.SIGKILL,1.0)])
+            query.assert_not_called();process.wait.assert_not_called()
+
+    def test_zero_grace_is_signal_only_and_never_queries_or_reaps(self):
+        module=self.module()
+        process=SimpleNamespace(pid=100,returncode=None,wait=Mock())
+        with patch.object(module.time,'monotonic',return_value=0.0), patch.object(module,'signal_group_or_retired',return_value=True) as send, patch.object(module,'group_has_executing_members') as query:
+            with self.assertRaisesRegex(RuntimeError,'unverified'):
+                module.retire_owned_group(process,graces=[(signal.SIGINT,0),(signal.SIGKILL,0)])
+            self.assertEqual(send.call_count,2);query.assert_not_called();process.wait.assert_not_called()
+
+    def test_darwin_eperm_probe_uses_only_remaining_signal_grace(self):
+        module=self.module()
+        with patch.object(module.time,'monotonic',return_value=2.5), patch.object(module.os,'killpg',side_effect=PermissionError('zombie')), patch.object(module,'group_has_executing_members',return_value=False) as query:
+            self.assertFalse(module.signal_group_or_retired(100,signal.SIGINT,deadline=3.0))
+            query.assert_called_once_with(100,timeout=0.5,require_leader=False)
+        with patch.object(module.time,'monotonic',return_value=3.0), patch.object(module.os,'killpg',side_effect=PermissionError('unknown')), patch.object(module,'group_has_executing_members') as query:
+            with self.assertRaises(PermissionError):module.signal_group_or_retired(100,signal.SIGINT,deadline=3.0)
+            query.assert_not_called()
+
+    def test_retirement_inventory_requires_unique_pinned_leader(self):
+        module=self.module()
+        for rows in ['101 100 Z\n','100 100 Z\n100 100 Z\n']:
+            with self.subTest(rows=rows), patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout=rows,stderr='',returncode=0)):
+                with self.assertRaises(RuntimeError):module.group_has_executing_members(100,require_leader=True)
+        with patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',return_value=SimpleNamespace(stdout='',stderr='',returncode=1)):
+            with self.assertRaises(RuntimeError):module.group_has_executing_members(100,require_leader=True)
+
+    def test_live_final_kernel_probe_prevents_zombie_snapshot_retirement(self):
+        module=self.module()
+        with patch.object(module.os,'killpg',side_effect=[PermissionError('raced'),None]) as send, patch.object(module,'group_has_executing_members',return_value=False):
+            self.assertTrue(module.signal_group_or_retired(100,0))
+            self.assertEqual(send.call_args_list[-1].args,(100,0))
+
+    def test_darwin_live_kernel_probe_never_uses_ps_alone_to_retire(self):
+        module=self.module();clock=[0.0]
+        process=SimpleNamespace(pid=100,returncode=None,wait=Mock())
+        with patch.object(module.sys,'platform','darwin'), patch.object(module.time,'monotonic',side_effect=lambda:clock[0]), patch.object(module.time,'sleep',side_effect=lambda value:clock.__setitem__(0,clock[0]+value)), patch.object(module.os,'killpg',return_value=None), patch.object(module,'group_has_executing_members',return_value=False) as query:
+            with self.assertRaisesRegex(RuntimeError,'unverified'):
+                module.retire_owned_group(process,graces=[(signal.SIGKILL,1)])
+            query.assert_not_called();process.wait.assert_not_called()
+            self.assertEqual(clock[0],1)
+
     def test_artifact_projection_excludes_environment_and_only_reports_allowed_keys(self):
         module=self.module()
         value={'EnvironmentVariables':{'TOKEN':'private'},'TestTargets':[{'UITargetAppPath':'app','OnlyTestIdentifiers':['test'], 'Secret':'private'}]}

@@ -475,11 +475,21 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
         progress.measure(.navigation) { XCUIRemote.shared.press(.left) }
         XCTAssertTrue(progress.measure(.focusWait) { first.wait(for: \.hasFocus, toEqual: true, timeout: 5) })
 
+        var verifiedTop: CardFocusSnapshot?
         for cycle in 0..<2 {
             progress.cycle = cycle
             progress.step = -1
             progress.direction = .none
-            var snapshot = try stableSnapshot(app: app, progress: progress)
+            var snapshot: CardFocusSnapshot
+            if let verifiedTop {
+                // The previous cycle already verified this top snapshot with
+                // two complete samples. Only focus reads and attachment creation
+                // intervened; every new navigation still captures a fresh pair.
+                snapshot = verifiedTop
+            } else {
+                snapshot = try stableSnapshot(app: app, progress: progress)
+            }
+            verifiedTop = nil
             var reachedBottom = false
             for step in 0..<30 {
                 if try snapshot.focusedIndex() >= 75 {
@@ -530,6 +540,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             XCTAssertTrue(reachedTop, "Coverage failure: did not return to the first fixture card")
             XCTAssertTrue(progress.measure(.focusWait) { first.hasFocus })
             attach(snapshot, name: "focus-returned-\(grouping)-\(cycle)", progress: progress)
+            verifiedTop = snapshot
         }
         print("CARD_FOCUS_RESULT grouping=\(grouping) calibrated=true cycles=2 residualScale=notObserved")
     }
@@ -616,17 +627,26 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
 
     @MainActor
     private func captureStableSnapshot(app: XCUIApplication, progress: CardFocusProgress) throws -> CardFocusSnapshot {
-        let started = Date()
-        let deadline = started.addingTimeInterval(12)
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + 12
         // Remote presses can return before the native focus/scroll transition
         // finishes. Avoid paying for an immediate transitional screenshot, but
         // still require two complete matching samples within the same deadline.
         progress.settleAfterNavigation()
         var previous: CardFocusSnapshot?
         var lastScreenshot: XCUIScreenshot?
+        var previousScreenshotCompleted: TimeInterval?
         var lastReason = "Rendered focus/scroll state never stabilized"
         var samples = 0
-        while Date() < deadline {
+        while let delay = CardFocusSamplingTiming.delayBeforeSample(
+            now: ProcessInfo.processInfo.systemUptime, deadline: deadline,
+            previousScreenshotCompleted: previousScreenshotCompleted
+        ) {
+            // Raster/bookkeeping work already consumes the polling interval.
+            // Finish any remaining wait before acquiring AX, so no new delay
+            // can make the following fresh hierarchy/pixel pair less current.
+            if delay > 0 { Thread.sleep(forTimeInterval: delay) }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { break }
             samples += 1
             progress.sample = samples
             let sampleStarted = ProcessInfo.processInfo.systemUptime
@@ -644,7 +664,13 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                 continue
             }
             let candidates = probeAttributes(in: hierarchy)
-            let screenshot = progress.measure(.screenshot) { XCUIScreen.main.screenshot() }
+            let screenshot = progress.measure(.screenshot) {
+                let screenshot = XCUIScreen.main.screenshot()
+                // Pixels may be captured near the return of a slow call. Its
+                // invocation time cannot pay the next observation's interval.
+                previousScreenshotCompleted = ProcessInfo.processInfo.systemUptime
+                return screenshot
+            }
             lastScreenshot = screenshot
             let rasterStarted = progress.begin(.raster)
             let screenFrame = hierarchy.frame
@@ -695,7 +721,7 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
             } else {
                 if let previous, current.isStable(comparedTo: previous) {
                     progress.sampleOutcome(.stablePair, started: sampleStarted)
-                    print("CARD_FOCUS_CAPTURE elapsed=\(Date().timeIntervalSince(started)) "
+                    print("CARD_FOCUS_CAPTURE elapsed=\(ProcessInfo.processInfo.systemUptime - started) "
                         + "samples=\(samples) candidates=\(candidates.count) visible=\(observations.count)")
                     return current
                 }
@@ -704,9 +730,8 @@ final class ChannelCardFocusDiagnosticTests: XCTestCase {
                 lastReason = "Rendered geometry is changing: \(current.summary)"
                 previous = current
             }
-            // Poll for stable rendered widths and AX positions, rather than
-            // treating a transient screenshot/AX mismatch as a product failure.
-            Thread.sleep(forTimeInterval: 0.15)
+            // The next iteration still needs a fresh complete AX/pixel sample;
+            // its start gate replaces the unconditional post-processing sleep.
         }
         if let lastScreenshot {
             progress.measure(.attachment) {
@@ -947,6 +972,60 @@ private struct CardFocusSnapshot {
                 || abs($0.0.accessibilityFrame.minY - $0.1.accessibilityFrame.minY) > 1
         }) { return .position }
         return .otherChange
+    }
+}
+
+private enum CardFocusSamplingTiming {
+    static func delayBeforeSample(
+        now: TimeInterval, deadline: TimeInterval, previousScreenshotCompleted: TimeInterval?
+    ) -> TimeInterval? {
+        guard now < deadline else { return nil }
+        let earliestSampleStart = previousScreenshotCompleted.map { $0 + 0.15 } ?? now
+        guard earliestSampleStart < deadline else { return nil }
+        return max(0, earliestSampleStart - now)
+    }
+}
+
+final class ChannelCardFocusSamplingTimingTests: XCTestCase {
+    func testFirstSampleDoesNotWaitForAnUnobservedScreenshot() throws {
+        XCTAssertEqual(try XCTUnwrap(CardFocusSamplingTiming.delayBeforeSample(
+            now: 4, deadline: 12, previousScreenshotCompleted: nil)), 0)
+    }
+
+    func testSlowScreenshotStillRequiresTheIntervalAfterItsCompletion() throws {
+        // Capture started at t=0, but pixels may have been observed just before
+        // it completed at t=1. Only the later 10 ms count toward the interval.
+        XCTAssertEqual(try XCTUnwrap(CardFocusSamplingTiming.delayBeforeSample(
+            now: 1.01, deadline: 12, previousScreenshotCompleted: 1)), 0.14, accuracy: 0.000_001)
+    }
+
+    func testRasterAndBookkeepingWorkConsumeThePollingInterval() throws {
+        for elapsed in [0.15, 0.5, 2.4] {
+            XCTAssertEqual(try XCTUnwrap(CardFocusSamplingTiming.delayBeforeSample(
+                now: 4 + elapsed, deadline: 12, previousScreenshotCompleted: 4)), 0)
+        }
+    }
+
+    func testExpiredDeadlineDoesNotAdmitAnotherSample() {
+        for now in [12.0, 12.1] {
+            XCTAssertNil(CardFocusSamplingTiming.delayBeforeSample(
+                now: now, deadline: 12, previousScreenshotCompleted: nil))
+        }
+    }
+
+    func testRequiredIntervalMustFinishBeforeTheDeadline() {
+        for deadline in [0.10, 0.15] {
+            XCTAssertNil(CardFocusSamplingTiming.delayBeforeSample(
+                now: 0.05, deadline: deadline, previousScreenshotCompleted: 0))
+        }
+    }
+
+    func testEnoughDeadlineRoomPreservesTheFullMinimumInterval() throws {
+        let now = 0.05
+        let delay = try XCTUnwrap(CardFocusSamplingTiming.delayBeforeSample(
+            now: now, deadline: 0.16, previousScreenshotCompleted: 0))
+        XCTAssertEqual(now + delay, 0.15, accuracy: 0.000_001)
+        XCTAssertLessThan(now + delay, 0.16)
     }
 }
 
