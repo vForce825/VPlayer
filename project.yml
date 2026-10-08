@@ -462,3 +462,6 @@ schemes:
           parallelizable: false
           selectedTests:
             - IOSReleaseStartupTests
+    run:
+      config: Release
+      executable: VPlayeriOS

@@ -1153,6 +1153,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             )
             assembly?.binding.invalidate()
             assembly = candidate
+            publishSourceMediaInformationIsolated()
         } catch {
             binding.invalidate()
             assembly?.binding.invalidate()
@@ -1182,6 +1183,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 videoFormat = format
                 freshVideoFormatArrived = true
                 try consumeCanonicalFingerprintIsolated(latestEventFingerprint: fingerprint)
+                publishSourceMediaInformationIsolated()
             case let .accessUnit(accessUnit):
                 metrics?.recordVideoAccessUnit()
                 guard mediaAdmissionOpen else {
@@ -2489,6 +2491,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         }
         clock.pause()
         clearMediaInformationIsolated(publish: true)
+        if videoFormat != nil { publishSourceMediaInformationIsolated() }
         outputCadenceDurations.removeAll(keepingCapacity: true)
         switch resetScope {
         case .timeline:
@@ -2540,6 +2543,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         readiness?.configure(requiredVideoFrameCount: requiredVideoFrameCount)
         readyPublished = false
         clearMediaInformationIsolated(publish: true)
+        if videoFormat != nil { publishSourceMediaInformationIsolated() }
         outputCadenceDurations.removeAll(keepingCapacity: true)
         preparedAnchor = nil
         clearRetainedVideoIsolated(keepingCapacity: true)
@@ -2764,7 +2768,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             return
         }
         guard videoCoordinator.isClassificationResolved,
-              mediaInformation != nil,
+              mediaInformation?.isSourceProbe == false,
               mediaInformationGeneration == generationController.current else {
             // Classification and media metadata are admission prerequisites for
             // video readiness, but diagnostics still need to expose the
@@ -2927,7 +2931,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         if readiness.isOpen,
            tracks?.video == nil
                 || (videoCoordinator.isClassificationResolved
-                    && mediaInformation != nil
+                    && mediaInformation?.isSourceProbe == false
                     && mediaInformationGeneration == generationController.current) {
             displayResumedCycle = readiness.cycleID
             resumeDisplayForOpenReadinessGateIsolated()
@@ -2940,7 +2944,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         guard tracks?.video == nil
                 || (videoCoordinator.isClassificationResolved
-                    && mediaInformation != nil
+                    && mediaInformation?.isSourceProbe == false
                     && mediaInformationGeneration == generationController.current) else { return }
         setSharedTimelineOpenedIsolated(true)
         applyPermittedOutputRateIsolated()
@@ -3039,6 +3043,26 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         mediaInformationGeneration = nil
         guard publish, hadInformation else { return }
         eventSink(.mediaInformation(nil, generation: generationController.current))
+    }
+
+    /// Selected source facts are useful before decoding, but grant no output
+    /// readiness or transformed cadence. Keep this synchronous with assembly
+    /// ownership so late callbacks cannot relabel a successor source.
+    private func publishSourceMediaInformationIsolated() {
+        assertIsolated()
+        guard !terminal, let video = tracks?.video else { return }
+        let generation = generationController.current
+        if mediaInformationGeneration == generation, mediaInformation?.isSourceProbe == false { return }
+        let dimensions = videoFormat.map(CMVideoFormatDescriptionGetDimensions)
+            ?? CMVideoDimensions(width: video.width, height: video.height)
+        guard dimensions.width > 0, dimensions.height > 0 else { return }
+        let information = PlaybackMediaInformation(sourceWidth: dimensions.width,
+            sourceHeight: dimensions.height, scanMode: nil,
+            sourceFrameRate: validatedFrameRate(video.frameRate))
+        guard mediaInformationGeneration != generation || mediaInformation != information else { return }
+        mediaInformation = information
+        mediaInformationGeneration = generation
+        eventSink(.mediaInformation(information, generation: generation))
     }
 
     private func publishMediaInformationIfReadyIsolated() {

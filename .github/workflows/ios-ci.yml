@@ -57,7 +57,8 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           echo "ACCEPTANCE_HEAD=$CANDIDATE_SHA"
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
-          brew install jq
+          brew install jq ripgrep
+          command -v rg
           Scripts/build-ffmpeg.sh --platform ios
           Scripts/audit-ffmpeg.sh --platform ios Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework
           Scripts/Tests/test_ffmpeg_artifact_audit.sh --platform ios
@@ -67,7 +68,9 @@ jobs:
           python3 Scripts/Tests/test_ios_target_structure.py
           python3 Scripts/Tests/test_cpu_video_processing.py
           python3 Scripts/Tests/test_ios_pip_contract.py
+          python3 Scripts/Tests/test_samplebuffer_source_metadata.py
           python3 Scripts/Tests/test_ios_workflow.py
+          python3 Scripts/Tests/test_ios_startup_runner.py
       - name: Choose an available iOS 27 iPhone simulator
         id: simulator
         run: |
@@ -76,6 +79,7 @@ jobs:
             .value[] | select(.name | startswith("iPhone")) | .udid' | head -1)"
           test -n "$device"
           echo "IOS_TEST_DESTINATION=platform=iOS Simulator,id=$device" >> "$GITHUB_ENV"
+          echo "IOS_SIMULATOR_UDID=$device" >> "$GITHUB_ENV"
       - name: Compile Release for a physical iPhone destination without signing
         timeout-minutes: 25
         run: |
@@ -86,11 +90,8 @@ jobs:
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 20
         run: |
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayeriOSReleaseStartup \
-            -configuration Release -destination "$IOS_TEST_DESTINATION" \
-            -derivedDataPath "$RUNNER_TEMP/iOS-Release" \
-            -resultBundlePath "$RUNNER_TEMP/iOS-Release.xcresult" \
-            CODE_SIGNING_ALLOWED=NO -parallel-testing-enabled NO
+          python3 Scripts/Support/ios-startup-runner.py \
+            --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release"
       - name: Run shared playback and iPhone touch tests
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 60
@@ -104,10 +105,13 @@ jobs:
       - name: Report test failures and qualification limits
         if: always()
         run: |
-          python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS-Release.xcresult"
-          python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS.xcresult"
+          status=0
+          for bundle in iOS-RunnerControl iOS-Release iOS; do
+            python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/$bundle.xcresult" || status=1
+          done
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
+          exit "$status"
       - name: Fail closed until generated outputs are committed
         if: always() && steps.generated.outputs.needs_refresh == 'true'
         run: |
