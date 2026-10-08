@@ -15,6 +15,21 @@ BACKEND = ROOT / 'Sources/VPlayerPlayback/Pipeline/HLSAVPlayerPlaybackBackend.sw
 
 
 class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
+    def test_empty_track_cancellation_waits_for_callback_registration_not_network(self):
+        source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/AVPlayerItemCoordinatorTests.swift').read_text()
+        test = source.split('func testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission()', 1)[1].split('func testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation()', 1)[0]
+        self.assertNotIn('origin.requestCount', test)
+        waiting = test.split('let deadline =', 1)[1].split('XCTAssertEqual(driver.prepareWait.activePhase', 1)[0]
+        self.assertIn('driver.prepareWait.activePhase != .nativeTracks', waiting)
+        self.assertIn('AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline + 2', waiting)
+        for value in ['XCTAssertEqual(driver.activeWaiterCount, 1)',
+                      'XCTAssertEqual(driver.player.currentItem?.status, .unknown)',
+                      'XCTAssertEqual(driver.player.currentItem?.tracks.count, 0)',
+                      'XCTAssertEqual(driver.player.rate, 0)', 'waiter.cancel()',
+                      'error is CancellationError', 'XCTAssertEqual(retainedKVOCount, 0)',
+                      'XCTAssertEqual(AVPlayerSDKCallbackLease.occupiedCount, callbackBaseline)']:
+            self.assertIn(value, test)
+
     def test_initial_native_track_wait_preserves_one_shot_slot_and_full_inspection(self):
         source = COORDINATOR.read_text()
         prepare = source.split('func prepare(url:', 1)[1].split('private func publishSelectedMediaInformation(', 1)[0]

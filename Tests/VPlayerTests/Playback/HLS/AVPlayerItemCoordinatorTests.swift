@@ -6454,7 +6454,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
     }
 
     func testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission() async throws {
-        try await withBlockedNativeTrackWaitDriver(outputNonce: 23_277) { driver, item, origin in
+        try await withBlockedNativeTrackWaitDriver(outputNonce: 23_277) { driver, item, _ in
             let callbackBaseline = AVPlayerSDKCallbackLease.occupiedCount
             let finished = FinalLockedFlag()
             let waiter = Task {
@@ -6463,11 +6463,13 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             }
             defer { waiter.cancel() }
             let deadline = ContinuousClock.now + .seconds(5)
-            while (!driver.prepareWait.isActive || origin.requestCount == 0),
+            // Cancellation exercises registered SDK observers, independently of
+            // when AVPlayer decides to issue its first HTTP request.
+            while (driver.prepareWait.activePhase != .nativeTracks
+                   || AVPlayerSDKCallbackLease.occupiedCount != callbackBaseline + 2),
                   !finished.value, ContinuousClock.now < deadline { await Task.yield() }
             XCTAssertEqual(driver.prepareWait.activePhase, .nativeTracks)
             XCTAssertEqual(driver.activeWaiterCount, 1)
-            XCTAssertGreaterThan(origin.requestCount, 0)
             XCTAssertEqual(driver.player.currentItem?.status, .unknown)
             XCTAssertEqual(driver.player.currentItem?.tracks.count, 0)
             XCTAssertNil(driver.player.currentItem?.error)
