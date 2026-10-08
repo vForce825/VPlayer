@@ -5,6 +5,8 @@
 import AVFoundation
 import AVKit
 import XCTest
+import SwiftUI
+import UIKit
 @testable import VPlayer
 import VPlayerPlayback
 
@@ -116,5 +118,145 @@ final class IOSPlaybackSessionTests: XCTestCase {
         XCTAssertTrue(session.isClosing)
         XCTAssertFalse(session.isFullScreenPresented)
         session.close()
+    }
+}
+
+@MainActor
+final class IOSNativePictureInPictureTests: XCTestCase {
+    func testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession() async throws {
+        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+            throw XCTSkip("AVKit reports Picture in Picture unsupported on this runtime")
+        }
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }, "PiP test requires an active app scene")
+        let fixture = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "homepod-live-h264-aac-80s",
+            withExtension: "ts", subdirectory: "Video"))
+        let origin = try NativeHLSHTTPFixture(resources: ["/synthetic.ts": .init(
+            data: Data(contentsOf: fixture), contentType: "video/mp2t")], credential: nil)
+        let base = AppDependencies.uiTesting()
+        // Use the real PlaybackController/audio-session owner, not UITestPlaybackEngine.
+        let dependencies = AppDependencies(libraryStartup: base.libraryStartup,
+            foregroundRefreshDriver: base.foregroundRefreshDriver,
+            backgroundRefreshRegistrar: base.backgroundRefreshRegistrar,
+            repository: base.repository, playbackSettings: base.playbackSettings)
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "synthetic-pip",
+            streamURL: origin.url("synthetic.ts"), title: "Synthetic PiP")
+        let session = IOSPlaybackSession(presentation: .init(request: request, logoURL: nil, programmes: []),
+            dependencies: dependencies)
+        let previousKeyWindow = scene.windows.first { $0.isKeyWindow }
+        let window = UIWindow(windowScene: scene)
+        window.rootViewController = UIHostingController(rootView: NativePiPSmokeRoot(session: session))
+        window.makeKeyAndVisible()
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+            previousKeyWindow?.makeKeyAndVisible()
+        }
+        var failure: (any Error)?
+        do {
+            session.start()
+            try await waitFor("sample-buffer playback and PiP readiness", timeout: 25) {
+                guard case .playing = session.model.state,
+                      let presentation = session.model.presentation,
+                      case let .sampleBuffer(context) = presentation.presentation,
+                      let layer = context.makeVideoView().layer as? AVSampleBufferDisplayLayer else { return false }
+                return layer.isReadyForDisplay && session.pictureInPicture.isPossible
+            }
+            let model = session.model
+            let host = session.host
+            let presentation = try XCTUnwrap(model.presentation)
+            guard case let .sampleBuffer(context) = presentation.presentation else {
+                throw NativePiPTestFailure.wrongBackend
+            }
+            let layer = context.makeVideoView().layer
+            let native = try XCTUnwrap(session.pictureInPicture.nativeControllerForTesting)
+            let beforeTransitions = await dependencies.playbackMetricsProvider(.seconds(1))
+            let baselineAudioGaps = try XCTUnwrap(beforeTransitions).audioLargeGapCount
+            let enterBegan = ContinuousClock.now
+            session.pictureInPicture.start()
+            try await waitFor("native PiP start", timeout: 10) {
+                native.isPictureInPictureActive && session.pictureInPicture.isActive && !session.isFullScreenPresented
+            }
+            print("IOS_PIP_NATIVE_ENTER_LIFECYCLE_DURATION=\(enterBegan.duration(to: .now))")
+            try await assertMediaProgress(dependencies: dependencies, stage: "PiP", baselineAudioGaps: baselineAudioGaps)
+            XCTAssertTrue(session.model === model)
+            XCTAssertTrue(session.host === host)
+            XCTAssertTrue(context.makeVideoView().layer === layer)
+            let restoreBegan = ContinuousClock.now
+            session.showFullScreen()
+            try await waitFor("app-initiated native PiP restoration", timeout: 10) {
+                !native.isPictureInPictureActive && !session.pictureInPicture.isActive &&
+                    host.isViewLoaded && host.view.window === window
+            }
+            print("IOS_PIP_NATIVE_RESTORE_LIFECYCLE_DURATION=\(restoreBegan.duration(to: .now))")
+            try await assertMediaProgress(dependencies: dependencies, stage: "restored-fullscreen", baselineAudioGaps: baselineAudioGaps)
+            XCTAssertFalse(session.isClosing)
+            XCTAssertEqual(model.presentation?.identity, presentation.identity)
+            XCTAssertTrue(context.makeVideoView().layer === layer)
+            try await waitFor("reattached source ready for second PiP", timeout: 10) {
+                session.pictureInPicture.isPossible &&
+                    session.pictureInPicture.nativeControllerForTesting === native &&
+                    model.presentation?.identity == presentation.identity
+            }
+            session.pictureInPicture.start()
+            try await waitFor("second native PiP start", timeout: 10) {
+                native.isPictureInPictureActive && session.pictureInPicture.isActive
+            }
+            session.close()
+            try await waitFor("native PiP stop after explicit close", timeout: 10) { !native.isPictureInPictureActive }
+            XCTAssertTrue(session.isClosing)
+        } catch {
+            print("IOS_PIP_NATIVE_FAILURE os=\(UIDevice.current.systemVersion) scene=\(scene.activationState.rawValue) visible=\(!window.isHidden) possible=\(session.pictureInPicture.isPossible) active=\(session.pictureInPicture.isActive)")
+            failure = error
+        }
+        session.close()
+        await session.model.stop()
+        await origin.close()
+        if let failure { throw failure }
+    }
+
+    private func assertMediaProgress(dependencies: AppDependencies, stage: String, baselineAudioGaps: UInt64) async throws {
+        let initialSnapshot = await dependencies.playbackMetricsProvider(.seconds(1))
+        let initial = try XCTUnwrap(initialSnapshot, "Missing production playback metrics")
+        let clock = try XCTUnwrap(initial.clockTimeSeconds)
+        let pts = try XCTUnwrap(initial.videoLatestPTSSeconds)
+        let deadline = ContinuousClock.now + .seconds(6)
+        while ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+            guard let next = await dependencies.playbackMetricsProvider(.seconds(1)),
+                  let nextClock = next.clockTimeSeconds, let nextPTS = next.videoLatestPTSSeconds else { continue }
+            if nextClock > clock + 0.25, nextPTS > pts,
+               next.videoRendererTotalFrameCount > initial.videoRendererTotalFrameCount {
+                XCTAssertEqual(next.audioLargeGapCount, baselineAudioGaps,
+                    "PiP lifecycle must not introduce a large audio discontinuity")
+                print("IOS_PIP_NATIVE_PROGRESS stage=\(stage) clock_delta=\(nextClock-clock) rendered_delta=\(next.videoRendererTotalFrameCount-initial.videoRendererTotalFrameCount)")
+                return
+            }
+        }
+        XCTFail("Production clock, processed video and native renderer did not progress during \(stage)")
+        throw NativePiPTestFailure.timeout
+    }
+
+    private func waitFor(_ stage: String, timeout: Int, condition: @MainActor () -> Bool) async throws {
+        let deadline = ContinuousClock.now + .seconds(timeout)
+        while ContinuousClock.now < deadline {
+            if condition() { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Native PiP timed out: \(stage)")
+        throw NativePiPTestFailure.timeout
+    }
+}
+
+private enum NativePiPTestFailure: Error { case timeout, wrongBackend }
+
+private struct NativePiPSmokeRoot: View {
+    @Bindable var session: IOSPlaybackSession
+    var body: some View {
+        if session.isFullScreenPresented {
+            IOSFullScreenPlayerView(session: session, onClose: {})
+        } else {
+            Color.black.ignoresSafeArea()
+        }
     }
 }

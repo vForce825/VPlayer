@@ -11,7 +11,7 @@ import VPlayerPlayback
 /// playback command; an explicit close is the only UI path that retires it.
 @MainActor
 @Observable
-final class IOSPlaybackSession: Identifiable {
+final class IOSPlaybackSession {
     let presentation: PlayerChannelPresentation
     let model: FullScreenPlayerViewModel
     let mount: PlaybackPresentationHostMount

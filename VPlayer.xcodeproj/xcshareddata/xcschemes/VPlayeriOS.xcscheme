@@ -16,7 +16,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
-               BuildableName = "VPlayerCoreiOS.framework"
+               BuildableName = "VPlayerCore.framework"
                BlueprintName = "VPlayerCoreiOS"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
@@ -30,7 +30,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "2B46C7BA7F9C0CB4785D3DEA"
-               BuildableName = "VPlayerPlaybackiOS.framework"
+               BuildableName = "VPlayerPlayback.framework"
                BlueprintName = "VPlayerPlaybackiOS"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
@@ -44,7 +44,7 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
-               BuildableName = "VPlayeriOS.app"
+               BuildableName = "VPlayer.app"
                BlueprintName = "VPlayeriOS"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
@@ -89,9 +89,9 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
-            BuildableName = "VPlayerCoreiOS.framework"
-            BlueprintName = "VPlayerCoreiOS"
+            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BuildableName = "VPlayer.app"
+            BlueprintName = "VPlayeriOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -137,15 +137,16 @@
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
       allowLocationSimulation = "YES">
-      <MacroExpansion>
+      <BuildableProductRunnable
+         runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
-            BuildableName = "VPlayerCoreiOS.framework"
-            BlueprintName = "VPlayerCoreiOS"
+            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BuildableName = "VPlayer.app"
+            BlueprintName = "VPlayeriOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
-      </MacroExpansion>
+      </BuildableProductRunnable>
       <CommandLineArguments>
       </CommandLineArguments>
    </LaunchAction>
@@ -155,15 +156,16 @@
       savedToolIdentifier = ""
       useCustomWorkingDirectory = "NO"
       debugDocumentVersioning = "YES">
-      <MacroExpansion>
+      <BuildableProductRunnable
+         runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
-            BuildableName = "VPlayerCoreiOS.framework"
-            BlueprintName = "VPlayerCoreiOS"
+            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BuildableName = "VPlayer.app"
+            BlueprintName = "VPlayeriOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
-      </MacroExpansion>
+      </BuildableProductRunnable>
    </ProfileAction>
    <AnalyzeAction
       buildConfiguration = "Debug">

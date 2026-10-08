@@ -89,7 +89,7 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
 /// until the existing registry grants the driver its exact mutation authority.
 /// The recursive lock keeps the permission scope thread-local in practice:
 /// another thread cannot borrow a driver call's open scope.
-final class IOSControlledAVPlayer: AVPlayer, @unchecked Sendable {
+private final class IOSPlayerTransportState: @unchecked Sendable {
     private let transportLock = NSRecursiveLock()
     private var driverMutationDepth = 0
     private var intentHandler: (@MainActor @Sendable (Bool) -> Void)?
@@ -111,7 +111,7 @@ final class IOSControlledAVPlayer: AVPlayer, @unchecked Sendable {
         operation()
     }
 
-    private func transport(paused: Bool, native: () -> Void) {
+    func transport(paused: Bool, native: () -> Void) {
         transportLock.lock()
         if driverMutationDepth > 0 {
             native()
@@ -138,17 +138,30 @@ final class IOSControlledAVPlayer: AVPlayer, @unchecked Sendable {
         if let handler, let paused { handler(paused) }
     }
 
+}
+
+final class IOSControlledAVPlayer: AVPlayer, @unchecked Sendable {
+    nonisolated private let transportState = IOSPlayerTransportState()
+
+    @MainActor
+    func setTransportIntentHandler(_ handler: (@MainActor @Sendable (Bool) -> Void)?) {
+        transportState.setTransportIntentHandler(handler)
+    }
+    func performDriverMutation(_ operation: () -> Void) {
+        transportState.performDriverMutation(operation)
+    }
+
     override var rate: Float {
         get { super.rate }
-        set { transport(paused: newValue == 0) { super.rate = newValue } }
+        set { transportState.transport(paused: newValue == 0) { super.rate = newValue } }
     }
-    override func play() { transport(paused: false) { super.play() } }
-    override func pause() { transport(paused: true) { super.pause() } }
+    override func play() { transportState.transport(paused: false) { super.play() } }
+    override func pause() { transportState.transport(paused: true) { super.pause() } }
     override func playImmediately(atRate rate: Float) {
-        transport(paused: rate == 0) { super.playImmediately(atRate: rate) }
+        transportState.transport(paused: rate == 0) { super.playImmediately(atRate: rate) }
     }
     override func setRate(_ rate: Float, time itemTime: CMTime, atHostTime hostClockTime: CMTime) {
-        transport(paused: rate == 0) { super.setRate(rate, time: itemTime, atHostTime: hostClockTime) }
+        transportState.transport(paused: rate == 0) { super.setRate(rate, time: itemTime, atHostTime: hostClockTime) }
     }
 }
 #endif

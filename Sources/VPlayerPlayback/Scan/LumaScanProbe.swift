@@ -375,7 +375,7 @@ private final class LumaScanInFlightResources:
     }
 }
 
-private final class SystemLumaScanProbeBackend: LumaScanProbeBackend, @unchecked Sendable {
+final class SystemLumaScanProbeBackend: LumaScanProbeBackend, @unchecked Sendable {
     private final class ShaderBundleToken {}
 
     private static let shaderBundle = Bundle(for: ShaderBundleToken.self)

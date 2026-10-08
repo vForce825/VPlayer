@@ -346,6 +346,37 @@ final class LumaScanProbeTests: XCTestCase {
         XCTAssertGreaterThan(sample.motionRatio, 0.015)
     }
 
+    #if os(iOS)
+    func testCPUScanMatchesActualMetalForBothDepthsRangesAndMotionPatterns() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue() else {
+            throw XCTSkip("Metal device unavailable for CPU/Metal parity")
+        }
+        for format in [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                       kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+                       kCVPixelFormatType_420YpCbCr10BiPlanarFullRange] {
+            for pattern in [ProbePattern.progressiveDiagonal, .alternatingFields] {
+                let pair = try makePair(pixelFormat: format, pattern: pattern)
+                let cpu = try CPUVideoProcessing.scan(current: pair.current, previous: pair.previous)
+                let gpu = try SystemLumaScanProbeBackend(commandQueue: queue)
+                let completed = expectation(description: "Actual Metal scan parity")
+                let recorder = ProbeCompletionRecorder()
+                try gpu.submit(current: pair.current, previous: pair.previous, generation: generation) {
+                    recorder.append($0)
+                    completed.fulfill()
+                }
+                wait(for: [completed], timeout: 5)
+                let metal = try XCTUnwrap(recorder.results.first).get()
+                XCTAssertEqual(cpu.sampleCount, metal.sampleCount)
+                // UNORM float arithmetic may quantize one code differently; the
+                // tolerance is below the classifier's smallest decision margin.
+                XCTAssertEqual(cpu.combRatio, metal.combRatio, accuracy: 2 / 65_535)
+                XCTAssertEqual(cpu.motionRatio, metal.motionRatio, accuracy: 2 / 65_535)
+            }
+        }
+    }
+    #endif
+
     private func runRealProbe(
         pixelFormat: OSType,
         pattern: ProbePattern

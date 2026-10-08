@@ -359,6 +359,62 @@ final class YADIFGoldenPixelTests: XCTestCase {
     }
 
     #if os(iOS)
+    func testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification() throws {
+        for (width, height) in [(1_920, 1_080), (3_840, 2_160)] {
+            for depth in [8, 10] {
+                let format = depth == 8 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                let inputs = try (0..<3).map { seed in
+                    var buffer: CVPixelBuffer?
+                    let status = CVPixelBufferCreate(nil, width, height, format,
+                        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+                    XCTAssertEqual(status, kCVReturnSuccess)
+                    let pixel = try XCTUnwrap(buffer)
+                    XCTAssertEqual(CVPixelBufferLockBaseAddress(pixel, []), kCVReturnSuccess)
+                    defer { CVPixelBufferUnlockBaseAddress(pixel, []) }
+                    for plane in 0..<2 {
+                        let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixel, plane))
+                        let rows = CVPixelBufferGetHeightOfPlane(pixel, plane)
+                        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane)
+                        for y in 0..<rows {
+                            let row = base.advanced(by: y * stride)
+                            if depth == 8 {
+                                let codes = row.assumingMemoryBound(to: UInt8.self)
+                                for x in 0..<width { codes[x] = UInt8(truncatingIfNeeded: x * 13 + y * 17 + seed * 31) }
+                            } else {
+                                let codes = row.assumingMemoryBound(to: UInt16.self)
+                                for x in 0..<width { codes[x] = UInt16((x * 13 + y * 17 + seed * 31) & 1_023) << 6 }
+                            }
+                        }
+                    }
+                    return pixel
+                }
+                let outputs = try ProgressiveSurfacePool().allocatePair(matching: inputs[1])
+                let job = YADIFJob(previous: normalized(inputs[0], id: 1),
+                    current: normalized(inputs[1], id: 2), next: normalized(inputs[2], id: 3),
+                    order: resolved(.top), spatialOnly: false)
+                try CPUVideoProcessing.yadif(job: job, outputs: outputs)
+                var milliseconds: [Double] = []
+                for _ in 0..<5 {
+                    let start = ContinuousClock.now
+                    try CPUVideoProcessing.yadif(job: job, outputs: outputs)
+                    let elapsed = start.duration(to: .now).components
+                    milliseconds.append(Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15)
+                }
+                #if targetEnvironment(simulator)
+                let environment = "simulator-not-iphone-hardware"
+                #else
+                let environment = "device-short-run-not-thermal-qualification"
+                #endif
+                #if DEBUG
+                let configuration = "debug-functional-timing-not-release-performance"
+                #else
+                let configuration = "release"
+                #endif
+                print("IOS_CPU_YADIF_BENCH width=\(width) height=\(height) depth=\(depth) workers=\(min(4, ProcessInfo.processInfo.activeProcessorCount)) pair_ms=\(milliseconds) environment=\(environment) configuration=\(configuration)")
+            }
+        }
+    }
+
     func testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly() throws {
         for (format, name, bytesPerFrame) in [
             (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "nv12", Self.nv12BytesPerFrame),
@@ -818,7 +874,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
                     sourcePTS90k: nil
                 ),
                 formatMetadata: VideoFormatMetadata(
-                    dimensions: .init(width: 64, height: 36),
+                    dimensions: .init(width: Int32(CVPixelBufferGetWidth(pixelBuffer)), height: Int32(CVPixelBufferGetHeight(pixelBuffer))),
                     bitDepth: tenBit ? 10 : 8,
                     range: .video,
                     matrix: .bt709,

@@ -101,6 +101,11 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored private var paused = true
     nonisolated private let snapshot = PiPPlaybackSnapshot()
 
+    #if DEBUG
+    /// Read-only native state for hosted integration tests, not a transport authority.
+    var nativeControllerForTesting: AVPictureInPictureController? { controller }
+    #endif
+
     init(target: any NowPlayingPlaybackTarget) { self.target = target; super.init() }
 
     func install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer, identity: PresentationIdentity) {
