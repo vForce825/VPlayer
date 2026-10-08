@@ -16,6 +16,7 @@
 		01AE6AE7B5718C8E0E05DD86 /* PlaybackMediaInformationPresentation.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0A40045AF4BBFA8EDF9BB05 /* PlaybackMediaInformationPresentation.swift */; };
 		01F9F35EF7505711B6DB8D88 /* HLSCompressedAudioCapability.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38EB920A4576BD8832FE561E /* HLSCompressedAudioCapability.swift */; };
 		025CAAC343833537D2E31B69 /* AudioSessionControlIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F7DCDFD043AD016D2B3456E /* AudioSessionControlIdentity.swift */; };
+		0296B8DACFFB11BD484C12E7 /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B16CFEEA73472380FF70D554 /* VPlayerPlayback.framework */; };
 		02A12F1D42C6988A086B2BE5 /* OutputCleanupCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5902DFB90B0B9D0700E5B82 /* OutputCleanupCoordinatorTests.swift */; };
 		02B8D95A9C4B5D00D4804C03 /* AVKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5498201DF1E4B105E63C7D22 /* AVKit.framework */; };
 		03A33825C47BC2A9E6ABA5D2 /* YADIFProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88BF6A356D15DC7B669B2F90 /* YADIFProcessor.swift */; };
@@ -477,8 +478,10 @@
 		6EBEFF76407705B9CED67829 /* AcceptanceMatrixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D76E3CB2F6EEC12BA3AF530 /* AcceptanceMatrixTests.swift */; };
 		6F142D6299B4BE10473EB78A /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
 		6F70DEFE57C5EC7D67568F2A /* PlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04B1C41063994266AE47E7D3 /* PlaybackController.swift */; };
+		6F9D9D5BF329B72931C5D3E2 /* YADIFGoldenPixelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6EF6D663829A5963CB19BB34 /* YADIFGoldenPixelTests.swift */; };
 		6FB888CB7A0511BA27B750CF /* PlaybackDeadlineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8197D5CA575A4A011748B08 /* PlaybackDeadlineTests.swift */; };
 		700C6B9D128DE1F58342797D /* VPFFmpegAudioConverter.h in Headers */ = {isa = PBXBuildFile; fileRef = E7A5CC098C3095AC2EAD6CD4 /* VPFFmpegAudioConverter.h */; settings = {ATTRIBUTES = (Public, ); }; };
+		7076B8345B40C1F274BD4DA4 /* VPlayerPlayback.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = B16CFEEA73472380FF70D554 /* VPlayerPlayback.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		707FDA07DDFDEA417193A75A /* RefreshTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8962CD0CAB958608B6C759D /* RefreshTypes.swift */; };
 		70A7232C5674E7E2B50428FB /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 0B493CE54CC5A173AD759949 /* PrivacyInfo.xcprivacy */; };
 		70BD0D88ACC9791C1329B2FA /* SourcePlanning in Resources */ = {isa = PBXBuildFile; fileRef = 54D538B411151422DB1C8C09 /* SourcePlanning */; };
@@ -795,6 +798,7 @@
 		BD0915983FDEEEA04D4E067D /* RefreshCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */; };
 		BD1B6F376322FA4EFF1025DA /* HLSProxyResourceRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B809C72A2524E27620E1349 /* HLSProxyResourceRegistryTests.swift */; };
 		BD57104CA4ABD0F30443F7AF /* SampleBufferVideoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7D98FDBCA4A67C018465639F /* SampleBufferVideoView.swift */; };
+		BD59CD449F4C64AD911BEF70 /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 36FC89162FB8D01A895E763D /* VPlayerCore.framework */; };
 		BD6772B0C4E039AB7DE8BCA6 /* HomePodAVPlayerSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0BB9E08C9B836942CCC3DA3 /* HomePodAVPlayerSession.swift */; };
 		BDACBDD0950A397E10C7A1C3 /* ChannelSections.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0C8E604CB846FBCA82EAA8EF /* ChannelSections.swift */; };
 		BDFC58C709649D40F7A0CF1E /* HLSOwnedSourcePlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC433A3486018D693213676F /* HLSOwnedSourcePlan.swift */; };
@@ -901,6 +905,7 @@
 		D6035F5BAA62E59B4859896F /* ReleaseIdentityFixture.swift in Sources */ = {isa = PBXBuildFile; fileRef = ADEE9270141173EE733B80F3 /* ReleaseIdentityFixture.swift */; };
 		D634450F094C9ADDD9E4DF08 /* IOSRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3BE7AC95265001D7D087109 /* IOSRootView.swift */; };
 		D6D6177FA95958B08946DC87 /* PlaybackApplicationChargeLedger.swift in Sources */ = {isa = PBXBuildFile; fileRef = C6DFC270915620D87FA6B63A /* PlaybackApplicationChargeLedger.swift */; };
+		D6F46792FF83EF7F56567AD1 /* VPlayerCore.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 36FC89162FB8D01A895E763D /* VPlayerCore.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		D6FBABC968B226C01CC8D6F8 /* ChannelBrowserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = EF2312CDCDAAF53C4BA80484 /* ChannelBrowserView.swift */; };
 		D710DC06A108C6F6E15BA599 /* PlaybackPresentationRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = C522508DCFF656885201D078 /* PlaybackPresentationRelay.swift */; };
 		D72A4FEF8BB086E364633765 /* VPLoadedRangeCoverage.h in Headers */ = {isa = PBXBuildFile; fileRef = 7D40021745926C5F48C68F32 /* VPLoadedRangeCoverage.h */; settings = {ATTRIBUTES = (Public, ); }; };
@@ -1100,6 +1105,13 @@
 			remoteGlobalIDString = 577E83D115BAEF7CAC5C21C8;
 			remoteInfo = VPlayerCore;
 		};
+		2DA7719A3408F21B0C7F2515 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8DC00384259C1974ED03CE48 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 07BB19ADD27DD8F9FB9F442E;
+			remoteInfo = VPlayerCoreiOS;
+		};
 		332EDFF48AB9E719BE752606 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 8DC00384259C1974ED03CE48 /* Project object */;
@@ -1129,6 +1141,13 @@
 			remoteInfo = VPlayerCoreiOS;
 		};
 		76A447849D051F58A7C0C277 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 8DC00384259C1974ED03CE48 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 2B46C7BA7F9C0CB4785D3DEA;
+			remoteInfo = VPlayerPlaybackiOS;
+		};
+		7BAA275E2A8596D25E9744F0 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 8DC00384259C1974ED03CE48 /* Project object */;
 			proxyType = 1;
@@ -1208,6 +1227,18 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		172F4AE5C97DC413D261A7A8 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				D6F46792FF83EF7F56567AD1 /* VPlayerCore.framework in Embed Frameworks */,
+				7076B8345B40C1F274BD4DA4 /* VPlayerPlayback.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		2AFBC03710CC4F5C7FD5BBEC /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -1388,6 +1419,7 @@
 		261D10E9007A97B958090900 /* FullScreenPlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FullScreenPlayerViewModel.swift; sourceTree = "<group>"; };
 		272C033283B2E51C5066F18E /* AcceptanceMediaSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcceptanceMediaSupport.swift; sourceTree = "<group>"; };
 		278E9315B314D76D1EE71C14 /* CompressedVideoAssemblerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompressedVideoAssemblerTests.swift; sourceTree = "<group>"; };
+		27A5279B7DE43DC9092FAEDA /* VPlayeriOSBenchmarks.xctest */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.cfbundle; path = VPlayeriOSBenchmarks.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		27B68E071F13D11FE4E3172F /* LumaScanProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LumaScanProbeTests.swift; sourceTree = "<group>"; };
 		27CCD92C354A59559E02E534 /* PlaybackFixtureIntegrationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackFixtureIntegrationTests.swift; sourceTree = "<group>"; };
 		28CBFE07860F14CBAFCDC9C7 /* PlaybackSettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackSettingsStore.swift; sourceTree = "<group>"; };
@@ -1920,6 +1952,15 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		CD3F949472192790107CB2DC /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BD59CD449F4C64AD911BEF70 /* VPlayerCore.framework in Frameworks */,
+				0296B8DACFFB11BD484C12E7 /* VPlayerPlayback.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		D368CCA683A7BB82EB9C4AA3 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -2149,6 +2190,7 @@
 				D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */,
 				36FC89162FB8D01A895E763D /* VPlayerCore.framework */,
 				BB8F77358BEEBC4DD4F8FE32 /* VPlayerHLSAcceptanceTests.xctest */,
+				27A5279B7DE43DC9092FAEDA /* VPlayeriOSBenchmarks.xctest */,
 				01710AFC9B1749C27B0A1440 /* VPlayeriOSTests.xctest */,
 				058BA4944E26EE76DA2F2729 /* VPlayeriOSUITests.xctest */,
 				566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */,
@@ -3313,6 +3355,27 @@
 			productReference = F36B1C96A78B6085FC533929 /* VPlayer.app */;
 			productType = "com.apple.product-type.application";
 		};
+		DB2C77CC43B62A12BB1106A5 /* VPlayeriOSBenchmarks */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = DB12D9347680DB85A88330DF /* Build configuration list for PBXNativeTarget "VPlayeriOSBenchmarks" */;
+			buildPhases = (
+				BD34571B1B1965E7124D14CD /* Sources */,
+				CD3F949472192790107CB2DC /* Frameworks */,
+				172F4AE5C97DC413D261A7A8 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				AD521310FE4C4CE0E48758F9 /* PBXTargetDependency */,
+				42150186C3C7527ADD0A80B1 /* PBXTargetDependency */,
+			);
+			name = VPlayeriOSBenchmarks;
+			packageProductDependencies = (
+			);
+			productName = VPlayeriOSBenchmarks;
+			productReference = 27A5279B7DE43DC9092FAEDA /* VPlayeriOSBenchmarks.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		E723C02BBA5DEBF8E25DFC48 /* VPlayeriOSTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = CBF8DCB7B0B080762325F747 /* Build configuration list for PBXNativeTarget "VPlayeriOSTests" */;
@@ -3383,6 +3446,7 @@
 				01923E138B558831CD3630E6 /* VPlayerTests */,
 				9115CEC4C750352B2CCDE79B /* VPlayerUITests */,
 				C731374532D14C6EDEA5DCDD /* VPlayeriOS */,
+				DB2C77CC43B62A12BB1106A5 /* VPlayeriOSBenchmarks */,
 				E723C02BBA5DEBF8E25DFC48 /* VPlayeriOSTests */,
 				6C3114383BF842E301328C34 /* VPlayeriOSUITests */,
 			);
@@ -4236,6 +4300,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		BD34571B1B1965E7124D14CD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6F9D9D5BF329B72931C5D3E2 /* YADIFGoldenPixelTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		C33420724D4AE64AD38DF2D4 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -4555,6 +4627,11 @@
 			target = 577E83D115BAEF7CAC5C21C8 /* VPlayerCore */;
 			targetProxy = 0387351E894BB3BF83F85886 /* PBXContainerItemProxy */;
 		};
+		42150186C3C7527ADD0A80B1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 2B46C7BA7F9C0CB4785D3DEA /* VPlayerPlaybackiOS */;
+			targetProxy = 7BAA275E2A8596D25E9744F0 /* PBXContainerItemProxy */;
+		};
 		68642A45A15D7959FB495AB0 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = C601188C6545FD7063A7DDB7 /* VPlayerPlayback */;
@@ -4589,6 +4666,11 @@
 			isa = PBXTargetDependency;
 			target = 2B46C7BA7F9C0CB4785D3DEA /* VPlayerPlaybackiOS */;
 			targetProxy = 76A447849D051F58A7C0C277 /* PBXContainerItemProxy */;
+		};
+		AD521310FE4C4CE0E48758F9 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 07BB19ADD27DD8F9FB9F442E /* VPlayerCoreiOS */;
+			targetProxy = 2DA7719A3408F21B0C7F2515 /* PBXContainerItemProxy */;
 		};
 		AF944BADE26C5BFDFF2806B3 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
@@ -4686,6 +4768,25 @@
 				SWIFT_TREAT_WARNINGS_AS_ERRORS = YES;
 				SWIFT_VERSION = 6.0;
 				TVOS_DEPLOYMENT_TARGET = 27.0;
+			};
+			name = Debug;
+		};
+		009D46848D2EA7C517574360 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				BUNDLE_LOADER = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.benchmarks.ios;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "";
 			};
 			name = Debug;
 		};
@@ -4996,6 +5097,25 @@
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/VPlayer.app/VPlayer";
+			};
+			name = Release;
+		};
+		9A1CBD94F05E86AEDCE0E168 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ARCHS = arm64;
+				BUNDLE_LOADER = "";
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.benchmarks.ios;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "";
 			};
 			name = Release;
 		};
@@ -5413,6 +5533,15 @@
 			buildConfigurations = (
 				402389B012710B0E46B45748 /* Debug */,
 				86E3FD29905AA786214CAECA /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		DB12D9347680DB85A88330DF /* Build configuration list for PBXNativeTarget "VPlayeriOSBenchmarks" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				009D46848D2EA7C517574360 /* Debug */,
+				9A1CBD94F05E86AEDCE0E168 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
