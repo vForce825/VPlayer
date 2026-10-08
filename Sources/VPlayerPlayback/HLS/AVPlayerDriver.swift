@@ -725,7 +725,12 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             if !transferred { creationLock.withLock { releaseAdmissionLocked(admission) } }
         }
         guard player?.currentItem == nil else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
-        let driver = try SystemAVPlayerDriver(player: player ?? AVPlayer(),
+        #if os(iOS)
+        let nativePlayer = player ?? IOSControlledAVPlayer()
+        #else
+        let nativePlayer = player ?? AVPlayer()
+        #endif
+        let driver = try SystemAVPlayerDriver(player: nativePlayer,
             deadlineScheduler: deadlineScheduler, admission: admission,
             preferredForwardBufferDuration: preferredForwardBufferDuration,
             resourceContextReservation: resourceReservation,
@@ -737,6 +742,15 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         return driver
     }
     let player: AVPlayer
+    private func performPlayerTransportMutation(_ operation: () -> Void) {
+        #if os(iOS)
+        if let controlled = player as? IOSControlledAVPlayer {
+            controlled.performDriverMutation(operation)
+            return
+        }
+        #endif
+        operation()
+    }
     let preferredForwardBufferDuration: TimeInterval
     private var item: AVPlayerItem?
     private(set) var currentItemIdentity: AVPlayerItemInstanceIdentity?
@@ -987,7 +1001,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         cancelAllWaiters()
         installationResourceContextReservation = nil
         eventHub.releaseInstallationResourceContext()
-        player.pause()
+        performPlayerTransportMutation { player.pause() }
         player.automaticallyWaitsToMinimizeStalling = true
         let installed = AVPlayerItem(url: url)
         installed.preferredForwardBufferDuration = AVPlayerStartupBufferPolicy.selectionBufferSeconds(configured: preferredForwardBufferDuration)
@@ -995,7 +1009,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         // No app observer is installed on the new item yet. Only the exact SDK
         // mutation and driver identity CAS run under the original prepare fence.
         guard try admission({
-            player.replaceCurrentItem(with: installed)
+            performPlayerTransportMutation { player.replaceCurrentItem(with: installed) }
             item = installed
             currentItemIdentity = identity
         }) else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
@@ -1298,7 +1312,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         // Classification and this native admission run on MainActor. Inspect the
         // current pending scalar without holding the hub lock across AVPlayer.
         if let failure = eventHub.pendingAccessFailure(item: identity) { throw failure }
-        guard invocation.performPositiveRateSideEffect({ player.play() }) else {
+        guard invocation.performPositiveRateSideEffect({ performPlayerTransportMutation { player.play() } }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         naturalEndAuthority = invocation
@@ -1439,7 +1453,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         timeControlObservation = nil
         cancelNaturalEndDeadline()
         naturalEndAuthority = nil
-        player.pause()
+        performPlayerTransportMutation { player.pause() }
     }
 
     func waitUntilPaused(item identity: AVPlayerItemInstanceIdentity) async throws {
@@ -1840,7 +1854,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     func replaceCurrentItemWithNil(item identity: AVPlayerItemInstanceIdentity) {
         guard currentItemIdentity == identity, !systemAudioTransitionInFlight else { return }
         cancelAllWaiters()
-        player.replaceCurrentItem(with: nil)
+        performPlayerTransportMutation { player.replaceCurrentItem(with: nil) }
         item = nil
         currentItemIdentity = nil
         installationResourceContextReservation = nil

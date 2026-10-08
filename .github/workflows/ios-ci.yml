@@ -24,12 +24,10 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
-  generated-inputs:
-    name: Verify generated iOS project and Metal inputs
+  ios-tests:
+    name: iPhone generated inputs, simulator tests and unsigned device build
     runs-on: xcode-27
-    timeout-minutes: 25
-    outputs:
-      needs_refresh: ${{ steps.generated.outputs.needs_refresh }}
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
@@ -52,23 +50,6 @@ jobs:
           Scripts/build-metal-libraries.sh --platform ios
           mint run yonaskolb/XcodeGen@2.44.1 xcodegen generate --spec project.yml --project . --project-root .
           python3 Scripts/emit-generated-ios-inputs.py emit --baseline "$RUNNER_TEMP/generated-before.json"
-      - name: Fail closed until generated outputs are committed
-        if: steps.generated.outputs.needs_refresh == 'true'
-        run: |
-          echo 'Generated inputs differ. Commit the emitted verified public outputs and validate the new exact head.'
-          exit 1
-
-  ios-tests:
-    name: iPhone simulator tests and unsigned device build
-    needs: generated-inputs
-    if: needs.generated-inputs.outputs.needs_refresh == 'false'
-    runs-on: xcode-27
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          persist-credentials: false
       - name: Prepare audited iOS dependency profile
         timeout-minutes: 40
         run: |
@@ -123,3 +104,9 @@ jobs:
           python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS.xcresult"
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
+      - name: Fail closed until generated outputs are committed
+        if: always() && steps.generated.outputs.needs_refresh == 'true'
+        run: |
+          echo 'Native results above are diagnostic only: generated inputs differ from the committed tree.'
+          echo 'Commit the verified generated outputs and validate the new exact head before acceptance.'
+          exit 1

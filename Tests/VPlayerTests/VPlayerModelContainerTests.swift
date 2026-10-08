@@ -129,6 +129,7 @@ final class VPlayerModelContainerTests: XCTestCase {
         )
     }
 
+    #if os(tvOS)
     func testPersistentStoreRootAvoidsSandboxRestrictedApplicationSupport() throws {
         // On device tvOS denies creating Library/Application Support while the
         // simulator permits it, so only a path assertion catches a regression
@@ -150,6 +151,8 @@ final class VPlayerModelContainerTests: XCTestCase {
         XCTAssertEqual(root.path, caches.path)
         XCTAssertFalse(root.path.hasPrefix(applicationSupport.path))
     }
+
+    #endif
 
     func testStoreFilesDeletedLikeACachesPurgeStillReturnTheConfiguredProfiles() async throws {
         let fixture = try PersistentStoreFixture()

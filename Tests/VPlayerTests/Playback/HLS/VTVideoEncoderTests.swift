@@ -297,7 +297,7 @@ final class VTVideoEncoderTests: XCTestCase {
         XCTAssertTrue(snapshot.encodes.isEmpty)
     }
 
-    #if targetEnvironment(simulator)
+    #if os(tvOS) && targetEnvironment(simulator)
     func testSimulatorRejectsMeasuredUnsupportedNativeClosedGOPPropertyWithExactFailure() throws {
         let format = makeFormat(width: 1_280, height: 720)
         let bitrate = try VTVideoBitratePolicy.freeze(

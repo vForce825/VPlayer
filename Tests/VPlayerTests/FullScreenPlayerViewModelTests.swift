@@ -1913,6 +1913,24 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         await stop.value
     }
 
+    func testInitialReplayedStopDoesNotRetireNewRequestButMatchingStopDoes() async throws {
+        let engine = ControlledViewModelPlaybackEngine()
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+        model.start()
+        try await eventually { await engine.subscriberCount == 1 }
+        await engine.emit(state: .stopped)
+        try await eventually { model.state == .stopped }
+        XCTAssertFalse(model.hasStoppedCurrentRequest)
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .stopped)
+        try await eventually { model.hasStoppedCurrentRequest }
+        await model.stop()
+    }
+
+    #if os(tvOS)
     func testAVPlayerControllerDisablesSystemControls() {
         let context = AVPlayerPresentationContext(player: AVPlayer())
 
@@ -1929,6 +1947,8 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         DefaultPlaybackPresentationMount().detach(identified)
         XCTAssertNil(mountedController.player)
     }
+
+    #endif
 
     private enum PresentationFixtureKind {
         case sampleBuffer

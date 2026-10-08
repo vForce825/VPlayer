@@ -21,7 +21,7 @@ class IOSPiPContractTests(unittest.TestCase):
         self.assertNotIn('.fullScreenCover(item: $session)',text)
     def test_remote_stop_retires_root_session_without_using_view_disappearance(self):
         text=(ROOT/'Sources/VPlayeriOSApp/Player/IOSPlaybackSession.swift').read_text()
-        self.assertIn('if case .stopped = model.state { close(); return }',text)
+        self.assertIn('if model.hasStoppedCurrentRequest { close(); return }',text)
         view=(ROOT/'Sources/VPlayeriOSApp/Player/IOSFullScreenPlayerView.swift').read_text()
         self.assertNotIn('onDisappear { session.close()',view)
 

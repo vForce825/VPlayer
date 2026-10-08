@@ -23,7 +23,7 @@ final class GPUVideoProcessingGate: @unchecked Sendable {
             let previouslyAccepted = acceptsGPU
             if let foreground { self.foreground = foreground }
             if let pictureInPicture { self.pictureInPicture = pictureInPicture }
-            if acceptsGPU && !previouslyAccepted { fence = GPUVideoHandoffFence() }
+            if acceptsGPU && !previouslyAccepted { fence = GPUVideoHandoffFence(inheriting: fence.outstandingTickets) }
         }
     }
     /// nil means GPU work was admitted; otherwise CPU must join this exact
@@ -40,26 +40,41 @@ final class GPUVideoProcessingGate: @unchecked Sendable {
 }
 
 final class GPUVideoHandoffFence: @unchecked Sendable {
-    private let group = DispatchGroup()
-    fileprivate func makeTicket() -> GPUVideoWorkTicket {
-        group.enter()
-        return GPUVideoWorkTicket(group: group)
+    private let lock = NSLock()
+    private var tickets: [GPUVideoWorkTicket]
+    init(inheriting tickets: [GPUVideoWorkTicket] = []) { self.tickets = tickets }
+    var outstandingTickets: [GPUVideoWorkTicket] {
+        lock.withLock {
+            tickets.removeAll { $0.isFinished }
+            return tickets
+        }
     }
-    func wait(timeout: DispatchTime) -> Bool { group.wait(timeout: timeout) == .success }
+    fileprivate func makeTicket() -> GPUVideoWorkTicket {
+        lock.withLock {
+            tickets.removeAll { $0.isFinished }
+            let ticket = GPUVideoWorkTicket()
+            tickets.append(ticket)
+            return ticket
+        }
+    }
+    func wait(timeout: DispatchTime) -> Bool {
+        outstandingTickets.allSatisfy { $0.wait(timeout: timeout) }
+    }
 }
 
 final class GPUVideoWorkTicket: @unchecked Sendable {
     private let lock = NSLock()
-    private let group: DispatchGroup
+    private let group = DispatchGroup()
     private var finished = false
-    fileprivate init(group: DispatchGroup) { self.group = group }
+    fileprivate init() { group.enter() }
+    var isFinished: Bool { lock.withLock { finished } }
+    fileprivate func wait(timeout: DispatchTime) -> Bool { group.wait(timeout: timeout) == .success }
     func finish() {
-        let release = lock.withLock {
-            guard !finished else { return false }
+        lock.withLock {
+            guard !finished else { return }
+            group.leave()
             finished = true
-            return true
         }
-        if release { group.leave() }
     }
 }
 

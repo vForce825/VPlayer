@@ -10,6 +10,15 @@ import VPlayerPlayback
 
 @MainActor
 final class IOSPictureInPictureCoordinatorTests: XCTestCase {
+    func testRestoreIntentIsConsumedBeforeTheNextAutomaticPiPCycle() {
+        let snapshot = PiPPlaybackSnapshot()
+        let object = NSObject()
+        let identity = ObjectIdentifier(object)
+        snapshot.update(paused: false, available: true, identity: identity)
+        snapshot.requestRestore(identity)
+        XCTAssertTrue(snapshot.consumeRestoreIntent(identity))
+        XCTAssertFalse(snapshot.consumeRestoreIntent(identity), "A later automatic PiP close is not a restore")
+    }
     func testCallbackReferencePinsIdentityUntilTheActorHopFinishes() {
         weak var weakObject: NSObject?
         var reference: PiPCallbackReference<NSObject>?

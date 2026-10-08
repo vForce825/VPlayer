@@ -7001,7 +7001,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     private func withInstalledReview3Driver(outputNonce: UInt64,
         _ body: @MainActor (SystemAVPlayerDriver, AVPlayerItemInstanceIdentity) async throws -> Void) async throws {
-        let driver = try SystemAVPlayerDriver.make()
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         let item = AVPlayerItemInstanceIdentity(
             outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce),
             itemGeneration: 1)

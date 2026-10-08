@@ -18,4 +18,10 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('Scripts/test-ios.sh',text)
         self.assertIn('needs_refresh',text)
         self.assertIn('contents: read',text)
+    def test_generation_drift_is_reported_after_native_diagnostics_not_before(self):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        self.assertNotIn('if: needs.generated-inputs.outputs.needs_refresh', text)
+        self.assertGreater(text.index('name: Fail closed until generated outputs are committed'),
+                           text.index('name: Run shared playback and iPhone touch tests'))
+        self.assertIn("always() && steps.generated.outputs.needs_refresh == 'true'", text)
 if __name__=='__main__':unittest.main()

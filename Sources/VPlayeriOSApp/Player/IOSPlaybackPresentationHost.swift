@@ -40,12 +40,24 @@ final class IOSPlaybackHostController: PlaybackPresentationHostController {
         case .sampleBuffer:
             guard let layer = child.view.layer as? AVSampleBufferDisplayLayer else { return }
             pictureInPicture?.install(sampleBufferDisplayLayer: layer, identity: presentation.identity)
-        case .avPlayer:
+        case let .avPlayer(context):
             guard let view = child.view as? IOSAVPlayerLayerView else { return }
-            pictureInPicture?.install(playerLayer: view.playerLayer, identity: presentation.identity)
+            let identity = presentation.identity
+            guard context.setPictureInPictureTransportHandler({ [weak pictureInPicture] paused in
+                pictureInPicture?.requestPlayerTransport(paused: paused, identity: identity)
+            }, for: view.playerLayer) else { return }
+            pictureInPicture?.install(playerLayer: view.playerLayer, identity: identity)
         }
     }
+    override func detachAVPlayerChild(context: AVPlayerPresentationContext, child: UIViewController) {
+        guard let view = child.view as? IOSAVPlayerLayerView else { return }
+        context.detach(from: view.playerLayer)
+    }
     override func willUnmount(_ presentation: IdentifiedPlaybackPresentation, child: UIViewController) {
+        if case let .avPlayer(context) = presentation.presentation,
+           let view = child.view as? IOSAVPlayerLayerView {
+            _ = context.setPictureInPictureTransportHandler(nil, for: view.playerLayer)
+        }
         pictureInPicture?.retire(identity: presentation.identity)
     }
 }

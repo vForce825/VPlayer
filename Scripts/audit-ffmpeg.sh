@@ -14,7 +14,6 @@ physical_root="$(cd -P "$(dirname "$0")/.." && pwd)"
 vendor="$root/Vendor/FFmpeg"
 lock="$vendor/ffmpeg.lock.json"
 manifest="$vendor/component-manifest.json"
-required_system_symbols="$vendor/system-symbol-allowlist.txt"
 optional_system_symbols="$vendor/optional-system-symbol-allowlist.txt"
 work="$vendor/Work"
 source="$work/source"
@@ -50,6 +49,7 @@ if [[ "${1:-}" == "--platform" ]]; then
   shift 2
 fi
 ffmpeg_select_platform "$selected_platform"
+required_system_symbols="$vendor/$ffmpeg_required_symbols"
 build_work="$work$ffmpeg_work_suffix"
 [[ $# -eq 1 ]] || fail "usage: $0 [--platform tvos|ios] <FFmpeg.xcframework>"
 xcframework="$1"

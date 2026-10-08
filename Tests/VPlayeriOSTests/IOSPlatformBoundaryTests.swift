@@ -39,6 +39,29 @@ final class IOSPlatformBoundaryTests: XCTestCase {
         XCTAssertNil(view.windowDidChange)
     }
 
+    func testBluetoothA2DPHFPAndLEStayOnLocalSampleBufferPathAcrossVisualActivity() async throws {
+        let sdk = AudioSessionSDKSpy(categoryResults: [], multichannelFails: false,
+            executor: ControlTaskRegistry().executor)
+        let salt = try XCTUnwrap(AudioSessionEndpointSalt.make(using: sdk))
+        for port in [AVAudioSession.Port.bluetoothA2DP, .bluetoothHFP, .bluetoothLE] {
+            let route = GraphRouteSnapshot([.init(uid: "synthetic-headset",
+                portType: port.rawValue as NSString, dataSource: .missing)])
+            guard case let .available(ports, _, _) = AudioSessionBlockingCallLane.project(route, salt: salt) else {
+                return XCTFail("Bluetooth endpoint projection failed")
+            }
+            XCTAssertEqual(ports, .bluetooth)
+            XCTAssertFalse(ports.contains(.airPlay))
+            let harness = RouteServiceTestHarness(initialPorts: ports)
+            try await harness.acquireWithoutNotification()
+            await harness.advanceThroughStabilityWindow()
+            let visualGate = GPUVideoProcessingGate()
+            for foreground in [true, false, true] {
+                visualGate.setForeground(foreground)
+                XCTAssertEqual(harness.committedBackend, .sampleBuffer)
+            }
+        }
+    }
+
     func testPhoneStoreUsesApplicationSupportAndDeploymentLabel() throws {
         let url = try VPlayerModelContainer.persistentStoreRootURL()
         let expected = try FileManager.default.url(for: .applicationSupportDirectory,

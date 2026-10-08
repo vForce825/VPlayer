@@ -89,6 +89,18 @@ printf '%s\\n' "$ffmpeg_platform" "$ffmpeg_artifact_directory" "$ffmpeg_work_suf
             self.assertIn('candidate does not match', result.stderr)
             self.assertEqual((candidate / 'marker').read_text(), 'preserve')
 
+    def test_ios_required_symbols_are_exact_arm64_inventory_without_weakening_tv(self):
+        vendor=ROOT/'Vendor/FFmpeg'
+        def symbols(path):
+            return {line for line in path.read_text().splitlines() if line and not line.startswith('#')}
+        phone=vendor/'system-symbol-allowlist-ios.txt'
+        self.assertTrue(phone.exists(), 'iOS arm64 inventory must be independent of TV x86_64')
+        self.assertEqual(symbols(vendor/'system-symbol-allowlist.txt') - symbols(phone),
+                         {'_ceil', '_floor', '_rint', '_round', '_trunc'})
+        self.assertFalse(symbols(phone) - symbols(vendor/'system-symbol-allowlist.txt'))
+        audit=(ROOT/'Scripts/audit-ffmpeg.sh').read_text()
+        self.assertIn('required_system_symbols="$vendor/$ffmpeg_required_symbols"', audit)
+
     def test_metal_default_preserves_tv_and_ios_is_opt_in(self):
         source = (ROOT / 'Scripts/build-metal-libraries.sh').read_text()
         self.assertIn('--platform', source)

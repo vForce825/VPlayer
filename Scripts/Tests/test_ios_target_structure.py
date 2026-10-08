@@ -38,6 +38,19 @@ class IOSTargetStructureTests(unittest.TestCase):
         self.assertIn('audio',info['UIBackgroundModes'])
         self.assertNotIn('TVTopShelfImage',info)
         self.assertEqual(set(info['UISupportedInterfaceOrientations']),{'UIInterfaceOrientationPortrait','UIInterfaceOrientationLandscapeLeft','UIInterfaceOrientationLandscapeRight'})
+    def test_product_metadata_and_runnable_match_build_settings(self):
+        for target, product in [('VPlayerCoreiOS', 'VPlayerCore'), ('VPlayerPlaybackiOS', 'VPlayerPlayback'), ('VPlayeriOS', 'VPlayer')]:
+            self.assertIn('productName: '+product, self.target(target))
+        project=(ROOT/'VPlayer.xcodeproj/project.pbxproj').read_text()
+        for stale in ['path = VPlayerCoreiOS.framework;', 'path = VPlayerPlaybackiOS.framework;', 'path = VPlayeriOS.app;']:
+            self.assertFalse(stale in project, stale)
+        import xml.etree.ElementTree as ET
+        scheme=ET.parse(ROOT/'VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayeriOS.xcscheme')
+        runnable=scheme.find('./LaunchAction/BuildableProductRunnable/BuildableReference')
+        self.assertIsNotNone(runnable, 'Run must launch the iPhone app, not expand a framework')
+        self.assertEqual(runnable.attrib['BlueprintName'], 'VPlayeriOS')
+        self.assertEqual(runnable.attrib['BuildableName'], 'VPlayer.app')
+
     def test_tv_target_identity_remains_unchanged(self):
         app=self.target('VPlayer')
         self.assertIn('platform: tvOS',app)

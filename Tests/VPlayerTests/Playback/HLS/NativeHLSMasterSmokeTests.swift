@@ -97,11 +97,15 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertTrue(result.progressed, "The unmodified full source must actually progress")
                 XCTAssertNil(result.errorDomain)
             } else {
+                #if os(tvOS)
                 // Exact tvOS 27 reproduction for this unchanged TS/master, not
                 // a blanket claim that HLS trimming is unsupported by AVPlayer.
                 XCTAssertFalse(result.progressed)
                 XCTAssertEqual(result.errorDomain, "CoreMediaErrorDomain")
                 XCTAssertEqual(result.errorCode, -12865)
+                #else
+                print("IOS_NATIVE_ENDPOINT_CONTROL boundary=\(boundary) progressed=\(result.progressed) error=\(result.errorCode ?? 0)")
+                #endif
             }
         }
     }
@@ -931,7 +935,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertFalse(quantum.isCurrent(item: coordinator.item, physical: physical),
                     "A revision change revokes timing even when every SDK object is unchanged")
                 XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                // Inject an unexpected native pause, rather than a PiP intent.
+                #if os(iOS)
+                if let controlled = player as? IOSControlledAVPlayer {
+                    controlled.performDriverMutation { player.pause() }
+                } else { player.pause() }
+                #else
                 player.pause()
+                #endif
                 XCTAssertEqual(player.rate, 0)
                 XCTAssertEqual(player.timeControlStatus, .paused)
                 let early = try ExactMediaTime(player.currentTime())

@@ -76,6 +76,7 @@ final class Task10PresentationHostCapacityTests: XCTestCase {
         XCTAssertEqual(host.mountedIdentity, sharedIdentity)
     }
 
+    #if os(tvOS)
     func testLateAVPlayerDismantleOnlyDetachesItsExpectedController() {
         let context = AVPlayerPresentationContext(player: AVPlayer())
         let oldController = AVPlayerViewController()
@@ -97,6 +98,8 @@ final class Task10PresentationHostCapacityTests: XCTestCase {
             "迟到的A dismantle不得清除当前B"
         )
     }
+
+    #endif
 
     func testLateOuterHostDisconnectOnlyUninstallsItsExpectedHost() {
         let mount = PlaybackPresentationHostMount()

@@ -49,7 +49,7 @@ for metadata in \
   configure.flags \
   ffmpeg.lock.json \
   optional-system-symbol-allowlist.txt \
-  system-symbol-allowlist.txt; do
+  "$ffmpeg_required_symbols"; do
   cp "$vendor/$metadata" "$base/Vendor/FFmpeg/"
 done
 cp -R "$artifact" "$base/Vendor/FFmpeg/$ffmpeg_artifact_directory/"
@@ -220,7 +220,7 @@ printf '_abort\n' >> "$case_root/Vendor/FFmpeg/optional-system-symbol-allowlist.
 assert_rejected "$case_root" "system symbol allowlists overlap" "overlapping required and optional symbol allowlists"
 
 case_root="$(new_case stale-symbol)"
-printf '_vplayer_audit_stale_symbol\n' >> "$case_root/Vendor/FFmpeg/system-symbol-allowlist.txt"
+printf '_vplayer_audit_stale_symbol\n' >> "$case_root/Vendor/FFmpeg/$ffmpeg_required_symbols"
 assert_rejected "$case_root" "_vplayer_audit_stale_symbol" "a stale unresolved-symbol allowlist entry"
 
 echo "FFmpeg artifact audit tamper test OK"

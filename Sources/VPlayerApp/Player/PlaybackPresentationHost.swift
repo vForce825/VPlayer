@@ -67,6 +67,14 @@ class PlaybackPresentationHostController: UIViewController {
         context.attach(to: controller)
         return controller
     }
+    func detachAVPlayerChild(context: AVPlayerPresentationContext, child: UIViewController) {
+        if let controller = child as? AVPlayerViewController {
+            context.detach(from: controller)
+            controller.player = nil
+        } else {
+            context.detach()
+        }
+    }
     func didMount(_ presentation: IdentifiedPlaybackPresentation, child: UIViewController) {}
     func willUnmount(_ presentation: IdentifiedPlaybackPresentation, child: UIViewController) {}
 
@@ -77,12 +85,7 @@ class PlaybackPresentationHostController: UIViewController {
         case let .sampleBuffer(context):
             context.detach()
         case let .avPlayer(context):
-            if let controller = current.child as? AVPlayerViewController {
-                context.detach(from: controller)
-                controller.player = nil
-            } else {
-                context.detach()
-            }
+            detachAVPlayerChild(context: context, child: current.child)
         }
         current.child.willMove(toParent: nil)
         current.child.view.removeFromSuperview()

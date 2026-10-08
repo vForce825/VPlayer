@@ -178,6 +178,7 @@ targets:
         INFOPLIST_FILE: Tests/VPlayerUITests/Info.plist
         TEST_TARGET_NAME: VPlayer
   VPlayerCoreiOS:
+    productName: VPlayerCore
     type: framework
     platform: iOS
     deploymentTarget: "27.0"
@@ -193,6 +194,7 @@ targets:
         DEFINES_MODULE: true
         GENERATE_INFOPLIST_FILE: true
   VPlayerPlaybackiOS:
+    productName: VPlayerPlayback
     type: framework
     platform: iOS
     deploymentTarget: "27.0"
@@ -240,6 +242,7 @@ targets:
         PUBLIC_HEADERS_FOLDER_PATH: "$(CONTENTS_FOLDER_PATH)/Headers"
         OTHER_LDFLAGS: "$(inherited) -lz"
   VPlayeriOS:
+    productName: VPlayer
     type: application
     platform: iOS
     deploymentTarget: "27.0"
@@ -307,7 +310,6 @@ targets:
           - SourceProfileURLPresentationTests.swift
           - Playback/DisplayCriteriaControllerTests.swift
           - Playback/PlaybackPresentationContextTests.swift
-          - Fixtures
       - path: Tests/Fixtures/Video
         type: folder
         buildPhase: resources
@@ -437,6 +439,7 @@ schemes:
             - IOSReleaseStartupTests
     run:
       config: Debug
+      executable: VPlayeriOS
     archive:
       config: Release
   VPlayeriOSReleaseStartup:

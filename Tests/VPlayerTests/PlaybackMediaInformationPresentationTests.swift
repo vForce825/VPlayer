@@ -431,6 +431,7 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
         XCTAssertEqual(subject.accessibilityText, "正在检测画面规格…")
     }
 
+    #if os(tvOS)
     func testPlayerChannelInfoAccessibilityUsesChineseSemantics() {
         let current = programme(title: "新闻", start: 0, stop: 1_800)
         let next = programme(title: "天气", start: 1_800, stop: 3_600)
@@ -511,6 +512,8 @@ final class PlaybackMediaInformationPresentationTests: XCTestCase {
             "23:59 – 0:29"
         )
     }
+
+    #endif
 
     private func programme(title: String, start: TimeInterval, stop: TimeInterval) -> Programme {
         Programme(

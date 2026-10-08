@@ -17,23 +17,46 @@ struct PiPCallbackReference<Object: AnyObject>: @unchecked Sendable {
     var identity: ObjectIdentifier { ObjectIdentifier(object) }
 }
 
-private final class PiPPlaybackSnapshot: @unchecked Sendable {
+final class PiPPlaybackSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var paused = true
     private var available = false
     private var identity: ObjectIdentifier?
     private var restoreIdentity: ObjectIdentifier?
+    private var pendingTransport: (PiPCallbackReference<AVPictureInPictureController>, Bool)?
+    private var transportDeliveryQueued = false
     func update(paused: Bool, available: Bool, identity: ObjectIdentifier?) {
         lock.withLock {
-            if self.identity != identity { restoreIdentity = nil }
+            if self.identity != identity { restoreIdentity = nil; pendingTransport = nil }
             self.paused = paused; self.available = available; self.identity = identity
+        }
+    }
+    func queueTransport(_ controller: AVPictureInPictureController, paused: Bool) -> Bool {
+        lock.withLock {
+            guard identity == ObjectIdentifier(controller) else { return false }
+            pendingTransport = (PiPCallbackReference(controller), paused)
+            let shouldQueue = !transportDeliveryQueued
+            transportDeliveryQueued = true
+            return shouldQueue
+        }
+    }
+    func takeTransport() -> (PiPCallbackReference<AVPictureInPictureController>, Bool)? {
+        lock.withLock {
+            defer { pendingTransport = nil; transportDeliveryQueued = false }
+            return pendingTransport
         }
     }
     func requestRestore(_ identity: ObjectIdentifier) {
         lock.withLock { if self.identity == identity { restoreIdentity = identity } }
     }
     func clearRestoreIntent() { lock.withLock { restoreIdentity = nil } }
-    func isRestoring(_ identity: ObjectIdentifier) -> Bool { lock.withLock { restoreIdentity == identity } }
+    func consumeRestoreIntent(_ identity: ObjectIdentifier) -> Bool {
+        lock.withLock {
+            guard restoreIdentity == identity else { return false }
+            restoreIdentity = nil
+            return true
+        }
+    }
     func read(for controller: AVPictureInPictureController) -> (paused: Bool, available: Bool) {
         lock.withLock {
             guard identity == ObjectIdentifier(controller) else { return (true, false) }
@@ -69,6 +92,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored private var observation: NSKeyValueObservation?
     @ObservationIgnored private var pending: (PresentationIdentity, AVPictureInPictureController.ContentSource)?
     @ObservationIgnored private var presentationIdentity: PresentationIdentity?
+    @ObservationIgnored private var transportTask: Task<Void, Never>?
+    @ObservationIgnored private var pendingTransport: (PresentationIdentity, Bool)?
     @ObservationIgnored private var starting = false
     @ObservationIgnored private var restoring = false
     @ObservationIgnored private var closed = false
@@ -80,6 +105,28 @@ final class IOSPictureInPictureCoordinator: NSObject,
 
     func install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer, identity: PresentationIdentity) {
         install(.init(sampleBufferDisplayLayer: sampleBufferDisplayLayer, playbackDelegate: self), identity: identity)
+    }
+    func requestPlayerTransport(paused: Bool, identity: PresentationIdentity) {
+        guard !closed, presentationIdentity == identity else { return }
+        pendingTransport = (identity, paused)
+        startTransportWorker()
+    }
+    private func startTransportWorker() {
+        guard !closed, transportTask == nil, pendingTransport != nil else { return }
+        transportTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.transportTask = nil; self.startTransportWorker() }
+            while !Task.isCancelled, !self.closed, let command = self.pendingTransport {
+                self.pendingTransport = nil
+                guard self.presentationIdentity == command.0 else { continue }
+                await self.target?.setPausedFromNowPlaying(command.1)
+            }
+        }
+    }
+    private func drainSampleTransport() {
+        guard let command = snapshot.takeTransport(), currentID == command.0.identity,
+              let identity = presentationIdentity else { return }
+        requestPlayerTransport(paused: command.1, identity: identity)
     }
     func install(playerLayer: AVPlayerLayer, identity: PresentationIdentity) {
         install(.init(playerLayer: playerLayer), identity: identity)
@@ -102,6 +149,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
     }
     private func retireCurrent() {
         guard let current = controller else { return }
+        pendingTransport = nil
+        transportTask?.cancel()
         observation = nil
         controller = nil
         presentationIdentity = nil
@@ -154,8 +203,9 @@ final class IOSPictureInPictureCoordinator: NSObject,
         controller.startPictureInPicture()
     }
     func stopForRestoration() {
+        guard let controller, isActive || starting || controller.isPictureInPictureActive else { return }
         restoring = true
-        controller?.stopPictureInPicture()
+        controller.stopPictureInPicture()
     }
     func update(state: PlaybackState, paused: Bool) {
         self.state = state; self.paused = paused
@@ -173,6 +223,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
     func close() {
         guard !closed else { return }
         closed = true
+        pendingTransport = nil
+        transportTask?.cancel()
         observation = nil
         pending = nil
         for item in [controller, retiring].compactMap({ $0 }) {
@@ -210,7 +262,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
         guard currentID == identity else { return }
         starting = false; isActive = false
         PlaybackVideoProcessingActivity.setPictureInPicture(false)
-        if !restoring && !snapshot.isRestoring(identity) { onStopped?() }
+        let restored = snapshot.consumeRestoreIntent(identity)
+        if !restoring && !restored { onStopped?() }
         restoring = false
     }
     private func failed(_ identity: ObjectIdentifier) {
@@ -220,7 +273,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
             return
         }
         guard currentID == identity else { return }
-        starting = false; isActive = false
+        starting = false; isActive = false; restoring = false
+        snapshot.clearRestoreIntent()
         PlaybackVideoProcessingActivity.setPictureInPicture(false)
         message = "暂时无法进入画中画，播放会继续。请返回全屏后重试。"
     }
@@ -235,33 +289,30 @@ final class IOSPictureInPictureCoordinator: NSObject,
 
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
         let reference = PiPCallbackReference(controller)
-        Task { @MainActor [weak self] in self?.didStart(reference.identity) }
+        DispatchQueue.main.async { [weak self] in self?.didStart(reference.identity) }
     }
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
         let reference = PiPCallbackReference(controller)
-        Task { @MainActor [weak self] in self?.didStop(reference.identity) }
+        DispatchQueue.main.async { [weak self] in self?.didStop(reference.identity) }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: any Error) {
         let reference = PiPCallbackReference(controller)
-        Task { @MainActor [weak self] in self?.failed(reference.identity) }
+        DispatchQueue.main.async { [weak self] in self?.failed(reference.identity) }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
         let reference = PiPCallbackReference(controller)
         let reply = PiPRestoreReply(completionHandler)
         snapshot.requestRestore(reference.identity)
-        Task { @MainActor [weak self] in
+        DispatchQueue.main.async { [weak self] in
             guard let self else { reply.call(false); return }
             self.restore(reference.identity, reply: reply)
         }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
-        let reference = PiPCallbackReference(controller)
-        Task { @MainActor [weak self] in
-            guard let self, !self.closed, self.currentID == reference.identity else { return }
-            await self.target?.setPausedFromNowPlaying(!playing)
-        }
+        guard snapshot.queueTransport(controller, paused: !playing) else { return }
+        DispatchQueue.main.async { [weak self] in self?.drainSampleTransport() }
     }
     nonisolated func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
         snapshot.read(for: controller).available ? CMTimeRange(start: .zero, duration: .positiveInfinity) : .invalid

@@ -38,6 +38,46 @@ private final class CPUOneShot<Value: Sendable>: @unchecked Sendable {
     }
 }
 
+/// Handles even a synchronous mock/native callback without blocking it. GPU
+/// completion is exposed only after submit has returned and released its input
+/// temporaries; it must precede ticket completion so a waiting CPU successor
+/// cannot publish newer PTS first.
+final class GPUSubmissionReturn<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var returned = false
+    private var received = false
+    private var pending: Value?
+    private var callback: (@Sendable (Value) -> Void)?
+    init(_ callback: @escaping @Sendable (Value) -> Void) { self.callback = callback }
+    func receive(_ value: Value) {
+        let deliver = lock.withLock { () -> (@Sendable (Value) -> Void)? in
+            guard !received else { return nil }
+            received = true
+            guard returned else { pending = value; return nil }
+            defer { callback = nil }
+            return callback
+        }
+        deliver?(value)
+    }
+    func submissionReturned() {
+        let delivery = lock.withLock { () -> (Value, @Sendable (Value) -> Void)? in
+            returned = true
+            guard let pending, let callback else { return nil }
+            self.pending = nil; self.callback = nil
+            return (pending, callback)
+        }
+        if let delivery { delivery.1(delivery.0) }
+    }
+}
+
+/// Confined to the serial handoff lane after enqueue. Clearing the only work
+/// slot releases physical surfaces before completion exposes capacity/drain.
+private final class CPUWorkSlot<Value: Sendable>: @unchecked Sendable {
+    var value: Value?
+    init(_ value: Value) { self.value = value }
+    func clear() { value = nil }
+}
+
 private struct CPUYADIFWork: @unchecked Sendable {
     let job: YADIFJob
     let outputs: (first: CVPixelBuffer, second: CVPixelBuffer)
@@ -59,27 +99,38 @@ final class AdaptiveYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Se
     func submit(job: YADIFJob, outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
                 completion: @escaping @Sendable (YADIFCommandCompletion) -> Void) throws(YADIFFailure) {
         guard let revision = limiter.admit() else { throw .commandBufferAllocationFailed }
-        let work = CPUYADIFWork(job: job, outputs: outputs)
+        let work = CPUWorkSlot(CPUYADIFWork(job: job, outputs: outputs))
         let finish = CPUOneShot<YADIFCommandCompletion> { [limiter] result in
             limiter.retire()
             completion(result)
         }
         lane.async { [self, work] in
-            guard limiter.isCurrent(revision) else { finish.call(.init(result: .failed)); return }
+            guard limiter.isCurrent(revision) else { work.clear(); finish.call(.init(result: .failed)); return }
             do {
+                var gpuCompletion: GPUSubmissionReturn<YADIFCommandCompletion>?
                 let fence = try gate.withGPUAdmission { ticket in
-                    try gpu.submit(job: work.job, outputs: work.outputs) { result in
+                    let handoff = GPUSubmissionReturn<YADIFCommandCompletion> { result in
                         finish.call(result)
                         ticket.finish()
                     }
+                    gpuCompletion = handoff
+                    try gpu.submit(job: work.value!.job, outputs: work.value!.outputs) { result in
+                        handoff.receive(result)
+                    }
                 }
-                guard let fence else { return }
+                if let gpuCompletion {
+                    work.clear()
+                    gpuCompletion.submissionReturned()
+                    return
+                }
+                guard let fence else { preconditionFailure("Missing GPU completion owner") }
                 guard fence.wait(timeout: .now() + .seconds(5)), limiter.isCurrent(revision) else {
-                    finish.call(.init(result: .failed)); return
+                    work.clear(); finish.call(.init(result: .failed)); return
                 }
-                try CPUVideoProcessing.yadif(job: work.job, outputs: work.outputs)
+                try CPUVideoProcessing.yadif(job: work.value!.job, outputs: work.value!.outputs)
+                work.clear()
                 finish.call(.init(result: .completed))
-            } catch { finish.call(.init(result: .failed)) }
+            } catch { work.clear(); finish.call(.init(result: .failed)) }
         }
     }
 }
@@ -102,26 +153,37 @@ final class AdaptiveLumaScanProbeBackend: LumaScanProbeBackend, @unchecked Senda
     func submit(current: CVPixelBuffer, previous: CVPixelBuffer, generation: MediaGeneration,
                 completion: @escaping @Sendable (Result<ContentProbeSample, LumaScanProbeFailure>) -> Void) throws(LumaScanProbeFailure) {
         guard let revision = limiter.admit() else { throw .resultBufferAllocationFailed }
-        let work = CPUScanWork(current: current, previous: previous, generation: generation)
+        let work = CPUWorkSlot(CPUScanWork(current: current, previous: previous, generation: generation))
         let finish = CPUOneShot<Result<ContentProbeSample, LumaScanProbeFailure>> { [limiter] result in
             limiter.retire(); completion(result)
         }
         lane.async { [self, work] in
-            guard limiter.isCurrent(revision) else { finish.call(.failure(.asynchronousCommandFailed)); return }
+            guard limiter.isCurrent(revision) else { work.clear(); finish.call(.failure(.asynchronousCommandFailed)); return }
             do {
+                var gpuCompletion: GPUSubmissionReturn<Result<ContentProbeSample, LumaScanProbeFailure>>?
                 let fence = try gate.withGPUAdmission { ticket in
-                    try gpu.submit(current: work.current, previous: work.previous, generation: work.generation) { result in
+                    let handoff = GPUSubmissionReturn<Result<ContentProbeSample, LumaScanProbeFailure>> { result in
                         finish.call(result)
                         ticket.finish()
                     }
+                    gpuCompletion = handoff
+                    try gpu.submit(current: work.value!.current, previous: work.value!.previous,
+                        generation: work.value!.generation) { result in handoff.receive(result) }
                 }
-                guard let fence else { return }
+                if let gpuCompletion {
+                    work.clear()
+                    gpuCompletion.submissionReturned()
+                    return
+                }
+                guard let fence else { preconditionFailure("Missing GPU completion owner") }
                 guard fence.wait(timeout: .now() + .seconds(5)), limiter.isCurrent(revision) else {
-                    finish.call(.failure(.asynchronousCommandFailed)); return
+                    work.clear(); finish.call(.failure(.asynchronousCommandFailed)); return
                 }
-                finish.call(.success(try CPUVideoProcessing.scan(current: work.current, previous: work.previous)))
-            } catch let failure as LumaScanProbeFailure { finish.call(.failure(failure)) }
-            catch { finish.call(.failure(.asynchronousCommandFailed)) }
+                let result = try CPUVideoProcessing.scan(current: work.value!.current, previous: work.value!.previous)
+                work.clear()
+                finish.call(.success(result))
+            } catch let failure as LumaScanProbeFailure { work.clear(); finish.call(.failure(failure)) }
+            catch { work.clear(); finish.call(.failure(.asynchronousCommandFailed)) }
         }
     }
 }

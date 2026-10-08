@@ -9,6 +9,7 @@ ffmpeg_select_platform() {
   case "${1:-}" in
     tvos)
       ffmpeg_platform=tvos
+      ffmpeg_required_symbols=system-symbol-allowlist.txt
       ffmpeg_display_name=tvOS
       ffmpeg_artifact_directory=Artifacts
       ffmpeg_work_suffix=''
@@ -20,6 +21,7 @@ ffmpeg_select_platform() {
       ;;
     ios)
       ffmpeg_platform=ios
+      ffmpeg_required_symbols=system-symbol-allowlist-ios.txt
       ffmpeg_display_name=iOS
       ffmpeg_artifact_directory=Artifacts-iOS
       ffmpeg_work_suffix=/ios
