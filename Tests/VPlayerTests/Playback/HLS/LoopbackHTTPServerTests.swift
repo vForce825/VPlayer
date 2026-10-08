@@ -382,7 +382,7 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let admittedCharge = PlaybackResourceContextLedger.shared.chargedBytes
         XCTAssertGreaterThan(admittedCharge, contextBaseline)
         var alias = workspace
-        weak var weakWorkspace = workspace
+        weak let weakWorkspace = workspace
         workspace = nil
         XCTAssertNotNil(weakWorkspace)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, admittedCharge)
