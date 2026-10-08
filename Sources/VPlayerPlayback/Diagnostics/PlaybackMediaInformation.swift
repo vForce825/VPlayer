@@ -19,6 +19,36 @@ public enum PlaybackSourceCategory: String, Sendable, Equatable {
     case hlsMaster = "hls-master"
 }
 
+/// What the application actually does to the current AirPlay output. Passthrough
+/// describes the native/proxy application path, not the receiver's decoding or
+/// a claim of bit-perfect audio. Generated output is classified only after the
+/// installed branches have produced the all-track playable prefix.
+public enum PlaybackAirPlayOutputMode: Sendable, Equatable {
+    case passthrough
+    case remux
+    case audioTranscode
+    case videoTranscode
+    case mixedTranscode
+
+    static func generated(video: PlaybackOutputTrackProcessing?, audio: PlaybackOutputTrackProcessing?) -> Self? {
+        guard let video, let audio, video != .absent || audio != .absent else { return nil }
+        switch (video == .transcoded, audio == .transcoded) {
+        case (false, false): return .remux
+        case (false, true): return .audioTranscode
+        case (true, false): return .videoTranscode
+        case (true, true): return .mixedTranscode
+        }
+    }
+}
+
+/// Absence is confirmed from selected tracks; nil means a branch is not known.
+/// These are runtime branch facts, never the planner's proposed codec policy.
+enum PlaybackOutputTrackProcessing: Sendable, Equatable {
+    case absent
+    case copied
+    case transcoded
+}
+
 /// Stable media facts suitable for presentation to a viewer.
 public struct PlaybackMediaInformation: Sendable, Equatable {
     public let width: Int32
@@ -33,6 +63,9 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
     public private(set) var sourceCategory: PlaybackSourceCategory?
     /// The actual planner result; neither readiness nor an output-codec claim.
     public private(set) var plannedTransport: HLSPlaybackPlan.Transport?
+    public private(set) var airPlayOutputMode: PlaybackAirPlayOutputMode?
+    /// A confirmed audio-only output carries an output mode but no video facts.
+    public let isAudioOnly: Bool
 
     public init(
         width: Int32,
@@ -51,6 +84,8 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
         self.isSourceProbe = false
         self.sourceCategory = nil
         self.plannedTransport = nil
+        self.airPlayOutputMode = nil
+        self.isAudioOnly = false
     }
 
     public init(sourceWidth: Int32, sourceHeight: Int32, scanMode: PlaybackScanMode?,
@@ -64,6 +99,28 @@ public struct PlaybackMediaInformation: Sendable, Equatable {
         self.isSourceProbe = true
         self.sourceCategory = nil
         self.plannedTransport = nil
+        self.airPlayOutputMode = nil
+        self.isAudioOnly = false
+    }
+
+    public init(audioOnlyAirPlayOutputMode: PlaybackAirPlayOutputMode) {
+        width = 0
+        height = 0
+        scanMode = nil
+        sourceFrameRate = nil
+        outputFrameRate = nil
+        isSmoothMotionEnhanced = false
+        isSourceProbe = false
+        sourceCategory = nil
+        plannedTransport = nil
+        airPlayOutputMode = audioOnlyAirPlayOutputMode
+        isAudioOnly = true
+    }
+
+    func withAirPlayOutputMode(_ mode: PlaybackAirPlayOutputMode) -> Self {
+        var value = self
+        value.airPlayOutputMode = mode
+        return value
     }
 
     func withSourceRouting(category: PlaybackSourceCategory?, transport: HLSPlaybackPlan.Transport?) -> Self {
@@ -89,8 +146,9 @@ public protocol PlaybackMediaInformationPreparing: PlaybackEngine {
               afterMediaInformationReset: @escaping @Sendable () async -> Void) async
 }
 
-/// A prepared HLS graph owns one immutable value, including a valid audio-only
-/// nil. Its output lifecycle is distinct from the demuxer's media generation.
+/// A prepared HLS graph owns one immutable, lifecycle-bound snapshot. Confirmed
+/// audio-only output has a mode without video facts; nil clears invalidated facts.
+/// Its output lifecycle is distinct from the demuxer's media generation.
 struct PlaybackPreparedMediaInformation: Sendable, Equatable {
     let lifecycle: OutputLifecycleEpoch
     let information: PlaybackMediaInformation?

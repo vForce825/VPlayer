@@ -4435,6 +4435,25 @@ final class Task9RuntimeCapacityTests: XCTestCase {
         }
     }
 
+    func testPipelineAirPlayOutputMetadataFitsAndRoundTripsInExistingFixedSlot() {
+        XCTAssertEqual(PlaybackPipelineEventStorage.payloadStride, 48)
+        XCTAssertLessThanOrEqual(MemoryLayout<PlaybackPipelineEventStorage.MediaPayload>.stride, 48)
+        let slot = Task9NativePayloadSlot()
+        let modes: [PlaybackAirPlayOutputMode] = [.passthrough, .remux, .audioTranscode, .videoTranscode, .mixedTranscode]
+        for mode in modes {
+            let video = PlaybackMediaInformation(width: 1_920, height: 1_080, scanMode: .progressive,
+                sourceFrameRate: .init(num: 25, den: 1), outputFrameRate: 25, isSmoothMotionEnhanced: false)
+                .withAirPlayOutputMode(mode).withSourceRouting(category: .hlsMedia, transport: .generated)
+            for information in [video, PlaybackMediaInformation(audioOnlyAirPlayOutputMode: mode)] {
+                for generation: MediaGeneration? in [nil, .init(rawValue: 0), .init(rawValue: .max)] {
+                    let event = PlaybackPipelineEvent.mediaInformation(information, generation: generation)
+                    slot.initialize(event)
+                    XCTAssertEqual(slot.move(), event)
+                }
+            }
+        }
+    }
+
     func testPipelineNativeMediaPayloadPreservesAllOptionalAndFloatingPointBits() {
         let slot = Task9NativePayloadSlot()
         for cycle: UInt64 in [0, .max] {

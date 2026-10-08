@@ -15,6 +15,38 @@ BACKEND = ROOT / 'Sources/VPlayerPlayback/Pipeline/HLSAVPlayerPlaybackBackend.sw
 
 
 class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
+    def test_paused_track_controls_keep_original_failure_and_bound_observation(self):
+        source = SMOKE.read_text()
+        self.assertIn('func testRealPublicMIMEPlanningPlaysNativeAndManagedMediaWithoutGeneration()', source)
+        for name in ['MediaPublic', 'MediaStub', 'MasterPublic', 'MasterStub']:
+            self.assertIn('func testPausedAdapterTracks' + name + '()', source)
+        raw = source.split('private func runPausedSDKTrackControl(', 1)[1].split('private func runPausedAdapterTrackControl(', 1)[0]
+        self.assertLess(raw.index('item.observe(\\.tracks'), raw.index('player.replaceCurrentItem(with: item)'))
+        self.assertEqual(raw.count('player.preroll(atRate: 1)'), 1)
+        self.assertIn('.seconds(15)', raw)
+        self.assertIn('.seconds(2)', raw)
+        self.assertIn('await windowTimeout.value', raw)
+        self.assertIn('await timeout.value', raw)
+        self.assertIn('await callbackJoined.wait()', raw)
+        self.assertIn('await probe.closeAndJoin()', raw)
+        self.assertIn('await origin.close()', raw)
+        self.assertNotIn('player.play()', raw)
+        self.assertNotIn('while ', raw)
+        self.assertNotIn('asset.load', raw)
+        self.assertLess(raw.index('probe.endAvailabilityWindow()'), raw.index('probe.record("window-deadline"'))
+        probe = source.split('private final class NativePausedTracksProbe:', 1)[1].split('private final class NativePausedAdapterDiagnostic:', 1)[0]
+        self.assertIn('@MainActor private func record(', probe)
+        self.assertIn('sampledAt <= windowDeadline', probe)
+        self.assertIn('if pending.count == 16', probe)
+        self.assertIn('guard worker == nil', probe)
+        self.assertIn('await current?.value', probe)
+        for field in ['total=', 'enabled=', 'assets=', 'video=', 'audio=', 'since-preroll-us=', 'diagnostic-only=true']:
+            self.assertIn(field, source)
+        adapter = source.split('private final class NativePausedAdapterInspector:', 1)[1].split('private final class NativeSmokeFactory:', 1)[0]
+        self.assertIn('try await base.snapshot(item: item, source: source)', adapter)
+        self.assertIn('throw NativePausedAdapterStop.completed', adapter)
+        self.assertNotIn('return result', adapter)
+
     def test_endpoint_mismatch_retains_exact_predicate_before_original_recovery(self):
         driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
         self.assertTrue('private(set) var naturalEndFailureDiagnosticForTesting:' in driver)

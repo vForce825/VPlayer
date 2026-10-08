@@ -5313,7 +5313,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
     }
 
     /// A nil result means stale/unsafe, while a scoped nil information value is
-    /// a genuinely prepared audio-only graph. No sink is called under these locks.
+    /// cleared or unknown metadata. Confirmed audio-only output carries its own
+    /// output-mode snapshot. No sink is called under these locks.
     func preparedHLSMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
         try? transaction { output in
             guard let candidate = currentMountablePresentationLocked(output: output),

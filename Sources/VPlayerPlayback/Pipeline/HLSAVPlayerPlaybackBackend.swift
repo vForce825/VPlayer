@@ -196,9 +196,16 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     var outputItemGeneration: UInt64? { lock.withLock { nativeAdapter?.itemGeneration ?? bundle?.itemGeneration } }
 
     func preparedMediaInformation(for lifecycle: OutputLifecycleEpoch) -> PlaybackPreparedMediaInformation? {
-        let snapshot = lock.withLock { nativeAdapter?.metadata.snapshot(for: lifecycle) ?? bundle?.preparedMediaInformation(for: lifecycle) }
-        guard let snapshot, let information = snapshot.information,
-              let routing = currentSourceRouting(for: lifecycle) else { return snapshot }
+        let current = lock.withLock {
+            (nativeAdapter?.metadata.snapshot(for: lifecycle) ?? bundle?.preparedMediaInformation(for: lifecycle),
+             sourceDependencies != nil)
+        }
+        guard let snapshot = current.0 else { return nil }
+        guard current.1 else { return snapshot }
+        // A retired source must not bypass its generation fence merely because
+        // the selected item or generated bundle still has a cached snapshot.
+        guard let routing = currentSourceRouting(for: lifecycle) else { return nil }
+        guard let information = snapshot.information else { return snapshot }
         return .init(lifecycle: lifecycle, information: information.withSourceRouting(
             category: routing.category, transport: routing.transport))
     }
