@@ -86,8 +86,15 @@ jobs:
           xcodebuild build -project VPlayer.xcodeproj -scheme VPlayeriOS \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/iOS-Device" CODE_SIGNING_ALLOWED=NO
-      - name: Verify Release simulator cold starts without fixture bypass
+      - name: Build Release simulator tests before booting the simulator
+        id: release_build
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
+        timeout-minutes: 15
+        run: |
+          python3 Scripts/Support/ios-startup-runner.py --build-only \
+            --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release"
+      - name: Verify Release simulator cold starts without fixture bypass
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.release_build.outcome == 'success'
         timeout-minutes: 20
         run: |
           python3 Scripts/Support/ios-startup-runner.py \

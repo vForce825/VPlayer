@@ -58,6 +58,37 @@ class IOSStartupRunnerTests(unittest.TestCase):
         self.assertFalse(module.startup_completed(b''))
         self.assertFalse(module.startup_completed(complete.replace(b'index=2 ready=true',b'index=2 ready=false')))
         self.assertFalse(module.startup_completed(complete.replace(b'IOS_RELEASE_TERMINATE_RETURNED index=1',b'missing')))
+    def test_timeout_preserves_pre_interrupt_progress(self):
+        module=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            code,data=module.run_command('progress',[sys.executable,'-c',
+                "import time; print('COMPILER_PROGRESS_BEFORE_INTERRUPT',flush=True); time.sleep(60)"],
+                0.2,Path(directory),lambda:None)
+            self.assertEqual(code,124)
+            self.assertIn(b'COMPILER_PROGRESS_BEFORE_INTERRUPT',data)
+            self.assertIn(b'PRE_INTERRUPT',data)
+    def test_build_phase_is_generic_and_precedes_simulator_boot(self):
+        source=(ROOT/'Scripts/Support/ios-startup-runner.py').read_text()
+        self.assertIn("parser.add_argument('--build-only',action='store_true')",source)
+        self.assertIn("'generic/platform=iOS Simulator'",source)
+        self.assertLess(source.index('if args.build_only:'),source.index("if device['state']!='Booted':"))
+    def test_compiler_sampling_matches_exact_derived_data_not_process_name(self):
+        module=self.module()
+        rows="10 1 10 0.1 01:00 10 /usr/bin/xcodebuild\n11 2 2 99 01:00 100 /x/swift-frontend -o /tmp/build/obj.o\n12 2 2 99 01:00 100 /x/swift-frontend -o /tmp/build-other/obj.o"
+        result=module.owned_process_rows(rows,10,Path('/tmp/build'))
+        self.assertEqual([row[0] for row in result],['10','11'])
+        self.assertEqual(result[1][6],'/x/swift-frontend')
+    def test_capture_failure_still_retires_owned_process(self):
+        module=self.module()
+        def broken_capture(_):raise OSError('synthetic unreadable log')
+        module.bounded_log=broken_capture
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile=Path(directory)/'owned.pid'
+            command="import os,time; open(%r,'w').write(str(os.getpid())); time.sleep(60)" % str(pidfile)
+            code,_=module.run_command('capture-failure',[sys.executable,'-c',command],
+                0.2,Path(directory),lambda:None)
+            self.assertEqual(code,124)
+            with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
     def test_artifact_projection_excludes_environment_and_only_reports_allowed_keys(self):
         module=self.module()
         value={'EnvironmentVariables':{'TOKEN':'private'},'TestTargets':[{'UITargetAppPath':'app','OnlyTestIdentifiers':['test'], 'Secret':'private'}]}

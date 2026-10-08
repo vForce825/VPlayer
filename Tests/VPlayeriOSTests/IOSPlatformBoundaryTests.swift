@@ -17,7 +17,10 @@ final class IOSPlatformBoundaryTests: XCTestCase {
             recorder.created += 1
             return recorder
         })
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first,
+            "Hosted iOS boundary test requires the app window scene")
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
         let view = context.makeVideoView()
         var format: CMVideoFormatDescription?
         XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,

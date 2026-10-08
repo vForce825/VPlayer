@@ -29,6 +29,8 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('id: prepare', text)
         self.assertIn('id: simulator', text)
         guard="if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'"
-        self.assertEqual(text.count(guard), 2)
+        self.assertEqual(text.count(guard), 3)
+        self.assertIn("steps.release_build.outcome == 'success'", text)
+        self.assertIn("--build-only", text)
         self.assertNotIn('continue-on-error', text)
 if __name__=='__main__':unittest.main()

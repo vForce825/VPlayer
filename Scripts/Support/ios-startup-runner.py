@@ -10,6 +10,7 @@ from pathlib import Path
 import plistlib
 import re
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -36,17 +37,58 @@ def startup_completed(data):
                          f'IOS_RELEASE_TERMINATE_RETURNED index={index}'.encode()])
     return all(marker in data for marker in required)
 
+def bounded_log(path):
+    with path.open('rb') as source:
+        head=source.read(8192)
+        source.seek(max(len(head),path.stat().st_size-16384))
+        return head+b'\nIOS_LOG_TAIL\n'+source.read(16384)
+
+def owned_process_rows(listing,pid,derived_data):
+    owned=[]
+    for line in listing.splitlines():
+        fields=line.strip().split(None,6)
+        if len(fields)!=7:continue
+        try:arguments=shlex.split(fields[6])
+        except ValueError:continue
+        if not arguments:continue
+        compiler=Path(arguments[0]).name in {'swift-frontend','swift-driver','swiftc'}
+        matching_output=derived_data is not None and any(
+            argument.startswith(str(derived_data)+'/') for argument in arguments[1:])
+        if fields[2]==str(pid) or (compiler and matching_output):
+            owned.append(fields[:6]+[arguments[0]])
+    return owned
+
+def sample_owned_processes(process,directory,command):
+    if sys.platform!='darwin':return
+    derived_data=Path(command[command.index('-derivedDataPath')+1]) if '-derivedDataPath' in command else None
+    listing=subprocess.run(['ps','-axo','pid=,ppid=,pgid=,pcpu=,etime=,rss=,command='],
+        capture_output=True,text=True,timeout=5,check=False).stdout
+    owned=owned_process_rows(listing,process.pid,derived_data)
+    print('IOS_STARTUP_OWNED_PROCESS_STATE='+json.dumps(owned[:24]),flush=True)
+    candidates=[str(process.pid)]+[row[0] for row in owned if 'swift-frontend' in row[6]][:1]
+    for pid in candidates:
+        sample=directory/('owned-sample-'+pid+'.txt')
+        try:subprocess.run(['sample',pid,'2','1','-file',str(sample)],
+            stdout=subprocess.DEVNULL,stderr=subprocess.STDOUT,timeout=8,check=False)
+        except subprocess.TimeoutExpired:continue
+        if sample.exists():print(bounded_log(sample).decode('utf-8','replace'),flush=True)
+
 def run_command(label,command,timeout,directory,diagnostics):
     path=directory/(label+'.log')
     print('IOS_STARTUP_PHASE_BEGIN='+label,flush=True)
     expired=False
+    before_interrupt=b''
     with path.open('wb') as output:
         process=subprocess.Popen(command,stdout=output,stderr=subprocess.STDOUT,start_new_session=True)
         try:code=process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             expired=True
-            print('IOS_STARTUP_PHASE_TIMEOUT='+label,flush=True)
-            try:diagnostics()
+            try:
+                print('IOS_STARTUP_PHASE_TIMEOUT='+label,flush=True)
+                before_interrupt=b'IOS_LOG_PRE_INTERRUPT\n'+bounded_log(path)
+                print(before_interrupt.decode('utf-8','replace'),flush=True)
+                sample_owned_processes(process,directory,command)
+                diagnostics()
             except Exception as error:
                 print('IOS_STARTUP_DIAGNOSTIC_FAILED='+type(error).__name__,flush=True)
             finally:
@@ -68,11 +110,11 @@ def run_command(label,command,timeout,directory,diagnostics):
     markers=bytearray()
     with path.open('rb') as source:
         for line in source:
-            if (b'IOS_RELEASE_' in line or b'error:' in line) and len(markers)<32768:
+            if (b'IOS_RELEASE_' in line or re.search(rb'(?:^|\s)(?:fatal )?error:',line)) and len(markers)<32768:
                 markers.extend(line[:32768-len(markers)])
         source.seek(max(0,source.tell()-16384))
         tail=source.read(16384)
-    data=bytes(markers)+tail
+    data=before_interrupt+bytes(markers)+tail
     print(data.decode('utf-8','replace'),flush=True)
     print(f'IOS_STARTUP_PHASE_END={label} exit={code} timed_out={expired}',flush=True)
     return code,data
@@ -81,6 +123,7 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--simulator',required=True)
     parser.add_argument('--derived-data',required=True,type=Path)
+    parser.add_argument('--build-only',action='store_true')
     args=parser.parse_args()
     if not re.fullmatch(r'[0-9A-Fa-f-]{36}',args.simulator):parser.error('exact simulator UUID required')
     directory=Path(tempfile.mkdtemp(prefix='vplayer-ios-startup-'))
@@ -122,17 +165,22 @@ def main():
         raise SystemExit('Selected destination is not an available iOS27 iPhone simulator')
     runtime,device=matches[0]
     print('IOS_STARTUP_SIMULATOR='+json.dumps({k:device.get(k) for k in ['name','udid','state']}|{'runtime':runtime}),flush=True)
-    if device['state']!='Booted':
-        code,_=run('boot',['xcrun','simctl','boot',args.simulator],30)
-        if code:return code
-    code,_=run('bootstatus',['xcrun','simctl','bootstatus',args.simulator,'-b'],120)
-    if code:return code
+    build_common=['-project','VPlayer.xcodeproj','-scheme','VPlayeriOSReleaseStartup',
+                  '-configuration','Release','-derivedDataPath',str(args.derived_data),
+                  'CODE_SIGNING_ALLOWED=NO']
+    if args.build_only:
+        code,_=run('build',['xcodebuild','build-for-testing']+build_common+[
+            '-destination','generic/platform=iOS Simulator'],480)
+        return code
     common=['-project','VPlayer.xcodeproj','-scheme','VPlayeriOSReleaseStartup','-configuration','Release',
             '-destination','platform=iOS Simulator,id='+args.simulator,'-derivedDataPath',str(args.derived_data),
             'CODE_SIGNING_ALLOWED=NO','-parallel-testing-enabled','NO','-collect-test-diagnostics','never',
             '-test-timeouts-enabled','YES','-default-test-execution-time-allowance','120',
             '-maximum-test-execution-time-allowance','300']
-    code,_=run('build',['xcodebuild','build-for-testing']+common,480)
+    if device['state']!='Booted':
+        code,_=run('boot',['xcrun','simctl','boot',args.simulator],30)
+        if code:return code
+    code,_=run('bootstatus',['xcrun','simctl','bootstatus',args.simulator,'-b'],120)
     if code:return code
     for path in sorted((args.derived_data/'Build/Products').glob('*.xctestrun')):
         print('IOS_STARTUP_XCTESTRUN='+json.dumps(artifact_facts(plistlib.loads(path.read_bytes()))),flush=True)
