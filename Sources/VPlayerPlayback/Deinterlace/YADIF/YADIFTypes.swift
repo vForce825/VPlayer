@@ -7,11 +7,16 @@ import Foundation
 import Metal
 
 protocol YADIFCommandSubmitting: AnyObject, Sendable {
+    func cancelPendingWork()
     func submit(
         job: YADIFJob,
         outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
         completion: @escaping @Sendable (YADIFCommandCompletion) -> Void
     ) throws(YADIFFailure)
+}
+
+extension YADIFCommandSubmitting {
+    func cancelPendingWork() {}
 }
 
 enum YADIFCommandResult: Sendable, Equatable {

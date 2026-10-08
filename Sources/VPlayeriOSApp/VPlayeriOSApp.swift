@@ -9,6 +9,7 @@ import VPlayerPlayback
 @main
 struct VPlayeriOSApp: App {
     private let bootstrap = LiveAppBootstrap.production()
+    private let videoProcessingLifecycle = IOSVideoProcessingLifecycle()
     private let initialDependencies: AppDependencies?
     init() {
         let configuration = AppLaunchConfiguration(arguments: ProcessInfo.processInfo.arguments)

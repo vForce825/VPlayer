@@ -17,7 +17,7 @@ struct IOSFullScreenPlayerView: View {
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            PlaybackPresentationHostView(mount: session.mount).ignoresSafeArea()
+            IOSPlaybackHostView(session: session).ignoresSafeArea()
             Color.clear.contentShape(Rectangle()).onTapGesture { controls.apply(.userInteraction) }
             status
             VStack {
@@ -28,6 +28,11 @@ struct IOSFullScreenPlayerView: View {
                     .accessibilityLabel("关闭播放").accessibilityIdentifier("player-back")
                     Text(session.presentation.request.title).font(.headline).lineLimit(1)
                     Spacer()
+                    Button { session.pictureInPicture.start() } label: {
+                        Image(systemName: "pip.enter").frame(width: 44, height: 44)
+                    }
+                    .disabled(!session.pictureInPicture.isPossible)
+                    .accessibilityLabel("画中画").accessibilityIdentifier("player-pip")
                     Button { showsSettings = true } label: {
                         Image(systemName: "gearshape").frame(width: 44, height: 44)
                     }.accessibilityLabel("播放设置").accessibilityIdentifier("player-settings")
@@ -36,6 +41,9 @@ struct IOSFullScreenPlayerView: View {
                 Spacer()
                 if controls.isVisible {
                     VStack(spacing: 12) {
+                        if let message = session.pictureInPicture.message {
+                            Text(message).font(.caption).accessibilityIdentifier("player-pip-message")
+                        }
                         Text(PlaybackMediaInformationPresentation(information: model.mediaInformation).visualText)
                             .font(.caption)
                         if let output = PlaybackMediaInformationPresentation(information: model.mediaInformation).airPlayOutputText {

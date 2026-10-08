@@ -7,7 +7,7 @@ import Darwin
 import Foundation
 import VideoToolbox
 
-enum NativeHLSPlatform: Sendable {
+enum NativeHLSPlatform: Sendable, Equatable {
     case appleTV
     case iPhone
 

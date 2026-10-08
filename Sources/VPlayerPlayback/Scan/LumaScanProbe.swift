@@ -153,6 +153,7 @@ enum LumaScanInputValidator {
 }
 
 protocol LumaScanProbeBackend: AnyObject, Sendable {
+    func cancelPendingWork()
     func submit(
         current: CVPixelBuffer,
         previous: CVPixelBuffer,
@@ -161,6 +162,10 @@ protocol LumaScanProbeBackend: AnyObject, Sendable {
             Result<ContentProbeSample, LumaScanProbeFailure>
         ) -> Void
     ) throws(LumaScanProbeFailure)
+}
+
+extension LumaScanProbeBackend {
+    func cancelPendingWork() {}
 }
 
 public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
@@ -186,7 +191,12 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
         maximumFrames: Int = 12
     ) throws {
         try self.init(maximumFrames: maximumFrames) {
-            try SystemLumaScanProbeBackend(commandQueue: commandQueue)
+            let gpu = try SystemLumaScanProbeBackend(commandQueue: commandQueue)
+            #if os(iOS)
+            return AdaptiveLumaScanProbeBackend(gpu: gpu)
+            #else
+            return gpu
+            #endif
         }
     }
 
@@ -254,20 +264,17 @@ public final class LumaScanProbe: LumaScanProbing, @unchecked Sendable {
     }
 
     public func stop(generation: MediaGeneration) {
-        stateLock.withLock {
+        let cancelled = stateLock.withLock { () -> Bool in
             guard let active = state.activeGeneration else {
                 adopt(generation: generation, stopped: true)
-                return
+                return true
             }
-            guard generation >= active else {
-                return
-            }
-            if generation > active {
-                adopt(generation: generation, stopped: true)
-            } else {
-                state.stopped = true
-            }
+            guard generation >= active else { return false }
+            if generation > active { adopt(generation: generation, stopped: true) }
+            else { state.stopped = true }
+            return true
         }
+        if cancelled { backend.cancelPendingWork() }
     }
 
     private func finish(
@@ -483,6 +490,9 @@ private final class SystemLumaScanProbeBackend: LumaScanProbeBackend, @unchecked
             }
         }
         commandBuffer.commit()
+        #if os(iOS)
+        commandBuffer.waitUntilScheduled()
+        #endif
     }
 
     private func map(

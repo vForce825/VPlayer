@@ -297,16 +297,35 @@ targets:
     deploymentTarget: "27.0"
     sources:
       - path: Tests/VPlayeriOSTests
-      - path: Tests/VPlayerTests/FullScreenPlayerViewModelTests.swift
-      - path: Tests/VPlayerTests/NowPlayingIntegrationTests.swift
-      - path: Tests/VPlayerTests/ChannelSectionsTests.swift
-      - path: Tests/VPlayerTests/ChannelProgrammePresentationTests.swift
-      - path: Tests/VPlayerTests/PlaybackSettingsStoreTests.swift
+      - path: Tests/VPlayerTests
+        excludes:
+          - ProjectConfigurationTests.swift
+          - VPlayerAppStartupTests.swift
+          - ReducedResourceUsageTests.swift
+          - AppModelTests.swift
+          - RefreshLifecycleTests.swift
+          - SourceProfileURLPresentationTests.swift
+          - Playback/DisplayCriteriaControllerTests.swift
+          - Playback/PlaybackPresentationContextTests.swift
+          - Fixtures
       - path: Tests/Fixtures/Video
         type: folder
         buildPhase: resources
       - path: Tests/Fixtures/playlists
         type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/epg
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/SourcePlanning
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/Images
+        type: folder
+        buildPhase: resources
+      - path: Tests/VPlayerTests/Fixtures/Media/eac3-main-6x1block-5.1.eac3
+        buildPhase: resources
+      - path: Tests/VPlayerTests/Fixtures/Media/supported-audio-coverage.json
         buildPhase: resources
     dependencies:
       - target: VPlayerCoreiOS
@@ -414,7 +433,24 @@ schemes:
           parallelizable: false
         - name: VPlayeriOSUITests
           parallelizable: false
+          skippedTests:
+            - IOSReleaseStartupTests
     run:
       config: Debug
     archive:
       config: Release
+  VPlayeriOSReleaseStartup:
+    build:
+      targets:
+        VPlayerCoreiOS: all
+        VPlayerPlaybackiOS: all
+        VPlayeriOS: all
+        VPlayeriOSUITests: [test]
+    test:
+      config: Release
+      gatherCoverageData: false
+      targets:
+        - name: VPlayeriOSUITests
+          parallelizable: false
+          selectedTests:
+            - IOSReleaseStartupTests

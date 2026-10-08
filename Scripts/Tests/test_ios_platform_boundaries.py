@@ -34,6 +34,18 @@ class IOSPlatformBoundaryTests(unittest.TestCase):
         self.assertIn('maximumWidth: 1_920', source)
         self.assertIn('maximumWidth: 3_840', source)
 
+    def test_adaptive_processing_uses_shared_admission_and_real_completion(self):
+        path=ROOT/'Sources/VPlayerPlayback/ProcessingCPU/GPUVideoProcessingGate.swift'
+        self.assertTrue(path.exists(), 'bidirectional GPU admission gate is missing')
+        source=path.read_text()
+        self.assertIn('DispatchGroup',source)
+        self.assertIn('setForeground',source)
+        self.assertIn('setPictureInPicture',source)
+        for name in ['Deinterlace/YADIF/YADIFProcessor.swift','Scan/LumaScanProbe.swift']:
+            source=(ROOT/'Sources/VPlayerPlayback'/name).read_text()
+            self.assertIn('waitUntilScheduled()',source)
+            self.assertIn('#if os(iOS)',source)
+
     def test_phone_persistence_does_not_use_tv_cache_policy(self):
         source = (ROOT/'Sources/VPlayerCore/Persistence/VPlayerModelContainer.swift').read_text()
         self.assertIn('#if os(iOS)', source)

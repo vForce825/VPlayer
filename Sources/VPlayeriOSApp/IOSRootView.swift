@@ -57,14 +57,43 @@ struct IOSRootView: View {
             dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(value)
         }
         .onChange(of: model.presentedPlaybackRequest) { _, request in replaceSession(for: request) }
+        .onChange(of: session?.isClosing) { _, closing in
+            if closing == true { model.dismissPlayback() }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if let active = session, !active.isClosing, !active.isFullScreenPresented {
+                HStack(spacing: 14) {
+                    Button { active.showFullScreen() } label: {
+                        Label(active.presentation.request.title, systemImage: "play.rectangle")
+                            .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Button { active.model.togglePause() } label: {
+                        Image(systemName: active.model.isPaused ? "play.fill" : "pause.fill")
+                    }.accessibilityLabel(active.model.isPaused ? "播放" : "暂停")
+                    Button { active.close(); model.dismissPlayback() } label: { Image(systemName: "xmark") }
+                        .accessibilityLabel("关闭播放")
+                }
+                .padding().background(.regularMaterial)
+            }
+        }
         .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil },
             set: { if !$0 { model.dismissAlert() } })) {
             Button("知道了") { model.dismissAlert() }
         } message: { Text(model.alertMessage ?? "") }
-        .fullScreenCover(item: $session) { active in
-            IOSFullScreenPlayerView(session: active) { model.dismissPlayback() }
-                .interactiveDismissDisabled()
+        .fullScreenCover(isPresented: fullScreenBinding) {
+            if let active = session {
+                IOSFullScreenPlayerView(session: active) { model.dismissPlayback() }
+                    .id(active.id)
+                    .interactiveDismissDisabled()
+            }
         }
+    }
+    private var fullScreenBinding: Binding<Bool> {
+        let owner = session
+        return Binding(get: { owner?.isFullScreenPresented ?? false }, set: { value in
+            guard session?.id == owner?.id else { return }
+            owner?.isFullScreenPresented = value
+        })
     }
     private func replaceSession(for request: PlaybackRequest?) {
         guard session?.id != request?.id else { return }
