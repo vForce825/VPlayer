@@ -35,7 +35,7 @@ enum NativeHLSCapabilities {
         // Query playlist support separately; never use WebKit's private SPI.
         let playlistPlayable = evidence.playable("application/vnd.apple.mpegurl")
         let containersPlayable = !facts.media.isEmpty && facts.media.allSatisfy {
-            nativeContainerPlayable($0, evidence: evidence)
+            nativeHLSMediaPlayable($0, evidence: evidence)
         }
         var videoFormats: [HLSVideoCapability] = []
         var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K
@@ -112,16 +112,24 @@ enum NativeHLSCapabilities {
             supportsInBandClosedCaptions: true)
     }
 
-    private static func nativeContainerPlayable(_ media: HLSMediaFacts, evidence: NativeHLSPlatformEvidence) -> Bool {
+    private static func nativeHLSMediaPlayable(_ media: HLSMediaFacts, evidence: NativeHLSPlatformEvidence) -> Bool {
         guard !media.hasUnsupportedTracks, media.audio.count <= 8 else { return false }
         if media.container == .webVTT { return media.video == nil && media.audio.isEmpty }
         let mime: String
         switch media.container {
         case .mpegTS:
-            // HLS authoring requires HEVC in fragmented MP4. Audio-only TS still
-            // uses video/mp2t; audio/mp4 would test a different container.
-            guard media.video?.codec != .hevc else { return false }
-            mime = "video/mp2t"
+            // Apple HLS authoring permits AVC in TS. This narrowly admitted
+            // AVC/LC-AAC contract is backed by the byte-fed PAT/PMT/PES probe;
+            // selected AVPlayer tracks must still match before activation.
+            // video/mp2t uses the ISO/IEC 13818-1 codec namespace, so feeding it
+            // avc1/mp4a tokens is not an HLS capability test. Query those tokens
+            // in their BMFF namespace for decoder/format evidence, NOT TS proof.
+            // Other TS combinations retain generated handling until separately
+            // verified; HEVC remains fMP4-only for native HLS.
+            guard media.video == nil || media.video?.codec == .h264,
+                  media.audio.allSatisfy({ $0.formatValidated && $0.service == .independentMain &&
+                      HLSAudioProcessingPolicy.supportsSourceLC($0) }) else { return false }
+            mime = media.video == nil ? "audio/mp4" : "video/mp4"
         case .fragmentedMP4: mime = media.video == nil ? "audio/mp4" : "video/mp4"
         case .isoBMFF, .webVTT, .unknown: return false
         }

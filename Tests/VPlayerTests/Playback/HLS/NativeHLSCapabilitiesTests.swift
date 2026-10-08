@@ -73,20 +73,20 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         }
     }
 
-    func testMediaContainerDenialCannotBorrowMP4CodecSupportOrPassingSibling() throws {
+    func testMediaCodecCombinationDenialCannotBorrowPassingSibling() throws {
         let (source, value) = try mimeSource()
-        for denied in ["application/vnd.apple.mpegurl", "video/mp2t; codecs=\"avc1.640028,mp4a.40.2\"",
+        for denied in ["application/vnd.apple.mpegurl", "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"",
                        "video/mp4; codecs=\"avc1.640028\"", "audio/mp4; codecs=\"mp4a.40.2\""] {
             let result = NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: mimeEvidence(denied: denied))
             XCTAssertEqual(try HLSPlaybackPlanner.makePlan(source: source, facts: value, capabilities: result).transport, .generated, denied)
         }
         let original = try XCTUnwrap(value.media.first)
         let sibling = HLSMediaFacts(url: URL(string: "https://example.test/sibling")!, container: .fragmentedMP4,
-            video: original.video, audio: original.audio, hasUnsupportedTracks: false)
+            video: video(range: .hlg, rate: 50), audio: original.audio, hasUnsupportedTracks: false)
         let mixed = HLSCompatibilityFacts(source: source, media: [original, sibling], complete: true, inspectedBytes: 376)
         let result = NativeHLSCapabilities.make(facts: mixed, route: route(.airPlay),
-            evidence: mimeEvidence(denied: "video/mp2t; codecs=\"avc1.640028,mp4a.40.2\""))
-        XCTAssertTrue(result.videoFormats.isEmpty, "A passing sibling cannot lend its broad envelope to rejected TS")
+            evidence: mimeEvidence(denied: "video/mp4; codecs=\"avc1.640028,mp4a.40.2\""))
+        XCTAssertTrue(result.videoFormats.isEmpty, "A passing sibling cannot lend its broad envelope to a rejected source codec combination")
         XCTAssertTrue(result.nativeAudioCodecs.isEmpty)
     }
 
@@ -123,7 +123,7 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         }
     }
 
-    func testAudioOnlyTSUsesTransportContainerAndGeneratedDolbySurvivesVideoDenial() throws {
+    func testAudioOnlyTSUsesValidatedHLSContractAndGeneratedDolbySurvivesVideoDenial() throws {
         let (source, value) = try mimeSource()
         let audio = try XCTUnwrap(value.media.first?.audio.first)
         let audioOnly = HLSCompatibilityFacts(source: source, media: [.init(url: source.responseURL, container: .mpegTS,
@@ -131,7 +131,7 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         let admitted = NativeHLSCapabilities.make(facts: audioOnly, route: route(.airPlay), evidence: mimeEvidence())
         XCTAssertTrue(admitted.nativeAudioCodecs.contains(.aac))
         let denied = NativeHLSCapabilities.make(facts: audioOnly, route: route(.airPlay),
-            evidence: mimeEvidence(denied: "video/mp2t; codecs=\"mp4a.40.2\""))
+            evidence: mimeEvidence(denied: "audio/mp4; codecs=\"mp4a.40.2\""))
         XCTAssertTrue(denied.nativeAudioCodecs.isEmpty)
         for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
             let value = try facts(codec: codec, video: video(range: .hlg, rate: 50))
@@ -141,6 +141,29 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
             XCTAssertEqual(result.compressedAudioAdmissionCandidates.count, 1,
                 "Generated Dolby trial remains audio-scoped when native video is unavailable")
             XCTAssertTrue(result.compressedAudioCodecs.contains(codec))
+        }
+    }
+
+    func testStandaloneTSCannotBorrowTheHLSCarriageContract() throws {
+        let (playlist, original) = try mimeSource()
+        let direct = ResolvedPlaybackSource(context: playlist.context, responseURL: playlist.responseURL,
+            generation: playlist.generation, topology: .media(Data([0x47])))
+        let value = HLSCompatibilityFacts(source: direct, media: original.media, complete: true, inspectedBytes: 188)
+        let result = NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: mimeEvidence())
+        XCTAssertEqual(try HLSPlaybackPlanner.makePlan(source: direct, facts: value, capabilities: result).transport, .generated)
+    }
+
+    func testTransportStreamCorrectionDoesNotAdmitUnverifiedDolbyCombination() throws {
+        let (source, original) = try mimeSource()
+        for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
+            let dolby = try XCTUnwrap(try facts(codec: codec).media.first?.audio.first)
+            let value = HLSCompatibilityFacts(source: source, media: [.init(url: source.responseURL, container: .mpegTS,
+                video: original.media.first?.video, audio: [dolby], hasUnsupportedTracks: false)], complete: true, inspectedBytes: 188)
+            let result = NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: mimeEvidence())
+            XCTAssertTrue(result.videoFormats.isEmpty)
+            XCTAssertTrue(result.nativeAudioCodecs.isEmpty)
+            XCTAssertTrue(result.nativeAudioAdmissionCandidates.isEmpty)
+            XCTAssertEqual(result.compressedAudioAdmissionCandidates.count, 1)
         }
     }
 
@@ -162,14 +185,14 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         XCTAssertTrue(result.nativeAudioCodecs.isEmpty)
     }
 
-    func testCurrentSDKPublicMIMEQueriesUseActualMediaContainers() throws {
+    func testCurrentSDKPublicMIMEQueriesKeepHLSAndCodecNamespacesSeparate() throws {
         let (source, value) = try mimeSource()
         let bare = AVURLAsset.isPlayableExtendedMIMEType("application/vnd.apple.mpegurl")
         let mp4 = AVURLAsset.isPlayableExtendedMIMEType("video/mp4; codecs=\"avc1.640028,mp4a.40.2\"")
         let ts = AVURLAsset.isPlayableExtendedMIMEType("video/mp2t; codecs=\"avc1.640028,mp4a.40.2\"")
         let qualifiedPlaylist = AVURLAsset.isPlayableExtendedMIMEType("application/vnd.apple.mpegurl; codecs=\"avc1.640028,mp4a.40.2\"")
-        print("NATIVE_HLS_PUBLIC_MIME sdk-runtime=true bare-hls=\(bare) mp4=\(mp4) ts=\(ts) playlist-codecs=\(qualifiedPlaylist)")
-        XCTAssertTrue(bare); XCTAssertTrue(mp4); XCTAssertTrue(ts)
+        print("NATIVE_HLS_PUBLIC_MIME sdk-runtime=true bare-hls=\(bare) mp4=\(mp4) ts-bmff-codecs=\(ts) playlist-bmff-codecs=\(qualifiedPlaylist)")
+        XCTAssertTrue(bare); XCTAssertTrue(mp4)
         // Only the documented model/hardware envelope is injected for simulator
         // coverage. Every MIME answer above and below comes from the real SDK.
         let evidence = NativeHLSPlatformEvidence(model: "AppleTV14,1", hardwareH264: true, hardwareHEVC: true,
@@ -182,7 +205,7 @@ final class NativeHLSCapabilitiesTests: XCTestCase {
         .init(model: model, hardwareH264: true, hardwareHEVC: true, hdrEligible: true, playable: { mime in
             if mime == denied { return false }
             return mime == "application/vnd.apple.mpegurl" || mime.hasPrefix("video/mp4; codecs=") ||
-                mime.hasPrefix("audio/mp4; codecs=") || mime.hasPrefix("video/mp2t; codecs=")
+                mime.hasPrefix("audio/mp4; codecs=")
         })
     }
     private func mimeSource(managed: Bool = false, container: HLSMediaFacts.Container = .mpegTS) throws
