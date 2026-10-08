@@ -163,6 +163,7 @@ class WorkflowContracts(unittest.TestCase):
             'VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput',
             'VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate',
             'VPlayerTests/PlaybackMediaInformationPresentationTests/testSourceAndPlannedPathAreExplicitWithoutReadinessClaims',
+            'VPlayerTests/NativeHLSCapabilitiesTests',
             'VPlayerTests/NativeHLSMasterSmokeTests',
             'VPlayerTests/NativeOwnedDolbyFallbackSmokeTests',
             'VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact',

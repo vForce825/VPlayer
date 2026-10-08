@@ -10,6 +10,37 @@ import XCTest
 
 @MainActor
 final class NativeHLSMasterSmokeTests: XCTestCase {
+    func testRealPublicMIMEPlanningPlaysNativeAndManagedMediaWithoutGeneration() async throws {
+        executionTimeAllowance = 120
+        let deadline = ContinuousClock.now + .seconds(90)
+        for managed in [false, true] {
+            let origin = try makeOrigin(bytes: fixtureBytes(), managed: managed)
+            var failure: (any Error)?
+            do {
+                try await withController(deadline: deadline, publicMIMEQueries: true) { [self] controller, registry, factory in
+                    await controller.play(.init(sourceProfileID: UUID(), channelID: "public-mime-media-\(managed)",
+                        streamURL: origin.url("media.m3u8"), title: "Public MIME media",
+                        attributes: managed ? ["Authorization": "ordinary fixture"] : [:]))
+                    try await until(registry: registry, factory: factory, phase: "public-mime-media-startup", managed: managed,
+                        deadline: min(deadline, .now + .seconds(20))) {
+                        guard case .playing = registry.playbackStateSnapshot(),
+                              let backend = factory.backend, let coordinator = backend.nativeCoordinatorForTesting,
+                              coordinator.isPrepared, coordinator.currentActivation != nil,
+                              let player = backend.presentation?.avPlayerForNativeSmoke else { return false }
+                        return player.currentTime().seconds > 0.5
+                    }
+                    let backend = try XCTUnwrap(factory.backend)
+                    let coordinator = try XCTUnwrap(backend.nativeCoordinatorForTesting)
+                    XCTAssertEqual(coordinator.owned.plan.transport, managed ? .proxy : .native)
+                    XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+                    print("NATIVE_HLS_PUBLIC_MIME_PLAYBACK sdk-runtime=true managed=\(managed) progressed=true generated=0")
+                }
+            } catch { failure = error }
+            await origin.close()
+            if let failure { throw failure }
+        }
+    }
+
     func testNativeSDKEndBoundaryControlsKeepSameSource() async throws {
         let bytes = try fixtureBytes()
         // These sequential SDK controls isolate endpoint ordering. They do not
@@ -1027,14 +1058,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
             throw HLSSourceError.deadline
         }
     }
-    private func withController(deadline: ContinuousClock.Instant? = nil, driver: SystemAVPlayerDriver? = nil,
+    private func withController(deadline: ContinuousClock.Instant? = nil, driver: SystemAVPlayerDriver? = nil, publicMIMEQueries: Bool = false,
         _ body: @escaping @MainActor (PlaybackController, ControlTaskRegistry, NativeSmokeFactory) async throws -> Void) async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let sdk = FakeAudioSessionSDK(initialPorts: .airPlay)
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress, notificationCenter: NotificationCenter())
         let owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: monitor)
         let trace = NativeSmokeTrace()
-        let factory = NativeSmokeFactory(trace: trace, driver: driver)
+        let factory = NativeSmokeFactory(trace: trace, driver: driver, publicMIMEQueries: publicMIMEQueries)
         let controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: PlaybackAudioRouteService(registry: registry, owner: owner), backendFactory: factory)
         let bodyTask = Task { @MainActor in
@@ -1220,7 +1251,7 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
     private let factory: SystemPlaybackBackendFactory
     private let sourceDependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies
     private let driver: SystemAVPlayerDriver?
-    init(trace: NativeSmokeTrace, driver: SystemAVPlayerDriver? = nil) {
+    init(trace: NativeSmokeTrace, driver: SystemAVPlayerDriver? = nil, publicMIMEQueries: Bool = false) {
         self.trace = trace
         self.driver = driver
         let dependencies: @Sendable (PlaybackSourceContext) -> HLSNativeSourceDependencies = { context in
@@ -1229,8 +1260,16 @@ private final class NativeSmokeFactory: PlaybackBackendFactory, @unchecked Senda
                 guard let system = driver as? SystemAVPlayerDriver else { throw HLSSourceError.incompleteEvidence }
                 return NativeSmokeTracingInspector(driver: system, trace: trace)
             }
-            dependencies.capabilities = { _, _ in
-                .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
+            dependencies.capabilities = { facts, route in
+                if publicMIMEQueries {
+                    // The simulator's hardware identity is deliberately outside
+                    // production admission. Inject only that envelope; use the
+                    // production capability builder and actual SDK MIME answers.
+                    return NativeHLSCapabilities.make(facts: facts, route: route,
+                        evidence: .init(model: "AppleTV14,1", hardwareH264: true, hardwareHEVC: true,
+                            hdrEligible: true, playable: { AVURLAsset.isPlayableExtendedMIMEType($0) }))
+                }
+                return .init(videoFormats: [.init(codec: .h264, profiles: [66, 77, 100], maximumLevel: 52,
                     maximumWidth: 1_920, maximumHeight: 1_080, maximumFrameRate: MediaRational(num: 60, den: 1)!,
                     bitDepths: [8], chromaFormats: [1], tiers: [.main], videoRanges: [.sdr])], nativeAudioCodecs: [.aac],
                     supportsWebVTT: true, supportsGenerated: false, supportsInBandClosedCaptions: true)

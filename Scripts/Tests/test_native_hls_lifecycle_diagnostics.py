@@ -64,7 +64,7 @@ class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
             'eos-ordering-startup', 'eos-ordering-first-read', 'eos-ordering-refresh',
             'eos-ordering-error', 'eos-ordering-progress',
             'refresh-return-startup', 'refresh-return-first-read',
-            'quantum-owner-original', 'quantum-owner-successor',
+            'quantum-owner-original', 'quantum-owner-successor', 'public-mime-media-startup',
         })
         helper = source.split('private func until(', 1)[1].split('private func withController(', 1)[0]
         self.assertIn('file: StaticString = #filePath, line: UInt = #line', helper)

@@ -431,6 +431,7 @@ jobs:
             --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceShowsKnownFactsWithoutClaimingTransformedOutput \
             --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testProbedSourceKeepsUnknownFieldsDetectingWithoutGuessingScanOrRate \
             --only-testing VPlayerTests/PlaybackMediaInformationPresentationTests/testSourceAndPlannedPathAreExplicitWithoutReadinessClaims \
+            --only-testing VPlayerTests/NativeHLSCapabilitiesTests \
             --only-testing VPlayerTests/NativeHLSMasterSmokeTests \
             --only-testing VPlayerTests/NativeOwnedDolbyFallbackSmokeTests \
             --only-testing VPlayerTests/HLSCompatibilityProbeTests/testCompleteTSWithOrdinaryDVBInformationPreservesEveryMediaFact \
