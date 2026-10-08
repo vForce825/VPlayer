@@ -307,6 +307,92 @@ final class LoopbackHTTPServerTests: XCTestCase {
             startup.canonicalCoverageDigest)
     }
 
+    func testPausedWorkspaceMallocBuffersRespectAlignmentAndPhysicalPrechargeBoundaries() throws {
+        for count in [1, 16, 17, 24, 31, 32, 384] {
+            for _ in 0..<3 {
+                let limit = try PausedWorkspaceBuffer<UInt16>.reservationBytes(count: count)
+                let storage = try PausedWorkspaceBuffer<UInt16>(count: count, repeating: 0)
+                XCTAssertEqual(UInt(bitPattern: storage.values) % UInt(MemoryLayout<UInt16>.alignment), 0)
+                XCTAssertLessThanOrEqual(storage.actualBytes, limit)
+                for index in 0..<count { storage.values[index] = UInt16(index) }
+                XCTAssertEqual(storage.values[count - 1], UInt16(count - 1))
+                print("PAUSED_WORKSPACE_MALLOC count=\(count) alignment=\(MemoryLayout<UInt16>.alignment) reserved=\(limit) actual=\(storage.actualBytes)")
+                storage.destroy()
+            }
+        }
+        let aligned = try PausedWorkspaceBuffer<SIMD8<UInt64>>(count: 3, repeating: .zero)
+        XCTAssertEqual(UInt(bitPattern: aligned.values) % UInt(MemoryLayout<SIMD8<UInt64>>.alignment), 0)
+        XCTAssertLessThanOrEqual(aligned.actualBytes,
+            try PausedWorkspaceBuffer<SIMD8<UInt64>>.reservationBytes(count: 3))
+        aligned.destroy()
+        XCTAssertThrowsError(try PausedWorkspaceBuffer<UInt16>.reservationBytes(count: 0))
+        XCTAssertThrowsError(try PausedWorkspaceBuffer<UInt16>.reservationBytes(count: Int.max))
+        XCTAssertThrowsError(try PausedWorkspaceBuffer<UInt16>(count: 24, repeating: 0, allocator: { _ in nil }))
+    }
+
+    func testPausedWorkspacePartialAllocationFailureFreesEveryRawOwnerAndReservation() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        for failureAt in 1...3 {
+            let contextBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+            let applicationBaseline = PlaybackApplicationChargeLedger.shared.chargedBytes
+            var attempts = 0
+            var allocated: [UInt] = []
+            var freed: [UInt] = []
+            XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner, allocator: { bytes in
+                attempts += 1
+                guard attempts != failureAt else { return nil }
+                let pointer = malloc(bytes)
+                if let pointer { allocated.append(UInt(bitPattern: pointer)) }
+                return pointer
+            }, deallocator: { pointer in
+                freed.append(UInt(bitPattern: pointer))
+                free(pointer)
+            })) { error in
+                XCTAssertEqual(error as? LoopbackHTTPReservationError, .hardCapacityExceeded)
+            }
+            XCTAssertEqual(attempts, failureAt)
+            XCTAssertEqual(freed.sorted(), allocated.sorted())
+            XCTAssertEqual(Set(freed).count, freed.count)
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, contextBaseline)
+            XCTAssertEqual(PlaybackApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+        }
+    }
+
+    func testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased() async throws {
+        let fixture = try await Task20HTTPFixture.start()
+        defer { fixture.shutdown() }
+        let store = fixture.task19.store
+        let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let owner = try PausedWindowCoverageLease.reserve()
+        _ = try owner.retainMetadata(in: store, key: media)
+        let contextBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+        let applicationBaseline = PlaybackApplicationChargeLedger.shared.chargedBytes
+        var workspace: PausedCoverageWorkspace? = try store.reservePausedCoverageWorkspace(owner: owner)
+        let limit = try PausedCoverageWorkspace.allocationLimits(
+            mapCount: XCTUnwrap(workspace).mapCount, sampleCount: XCTUnwrap(workspace).sampleCount)
+        let actual = try XCTUnwrap(workspace?.actualAllocationBytes)
+        XCTAssertLessThanOrEqual(actual.ordinals, limit.ordinals)
+        XCTAssertLessThanOrEqual(actual.cursors, limit.cursors)
+        XCTAssertLessThanOrEqual(actual.heap, limit.heap)
+        let admittedCharge = PlaybackResourceContextLedger.shared.chargedBytes
+        XCTAssertGreaterThan(admittedCharge, contextBaseline)
+        var alias = workspace
+        weak var weakWorkspace = workspace
+        workspace = nil
+        XCTAssertNotNil(weakWorkspace)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, admittedCharge)
+        withExtendedLifetime(alias) {}
+        alias = nil
+        XCTAssertNil(weakWorkspace)
+        XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, contextBaseline)
+        XCTAssertEqual(PlaybackApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+    }
+
     func testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge() async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
@@ -581,9 +667,14 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let baseline = ledger.chargedBytes
         let blocker = try ledger.reserve(allocationIdentity: .stable(UUID()),
             bytes: PlaybackResourceContextLedger.hardBytes - baseline)
-        XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner)) { error in
+        var allocationAttempts = 0
+        XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner, allocator: { bytes in
+            allocationAttempts += 1
+            return malloc(bytes)
+        })) { error in
             XCTAssertEqual(error as? LoopbackHTTPReservationError, .hardCapacityExceeded)
         }
+        XCTAssertEqual(allocationAttempts, 0, "Admission failure must precede raw allocation")
         XCTAssertEqual(ledger.chargedBytes, PlaybackResourceContextLedger.hardBytes)
         ledger.release(blocker)
         XCTAssertEqual(ledger.chargedBytes, baseline)

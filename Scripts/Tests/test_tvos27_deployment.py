@@ -17,7 +17,7 @@ class TVOS27DeploymentTests(unittest.TestCase):
         targets=re.findall(r'^  ([A-Za-z][A-Za-z0-9]+):$',target_section,re.M)
         tv_targets = {'VPlayerCore','VPlayerPlayback','VPlayer','VPlayerTests',
             'VPlayerReleaseBoundaryTests','VPlayerUITests','VPlayerHLSAcceptanceTests'}
-        ios_targets = {'VPlayerCoreiOS','VPlayerPlaybackiOS','VPlayeriOS','VPlayeriOSTests','VPlayeriOSUITests'}
+        ios_targets = {'VPlayerCoreiOS','VPlayerPlaybackiOS','VPlayeriOS','VPlayeriOSTests','VPlayeriOSUITests','VPlayeriOSBenchmarks'}
         self.assertEqual(set(targets), tv_targets | ios_targets)
         self.assertEqual(len(floors),len(targets)+2)
         for name in tv_targets:

@@ -341,6 +341,22 @@ targets:
         ARCHS: arm64
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests.ios
         GENERATE_INFOPLIST_FILE: true
+  VPlayeriOSBenchmarks:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayerTests/Deinterlace/YADIFGoldenPixelTests.swift
+    dependencies:
+      - target: VPlayerCoreiOS
+      - target: VPlayerPlaybackiOS
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.benchmarks.ios
+        GENERATE_INFOPLIST_FILE: true
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
   VPlayeriOSUITests:
     type: bundle.ui-testing
     platform: iOS
@@ -465,3 +481,17 @@ schemes:
     run:
       config: Release
       executable: VPlayeriOS
+  VPlayeriOSBenchmarks:
+    build:
+      targets:
+        VPlayerCoreiOS: all
+        VPlayerPlaybackiOS: all
+        VPlayeriOSBenchmarks: [test]
+    test:
+      config: Release
+      gatherCoverageData: false
+      targets:
+        - name: VPlayeriOSBenchmarks
+          parallelizable: false
+          selectedTests:
+            - YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification

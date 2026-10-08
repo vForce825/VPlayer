@@ -6,7 +6,14 @@ import XCTest
 
 @MainActor
 final class IOSLibraryFlowTests: XCTestCase {
+    private func require(_ element: XCUIElement, in app: XCUIApplication, stage: String,
+                         timeout: TimeInterval, file: StaticString = #filePath, line: UInt = #line) {
+        let found = element.waitForExistence(timeout: timeout)
+        XCTAssertTrue(found, found ? "" : "IOS_UI_STAGE=\(stage)\n" + String(app.debugDescription.prefix(3000)),
+            file: file, line: line)
+    }
     private func launch() -> XCUIApplication {
+        continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["-ui-fixture", "seeded", "-uiTestResetPlaybackSettings"]
         app.launch()
@@ -14,38 +21,42 @@ final class IOSLibraryFlowTests: XCTestCase {
     }
     func testTouchChannelSelectionCloseAndReopen() {
         let app = launch()
+        defer { app.terminate() }
         let channel = app.buttons["channel.http"]
-        XCTAssertTrue(channel.waitForExistence(timeout: 15))
+        require(channel, in: app, stage: "initial-channel", timeout: 15)
         for _ in 0..<3 {
             channel.tap()
-            XCTAssertTrue(app.buttons["player-back"].waitForExistence(timeout: 5))
+            require(app.buttons["player-back"], in: app, stage: "player-back", timeout: 5)
             app.buttons["player-back"].tap()
-            XCTAssertTrue(channel.waitForExistence(timeout: 5))
+            require(channel, in: app, stage: "channel-after-close", timeout: 5)
         }
     }
     func testSourceEditorCancelAndReopen() {
         let app = launch()
+        defer { app.terminate() }
         app.tabBars.buttons["播放列表"].tap()
         let add = app.buttons["source.add"]
-        XCTAssertTrue(add.waitForExistence(timeout: 10))
+        require(add, in: app, stage: "source-add", timeout: 10)
         for _ in 0..<2 {
             add.tap()
-            XCTAssertTrue(app.textFields["source.editor.name"].waitForExistence(timeout: 5))
+            require(app.textFields["source.editor.name"], in: app, stage: "source-editor", timeout: 5)
             app.buttons["source.editor.cancel"].tap()
-            XCTAssertTrue(add.waitForExistence(timeout: 5))
+            require(add, in: app, stage: "source-after-cancel", timeout: 5)
         }
     }
     func testRotationAndPlaybackSettingsKeepPlayerSession() {
         let app = launch()
-        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 15))
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "rotation-initial-channel", timeout: 15)
         app.buttons["channel.http"].tap()
-        XCTAssertTrue(app.buttons["player-back"].waitForExistence(timeout: 5))
+        require(app.buttons["player-back"], in: app, stage: "player-back", timeout: 5)
+        defer { XCUIDevice.shared.orientation = .portrait }
         XCUIDevice.shared.orientation = .landscapeLeft
-        XCTAssertTrue(app.buttons["player-back"].exists)
+        XCTAssertTrue(app.buttons["player-back"].exists, "IOS_UI_STAGE=after-rotation\n" + String(app.debugDescription.prefix(3000)))
         app.buttons["player-settings"].tap()
-        XCTAssertTrue(app.buttons["player.settings.done"].waitForExistence(timeout: 5))
+        require(app.buttons["player.settings.done"], in: app, stage: "settings-presented", timeout: 5)
         app.buttons["player.settings.done"].tap()
-        XCTAssertTrue(app.buttons["player-back"].waitForExistence(timeout: 5))
+        require(app.buttons["player-back"], in: app, stage: "player-back", timeout: 5)
         XCUIDevice.shared.orientation = .portrait
         app.buttons["player-back"].tap()
     }

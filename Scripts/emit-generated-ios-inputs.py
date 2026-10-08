@@ -17,7 +17,7 @@ args=parser.parse_args()
 root=Path(__file__).resolve().parents[1]
 paths=['VPlayer.xcodeproj/project.pbxproj']
 paths += [f'VPlayer.xcodeproj/xcshareddata/xcschemes/{name}.xcscheme' for name in
-          ['VPlayer','VPlayerReleaseBoundaryTests','VPlayerReleaseStartupTests','VPlayerHLSAcceptance','VPlayeriOS','VPlayeriOSReleaseStartup']]
+          ['VPlayer','VPlayerReleaseBoundaryTests','VPlayerReleaseStartupTests','VPlayerHLSAcceptance','VPlayeriOS','VPlayeriOSReleaseStartup','VPlayeriOSBenchmarks']]
 paths += [f'Sources/VPlayerPlayback/Resources/{name}.metallib' for name in
           ['VPlayerPlayback-ios','VPlayerPlayback-iphonesimulator']]
 def read(name):

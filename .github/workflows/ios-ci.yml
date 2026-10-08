@@ -24,8 +24,41 @@ env:
   PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
+  generated-inputs:
+    name: Pinned iOS generated-input readback
+    runs-on: xcode-27
+    timeout-minutes: 15
+    outputs:
+      needs_refresh: ${{ steps.generated.outputs.needs_refresh }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Verify exact source and generator SDK
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test "$(xcrun --sdk iphoneos --show-sdk-version)" = '27.0'
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = '27.0'
+      - name: Generate pinned inputs and compare committed bytes
+        id: generated
+        run: |
+          brew install mint
+          mint bootstrap
+          python3 Scripts/emit-generated-ios-inputs.py capture --baseline "$RUNNER_TEMP/generated-before.json"
+          xcodebuild -downloadComponent MetalToolchain
+          Scripts/build-metal-libraries.sh --platform ios
+          mint run yonaskolb/XcodeGen@2.44.1 xcodegen generate --spec project.yml --project . --project-root .
+          python3 Scripts/emit-generated-ios-inputs.py emit --baseline "$RUNNER_TEMP/generated-before.json"
+      - name: Fail closed until generated outputs are committed
+        if: steps.generated.outputs.needs_refresh == 'true'
+        run: |
+          echo 'Commit the verified generated outputs before native acceptance.'
+          exit 1
   ios-tests:
-    name: iPhone generated inputs, simulator tests and unsigned device build
+    name: iPhone simulator tests and unsigned device build
+    needs: generated-inputs
+    if: ${{ needs.generated-inputs.outputs.needs_refresh == 'false' }}
     runs-on: xcode-27
     timeout-minutes: 180
     steps:
@@ -40,16 +73,6 @@ jobs:
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           test "$(xcrun --sdk iphoneos --show-sdk-version)" = '27.0'
           test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = '27.0'
-      - name: Generate pinned inputs and compare committed bytes
-        id: generated
-        run: |
-          brew install mint
-          mint bootstrap
-          python3 Scripts/emit-generated-ios-inputs.py capture --baseline "$RUNNER_TEMP/generated-before.json"
-          xcodebuild -downloadComponent MetalToolchain
-          Scripts/build-metal-libraries.sh --platform ios
-          mint run yonaskolb/XcodeGen@2.44.1 xcodegen generate --spec project.yml --project . --project-root .
-          python3 Scripts/emit-generated-ios-inputs.py emit --baseline "$RUNNER_TEMP/generated-before.json"
       - name: Prepare audited iOS dependency profile
         id: prepare
         timeout-minutes: 40
@@ -59,6 +82,7 @@ jobs:
           echo "ACCEPTANCE_TREE=$(git rev-parse HEAD^{tree})"
           brew install jq ripgrep
           command -v rg
+          xcodebuild -downloadComponent MetalToolchain
           Scripts/build-ffmpeg.sh --platform ios
           Scripts/audit-ffmpeg.sh --platform ios Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework
           Scripts/Tests/test_ffmpeg_artifact_audit.sh --platform ios
@@ -71,6 +95,9 @@ jobs:
           python3 Scripts/Tests/test_samplebuffer_source_metadata.py
           python3 Scripts/Tests/test_ios_workflow.py
           python3 Scripts/Tests/test_ios_startup_runner.py
+          python3 Scripts/Tests/test_paused_workspace_malloc.py
+          python3 Scripts/Tests/test_ios_benchmark_contract.py
+          python3 Scripts/Tests/test_ios_test_status_report.py
       - name: Choose an available iOS 27 iPhone simulator
         id: simulator
         run: |
@@ -99,8 +126,18 @@ jobs:
         run: |
           python3 Scripts/Support/ios-startup-runner.py \
             --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release"
-      - name: Run shared playback and iPhone touch tests
+      - name: Prepare mandatory synthetic shared-playback fixtures
+        id: fixtures
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
+        timeout-minutes: 40
+        run: |
+          brew install pkgconf x264 x265 nasm
+          tool_env="$(./Scripts/provision-hls-fixture-toolchain.sh)"
+          source "$tool_env"
+          ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
+          test -s Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
+      - name: Run shared playback and iPhone touch tests
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 60
         run: |
           Scripts/test-ios.sh -configuration Debug \
@@ -109,19 +146,28 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300
+      - name: Measure optimized CPU processing without device qualification
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
+        timeout-minutes: 30
+        run: |
+          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayeriOSBenchmarks \
+            -configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO \
+            -destination "$IOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/iOS-CPU-Release" \
+            -resultBundlePath "$RUNNER_TEMP/iOS-CPU-Release.xcresult" \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification
       - name: Report test failures and qualification limits
         if: always()
         run: |
           status=0
-          for bundle in iOS-RunnerControl iOS-Release iOS; do
+          for bundle in iOS-RunnerControl iOS-Release iOS iOS-CPU-Release; do
             python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/$bundle.xcresult" || status=1
           done
+          python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1
+          python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS-CPU-Release.xcresult" --benchmark || status=1
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
           exit "$status"
-      - name: Fail closed until generated outputs are committed
-        if: always() && steps.generated.outputs.needs_refresh == 'true'
-        run: |
-          echo 'Native results above are diagnostic only: generated inputs differ from the committed tree.'
-          echo 'Commit the verified generated outputs and validate the new exact head before acceptance.'
-          exit 1
