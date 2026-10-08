@@ -239,6 +239,10 @@ jobs:
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedTimeHeapJoinsComplementaryBFrameFragmentsAndRejectsRealGap \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedCoverageWorkspaceReportsSerializedVerificationAndPhysicalComponents \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission \
+            -only-testing:VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation \
             -only-testing:VPlayerTests/PausedWindowCoverageLeaseTests \
             -only-testing:VPlayerTests/LoopbackHTTPServerTests/testPausedWindowRequiresItsOwnFrozenInitializationCompletion \
             -only-testing:VPlayerTests/Task9RuntimeCapacityTests/testPipelineNativePayloadRoundTripsEveryErrorCaseAndRebindsBetweenDifferentTypes \
@@ -420,6 +424,14 @@ jobs:
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testSourceCategoryUsesResolvedTopologyRatherThanURLSuffix \
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testRouteEnrichmentPreservesSourceAndOutputFactsAndFixedPayload \
             --only-testing VPlayerTests/HLSPlaybackPlanTests/testProbeMetadataStillFitsExistingFixedEventPayload \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksBlockInspectionUntilOriginalPreparationContinues \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPausedNativeTrackWaitKeepsPreparationAndFrozenOriginalBudget \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testPendingNativeTracksExpireUnderOriginalStartupDeadline \
+            --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testNativeTrackAvailabilityCannotReplaceSelectedFormatProof \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRetainsBothObserversUntilCancellationRetiresToken \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackWaitSlotRejectsBothObserversAfterInitialCallbackCompletes \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testRealEmptyNativeTrackWaitCancellationReleasesBothCallbacksAndDriverAdmission \
+            --only-testing VPlayerTests/AVPlayerItemCoordinatorTests/testNativeTrackSecondCallbackCapacityFailureRollsBackBeforeObservation \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testSourceMetadataArrivesBeforeCapabilitiesAndIsReplacedByPreparedMetadata \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testGeneratedSourceMetadataArrivesBeforeGraphConstructionAndClearsOnFailure \
             --only-testing VPlayerTests/NativeHLSAdapterLifecycleTests/testMasterProbeDoesNotPublishAnArbitraryVariantBeforeSelection \

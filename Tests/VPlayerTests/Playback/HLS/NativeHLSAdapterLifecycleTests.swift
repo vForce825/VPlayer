@@ -10,6 +10,99 @@ import XCTest
 
 @MainActor
 final class NativeHLSAdapterLifecycleTests: XCTestCase {
+    func testPendingNativeTracksBlockInspectionUntilOriginalPreparationContinues() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            let gate = fixture.hold(.tracks)
+            fixture.play(observingMediaInformation: true)
+            try await fixture.until { gate.entered && fixture.metadata.last??.plannedTransport == .native }
+            XCTAssertEqual(fixture.driver.prerolls, 1)
+            XCTAssertEqual(fixture.driver.trackWaits, 1)
+            XCTAssertEqual(fixture.inspector.reads, 0)
+            XCTAssertEqual(fixture.driver.plays, 0)
+            XCTAssertFalse(fixture.registry.outputResourceContextSnapshot()?.prepared ?? true)
+            XCTAssertNil(fixture.metadata.last??.airPlayOutputMode)
+            let item = fixture.driver.currentItemIdentity
+            gate.release()
+            try await fixture.until { fixture.isPlaying && fixture.metadata.last??.airPlayOutputMode == .passthrough }
+            XCTAssertEqual(fixture.driver.currentItemIdentity, item)
+            XCTAssertGreaterThan(fixture.inspector.reads, 0)
+            XCTAssertEqual(fixture.driver.trackWaits, 1)
+        }
+    }
+
+    func testPausedNativeTrackWaitKeepsPreparationAndFrozenOriginalBudget() async throws {
+        let clock = ManualPlaybackClock(100)
+        try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
+            let gate = fixture.hold(.tracks, respondsToCancellation: true)
+            fixture.play(); try await fixture.until { gate.entered }
+            let item = fixture.driver.currentItemIdentity
+            let task = fixture.registry.outputResourceContextSnapshot()?.sourceTask
+            await fixture.controller.setPaused(true)
+            let paused = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.parentDeadline)
+            let budget: PlaybackProgressBudgetTicket
+            switch paused { case .coldStart(let value), .outputRecovery(let value): budget = value }
+            XCTAssertNil(budget.runningSince)
+            clock.advance(nanoseconds: 61_000_000_000)
+            fixture.registry.executor.sync {}
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.sourceTask, task)
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.parentDeadline, paused)
+            XCTAssertEqual(fixture.driver.currentItemIdentity, item)
+            XCTAssertEqual(fixture.inspector.reads, 0)
+            XCTAssertEqual(fixture.driver.plays, 0)
+            XCTAssertFalse(gate.cancellationObserved)
+            gate.release()
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot()?.prepared == true }
+            XCTAssertEqual(fixture.driver.plays, 0)
+            await fixture.controller.setPaused(false)
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.currentItemIdentity, item)
+            XCTAssertEqual(fixture.driver.trackWaits, 1)
+        }
+    }
+
+    func testPendingNativeTracksExpireUnderOriginalStartupDeadline() async throws {
+        let clock = ManualPlaybackClock(100)
+        try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
+            let gate = fixture.hold(.tracks, respondsToCancellation: true)
+            fixture.play(); try await fixture.until { gate.entered }
+            let original = try XCTUnwrap(fixture.registry.outputResourceContextSnapshot()?.parentDeadline)
+            let budget: PlaybackProgressBudgetTicket
+            switch original { case .coldStart(let value), .outputRecovery(let value): budget = value }
+            let remaining = try budget.remainingNanoseconds(at: clock.nowNanoseconds)
+            XCTAssertGreaterThan(remaining, 0)
+            clock.advance(nanoseconds: remaining - 1)
+            fixture.registry.executor.sync {}
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.parentDeadline, original)
+            XCTAssertEqual(fixture.inspector.reads, 0)
+            clock.advance(nanoseconds: 1)
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+            await fixture.registry.joinOwnedTerminalCleanup()
+            XCTAssertTrue(gate.cancellationObserved)
+            XCTAssertEqual(fixture.driver.plays, 0)
+            XCTAssertEqual(fixture.inspector.reads, 0)
+            XCTAssertGreaterThan(fixture.driver.joins, 0)
+            XCTAssertNil(fixture.driver.currentItemIdentity)
+        }
+    }
+
+    func testNativeTrackAvailabilityCannotReplaceSelectedFormatProof() async throws {
+        for missingAudio in [false, true] {
+            try await NativeAdapterFixture.withFixture { fixture in
+                let gate = fixture.hold(.tracks)
+                fixture.inspector.rejectFormat = !missingAudio
+                fixture.inspector.missingExpectedAudio = missingAudio
+                fixture.play(); try await fixture.until { gate.entered }
+                XCTAssertEqual(fixture.inspector.reads, 0)
+                gate.release()
+                try await fixture.until { fixture.failure != nil }
+                XCTAssertEqual(fixture.driver.trackWaits, 1)
+                XCTAssertEqual(fixture.inspector.reads, 1)
+                XCTAssertEqual(fixture.driver.plays, 0)
+                XCTAssertEqual(fixture.failure?.code, "playback.backend.prepare")
+            }
+        }
+    }
+
     func testNativeAndProxyPublishConfirmedPassthroughForVideoAndAudioOnly() async throws {
         for managed in [false, true] {
             for audioOnly in [false, true] {
@@ -652,6 +745,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
             XCTAssertTrue(fixture.driver.physical === physical)
             XCTAssertGreaterThan(fixture.inspector.reads, reads, "Resume must reload selected format before positive rate")
             XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
+            XCTAssertEqual(fixture.driver.trackWaits, 1, "Resume must not repeat the initial availability wait")
         }
     }
 
@@ -670,7 +764,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
                 XCTAssertTrue(fixture.driver.disconnectedFromSystemAudio)
                 XCTAssertEqual(fixture.driver.plays, 0)
                 XCTAssertNil(fixture.failure)
-                if phase == .ready || phase == .preroll || phase == .format {
+                if phase == .ready || phase == .preroll || phase == .tracks || phase == .format {
                     XCTAssertGreaterThan(fixture.driver.joins, 0)
                 }
 
@@ -987,7 +1081,7 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
 /// releases gates and joins tasks before Registry/controller teardown finishes.
 @MainActor
 private final class NativeAdapterFixture {
-    enum Phase: CaseIterable { case probe, capabilities, ready, preroll, format }
+    enum Phase: CaseIterable { case probe, capabilities, ready, preroll, tracks, format }
     let registry: ControlTaskRegistry
     let controller: PlaybackController
     let driver = NativeFixtureDriver()
@@ -1074,6 +1168,7 @@ private final class NativeAdapterFixture {
         case .capabilities: probe.capabilitiesGate = gate
         case .ready: driver.readyGate = gate
         case .preroll: driver.prerollGate = gate
+        case .tracks: driver.tracksGate = gate
         case .format: inspector.gate = gate
         }
         return gate
@@ -1326,8 +1421,9 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var currentItemIdentity: AVPlayerItemInstanceIdentity?
     var physical: NSObject?
     var selectedAudio = NSObject()
-    var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
+    var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, tracksGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
+    var trackWaits = 0
     var naturalEndObservations = 0, explicitEndMutations = 0
     var failReady = false
     var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
@@ -1351,6 +1447,11 @@ private final class NativeFixtureDriver: AVPlayerDriving {
         return item
     }
     func primeMediaData(item: AVPlayerItemInstanceIdentity) async throws { prerolls += 1; await prerollGate?.wait() }
+    func waitForNativeTracks(item: AVPlayerItemInstanceIdentity) async throws {
+        trackWaits += 1
+        await tracksGate?.wait()
+        guard currentItemIdentity == item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
+    }
     func joinNativeCallbackTails() async { joins += 1 }
     func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime { clock = time; return time }
     func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {}

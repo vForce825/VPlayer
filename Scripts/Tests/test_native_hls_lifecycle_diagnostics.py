@@ -15,6 +15,40 @@ BACKEND = ROOT / 'Sources/VPlayerPlayback/Pipeline/HLSAVPlayerPlaybackBackend.sw
 
 
 class NativeHLSLifecycleDiagnosticsTests(unittest.TestCase):
+    def test_initial_native_track_wait_preserves_one_shot_slot_and_full_inspection(self):
+        source = COORDINATOR.read_text()
+        prepare = source.split('func prepare(url:', 1)[1].split('private func publishSelectedMediaInformation(', 1)[0]
+        order = ['driver.primeMediaData(item: item)', 'driver.waitForNativeTracks(item: item)', 'selectionSnapshot']
+        for value in order:
+            self.assertIn(value, prepare)
+        self.assertEqual([prepare.index(value) for value in order], sorted(prepare.index(value) for value in order))
+        self.assertEqual(source.count('driver.waitForNativeTracks(item: item)'), 1)
+        driver = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
+        self.assertIn('func waitForNativeTracks(', driver)
+        wait = driver.split('func waitForNativeTracks(', 1)[1].split('func selectAudibleMedia(', 1)[0]
+        for value in ['gate.begin(.nativeTracks)', 'gate.retainStatus(', 'options: [.initial]',
+                      'Task.checkCancellation()', 'player.currentItem === physical', 'gate.retire(token)']:
+            self.assertIn(value, wait)
+        for value in ['Task {', 'Task.sleep', 'schedule(', 'while ', 'isEnabled', 'assetTrack', 'player.play(']:
+            self.assertNotIn(value, wait)
+        slot = driver.split('final class AVPlayerPrepareWaitSlot:', 1)[1]
+        self.assertIn('private var statusObservation: NSKeyValueObservation?', slot)
+        self.assertIn('owned/公开 prepare status KVO wrapper', slot)
+        self.assertIn('statusObservation?.invalidate()', slot)
+        self.assertNotIn('consume', slot)
+
+    def test_paused_track_replacements_only_target_existing_fixture_resources(self):
+        source = SMOKE.read_text()
+        raw = source.split('private func runPausedSDKTrackControl(', 1)[1].split('private func runPausedAdapterTrackControl(', 1)[0]
+        origin = source.split('private func makeOrigin(', 1)[1].split('private func shortTrackFixtureBytes(', 1)[0]
+        replacements = set(re.findall(r'origin\.replace\("([^"]+)"', raw))
+        resources = set(re.findall(r'"(/[^"\n]+)": \.init', origin))
+        self.assertTrue(replacements)
+        self.assertIn('/single-master.m3u8', resources)
+        self.assertFalse(replacements - resources, f'Replacement cannot insert new resources: {replacements - resources}')
+        fixture = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSHTTPFixture.swift').read_text()
+        self.assertIn('precondition(resources[path] != nil)', fixture)
+
     def test_paused_track_controls_keep_original_failure_and_bound_observation(self):
         source = SMOKE.read_text()
         self.assertIn('func testRealPublicMIMEPlanningPlaysNativeAndManagedMediaWithoutGeneration()', source)

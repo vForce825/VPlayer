@@ -75,6 +75,11 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         // AVPlayer retains its original default/alternate media selections.
         try await driver.primeMediaData(item: item)
         try validatePrepare()
+        // Item readiness and preroll may precede the SDK's raw track publication.
+        // This one initial wait shares the original preparation deadline; only
+        // the unchanged inspector below can establish selected-format evidence.
+        try await driver.waitForNativeTracks(item: item)
+        try validatePrepare()
         let snapshot = try await selectionSnapshot { try self.validatePrepare() }
         try validatePrepare()
         guard driver.currentItemIdentity == item, driver.rate == 0 else { throw AVPlayerItemCoordinatorFailure.staleIdentity }

@@ -10,6 +10,52 @@ import XCTest
 
 @MainActor
 final class NativeHLSMasterSmokeTests: XCTestCase {
+    func testRealNativeInitialTrackAvailabilityAndPopulatedFastPathStayPaused() async throws {
+        executionTimeAllowance = 30
+        let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
+        let identity = AVPlayerItemInstanceIdentity(outputLifecycleEpoch:
+            AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 27_340), itemGeneration: 1)
+        try driver.install(url: origin.url("media.m3u8"), identity: identity)
+        let operation = Task { @MainActor in
+            _ = try await driver.waitUntilReady(item: identity)
+            try await driver.primeMediaData(item: identity)
+            try await driver.waitForNativeTracks(item: identity)
+            let physical = try XCTUnwrap(driver.nativeCurrentItem(identity))
+            XCTAssertFalse(physical.tracks.isEmpty)
+            XCTAssertLessThanOrEqual(physical.tracks.count, 16)
+            XCTAssertEqual(driver.rate, 0)
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            let callbacks = AVPlayerSDKCallbackLease.occupiedCount
+            try await driver.waitForNativeTracks(item: identity)
+            XCTAssertLessThanOrEqual(AVPlayerSDKCallbackLease.occupiedCount, callbacks)
+            XCTAssertEqual(driver.activeWaiterCount, 0)
+            XCTAssertEqual(driver.fixedTimerCount, 0)
+            XCTAssertTrue(driver.nativeCurrentItem(identity) === physical)
+            // Raw presence is deliberately weaker than selected-format proof.
+            // Disabling real tracks cannot cause this candidate-only fast path
+            // to manufacture enabled A/V, or start playback to obtain evidence.
+            let enabled = physical.tracks.filter(\.isEnabled)
+            defer { enabled.forEach { $0.isEnabled = true } }
+            enabled.forEach { $0.isEnabled = false }
+            try await driver.waitForNativeTracks(item: identity)
+            XCTAssertTrue(physical.tracks.allSatisfy { !$0.isEnabled })
+            XCTAssertEqual(driver.rate, 0)
+            print("NATIVE_HLS_TRACK_AVAILABILITY sdk-runtime=true raw=\(physical.tracks.count) fast-path=true rate=0 selected-proof=false")
+        }
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(15)) } catch { return }
+            operation.cancel()
+        }
+        var failure: (any Error)?
+        do { try await operation.value } catch { failure = error }
+        timeout.cancel(); await timeout.value
+        driver.replaceCurrentItemWithNil(item: identity)
+        await driver.joinNativeCallbackTails()
+        await origin.close()
+        if let failure { throw failure }
+    }
+
     func testRealPublicMIMEPlanningPlaysNativeAndManagedMediaWithoutGeneration() async throws {
         executionTimeAllowance = 120
         let deadline = ContinuousClock.now + .seconds(90)
@@ -97,12 +143,6 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         let origin = try makeOrigin(bytes: shortFixture ? shortTrackFixtureBytes() : fixtureBytes(), managed: false)
         if shortFixture {
             origin.replace("/media.m3u8", resource: .init(data: shortTrackFixtureManifest(),
-                contentType: "application/vnd.apple.mpegurl"))
-        }
-        if entry == "single-master.m3u8" {
-            // Ordinary fixture resource only; no production/proxy graph rewrite.
-            origin.replace("/single-master.m3u8", resource: .init(
-                data: Data("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n".utf8),
                 contentType: "application/vnd.apple.mpegurl"))
         }
         let player = AVPlayer()
@@ -1060,9 +1100,11 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
     }
     private func makeOrigin(bytes: Data, managed: Bool, disconnectAfterBodyBytes: Int? = nil) throws -> NativeHLSHTTPFixture {
         let master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=5000000\nmedia.m3u8\n"
+        let singleMaster = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=4000000\nmedia.m3u8\n"
         let media = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n#EXT-X-ENDLIST\n"
         return try NativeHLSHTTPFixture(resources: [
             "/master.m3u8": .init(data: Data(master.utf8), contentType: "application/vnd.apple.mpegurl"),
+            "/single-master.m3u8": .init(data: Data(singleMaster.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/media.m3u8": .init(data: Data(media.utf8), contentType: "application/vnd.apple.mpegurl"),
             "/part.ts": .init(data: bytes, contentType: "video/mp2t", disconnectAfterBodyBytes: disconnectAfterBodyBytes)], credential: managed ? "ordinary fixture" : nil)
     }

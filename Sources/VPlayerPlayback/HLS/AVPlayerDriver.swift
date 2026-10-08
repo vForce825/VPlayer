@@ -195,7 +195,7 @@ struct AVPlayerDriverAdmission: Sendable {
 
 /// 实际交给SDK的callback持有本租约；执行、取消和driver退休均不提前归还。
 final class AVPlayerSDKCallbackLease: @unchecked Sendable {
-    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio, nativeObservation }
+    enum Kind: UInt8, Sendable { case timeControl, accessLog, endpoint, ready, seek, loaded, preroll, errorLog, logFetch, systemAudio, nativeObservation, nativeTracks }
     nonisolated(unsafe) private static var occupied: UInt8 = 0
     private let slot: UInt8
     let kind: Kind
@@ -1051,6 +1051,66 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
         return identity
+    }
+
+    /// Initial native preparation only. The original Registry preparation task
+    /// and startup/recovery deadline own cancellation; this driver adds no timer.
+    func waitForNativeTracks(item identity: AVPlayerItemInstanceIdentity) async throws {
+        try Task.checkCancellation()
+        guard currentItemIdentity == identity, let physical = item, player.currentItem === physical else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        guard player.rate == 0, player.timeControlStatus != .playing else {
+            throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+        }
+        if let result = Self.nativeTrackAvailability(physical) { _ = try result.get(); return }
+        // Reserve both fixed callback owners before registering either KVO.
+        // A second-credit failure leaves no observer or continuation behind.
+        let tracksLease = try reserveSDKCallbackLease(.nativeTracks)
+        let statusLease = try reserveSDKCallbackLease(.nativeTracks)
+        let gate = prepareWait
+        let token = try gate.begin(.nativeTracks)
+        defer { gate.retire(token) }
+        _ = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.install(continuation, token: token)
+                let tracksCallback: @Sendable (AVPlayerItem, NSKeyValueObservedChange<[AVPlayerItemTrack]>) -> Void = { observed, _ in
+                    tracksLease.assertRegistered()
+                    if let result = Self.nativeTrackAvailability(observed) { gate.resolve(result, token: token) }
+                }
+                let statusCallback: @Sendable (AVPlayerItem, NSKeyValueObservedChange<AVPlayerItem.Status>) -> Void = { observed, _ in
+                    statusLease.assertRegistered()
+                    if let result = Self.nativeTrackAvailability(observed) { gate.resolve(result, token: token) }
+                }
+                tracksLease.inspectRegistration()
+                // No old/new array payload: callbacks read the bounded current
+                // count. Initial delivery closes the fast-path registration race.
+                gate.retain(physical.observe(\.tracks, options: [.initial], changeHandler: tracksCallback), token: token)
+                statusLease.inspectRegistration()
+                gate.retainStatus(physical.observe(\.status, options: [.initial], changeHandler: statusCallback), token: token)
+            }
+        } onCancel: { gate.resolve(.failure(CancellationError()), token: token) }
+        // A success may win the slot just before cancellation, replacement, or
+        // SDK failure. None of those may escape as current candidate availability.
+        try Task.checkCancellation()
+        guard currentItemIdentity == identity, item === physical, player.currentItem === physical else {
+            throw AVPlayerItemCoordinatorFailure.staleIdentity
+        }
+        guard player.rate == 0, player.timeControlStatus != .playing else {
+            throw AVPlayerItemCoordinatorFailure.directPauseNotConfirmed
+        }
+        guard let result = Self.nativeTrackAvailability(physical) else { throw AVPlayerItemCoordinatorFailure.selectionChanged }
+        _ = try result.get()
+    }
+
+    nonisolated private static func nativeTrackAvailability(_ item: AVPlayerItem) -> Result<Bool, Error>? {
+        if let error = item.error { return .failure(PlaybackErrorDiagnostics.snapshot(error)) }
+        if item.status == .failed { return .failure(AVPlayerItemCoordinatorFailure.itemFailed) }
+        let count = item.tracks.count
+        guard count <= 16 else { return .failure(AVPlayerItemCoordinatorFailure.capacityExceeded) }
+        guard item.status == .readyToPlay, count > 0 else { return nil }
+        // Presence only. The full selected-format inspector remains mandatory.
+        return .success(true)
     }
 
     func selectAudibleMedia(item identity: AVPlayerItemInstanceIdentity) async throws {
@@ -2074,14 +2134,19 @@ final class AVPlayerPrepareWaitSlot: @unchecked Sendable {
                 let observationPointer = UnsafeRawPointer(Unmanaged.passUnretained(observation).toOpaque())
                 body("owned/公开 prepare KVO wrapper", observationPointer, malloc_size(observationPointer))
             }
+            if let statusObservation {
+                let pointer = UnsafeRawPointer(Unmanaged.passUnretained(statusObservation).toOpaque())
+                body("owned/公开 prepare status KVO wrapper", pointer, malloc_size(pointer))
+            }
         }
     }
 #endif
-    enum Phase: UInt8, Sendable { case ready, mapping, seek, loaded, preroll }
+    enum Phase: UInt8, Sendable { case ready, mapping, seek, loaded, preroll, nativeTracks }
     struct Token: Sendable, Equatable { let generation: UInt64; let phase: Phase }
     private let lock = PreparationStorageLock()
     private var continuation: CheckedContinuation<Bool, Error>?
     private var observation: NSKeyValueObservation?
+    private var statusObservation: NSKeyValueObservation?
     private var generation: UInt64 = 0
     private var current: Token?
     private var terminal: Result<Bool, AVPlayerFixedPreparationFailure>?
@@ -2124,6 +2189,16 @@ final class AVPlayerPrepareWaitSlot: @unchecked Sendable {
         resolveFixed(result.mapError(AVPlayerFixedPreparationFailure.init), token: token)
     }
 
+    func retainStatus(_ observation: NSKeyValueObservation, token: Token) {
+        let keep = lock.withLock {
+            guard current == token, terminal == nil else { return false }
+            precondition(statusObservation == nil)
+            statusObservation = observation
+            return true
+        }
+        if !keep { observation.invalidate() }
+    }
+
     func resolveFixed(_ result: Result<Bool, AVPlayerFixedPreparationFailure>, token: Token) {
         let continuation = lock.withLock { () -> CheckedContinuation<Bool, Error>? in
             guard current == token, terminal == nil else { return nil }
@@ -2141,12 +2216,13 @@ final class AVPlayerPrepareWaitSlot: @unchecked Sendable {
     }
 
     func retire(_ token: Token) {
-        let observation = lock.withLock { () -> NSKeyValueObservation? in
-            guard current == token else { return nil }
-            defer { self.observation = nil }
-            return self.observation
+        let (observation, statusObservation) = lock.withLock { () -> (NSKeyValueObservation?, NSKeyValueObservation?) in
+            guard current == token else { return (nil, nil) }
+            defer { self.observation = nil; self.statusObservation = nil }
+            return (self.observation, self.statusObservation)
         }
         observation?.invalidate()
+        statusObservation?.invalidate()
         lock.withLock {
             guard current == token else { return }
             current = nil
