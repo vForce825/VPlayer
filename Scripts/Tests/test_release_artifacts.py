@@ -123,6 +123,31 @@ class ReleaseArtifactTests(unittest.TestCase):
         self.assertEqual(self.inspect(archive([('first.o', clean), ('second.o', clean)]))['members'], 2)
         self.reject(archive([('first.o', clean), ('unused.o', macho(sections=['__llvm_prf_cnts']))]))
 
+    def test_symbol_less_empty_clang_object_requires_exact_empty_structure(self):
+        # Clang's disabled x86 FFmpeg translation units contain no LC_SYMTAB.
+        segment = struct.pack('<II16sQQQQiiII', 0x19, 152, b'', 0, 0, 208, 0, 7, 7, 1, 0)
+        section = struct.pack('<16s16sQQIIIIIIII', b'__text', b'__TEXT',
+                              0, 0, 208, 0, 0, 0, 0x80000000, 0, 0, 0)
+        build = struct.pack('<6I', 0x32, 24, 7, 27 << 16, 27 << 16, 0)
+        empty = struct.pack('<8I', 0xfeedfacf, 0x01000007, 3, 1, 2, 176, 0x2000, 0) + segment + section + build
+        self.assertEqual(self.inspect(empty)['symbols'], 0)
+        self.assertEqual(self.inspect(archive([('empty.o', empty)]))['members'], 1)
+        self.reject(empty + b'\0')
+        self.reject(empty[:-1])
+        for offset, fmt, value in [(12, '<I', 2), (80, '<Q', 1), (144, '<Q', 1),
+                                   (160, '<I', 208), (164, '<I', 1), (168, '<I', 1),
+                                   (172, '<I', 1), (176, '<I', 1), (180, '<I', 1),
+                                   (192, '<I', 2), (196, '<I', 26 << 16)]:
+            altered = bytearray(empty)
+            struct.pack_into(fmt, altered, offset, value)
+            self.reject(bytes(altered))
+        altered = bytearray(empty + struct.pack('<II', 0x1234, 8))
+        struct.pack_into('<II', altered, 16, 3, 184)
+        self.reject(bytes(altered))
+        altered = bytearray(empty)
+        altered[104:120] = b'__llvm_prf_cnts\0\0'
+        self.reject(bytes(altered), 'instrumentation_section')
+
     def test_every_fat_architecture_and_nested_archive_is_checked(self):
         arm = macho()
         intel = macho(cpu=0x01000007)

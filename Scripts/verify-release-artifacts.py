@@ -190,6 +190,7 @@ def inspect_bytes(data, sdk, depth=0):
     end = cursor + cmdbytes
     symtab = None
     platform = None
+    empty_object_layout = []
     for _ in range(ncmds):
         require(cursor + 8 <= end, 'load_command_truncated')
         command, size = struct.unpack_from('<II', data, cursor)
@@ -207,12 +208,19 @@ def inspect_bytes(data, sdk, depth=0):
             require(size >= 72, 'segment_truncated')
             nsects = struct.unpack_from('<I', data, cursor + 64)[0]
             require(nsects <= 4096 and size == 72 + 80 * nsects, 'section_inventory_invalid')
+            empty_segment = (size == 152 and data[cursor + 8:cursor + 24] == bytes(16)
+                             and struct.unpack_from('<4Q', data, cursor + 24) == (0, 0, end, 0)
+                             and struct.unpack_from('<4I', data, cursor + 56) == (7, 7, 1, 0))
             for index in range(nsects):
                 offset = cursor + 72 + index * 80
                 name = data[offset:offset + 16].split(b'\0')[0].decode('ascii', errors='strict')
                 require(not SECTION.match(name.lstrip('_')), 'instrumentation_section')
                 count, fileoff = struct.unpack_from('<QI', data, offset + 40)
                 section_flags = struct.unpack_from('<I', data, offset + 64)[0]
+                empty_object_layout.append(empty_segment and
+                    struct.unpack_from('<16s16sQQIIIIIIII', data, offset) ==
+                    (b'__text' + bytes(10), b'__TEXT' + bytes(10),
+                     0, 0, end, 0, 0, 0, 0x80000000, 0, 0, 0))
                 if section_flags & 0xff not in (1, 0xc, 0x12):
                     require(fileoff + count <= len(data), 'section_data_truncated')
                 result['sections'] += 1
@@ -225,7 +233,15 @@ def inspect_bytes(data, sdk, depth=0):
             name = data[cursor + nameoff:terminator].decode('utf-8', errors='strict')
             require(not DEPENDENCY.search(Path(name).name), 'instrumentation_dependency')
         cursor += size
-    require(cursor == end and platform is not None and symtab is not None, 'macho_identity_incomplete')
+    require(cursor == end and platform is not None, 'macho_identity_incomplete')
+    if symtab is None:
+        # Clang emits no symbol table for a completely empty translation unit.
+        # Accept only its exact empty object layout: no data, relocations,
+        # extra commands or trailing bytes can hide uninspected content.
+        require(kind == 1 and ncmds == 2 and end == len(data)
+                and empty_object_layout == [True], 'macho_identity_incomplete')
+        result.update(slices=1, symbols=0, arches=[CPUS[cpu]], kinds=[kind])
+        return result
     symoff, nsyms, stroff, strsize = symtab
     require(nsyms <= MAX_SYMBOLS and symoff + nsyms * 16 <= len(data)
             and stroff + strsize <= len(data) and strsize > 0, 'symbol_table_truncated_or_limit')
