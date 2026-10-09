@@ -48,6 +48,29 @@ OPERANDS = frozenset(('-D', '-U', '-I', '-F', '-L', '-l', '-include', '-imacros'
     '-index-store-path', '-index-unit-output-path', '-serialize-diagnostics', '-module-name',
     '-output-file-map', '-emit-module-path', '-emit-module-doc-path', '-emit-module-source-info-path',
     '-emit-dependencies-path', '-emit-reference-dependencies-path', '-primary-file', '-filelist'))
+# Operand-taking options from the Apple ld manual. A spelling such as -rpath
+# may itself be another option's operand, including in a forwarded channel.
+LINKER_OPERAND_ARITIES = dict.fromkeys(('''arch o needed_library reexport_library upward_library
+    weak_library assert_weak_library delay_library syslibroot framework needed_framework weak_framework
+    assert_weak_framework reexport_framework upward_framework delay_framework force_load load_hidden
+    image_suffix add_ast_path filelist dtrace order_file macos_version_min ios_version_min image_base
+    install_name compatibility_version current_version pagezero_size stack_size bundle_loader
+    exported_symbols_list exported_symbol unexported_symbols_list unexported_symbol reexported_symbols_list
+    alias_list u U undefined rpath commons why_live map non_global_symbols_strip_list
+    non_global_symbols_no_strip_list oso_prefix bitcode_symbol_map keep_duplicates_list keep_duplicate
+    unaligned_pointers dirty_data_list max_default_common_align trace_symbol_layout_file trace_implicit_library
+    segment_order init sub_library sub_umbrella allowable_client client_name umbrella headerpad stack_addr
+    seg_addr_table segs_read_write_addr segs_read_only_addr dylib_file weak_reference_mismatches
+    deployment_target_mismatches arch_variant_lto_cache_mismatch duplicate_symbols read_only_relocs
+    dylinker_install_name e final_output dot interposable_list object_path_lto lto_library cache_path_lto
+    prune_interval_lto prune_after_lto max_relative_cache_size_lto memory_layout_file merge_library
+    merge_framework segalign sect_diff_relocs A Y multiply_defined_unused multiply_defined
+    seg_addr_table_filename poison_symbol poison_symbols_list''').split(), 1)
+LINKER_OPERAND_ARITIES = {'-' + key: value for key, value in LINKER_OPERAND_ARITIES.items()}
+LINKER_OPERAND_ARITIES.update({'-sectcreate': 3, '-platform_version': 3, '-sectalign': 3,
+    '-segprot': 3, '-sectorder': 3, '-rename_section': 4, '-add_empty_section': 2,
+    '-alias': 2, '-move_to_rw_segment': 2, '-move_to_ro_segment': 2, '-rename_segment': 2,
+    '-section_order': 2, '-segaddr': 2, '-seg_page_size': 2, '-sectobjectsymbols': 2})
 BAD_FLAGS = re.compile(r'^(?:--coverage$|-coverage$|-f(?:profile-(?:instr-generate|generate|arcs|instrument)|cs-profile-generate|'
     'test-coverage|coverage-(?:mapping|mcdc)|sanitize(?:=|-coverage)|instrument-functions|xray-instrument)|'
     '-(?:(?:ir-|cs-)?profile-generate|profile-coverage-mapping|sanitize(?:=|-coverage)|pg$|p$|finstrument-functions)|'
@@ -309,25 +332,42 @@ def expand_responses(arguments, derived, cwd, evidence=None):
     count = 0
     size = 0
     loader_options = frozenset(('-install_name', '-rpath'))
+    option_arities = dict.fromkeys(OPERANDS, 1) | LINKER_OPERAND_ARITIES
     driver_operand = forwarder = linker_operand = None
+    driver_remaining = linker_remaining = 0
+
+    def linker_token(token):
+        nonlocal linker_operand, linker_remaining
+        if linker_remaining:
+            linker_remaining -= 1
+            if not linker_remaining:
+                linker_operand = None
+        elif token in option_arities:
+            linker_operand = token
+            linker_remaining = option_arities[token]
 
     def append(token):
-        nonlocal driver_operand, forwarder, linker_operand
+        nonlocal driver_operand, driver_remaining, forwarder
         expanded.append(token)
         require(len(expanded) <= 65536, 'argument_limit')
         if forwarder is not None:
             if forwarder == '-Xlinker':
-                if linker_operand is not None:
-                    linker_operand = None
-                elif token in OPERANDS | loader_options:
-                    linker_operand = token
+                linker_token(token)
             forwarder = None
-        elif driver_operand is not None:
-            driver_operand = None
+        elif driver_remaining:
+            driver_remaining -= 1
+            if not driver_remaining:
+                driver_operand = None
         elif token in FORWARDERS:
             forwarder = token
-        elif token in OPERANDS | loader_options:
+        elif token.startswith('-Wl,'):
+            for value in token[4:].split(','):
+                linker_token(value)
+        elif token.startswith('-Xlinker='):
+            linker_token(token.split('=', 1)[1])
+        elif token in option_arities:
             driver_operand = token
+            driver_remaining = option_arities[token]
 
     def visit(tokens, stack=()):
         nonlocal count, size

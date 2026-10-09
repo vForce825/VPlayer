@@ -299,7 +299,14 @@ class ReleaseArtifactTests(unittest.TestCase):
             for tokens in (['-I', '-rpath', '@rpath/Frameworks'],
                            ['-Xclang', '-install_name', '@loader_path/Frameworks'],
                            ['-install_name', '-Xlinker', '@executable_path/Frameworks'],
-                           ['-Xlinker', '-L', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks']):
+                           ['-Xlinker', '-L', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks'],
+                           ['-framework', '-rpath', '@rpath/Frameworks'],
+                           ['-Xlinker', '-framework', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks'],
+                           ['-Wl,-framework', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks'],
+                           ['-Xlinker=-framework', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks'],
+                           ['-sectcreate', 'SEG', 'SEC', '-rpath', '@rpath/Frameworks'],
+                           ['-Xlinker', '-sectcreate', '-Xlinker', 'SEG', '-Xlinker', 'SEC',
+                            '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks']):
                 with self.subTest(tokens=tokens), self.assertRaises(self.guard.GuardError):
                     self.guard.expand_responses(tokens, root, root)
             response = root / 'link.rsp'
