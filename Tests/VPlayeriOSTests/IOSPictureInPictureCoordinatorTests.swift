@@ -124,7 +124,11 @@ final class IOSPlaybackSessionTests: XCTestCase {
 @MainActor
 final class IOSNativePictureInPictureTests: XCTestCase {
     func testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession() async throws {
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+        let runtimeSupportsPiP = AVPictureInPictureController.isPictureInPictureSupported()
+        let runtimeCapabilityMarker = runtimeSupportsPiP
+            ? "IOS_PIP_RUNTIME_SUPPORTED=true\n" : "IOS_PIP_RUNTIME_SUPPORTED=false\n"
+        FileHandle.standardOutput.write(Data(runtimeCapabilityMarker.utf8))
+        guard runtimeSupportsPiP else {
             throw XCTSkip("AVKit reports Picture in Picture unsupported on this runtime")
         }
         let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }

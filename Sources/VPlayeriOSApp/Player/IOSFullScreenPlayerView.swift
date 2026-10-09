@@ -65,6 +65,9 @@ struct IOSFullScreenPlayerView: View {
             }
             .foregroundStyle(.white)
         }
+        // Give the screen its own accessibility element while preserving the
+        // individual labels, identifiers and actions of its child controls.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("player-full-screen")
         #if DEBUG
         .onAppear { IOSPlaybackRouteDiagnostics.record("cover-appeared") }

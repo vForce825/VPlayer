@@ -5,6 +5,7 @@
 import importlib.util
 import contextlib
 import io
+import json
 import os
 import signal
 import subprocess
@@ -27,12 +28,12 @@ class IOSStartupRunnerTests(unittest.TestCase):
         module=self.module()
         with tempfile.TemporaryDirectory() as directory:
             for status in [0,7]:
-                code,_=module.run_command('control',[sys.executable,'-c',f'raise SystemExit({status})'],2,Path(directory),lambda:None)
+                code,_=module.run_command('control',[sys.executable,'-c',f'raise SystemExit({status})'],2,Path(directory),lambda deadline:None)
                 self.assertEqual(code,status)
     def test_timeout_is_failure_and_diagnostics_precede_owned_process_retirement(self):
         module=self.module();calls=[]
         with tempfile.TemporaryDirectory() as directory:
-            code,_=module.run_command('timeout',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda:calls.append('diagnostics'))
+            code,_=module.run_command('timeout',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda deadline:calls.append('diagnostics'))
             self.assertEqual(code,124);self.assertEqual(calls,['diagnostics'])
     def test_retires_descendant_when_leader_exits_on_interrupt(self):
         module=self.module()
@@ -42,7 +43,7 @@ class IOSStartupRunnerTests(unittest.TestCase):
             parent="import subprocess,sys,time; subprocess.Popen([sys.executable,'-c',%r]); time.sleep(60)" % child
             pid=None
             try:
-                code,_=module.run_command('descendant',[sys.executable,'-c',parent],0.3,Path(directory),lambda:None)
+                code,_=module.run_command('descendant',[sys.executable,'-c',parent],0.3,Path(directory),lambda deadline:None)
                 self.assertEqual(code,124)
                 pid=int(pidfile.read_text())
                 # Linux can briefly retain a killed orphan as a zombie; it is no longer executing.
@@ -70,13 +71,13 @@ class IOSStartupRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             code,data=module.run_command('progress',[sys.executable,'-c',
                 "import time; print('COMPILER_PROGRESS_BEFORE_INTERRUPT',flush=True); time.sleep(60)"],
-                0.2,Path(directory),lambda:None)
+                0.2,Path(directory),lambda deadline:None)
             self.assertEqual(code,124)
             self.assertIn(b'COMPILER_PROGRESS_BEFORE_INTERRUPT',data)
             self.assertIn(b'PRE_INTERRUPT',data)
     def test_build_phase_is_generic_and_precedes_simulator_boot(self):
         source=(ROOT/'Scripts/Support/ios-startup-runner.py').read_text()
-        self.assertIn("parser.add_argument('--build-only',action='store_true')",source)
+        self.assertIn("modes.add_argument('--build-only',action='store_true')",source)
         self.assertIn("'generic/platform=iOS Simulator'",source)
         self.assertLess(source.index('if args.build_only:'),source.index("if device['state']!='Booted':"))
     def test_compiler_sampling_matches_exact_derived_data_not_process_name(self):
@@ -93,7 +94,7 @@ class IOSStartupRunnerTests(unittest.TestCase):
             pidfile=Path(directory)/'owned.pid'
             command="import os,time; open(%r,'w').write(str(os.getpid())); time.sleep(60)" % str(pidfile)
             code,_=module.run_command('capture-failure',[sys.executable,'-c',command],
-                0.2,Path(directory),lambda:None)
+                0.2,Path(directory),lambda deadline:None)
             self.assertEqual(code,124)
             with self.assertRaises(ProcessLookupError):os.kill(int(pidfile.read_text()),0)
     def test_linux_global_inventory_distinguishes_zombies_live_and_other_groups(self):
@@ -172,21 +173,288 @@ class IOSStartupRunnerTests(unittest.TestCase):
             original(process)
             raise subprocess.TimeoutExpired(['ps'],3)
         with tempfile.TemporaryDirectory() as directory, patch.object(module,'retire_owned_group',side_effect=retire_then_report_unverified), contextlib.redirect_stdout(out):
-            code,_=module.run_command('bootstatus',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda:None)
+            code,_=module.run_command('bootstatus',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda deadline:None)
         self.assertEqual(code,124)
         self.assertIn('IOS_STARTUP_PHASE_TIMEOUT=bootstatus',out.getvalue())
         self.assertIn('IOS_STARTUP_CLEANUP_UNVERIFIED=TimeoutExpired',out.getvalue())
         self.assertIn('IOS_STARTUP_PHASE_END=bootstatus exit=124 timed_out=True',out.getvalue())
         self.assertNotIn('subprocess.TimeoutExpired:',out.getvalue())
 
-    def test_bootstatus_samples_exact_owned_pid_before_any_inventory(self):
+    def test_bootstatus_observes_exact_owned_pid_before_sample_without_inventory(self):
         module=self.module();commands=[]
         def invoke(command,**kwargs):commands.append(command);return SimpleNamespace(stdout='',returncode=1)
         with tempfile.TemporaryDirectory() as directory, patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',side_effect=invoke):
             module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcrun','simctl','bootstatus','12345678-1234-1234-1234-123456789012','-b'])
         self.assertTrue(commands)
-        self.assertEqual(commands[0][0:3],['sample','123','2'])
+        self.assertEqual(commands[0][0],sys.executable)
+        self.assertEqual(commands[0][-1],'123')
+        self.assertEqual(commands[1][0:3],['sample','123','2'])
         self.assertFalse(any('-axo' in command for command in commands))
+
+    def test_sample_timeout_keeps_bounded_partial_diagnostic_and_stack(self):
+        module=self.module();out=io.StringIO()
+        def invoke(command,**kwargs):
+            if command[0]!='sample':return SimpleNamespace(returncode=0)
+            kwargs['stdout'].write(b'ATTACH_DIAGNOSTIC\n'+b'x'*70000+b'\nDIAGNOSTIC_TAIL\n')
+            kwargs['stdout'].flush()
+            Path(command[-1]).write_bytes(b'PARTIAL_STACK\n'+b'x'*70000+b'\nSTACK_TAIL\n')
+            raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+        with tempfile.TemporaryDirectory() as directory, patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',side_effect=invoke), contextlib.redirect_stdout(out):
+            module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcrun','simctl','bootstatus','device','-b'])
+        for marker in ['ATTACH_DIAGNOSTIC','DIAGNOSTIC_TAIL','PARTIAL_STACK','STACK_TAIL','IOS_STARTUP_PROCESS_SAMPLE_TIMEOUT=123']:
+            self.assertIn(marker,out.getvalue())
+        self.assertLess(len(out.getvalue()),52000)
+
+    def test_identity_timeout_keeps_partial_output_and_continues_to_sample(self):
+        module=self.module();out=io.StringIO();commands=[]
+        def invoke(command,**kwargs):
+            commands.append((command,kwargs['timeout']))
+            if command[0]==sys.executable:
+                kwargs['stdout'].write(b'IDENTITY_BEFORE_PATH_STALL\n');kwargs['stdout'].flush()
+                raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+            return SimpleNamespace(returncode=0)
+        with tempfile.TemporaryDirectory() as directory, patch.object(module.sys,'platform','darwin'), patch.object(module.subprocess,'run',side_effect=invoke), contextlib.redirect_stdout(out):
+            module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcrun','simctl','bootstatus','device','-b'])
+        self.assertIn('IDENTITY_BEFORE_PATH_STALL',out.getvalue())
+        self.assertIn('IOS_STARTUP_PROCESS_IDENTITY_TIMEOUT=123',out.getvalue())
+        self.assertEqual(commands[0][1],2)
+        self.assertEqual(commands[1][0][0],'sample')
+
+    def test_identity_permission_denial_stops_before_second_api(self):
+        module=self.module();self.assertTrue(hasattr(module,'native_process_identity'))
+        import ctypes,errno
+        def denied(pid,buffer,size):
+            self.assertEqual((pid,size),(123,4096));ctypes.set_errno(errno.EPERM);return 0
+        library=SimpleNamespace(proc_name=Mock(side_effect=denied),proc_pidpath=Mock())
+        out=io.StringIO()
+        with patch.object(module.sys,'platform','darwin'),patch.object(ctypes,'CDLL',return_value=library),contextlib.redirect_stdout(out):
+            self.assertEqual(module.native_process_identity(123),77)
+        library.proc_pidpath.assert_not_called()
+        facts=json.loads(out.getvalue().splitlines()[-1].split('=',1)[1])
+        self.assertEqual((facts['pid'],facts['api'],facts['result'],facts['errno']),(123,'proc_name',0,errno.EPERM))
+
+    def test_identity_reports_each_api_without_hiding_exec_transition(self):
+        module=self.module();self.assertTrue(hasattr(module,'native_process_identity'))
+        import ctypes
+        def value(text):
+            def read(pid,buffer,size):buffer.value=text;return len(text)
+            return read
+        library=SimpleNamespace(proc_name=Mock(side_effect=value(b'xcrun')),proc_pidpath=Mock(side_effect=value(b'/Xcode/simctl')))
+        out=io.StringIO()
+        with patch.object(module.sys,'platform','darwin'),patch.object(ctypes,'CDLL',return_value=library),contextlib.redirect_stdout(out):
+            ctypes.set_errno(13)
+            self.assertEqual(module.native_process_identity(123),0)
+        rows=[json.loads(line.split('=',1)[1]) for line in out.getvalue().splitlines() if line.startswith('IOS_STARTUP_PROCESS_IDENTITY=')]
+        self.assertEqual([row['value'] for row in rows],['xcrun','/Xcode/simctl'])
+        self.assertEqual([row['errno'] for row in rows],[0,0])
+        self.assertEqual([row['api'] for row in rows],['proc_name','proc_pidpath'])
+
+    def test_only_bootstatus_gets_command_local_unbuffered_request(self):
+        module=self.module();commands=[['xcrun','simctl','bootstatus','device','-b'],['xcrun','simctl','boot','device'],['xcodebuild','build']]
+        original={'STDBUF1':'L','_STDBUF_O':'L','UNRELATED':'preserved'}
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'platform','darwin'),patch.dict(module.os.environ,original,clear=True):
+            for index,command in enumerate(commands):
+                with patch.object(module.subprocess,'Popen',return_value=SimpleNamespace(wait=lambda timeout:0)) as spawn:
+                    module.run_command('environment-'+str(index),command,1,Path(directory),lambda deadline:None)
+                child=spawn.call_args.kwargs.get('env')
+                if index==0:
+                    self.assertIsNotNone(child)
+                    self.assertEqual((child['STDBUF1'],child['_STDBUF_O']),('0','0'))
+                    self.assertEqual(child['UNRELATED'],'preserved')
+                else:self.assertIsNone(child)
+                self.assertTrue(spawn.call_args.kwargs['start_new_session'])
+                self.assertEqual(dict(module.os.environ),original)
+
+    def test_host_load_output_is_fixed_numeric_facts(self):
+        module=self.module();self.assertTrue(hasattr(module,'host_load_facts'));out=io.StringIO()
+        with patch.object(module.os,'getloadavg',return_value=(1.0,2.0,3.0)),patch.object(module.os,'cpu_count',return_value=3),contextlib.redirect_stdout(out):
+            module.host_load_facts('pre-boot')
+        facts=json.loads(out.getvalue().split('=',1)[1])
+        self.assertEqual(facts,{'context':'pre-boot','cpu_count':3,'loadavg_1m':1.0,'loadavg_5m':2.0,'loadavg_15m':3.0})
+
+    def test_shared_diagnostic_deadline_prevents_later_sample_and_inventory(self):
+        module=self.module();self.assertTrue(hasattr(module,'diagnostic_remaining'));clock=[0.0];calls=[]
+        def invoke(command,**kwargs):
+            calls.append((command,kwargs['timeout']));clock[0]+=kwargs['timeout']
+            raise subprocess.TimeoutExpired(command,kwargs['timeout'])
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'platform','darwin'),patch.object(module.time,'monotonic',side_effect=lambda:clock[0]),patch.object(module.subprocess,'run',side_effect=invoke):
+            module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcodebuild','build'],deadline=2)
+        self.assertEqual(len(calls),1)
+        self.assertEqual(calls[0][1],2)
+        self.assertEqual(clock[0],2)
+
+    def test_identity_permission_exit_does_not_try_another_observation_path(self):
+        module=self.module();calls=[]
+        def invoke(command,**kwargs):calls.append(command);return SimpleNamespace(returncode=77)
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'platform','darwin'),patch.object(module.subprocess,'run',side_effect=invoke):
+            module.sample_owned_processes(SimpleNamespace(pid=123),Path(directory),['xcrun','simctl','bootstatus','device','-b'])
+        self.assertEqual(len(calls),1)
+
+    def test_timeout_observers_share_one_deadline_before_cleanup(self):
+        module=self.module();seen=[]
+        def sample(process,directory,command,deadline):seen.append(('sample',deadline))
+        with tempfile.TemporaryDirectory() as directory,patch.object(module,'sample_owned_processes',side_effect=sample):
+            code,_=module.run_command('budget',[sys.executable,'-c','import time; time.sleep(30)'],0.05,Path(directory),lambda deadline:seen.append(('simulator',deadline)))
+        self.assertEqual(code,124)
+        self.assertEqual([kind for kind,_ in seen],['sample','simulator'])
+        self.assertEqual(seen[0][1],seen[1][1])
+
+    def test_missing_host_load_is_reported_without_raising(self):
+        module=self.module();out=io.StringIO()
+        with patch.object(module.os,'getloadavg',side_effect=OSError(5,'unavailable')),contextlib.redirect_stdout(out):
+            module.host_load_facts('pre-boot')
+        self.assertIn('IOS_STARTUP_HOST_LOAD_UNAVAILABLE=',out.getvalue())
+        self.assertIn('"errno": 5',out.getvalue())
+
+    def test_preboot_load_is_observed_before_the_single_boot_attempt(self):
+        module=self.module();events=[];device='12345678-1234-1234-1234-123456789012'
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone test','state':'Shutdown'}]}}
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'argv',['runner','--simulator',device,'--derived-data',directory]),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'host_load_facts',side_effect=lambda context:events.append(context)),patch.object(module,'run_command',side_effect=lambda label,*args:events.append(label) or (7,b'')):
+            self.assertEqual(module.main(),7)
+        self.assertEqual(events,['resolve-simctl','pre-boot','boot'])
+
+    def test_boot_only_selects_shutdown_iphone_and_never_builds_or_tests(self):
+        module=self.module();device='12345678-1234-1234-1234-123456789012';calls=[];out=io.StringIO()
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[
+            {'udid':'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA','isAvailable':True,'name':'iPhone busy','state':'Booted'},
+            {'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        def run(label,command,timeout,*args):calls.append((label,command,timeout));return 0,b''
+        with patch.object(module.sys,'argv',['runner','--boot-only']),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=run),contextlib.redirect_stdout(out):
+            try:code=module.main()
+            except SystemExit as error:self.fail('boot-only mode is missing: '+str(error))
+        self.assertEqual(code,0)
+        self.assertEqual(calls,[('first-launch-status',['xcodebuild','-checkFirstLaunchStatus'],10),
+            ('resolve-simctl',['/usr/bin/xcrun','--find','simctl'],5),
+            ('boot',['xcrun','simctl','boot',device],30),('bootstatus',['xcrun','simctl','bootstatus',device,'-b'],120)])
+        self.assertIn('IOS_BOOT_PROBE_APP_AND_XCTEST=not_run',out.getvalue())
+        self.assertIn('"outcome": "boot_ready"',out.getvalue())
+        self.assertIn(device,out.getvalue())
+
+    def test_boot_only_rejects_already_booted_selection_without_boot_retry(self):
+        module=self.module();device='12345678-1234-1234-1234-123456789012';out=io.StringIO()
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone busy','state':'Booted'}]}}
+        with patch.object(module.sys,'argv',['runner','--boot-only','--simulator',device]),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command') as run,contextlib.redirect_stdout(out):
+            try:code=module.main()
+            except SystemExit as error:self.fail('boot-only classification is missing: '+str(error))
+        self.assertEqual(code,1);run.assert_not_called()
+        self.assertIn('unverified_non_shutdown',out.getvalue())
+
+    def test_boot_only_failure_preserves_exit_and_does_not_start_tests(self):
+        module=self.module();device='12345678-1234-1234-1234-123456789012';out=io.StringIO()
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        for phase in ['boot','bootstatus']:
+            calls=[]
+            def run(label,*args):
+                calls.append(label)
+                return (69 if label=='first-launch-status' else 124 if label==phase else 0),b''
+            with self.subTest(phase=phase),patch.object(module.sys,'argv',['runner','--boot-only']),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=run),contextlib.redirect_stdout(out):
+                try:code=module.main()
+                except SystemExit as error:self.fail('boot-only failure classification is missing: '+str(error))
+                self.assertEqual(code,124)
+                self.assertEqual(calls,['first-launch-status','resolve-simctl','boot'] if phase=='boot' else ['first-launch-status','resolve-simctl','boot','bootstatus'])
+        self.assertIn('"outcome": "failed"',out.getvalue())
+        self.assertIn('IOS_BOOT_PROBE_FIRST_LAUNCH_STATUS={"exit": 69}',out.getvalue())
+
+    def test_verified_simctl_path_is_used_only_for_existing_timeout_inventory(self):
+        module=self.module();device='12345678-1234-1234-1234-123456789012';commands=[]
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        def run(label,command,timeout,directory,diagnostics):
+            if label=='resolve-simctl':return 0,b'/verified/Xcode/usr/bin/simctl\n'
+            self.assertEqual(command,['xcrun','simctl','boot',device])
+            diagnostics(module.time.monotonic()+25)
+            return 124,b''
+        def diagnostic(command,**kwargs):commands.append(command);return SimpleNamespace(returncode=1)
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'argv',['runner','--simulator',device,'--derived-data',directory]),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=run),patch.object(module.subprocess,'run',side_effect=diagnostic):
+            self.assertEqual(module.main(),124)
+        self.assertEqual(commands,[['/verified/Xcode/usr/bin/simctl','list','devices','booted','-j']])
+
+    def test_invalid_or_failed_simctl_resolution_does_not_invent_a_direct_path(self):
+        module=self.module();device='12345678-1234-1234-1234-123456789012'
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        for exit_code,data in [(0,b'relative/simctl\n'),(0,b'/bin/other\n'),(0,b'/a/simctl\n/b/simctl\n'),(69,b'/valid/simctl\n'),(0,b'\xff')]:
+            commands=[];out=io.StringIO()
+            def run(label,command,timeout,directory,diagnostics):
+                if label=='resolve-simctl':return exit_code,data
+                self.assertEqual(command,['xcrun','simctl','boot',device])
+                diagnostics(module.time.monotonic()+25);return 124,b''
+            def diagnostic(command,**kwargs):commands.append(command);return SimpleNamespace(returncode=1)
+            with self.subTest(data=data),tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'argv',['runner','--simulator',device,'--derived-data',directory]),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=run),patch.object(module.subprocess,'run',side_effect=diagnostic),contextlib.redirect_stdout(out):
+                self.assertEqual(module.main(),124)
+                self.assertEqual(commands,[['xcrun','simctl','list','devices','booted','-j']])
+                self.assertIn('"result": "unverified"',out.getvalue())
+
+    def test_acceptance_modes_still_require_explicit_destination_and_derived_data(self):
+        module=self.module()
+        for mode in [[],['--build-only']]:
+            with self.subTest(mode=mode),patch.object(module.sys,'argv',['runner']+mode),patch.object(module.subprocess,'check_output') as inventory,contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:module.main()
+                self.assertEqual(raised.exception.code,2);inventory.assert_not_called()
+
+    def test_first_launch_status_timeout_keeps_probe_unverified_without_boot(self):
+        module=self.module();out=io.StringIO();device='12345678-1234-1234-1234-123456789012'
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        with patch.object(module.sys,'argv',['runner','--boot-only']),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',return_value=(124,b'')) as run,contextlib.redirect_stdout(out):
+            self.assertEqual(module.main(),124)
+        self.assertEqual(run.call_count,1)
+        self.assertIn('unverified_preflight_timeout',out.getvalue())
+
+    def test_boot_probe_does_not_shorten_bootstatus_to_fit_an_exhausted_budget(self):
+        module=self.module();out=io.StringIO();device='12345678-1234-1234-1234-123456789012';clock=[0.0];calls=[]
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[{'udid':device,'isAvailable':True,'name':'iPhone cold','state':'Shutdown'}]}}
+        def run(label,*args):calls.append(label);clock[0]+=40;return 0,b''
+        with patch.object(module.sys,'argv',['runner','--boot-only']),patch.object(module.time,'monotonic',side_effect=lambda:clock[0]),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=run),contextlib.redirect_stdout(out):
+            self.assertEqual(module.main(),124)
+        self.assertEqual(calls,['first-launch-status','resolve-simctl','boot'])
+        self.assertIn('unverified_budget_exhausted',out.getvalue())
+
+    def test_boot_only_never_falls_back_to_another_runtime(self):
+        module=self.module();out=io.StringIO()
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0-extra':[{'udid':'12345678-1234-1234-1234-123456789012','isAvailable':True,'name':'iPhone wrong','state':'Shutdown'}]}}
+        with patch.object(module.sys,'argv',['runner','--boot-only']),patch.object(module.subprocess,'check_output',return_value=json.dumps(inventory)),patch.object(module,'run_command') as run,contextlib.redirect_stdout(out):
+            try:code=module.main()
+            except SystemExit as error:self.fail('boot-only no-device classification is missing: '+str(error))
+        self.assertEqual(code,1);run.assert_not_called()
+        self.assertIn('unverified_no_shutdown_device',out.getvalue())
+
+    def test_build_and_boot_only_modes_are_mutually_exclusive(self):
+        module=self.module();out=io.StringIO()
+        with patch.object(module.sys,'argv',['runner','--build-only','--boot-only']),contextlib.redirect_stderr(out):
+            with self.assertRaises(SystemExit) as raised:module.main()
+        self.assertEqual(raised.exception.code,2)
+        self.assertIn('not allowed with argument',out.getvalue())
+
+    @unittest.skipUnless(sys.platform=='darwin','installed Apple libc control requires Darwin')
+    def test_native_libc_unbuffered_request_exposes_output_before_exit(self):
+        # Regular file, no newline/fflush/normal exit: observe libc itself, not
+        # Python stdout or a terminal. Lack of support is explicitly unverified.
+        import select
+        command="import ctypes,os,sys; ctypes.CDLL(None).printf(b'IOS_LIBC_BUFFER_CONTROL'); os.write(int(sys.argv[1]),b'R'); os.read(int(sys.argv[2]),1)"
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'libc-control.log'
+            ready_read,ready_write=os.pipe();ack_read,ack_write=os.pipe()
+            with path.open('wb') as output:
+                process=subprocess.Popen([sys.executable,'-c',command,str(ready_write),str(ack_read)],
+                    stdout=output,stderr=subprocess.STDOUT,pass_fds=(ready_write,ack_read),
+                    env=dict(os.environ,STDBUF1='0',_STDBUF_O='0'))
+                os.close(ready_write);os.close(ack_read)
+                try:
+                    if not select.select([ready_read],[],[],2)[0]:
+                        print('IOS_STARTUP_NATIVE_LIBC_BUFFER_CONTROL=unverified_ready_timeout',flush=True)
+                        self.skipTest('libc control readiness exceeded diagnostic budget')
+                    self.assertEqual(os.read(ready_read,1),b'R')
+                    self.assertIsNone(process.poll(),'control must still be alive; exit flush proves nothing')
+                    if b'IOS_LIBC_BUFFER_CONTROL' not in path.read_bytes():
+                        print('IOS_STARTUP_NATIVE_LIBC_BUFFER_CONTROL=unverified',flush=True)
+                        self.skipTest('Apple libc unbuffered override not observed before exit')
+                    print('IOS_STARTUP_NATIVE_LIBC_BUFFER_CONTROL=observed_before_exit',flush=True)
+                finally:
+                    # Keep it blocked until observation; no normal-exit flush
+                    # can satisfy the assertion above.
+                    try:os.write(ack_write,b'A')
+                    except BrokenPipeError:pass
+                    os.close(ready_read);os.close(ack_write)
+                    if process.poll() is None:process.kill()
+                    process.wait(timeout=3)
 
     def test_scoped_inventory_permission_error_is_visible_without_fallback(self):
         module=self.module();out=io.StringIO()

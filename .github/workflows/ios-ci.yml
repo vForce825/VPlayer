@@ -40,6 +40,32 @@ jobs:
           test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(xcrun --sdk iphoneos --show-sdk-version)" = '27.0'
           test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = '27.0'
+      - name: Diagnose cold simulator boot before compilation
+        id: boot_probe
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          echo "IOS_BOOT_PROBE_HEAD=$(git rev-parse HEAD)"
+          echo "IOS_BOOT_PROBE_TREE=$(git rev-parse HEAD^{tree})"
+          echo "IOS_BOOT_PROBE_IMAGE=${ImageOS:-unavailable}"
+          echo "IOS_BOOT_PROBE_IMAGE_VERSION=${ImageVersion:-unavailable}"
+          python3 Scripts/Support/ios-startup-runner.py --boot-only
+      - name: Record diagnostic cold boot outcome
+        if: always() && !cancelled()
+        timeout-minutes: 1
+        env:
+          PROBE_OUTCOME: ${{ steps.boot_probe.outcome }}
+        run: |
+          case "$PROBE_OUTCOME" in
+            success) result=boot_ready_only ;;
+            failure) result=failed ;;
+            *) result=unverified ;;
+          esac
+          echo "IOS_BOOT_PROBE_STEP_OUTCOME=$PROBE_OUTCOME"
+          echo "IOS_BOOT_PROBE_CLASSIFICATION=$result"
+          echo 'IOS_BOOT_PROBE_APP_AND_XCTEST=not_run'
+          printf 'Pre-compilation iOS boot diagnostic: %s (step outcome: %s). App and XCTest were not run. Full iOS acceptance remains required on its separate worker.\n' \
+            "$result" "$PROBE_OUTCOME" >> "$GITHUB_STEP_SUMMARY"
       - name: Generate pinned inputs and compare committed bytes
         id: generated
         run: |
@@ -98,6 +124,7 @@ jobs:
           python3 Scripts/Tests/test_paused_workspace_malloc.py
           python3 Scripts/Tests/test_ios_benchmark_contract.py
           python3 Scripts/Tests/test_ios_test_status_report.py
+          python3 Scripts/Tests/test_ios_pip_runtime_report.py
       - name: Choose an available iOS 27 iPhone simulator
         id: simulator
         run: |
@@ -140,12 +167,23 @@ jobs:
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 60
         run: |
+          set -o pipefail
           Scripts/test-ios.sh -configuration Debug \
             -derivedDataPath "$RUNNER_TEMP/iOS-Simulator" \
             -resultBundlePath "$RUNNER_TEMP/iOS.xcresult" \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300
+            -maximum-test-execution-time-allowance 300 2>&1 | \
+            python3 Scripts/report-ios-pip-runtime.py --candidate "$CANDIDATE_SHA"
+      - name: Report startup and functional test results
+        if: always()
+        run: |
+          status=0
+          for bundle in iOS-RunnerControl iOS-Release iOS; do
+            python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/$bundle.xcresult" || status=1
+          done
+          python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1
+          exit "$status"
       - name: Measure optimized CPU processing without device qualification
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 30
@@ -159,14 +197,11 @@ jobs:
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
             -only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification
-      - name: Report test failures and qualification limits
+      - name: Report CPU measurement and qualification limits
         if: always()
         run: |
           status=0
-          for bundle in iOS-RunnerControl iOS-Release iOS iOS-CPU-Release; do
-            python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/$bundle.xcresult" || status=1
-          done
-          python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1
+          python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS-CPU-Release.xcresult" || status=1
           python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS-CPU-Release.xcresult" --benchmark || status=1
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
