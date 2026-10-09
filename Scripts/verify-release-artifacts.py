@@ -308,19 +308,40 @@ def expand_responses(arguments, derived, cwd, evidence=None):
     expanded = []
     count = 0
     size = 0
+    loader_options = frozenset(('-install_name', '-rpath'))
+    driver_operand = forwarder = linker_operand = None
+
+    def append(token):
+        nonlocal driver_operand, forwarder, linker_operand
+        expanded.append(token)
+        require(len(expanded) <= 65536, 'argument_limit')
+        if forwarder is not None:
+            if forwarder == '-Xlinker':
+                if linker_operand is not None:
+                    linker_operand = None
+                elif token in OPERANDS | loader_options:
+                    linker_operand = token
+            forwarder = None
+        elif driver_operand is not None:
+            driver_operand = None
+        elif token in FORWARDERS:
+            forwarder = token
+        elif token in OPERANDS | loader_options:
+            driver_operand = token
+
     def visit(tokens, stack=()):
         nonlocal count, size
         for token in tokens:
             if token.startswith('@'):
                 path = Path(token[1:]); path = (path if path.is_absolute() else cwd / path).resolve()
-                previous = expanded[-1:] if expanded[-1:] != ['-Xlinker'] else expanded[-2:-1]
-                if (previous and previous[0] in ('-install_name', '-rpath')
+                literal_operand = ((forwarder == '-Xlinker' and linker_operand in loader_options)
+                                   or (forwarder is None and driver_operand in loader_options))
+                if (literal_operand
                         and token.startswith(('@rpath/', '@loader_path/', '@executable_path/'))):
                     # Mach-O loader names are literal linker operands, not
                     # response files. Reject a real file collision as ambiguous.
                     require(not path.exists(), 'loader_response_collision')
-                    expanded.append(token)
-                    require(len(expanded) <= 65536, 'argument_limit')
+                    append(token)
                     continue
                 require(path.is_relative_to(derived.resolve()), 'response_outside_derived_data')
                 require(path not in stack and len(stack) < 8, 'response_cycle_or_depth')
@@ -336,8 +357,7 @@ def expand_responses(arguments, derived, cwd, evidence=None):
                     evidence.append(dict(path=str(path), sha256=hashlib.sha256(raw).hexdigest()))
                 visit(shlex.split(raw.decode('utf-8-sig')), (*stack, path))
             else:
-                expanded.append(token)
-                require(len(expanded) <= 65536, 'argument_limit')
+                append(token)
     visit(arguments)
     return expanded
 

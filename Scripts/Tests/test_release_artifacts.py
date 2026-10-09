@@ -296,6 +296,12 @@ class ReleaseArtifactTests(unittest.TestCase):
             # An actual response keeps its boundary checks even as a linker operand.
             with self.assertRaisesRegex(self.guard.GuardError, 'response_outside_derived_data'):
                 self.guard.expand_responses(['-rpath', '@/outside/args.rsp'], root, root)
+            for tokens in (['-I', '-rpath', '@rpath/Frameworks'],
+                           ['-Xclang', '-install_name', '@loader_path/Frameworks'],
+                           ['-install_name', '-Xlinker', '@executable_path/Frameworks'],
+                           ['-Xlinker', '-L', '-Xlinker', '-rpath', '-Xlinker', '@rpath/Frameworks']):
+                with self.subTest(tokens=tokens), self.assertRaises(self.guard.GuardError):
+                    self.guard.expand_responses(tokens, root, root)
             response = root / 'link.rsp'
             response.write_text('-install_name @rpath/Frameworks')
             evidence = []
