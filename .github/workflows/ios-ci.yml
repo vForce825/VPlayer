@@ -201,11 +201,31 @@ jobs:
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 30
         run: |
-          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -scheme VPlayeriOSBenchmarks \
-            -configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO \
-            -destination "$IOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
-            > "$RUNNER_TEMP/iOS-CPU-Release-settings.json"
-          python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); row=next(r for r in rows if r["target"] == "VPlayerPlaybackiOS"); keys=("GCC_OPTIMIZATION_LEVEL","OTHER_CFLAGS","SWIFT_OPTIMIZATION_LEVEL","ENABLE_TESTABILITY"); print("IOS_CPU_BUILD_SETTINGS="+json.dumps({k:row["buildSettings"].get(k) for k in keys},sort_keys=True))' "$RUNNER_TEMP/iOS-CPU-Release-settings.json"
+          # Query the production target directly; scheme output can omit dependencies.
+          # These are resolved simulator settings, not a captured compiler invocation.
+          echo 'IOS_CPU_BUILD_SETTINGS_SCOPE=VPlayerPlaybackiOS-Release-iphonesimulator-arm64'
+          if xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -target VPlayerPlaybackiOS \
+            -configuration Release -sdk iphonesimulator ARCHS=arm64 ENABLE_TESTABILITY=YES \
+            CLANG_ENABLE_CODE_COVERAGE=NO CODE_SIGNING_ALLOWED=NO \
+            > "$RUNNER_TEMP/iOS-CPU-Release-settings.json"; then
+            python3 - "$RUNNER_TEMP/iOS-CPU-Release-settings.json" <<'PYSETTINGS' || echo 'IOS_CPU_BUILD_SETTINGS_UNVERIFIED=parser_failed'
+          import json, sys
+          try:
+              with open(sys.argv[1]) as source:
+                  rows = json.load(source)
+              matches = [row for row in rows if isinstance(row, dict) and row.get('target') == 'VPlayerPlaybackiOS']
+              if len(matches) != 1:
+                  print('IOS_CPU_BUILD_SETTINGS_UNVERIFIED=expected_one_playback_target')
+              else:
+                  keys = ('GCC_OPTIMIZATION_LEVEL', 'OTHER_CFLAGS', 'SWIFT_OPTIMIZATION_LEVEL', 'ENABLE_TESTABILITY')
+                  values = {key: matches[0]['buildSettings'].get(key) for key in keys}
+                  print('IOS_CPU_BUILD_SETTINGS=' + json.dumps(values, sort_keys=True))
+          except (OSError, ValueError, TypeError, KeyError, AttributeError):
+              print('IOS_CPU_BUILD_SETTINGS_UNVERIFIED=unreadable_target_settings')
+          PYSETTINGS
+          else
+            echo 'IOS_CPU_BUILD_SETTINGS_UNVERIFIED=query_failed'
+          fi
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayeriOSBenchmarks \
             -configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO \
             -destination "$IOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \

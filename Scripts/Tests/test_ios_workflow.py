@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 from pathlib import Path
+import json
 import os
 import subprocess
 import tempfile
@@ -81,6 +82,88 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmark',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',text)
         self.assertEqual(text.count('Scripts/report-ios-test-status.py'),2)
+    def run_cpu_measurement(self, native_exit=0, settings_mode='normal'):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        step=text.split('name: Measure optimized CPU processing without device qualification',1)[1].split('      - name:',1)[0]
+        script=textwrap.dedent(step.split('        run: |\n',1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);(directory/'bin').mkdir()
+            native=directory/'bin/xcodebuild'
+            native.write_text(textwrap.dedent('''\
+                #!/usr/bin/env python3
+                import json,os,sys
+                args=sys.argv[1:]
+                with open(os.environ['XCODE_ARGS_LOG'],'a') as stream:
+                    stream.write(json.dumps(args)+'\\n')
+                if '-showBuildSettings' in args:
+                    if '-enableCodeCoverage' in args:
+                        print('The flag -enableCodeCoverage is only supported when testing.',file=sys.stderr)
+                        sys.exit(64)
+                    if os.environ['SETTINGS_MODE']=='query_failed': sys.exit(65)
+                    target=args[args.index('-target')+1] if '-target' in args else 'VPlayeriOSBenchmarks'
+                    row={'target':target,'buildSettings':{'GCC_OPTIMIZATION_LEVEL':'s',
+                        'OTHER_CFLAGS':'','SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES',
+                        'PRIVATE_SOURCE':'must-not-publish'}}
+                    rows=[row,{'target':'VPlayerCoreiOS','buildSettings':{'GCC_OPTIMIZATION_LEVEL':'0'}}]
+                    if os.environ['SETTINGS_MODE']=='missing': rows=[]
+                    if os.environ['SETTINGS_MODE']=='duplicate': rows.append(row)
+                    print(json.dumps(rows))
+                    sys.exit(0)
+                print('IOS_CPU_YADIF_BENCH width=1920 height=1080 depth=8 pair_ms=[1.0]')
+                print('native stderr',file=sys.stderr)
+                sys.exit(int(os.environ['NATIVE_EXIT']))
+                '''))
+            native.chmod(0o755)
+            args_log=directory/'args'
+            run=subprocess.run(['bash','-e','-o','pipefail','-c',script],cwd=directory,
+                env=dict(os.environ,PATH=str(directory/'bin')+os.pathsep+os.environ['PATH'],
+                    RUNNER_TEMP=str(directory),IOS_TEST_DESTINATION='platform=iOS Simulator,id=unit-test',
+                    XCODE_ARGS_LOG=str(args_log),NATIVE_EXIT=str(native_exit),SETTINGS_MODE=settings_mode),
+                capture_output=True,text=True,timeout=3)
+            calls=[json.loads(line) for line in args_log.read_text().splitlines()]
+            log=directory/'iOS-CPU-Release.log'
+            return run,calls,log.read_text() if log.exists() else None
+    def test_cpu_settings_query_reaches_production_target_and_preserves_native_test_exit(self):
+        for code in [0,7]:
+            with self.subTest(native_exit=code):
+                run,calls,log=self.run_cpu_measurement(native_exit=code)
+                self.assertEqual(run.returncode,code,run.stderr)
+                self.assertEqual(len(calls),2)
+                query,native=calls
+                self.assertEqual(query[query.index('-target')+1],'VPlayerPlaybackiOS')
+                self.assertEqual(query[query.index('-sdk')+1],'iphonesimulator')
+                self.assertNotIn('-destination',query)
+                self.assertIn('ARCHS=arm64',query)
+                self.assertIn('CLANG_ENABLE_CODE_COVERAGE=NO',query)
+                self.assertNotIn('-enableCodeCoverage',query)
+                for args in calls:
+                    self.assertEqual(args[args.index('-configuration')+1],'Release')
+                    self.assertIn('ENABLE_TESTABILITY=YES',args)
+                    self.assertIn('CODE_SIGNING_ALLOWED=NO',args)
+                self.assertEqual(native[:5],['test','-project','VPlayer.xcodeproj','-scheme','VPlayeriOSBenchmarks'])
+                self.assertEqual(native[native.index('-enableCodeCoverage')+1],'NO')
+                self.assertEqual(native[native.index('-default-test-execution-time-allowance')+1],'120')
+                self.assertEqual(native[native.index('-maximum-test-execution-time-allowance')+1],'300')
+                self.assertEqual(sum(arg.startswith('-only-testing:') for arg in native),2)
+                lines=[line for line in run.stdout.splitlines() if line.startswith('IOS_CPU_BUILD_SETTINGS=')]
+                self.assertEqual(len(lines),1)
+                self.assertEqual(json.loads(lines[0].split('=',1)[1]),{'GCC_OPTIMIZATION_LEVEL':'s',
+                    'OTHER_CFLAGS':'','SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES'})
+                self.assertNotIn('must-not-publish',run.stdout+run.stderr)
+                self.assertIn('IOS_CPU_YADIF_BENCH width=1920',log)
+                self.assertIn('native stderr',log)
+    def test_cpu_settings_diagnostic_failure_cannot_block_native_measurement_or_dump_settings(self):
+        for mode in ['missing','duplicate','query_failed']:
+            with self.subTest(settings_mode=mode):
+                run,calls,log=self.run_cpu_measurement(native_exit=7,settings_mode=mode)
+                self.assertEqual(run.returncode,7,'Diagnostics must preserve the native test outcome')
+                self.assertEqual(len(calls),2,'Missing diagnostic evidence cannot prevent the native test')
+                reason='query_failed' if mode=='query_failed' else 'expected_one_playback_target'
+                self.assertIn('IOS_CPU_BUILD_SETTINGS_UNVERIFIED='+reason,run.stdout)
+                self.assertNotIn('IOS_CPU_BUILD_SETTINGS=',run.stdout)
+                self.assertNotIn('Traceback',run.stderr)
+                self.assertNotIn('must-not-publish',run.stdout+run.stderr)
+                self.assertIn('IOS_CPU_YADIF_BENCH width=1920',log)
     def test_functional_results_are_reported_before_independent_cpu_measurement(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('name: Report startup and functional test results',text)

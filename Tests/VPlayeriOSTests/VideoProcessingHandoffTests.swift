@@ -516,7 +516,11 @@ final class AdaptiveYADIFDiagnosticsTests: XCTestCase {
         try CPUVideoProcessing.yadif(job: work.job, outputs: work.outputs) { timings in
             callbackCount += 1
             observed = timings
-            XCTAssertNoThrow(try work.assertOutput(73))
+            do {
+                try work.assertOutput(73)
+            } catch {
+                XCTFail("Timing callback could not inspect the unlocked CPU output: \(error)")
+            }
         }
         let total = (ProcessInfo.processInfo.systemUptime - started) * 1_000
         let timings = try XCTUnwrap(observed)
