@@ -197,7 +197,9 @@ final class IOSLibraryFlowTests: XCTestCase {
     }
     private func tapPlayerBackground(in app: XCUIApplication) {
         let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
-        require(screen, in: app, stage: "controls-background-screen", timeout: 5)
+        if !screen.exists {
+            require(screen, in: app, stage: "controls-background-screen", timeout: 5)
+        }
         // The observed center is outside the top bar and bottom transport card.
         screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
@@ -206,12 +208,16 @@ final class IOSLibraryFlowTests: XCTestCase {
                                        file: StaticString = #filePath, line: UInt = #line) {
         let probe = app.descendants(matching: .any)
             .matching(identifier: "ios.playback.route").firstMatch
-        let expectation = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "value ENDSWITH %@", " statusBar=\(expected)"),
-            object: probe)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 2), .completed,
-            "Expected actual UIWindowScene status bar \(expected); probe=\(probe.value ?? "missing")",
-            file: file, line: line)
+        let suffix = " statusBar=\(expected)"
+        // Check the current UIKit value first: XCTWaiter inserts a polling delay
+        // even when already true, consuming the real three-second idle interval.
+        if !probe.exists || !(probe.value as? String ?? "").hasSuffix(suffix) {
+            let expectation = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == true AND value ENDSWITH %@", suffix), object: probe)
+            XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 2), .completed,
+                "Expected actual UIWindowScene status bar \(expected); probe=\(probe.exists ? (probe.value as? String ?? "missing") : "missing")",
+                file: file, line: line)
+        }
         if screenshot {
             let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
             attachment.name = "System status bar \(expected)"
