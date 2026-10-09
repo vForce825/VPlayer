@@ -24,12 +24,46 @@ class IOSTargetStructureTests(unittest.TestCase):
     def test_phone_app_has_separate_entry_and_explicit_shared_models(self):
         app=self.target('VPlayeriOS')
         self.assertIn('TARGETED_DEVICE_FAMILY: "1"',app)
-        self.assertIn('com.vforce.vplayer.ios',app)
+        self.assertIn('PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer\n',app)
         self.assertIn('Sources/VPlayeriOSApp',app)
         for path in ['AppModel.swift','AppDependencies.swift','AppLaunchConfiguration.swift','Player/FullScreenPlayerViewModel.swift','Player/PlaybackPresentationHost.swift']:
             self.assertIn('Sources/VPlayerApp/'+path,app)
         for path in ['VPlayerApp.swift','Views/ChannelBrowserView.swift','Player/FullScreenPlayerView.swift']:
             self.assertNotIn('path: Sources/VPlayerApp/'+path+'\n',app)
+    def test_phone_and_tv_share_app_store_identity(self):
+        def bundle(target):
+            return re.search(r'PRODUCT_BUNDLE_IDENTIFIER: (\S+)', self.target(target)).group(1)
+        self.assertEqual(bundle('VPlayeriOS'), bundle('VPlayer'))
+        self.assertEqual(bundle('VPlayeriOS'), 'com.vforce.vplayer')
+        project=(ROOT/'VPlayer.xcodeproj/project.pbxproj').read_text()
+        self.assertNotIn('com.vforce.vplayer.ios', project)
+
+    def test_phone_app_icon_is_opaque_1024_square_and_catalogued(self):
+        import json
+        import struct
+        catalog=ROOT/'Sources/VPlayeriOSApp/Resources/Assets.xcassets'
+        manifest=catalog/'AppIcon.appiconset/Contents.json'
+        self.assertTrue(manifest.is_file(), 'iPhone AppIcon asset is missing')
+        contents=json.loads(manifest.read_text())
+        images=contents['images']
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]['idiom'], 'universal')
+        self.assertEqual(images[0]['platform'], 'ios')
+        self.assertEqual(images[0]['size'], '1024x1024')
+        data=(catalog/'AppIcon.appiconset'/images[0]['filename']).read_bytes()
+        self.assertEqual(data[:8], b'\x89PNG\r\n\x1a\n')
+        width,height,depth,color,_,_,_=struct.unpack('>IIBBBBB',data[16:29])
+        self.assertEqual((width,height,depth,color), (1024,1024,8,2), 'App Store icon must be 1024-square opaque RGB')
+        offset=8
+        chunks=[]
+        while offset<len(data):
+            size=struct.unpack('>I',data[offset:offset+4])[0]
+            chunks.append(data[offset+4:offset+8])
+            offset+=size+12
+        self.assertNotIn(b'tRNS',chunks, 'App Store icon must not use transparency')
+        self.assertTrue(b'sRGB' in chunks or b'iCCP' in chunks, 'Icon must declare its color space')
+        self.assertIn('ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon', self.target('VPlayeriOS'))
+
     def test_phone_declares_audio_background_and_portrait_landscape(self):
         import plistlib
         path=ROOT/'Sources/VPlayeriOSApp/Resources/Info.plist'
