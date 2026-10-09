@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+#if os(tvOS)
 import AVFoundation
 import AVKit
 import Foundation
@@ -10,19 +11,6 @@ import UIKit
 @MainActor
 public protocol DisplayCriteriaManaging: AnyObject {
     var preferredDisplayCriteria: AVDisplayCriteria? { get set }
-}
-
-@MainActor
-public protocol DisplayLinkControlling: AnyObject {
-    func pause()
-    func resetPresentationTiming()
-    func resume()
-}
-
-@MainActor
-public protocol DisplayReadinessControlling: AnyObject {
-    func closeForDisplayModeSwitch()
-    func reanchorAfterDisplayModeSwitch() -> Bool
 }
 
 @MainActor
@@ -40,7 +28,7 @@ public final class WindowDisplayCriteriaManager: DisplayCriteriaManaging {
 }
 
 @MainActor
-public final class DisplayCriteriaController: NSObject {
+public final class DisplayCriteriaController: NSObject, PlaybackDisplayModeControlling {
     typealias CriteriaFactory = (Float, CMFormatDescription) -> AVDisplayCriteria
 
     private let manager: DisplayCriteriaManaging
@@ -155,3 +143,5 @@ public final class DisplayCriteriaController: NSObject {
         }
     }
 }
+
+#endif

@@ -15,7 +15,15 @@ flags_file="$root/Vendor/FFmpeg/configure.flags"
 manifest="$root/Vendor/FFmpeg/component-manifest.json"
 work="$root/Vendor/FFmpeg/Work"
 source="$work/source"
-artifacts="$root/Vendor/FFmpeg/Artifacts"
+source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
+platform=tvos
+if [[ $# -ne 0 ]]; then
+  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/build-ffmpeg.sh [--platform tvos|ios]' >&2; exit 64; }
+  platform="$2"
+fi
+ffmpeg_select_platform "$platform"
+build_work="$work$ffmpeg_work_suffix"
+artifacts="$root/Vendor/FFmpeg/$ffmpeg_artifact_directory"
 lock_dir="$work/.build-lock"
 lock_token=""
 candidate=""
@@ -32,9 +40,9 @@ fail() {
 clear_generated_directory() {
   local directory="$1"
   case "$directory" in
-    "$work"/build-device|"$work"/build-sim-arm64|"$work"/build-sim-x86_64|\
-    "$work"/install-device|"$work"/install-sim-arm64|"$work"/install-sim-x86_64|\
-    "$work"/install-simulator|"$artifacts") ;;
+    "$build_work"/build-device|"$build_work"/build-sim-arm64|"$build_work"/build-sim-x86_64|\
+    "$build_work"/install-device|"$build_work"/install-sim-arm64|"$build_work"/install-sim-x86_64|\
+    "$build_work"/install-simulator|"$artifacts") ;;
     *) fail "refusing to clear unexpected path: $directory" ;;
   esac
   mkdir -p "$directory"
@@ -269,7 +277,7 @@ normalize_generated_config() {
 
 build_slice() {
   local name="$1" sdk="$2" arch="$3" triple="$4"
-  local build="$work/build-$name" prefix="$work/install-$name"
+  local build="$build_work/build-$name" prefix="$build_work/install-$name"
   local virtual_prefix="$virtual_install_base/$name"
   local stable_cflags
   local configure_flags=("${common_flags[@]}")
@@ -351,24 +359,34 @@ build_slice() {
   popd >/dev/null
 }
 
-build_slice device appletvos arm64 "arm64-apple-tvos${sdk_version_floor}"
-build_slice sim-arm64 appletvsimulator arm64 "arm64-apple-tvos${sdk_version_floor}-simulator"
-build_slice sim-x86_64 appletvsimulator x86_64 "x86_64-apple-tvos${sdk_version_floor}-simulator"
+if [[ "$platform" == "tvos" ]]; then
+  build_slice device appletvos arm64 "arm64-apple-tvos${sdk_version_floor}"
+  build_slice sim-arm64 appletvsimulator arm64 "arm64-apple-tvos${sdk_version_floor}-simulator"
+  build_slice sim-x86_64 appletvsimulator x86_64 "x86_64-apple-tvos${sdk_version_floor}-simulator"
+else
+  build_slice device iphoneos arm64 "arm64-apple-ios${sdk_version_floor}"
+  build_slice sim-arm64 iphonesimulator arm64 "arm64-apple-ios${sdk_version_floor}-simulator"
+fi
 
-sim="$work/install-simulator"
+sim="$build_work/install-simulator"
 clear_generated_directory "$sim"
 mkdir -p "$sim/lib" "$sim/include"
-/usr/bin/lipo -create \
-  "$work/install-sim-arm64/lib/libFFmpeg.a" \
-  "$work/install-sim-x86_64/lib/libFFmpeg.a" \
-  -output "$sim/lib/libFFmpeg.a"
-cp -R "$work/install-sim-arm64/include/." "$sim/include/"
-cp -R "$work/install-sim-x86_64/include/ffmpeg-build/sim-x86_64" "$sim/include/ffmpeg-build/"
-diff -qr -x ffmpeg-build "$work/install-sim-arm64/include" "$work/install-sim-x86_64/include" >/dev/null || \
-  fail "public simulator headers differ by architecture"
+if [[ "$platform" == "tvos" ]]; then
+  /usr/bin/lipo -create \
+    "$build_work/install-sim-arm64/lib/libFFmpeg.a" \
+    "$build_work/install-sim-x86_64/lib/libFFmpeg.a" \
+    -output "$sim/lib/libFFmpeg.a"
+  cp -R "$build_work/install-sim-arm64/include/." "$sim/include/"
+  cp -R "$build_work/install-sim-x86_64/include/ffmpeg-build/sim-x86_64" "$sim/include/ffmpeg-build/"
+  diff -qr -x ffmpeg-build "$build_work/install-sim-arm64/include" "$build_work/install-sim-x86_64/include" >/dev/null || \
+    fail "public simulator headers differ by architecture"
+else
+  cp "$build_work/install-sim-arm64/lib/libFFmpeg.a" "$sim/lib/libFFmpeg.a"
+  cp -R "$build_work/install-sim-arm64/include/." "$sim/include/"
+fi
 
 xcodebuild -create-xcframework \
-  -library "$work/install-device/lib/libFFmpeg.a" -headers "$work/install-device/include" \
+  -library "$build_work/install-device/lib/libFFmpeg.a" -headers "$build_work/install-device/include" \
   -library "$sim/lib/libFFmpeg.a" -headers "$sim/include" \
   -output "$candidate"
-"$root/Scripts/promote-ffmpeg-artifact.sh"
+"$root/Scripts/promote-ffmpeg-artifact.sh" --platform "$platform"

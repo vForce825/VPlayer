@@ -7,10 +7,18 @@ import Metal
 
 enum PlaybackMetalLibrary {
     private static var resourceName: String {
+        #if os(iOS)
+        #if targetEnvironment(simulator)
+        "VPlayerPlayback-iphonesimulator"
+        #else
+        "VPlayerPlayback-ios"
+        #endif
+        #else
         #if targetEnvironment(simulator)
         "VPlayerPlayback-tvsimulator"
         #else
         "VPlayerPlayback-tvos"
+        #endif
         #endif
     }
 

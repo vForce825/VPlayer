@@ -11,6 +11,30 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class NativeHLSCapabilitiesTests: XCTestCase {
+    func testPhoneEnvelopeDoesNotBorrowTVHardwareOrBypassMIMEDenial() throws {
+        let (_, value) = try mimeSource()
+        let phone = NativeHLSPlatformEvidence(platform: .iPhone, model: "iPhone17,1",
+            hardwareH264: true, hardwareHEVC: true, hdrEligible: true, playable: { _ in true })
+        let result = NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: phone)
+        XCTAssertEqual(result.videoFormats.count, 1)
+        XCTAssertEqual(result.videoFormats.first?.maximumWidth, 1920)
+        XCTAssertEqual(result.videoFormats.first?.maximumHeight, 1080)
+        for model in ["unknown", "simulator", "AppleTV14,1"] {
+            let denied = NativeHLSPlatformEvidence(platform: .iPhone, model: model,
+                hardwareH264: true, hardwareHEVC: true, hdrEligible: true, playable: { _ in true })
+            XCTAssertTrue(NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: denied).videoFormats.isEmpty)
+        }
+        let denied = NativeHLSPlatformEvidence(platform: .iPhone, model: "iPhone17,1",
+            hardwareH264: true, hardwareHEVC: true, hdrEligible: true,
+            playable: { $0 != "video/mp4; codecs=\"avc1.640028,mp4a.40.2\"" })
+        XCTAssertTrue(NativeHLSCapabilities.make(facts: value, route: route(.airPlay), evidence: denied).nativeAudioCodecs.isEmpty)
+        XCTAssertTrue(NativeHLSCapabilities.make(facts: try facts(codec: .aac, video: video(range: .hlg, rate: 50)),
+            route: route(.airPlay), evidence: phone).videoFormats.isEmpty)
+        XCTAssertTrue(NativeHLSCapabilities.make(facts: value, route: route(.airPlay),
+            evidence: evidence(model: "iPhone17,1")).videoFormats.isEmpty,
+            "An iPhone identifier cannot enter the unchanged Apple TV envelope")
+    }
+
     func testExactOwnedNativeDolbyCandidatesRemainIndependentOfGeneratedWriterProof() throws {
         for codec in [VPlayerPlayback.AudioCodec.ac3, .eac3] {
             let value = try facts(codec: codec)

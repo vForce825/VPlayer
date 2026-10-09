@@ -12,15 +12,21 @@ ROOT = Path(__file__).resolve().parents[2]
 class TVOS27DeploymentTests(unittest.TestCase):
     def test_all_project_and_target_floors(self):
         spec = (ROOT / 'project.yml').read_text()
-        floors = re.findall(r'(?:tvOS|deploymentTarget): "([0-9.]+)"', spec)
+        floors = re.findall(r'(?:tvOS|iOS|deploymentTarget): "([0-9.]+)"', spec)
         target_section=spec.split('targets:',1)[1].split('schemes:',1)[0]
         targets=re.findall(r'^  ([A-Za-z][A-Za-z0-9]+):$',target_section,re.M)
-        self.assertEqual(set(targets),{'VPlayerCore','VPlayerPlayback','VPlayer','VPlayerTests',
-            'VPlayerReleaseBoundaryTests','VPlayerUITests','VPlayerHLSAcceptanceTests'})
-        self.assertEqual(len(floors),len(targets)+1)
-        for name in targets:
+        tv_targets = {'VPlayerCore','VPlayerPlayback','VPlayer','VPlayerTests',
+            'VPlayerReleaseBoundaryTests','VPlayerUITests','VPlayerHLSAcceptanceTests'}
+        ios_targets = {'VPlayerCoreiOS','VPlayerPlaybackiOS','VPlayeriOS','VPlayeriOSTests','VPlayeriOSUITests','VPlayeriOSBenchmarks'}
+        self.assertEqual(set(targets), tv_targets | ios_targets)
+        self.assertEqual(len(floors),len(targets)+2)
+        for name in tv_targets:
             body=re.search(r'^  '+re.escape(name)+r':\n(.*?)(?=^  \w|\Z)',target_section,re.M|re.S).group(1)
             self.assertIn('    platform: tvOS',body)
+            self.assertIn('    deploymentTarget: "27.0"',body)
+        for name in ios_targets:
+            body=re.search(r'^  '+re.escape(name)+r':\n(.*?)(?=^  \w|\Z)',target_section,re.M|re.S).group(1)
+            self.assertIn('    platform: iOS',body)
             self.assertIn('    deploymentTarget: "27.0"',body)
         self.assertEqual(set(floors), {'27.0'})
         project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()
@@ -31,8 +37,11 @@ class TVOS27DeploymentTests(unittest.TestCase):
         self.assertEqual(len(generated_targets), len(targets))
         generated = re.findall(r'TVOS_DEPLOYMENT_TARGET = ([0-9.]+);', project)
         # Debug and Release for every native target, plus the project defaults.
-        self.assertEqual(len(generated), (len(targets) + 1) * 2)
+        self.assertEqual(len(generated), (len(tv_targets) + 1) * 2)
         self.assertEqual(set(generated), {'27.0'})
+        ios_generated = re.findall(r'IPHONEOS_DEPLOYMENT_TARGET = ([0-9.]+);', project)
+        self.assertEqual(len(ios_generated), (len(ios_targets) + 1) * 2)
+        self.assertEqual(set(ios_generated), {'27.0'})
 
     def test_swift_regression_counts_every_explicit_target_floor(self):
         spec = (ROOT / 'project.yml').read_text()
@@ -50,9 +59,9 @@ class TVOS27DeploymentTests(unittest.TestCase):
         project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()
         configured = re.findall(r'MARKETING_VERSION: "([0-9.]+)"', spec)
         generated = re.findall(r'MARKETING_VERSION = ([0-9.]+);', project)
-        self.assertEqual(len(configured), 3)
+        self.assertEqual(len(configured), 6)
         self.assertEqual(set(configured), {'2.0'})
-        self.assertEqual(len(generated), 6)
+        self.assertEqual(len(generated), 12)
         self.assertEqual(set(generated), {'2.0'})
 
     def test_standalone_builds_use_same_floor(self):

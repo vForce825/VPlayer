@@ -50,6 +50,7 @@ final class ChannelProgrammePresentationTests: XCTestCase {
     }
 }
 
+#if os(tvOS)
 /// These measure the production SwiftUI views in a tvOS UIKit host. The
 /// two/three-line probes distinguish actual allocated line height from an
 /// accessibility label that can still contain text truncated on screen.
@@ -222,3 +223,5 @@ final class ChannelProgrammeLayoutTests: XCTestCase {
         )
     }
 }
+
+#endif

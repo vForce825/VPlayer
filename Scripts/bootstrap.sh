@@ -60,7 +60,7 @@ cleanup_generated_check() {
     unlink "$temporary/VPlayer.xcodeproj/project.xcworkspace/contents.xcworkspacedata"
   test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme" || \
     unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme"
-  for scheme in VPlayerReleaseBoundaryTests VPlayerReleaseStartupTests VPlayerHLSAcceptance; do
+  for scheme in VPlayerReleaseBoundaryTests VPlayerReleaseStartupTests VPlayerHLSAcceptance VPlayeriOS VPlayeriOSReleaseStartup; do
     test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme" || \
       unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme"
   done

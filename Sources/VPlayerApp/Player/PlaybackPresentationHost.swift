@@ -8,7 +8,7 @@ import UIKit
 import VPlayerPlayback
 
 @MainActor
-final class PlaybackPresentationHostController: UIViewController {
+class PlaybackPresentationHostController: UIViewController {
     typealias AVPlayerControllerFactory = @MainActor () -> AVPlayerViewController
 
     private struct Mounted {
@@ -51,9 +51,7 @@ final class PlaybackPresentationHostController: UIViewController {
             child = UIViewController()
             child.view = context.makeVideoView()
         case let .avPlayer(context):
-            let playerController = avPlayerControllerFactory()
-            context.attach(to: playerController)
-            child = playerController
+            child = makeAVPlayerChild(context: context)
         }
         addChild(child)
         child.view.frame = view.bounds
@@ -61,20 +59,33 @@ final class PlaybackPresentationHostController: UIViewController {
         view.addSubview(child.view)
         child.didMove(toParent: self)
         mounted = Mounted(identified: presentation, child: child)
+        didMount(presentation, child: child)
     }
+
+    func makeAVPlayerChild(context: AVPlayerPresentationContext) -> UIViewController {
+        let controller = avPlayerControllerFactory()
+        context.attach(to: controller)
+        return controller
+    }
+    func detachAVPlayerChild(context: AVPlayerPresentationContext, child: UIViewController) {
+        if let controller = child as? AVPlayerViewController {
+            context.detach(from: controller)
+            controller.player = nil
+        } else {
+            context.detach()
+        }
+    }
+    func didMount(_ presentation: IdentifiedPlaybackPresentation, child: UIViewController) {}
+    func willUnmount(_ presentation: IdentifiedPlaybackPresentation, child: UIViewController) {}
 
     private func unmountCurrent() {
         guard let current = mounted else { return }
+        willUnmount(current.identified, child: current.child)
         switch current.identified.presentation {
         case let .sampleBuffer(context):
             context.detach()
         case let .avPlayer(context):
-            if let controller = current.child as? AVPlayerViewController {
-                context.detach(from: controller)
-                controller.player = nil
-            } else {
-                context.detach()
-            }
+            detachAVPlayerChild(context: context, child: current.child)
         }
         current.child.willMove(toParent: nil)
         current.child.view.removeFromSuperview()

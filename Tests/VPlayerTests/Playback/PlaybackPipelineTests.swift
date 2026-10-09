@@ -1430,6 +1430,42 @@ final class PlaybackPipelineTests: XCTestCase {
         )
     }
 
+    func testControllerForwardsSourceProbeBeforeReadyAndRejectsOlderGenerationMetadata() async throws {
+        let pipeline = FakeControllerPipeline()
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([pipeline]))
+        let informationStream = await controller.playbackMediaInformation()
+        let stateStream = await controller.events()
+        let information = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let states = PlaybackStreamRecorder<PlaybackState>()
+        let collector = Task { for await value in informationStream { information.append(value) } }
+        let stateCollector = Task { for await value in stateStream { states.append(value) } }
+        defer { collector.cancel(); stateCollector.cancel() }
+        addTeardownBlock { await controller.stop() }
+        let request = makeRequest(title: "source-before-output")
+        await controller.play(request)
+        func probe(width: Int32) -> PlaybackMediaInformation {
+            PlaybackMediaInformation(sourceWidth: width, sourceHeight: 1_080, scanMode: nil,
+                sourceFrameRate: MediaRational(num: 25, den: 1))
+        }
+        pipeline.emit(.mediaInformation(probe(width: 1_920), generation: .init(rawValue: 0)))
+        try await eventually { information.snapshot.last.flatMap { $0 }?.width == 1_920 }
+        XCTAssertFalse(states.snapshot.contains { if case .playing = $0 { return true }; return false })
+        XCTAssertTrue(information.snapshot.last.flatMap { $0 }?.isSourceProbe == true)
+        pipeline.emit(.mediaInformation(probe(width: 1_280), generation: .init(rawValue: 1)))
+        try await eventually { information.snapshot.last.flatMap { $0 }?.width == 1_280 }
+        let beforeStale = information.snapshot.count
+        pipeline.emit(.mediaInformation(probe(width: 640), generation: .init(rawValue: 0)))
+        pipeline.emit(.mediaInformation(nil, generation: .init(rawValue: 0)))
+        pipeline.emit(.mediaInformation(probe(width: 1_440), generation: .init(rawValue: 1)))
+        try await eventually { information.snapshot.last.flatMap { $0 }?.width == 1_440 }
+        XCTAssertEqual(information.snapshot.count, beforeStale + 1)
+        XCTAssertFalse(information.snapshot.compactMap { $0 }.contains { $0.width == 640 })
+        XCTAssertFalse(states.snapshot.contains { if case .playing = $0 { return true }; return false })
+        await controller.stop()
+        collector.cancel(); stateCollector.cancel()
+        await collector.value; await stateCollector.value
+    }
+
     func testControllerClearsMediaInformationAcrossReplacementAndFailure() async throws {
         let first = FakeControllerPipeline()
         let second = FakeControllerPipeline()
@@ -1480,6 +1516,132 @@ final class PlaybackPipelineTests: XCTestCase {
         await collector.value
     }
 
+    func testSelectedTrackSourceFactsPublishBeforeFormatsFramesAndReadiness() async throws {
+        let harness = makeHarness()
+        addTeardownBlock { await harness.pipeline.stop() }
+        harness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+        let selected = PlaybackFakeMedia.tracks(videoFrameRate: MediaRational(num: 25, den: 1), videoFieldOrder: .tt)
+        harness.demux.emit(.tracks(selected))
+        try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+        let current = await harness.pipeline.debugSnapshot().generation
+        let facts = try XCTUnwrap(harness.events.snapshot().compactMap { event -> PlaybackMediaInformation? in
+            guard case let .mediaInformation(value, generation) = event, generation == current else { return nil }
+            return value
+        }.last)
+        XCTAssertTrue(facts.isSourceProbe)
+        XCTAssertEqual(facts.width, 1_920)
+        XCTAssertEqual(facts.height, 1_080)
+        XCTAssertEqual(facts.sourceFrameRate, MediaRational(num: 25, den: 1))
+        XCTAssertNil(facts.scanMode)
+        XCTAssertNil(facts.outputFrameRate)
+        XCTAssertFalse(facts.isSmoothMotionEnhanced)
+        XCTAssertNil(facts.airPlayOutputMode)
+        XCTAssertNil(facts.sourceCategory)
+        XCTAssertNil(facts.plannedTransport)
+        XCTAssertTrue(harness.decoder.snapshot().isEmpty)
+        XCTAssertTrue(harness.renderer.snapshot().frames.isEmpty)
+        XCTAssertFalse(harness.events.snapshot().contains { if case .ready = $0 { return true }; return false })
+        await harness.pipeline.stop()
+    }
+
+    func testSourceFactsSurviveFirstFormatGenerationWithoutClaimingOutputCadence() async throws {
+        let harness = makeHarness()
+        addTeardownBlock { await harness.pipeline.stop() }
+        let generation = try await configure(harness, initialRandomAccessPTS: nil,
+            tracks: PlaybackFakeMedia.tracks(videoFrameRate: MediaRational(num: 25, den: 1), videoFieldOrder: .tt))
+        let source = try XCTUnwrap(harness.events.snapshot().compactMap { event -> PlaybackMediaInformation? in
+            guard case let .mediaInformation(value, eventGeneration) = event,
+                  eventGeneration == generation else { return nil }
+            return value
+        }.last)
+        XCTAssertEqual(generation.rawValue, 1)
+        XCTAssertTrue(source.isSourceProbe)
+        XCTAssertEqual(source.sourceFrameRate, MediaRational(num: 25, den: 1))
+        XCTAssertNil(source.scanMode)
+        XCTAssertNil(source.outputFrameRate)
+        XCTAssertFalse(source.isSmoothMotionEnhanced)
+        XCTAssertTrue(harness.yadif.snapshot().orders.isEmpty)
+        XCTAssertFalse(harness.events.snapshot().contains { if case .ready = $0 { return true }; return false })
+        await harness.pipeline.stop()
+    }
+
+    func testSelectedSourceReplacementAndAudioOnlyClearRejectLateOldAssemblyFacts() async throws {
+        let harness = makeHarness()
+        addTeardownBlock { await harness.pipeline.stop() }
+        let initial = try await configure(harness, initialRandomAccessPTS: nil,
+            tracks: PlaybackFakeMedia.tracks(videoFrameRate: MediaRational(num: 25, den: 1)))
+        let oldVideo = try XCTUnwrap(harness.assemblers.videoInstances.first)
+        let base = PlaybackFakeMedia.tracks()
+        let replacement = DemuxTrackSet(selectedProgramID: 2,
+            video: VideoTrackDescriptor(streamIndex: 202, codec: .h264,
+                timeBase: MediaRational(num: 1, den: 90_000)!, width: 1_280, height: 720,
+                videoDelay: 0, extradata: Data([0x44]), frameRate: MediaRational(num: 30, den: 1)),
+            audio: base.audio)
+        harness.demux.emit(.tracks(replacement))
+        try await eventually { harness.assemblers.videoInstances.count == 2 }
+        let current = await harness.pipeline.debugSnapshot().generation
+        XCTAssertGreaterThan(current, initial)
+        let replacementEvents = harness.events.snapshot().compactMap { event -> PlaybackMediaInformation? in
+            guard case let .mediaInformation(value, eventGeneration) = event,
+                  eventGeneration == current else { return nil }
+            return value
+        }
+        let source = try XCTUnwrap(replacementEvents.last)
+        XCTAssertTrue(replacementEvents.allSatisfy { $0.width == 1_280 && $0.height == 720 && $0.isSourceProbe })
+        XCTAssertEqual(source.sourceFrameRate, MediaRational(num: 30, den: 1))
+        let beforeLate = harness.events.snapshot().count
+        oldVideo.emit(.format(try PlaybackFakeMedia.videoFormat(), MediaFormatFingerprint(bytes: Data([0xEE]))))
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.events.snapshot().count, beforeLate)
+
+        let secondVideo = try XCTUnwrap(harness.assemblers.videoInstances.last)
+        harness.demux.emit(.tracks(PlaybackFakeMedia.audioOnlyTracks()))
+        try await eventually { (await harness.pipeline.debugSnapshot()).generation > current }
+        let afterAudioOnly = harness.events.snapshot()
+        let lastMetadata = afterAudioOnly.last { if case .mediaInformation = $0 { return true }; return false }
+        XCTAssertTrue(lastMetadata.map { event in
+            if case .mediaInformation(nil, _) = event { return true }
+            return false
+        } ?? false, "Audio-only replacement must clear source video facts")
+        secondVideo.emit(.format(try PlaybackFakeMedia.videoFormat(), MediaFormatFingerprint(bytes: Data([0xEF]))))
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(harness.events.snapshot().count, afterAudioOnly.count)
+        await harness.pipeline.stop()
+    }
+
+    func testRepeatedFormatFactsDeduplicateSourceProbeAndInvalidSourceValuesStayUnknown() async throws {
+        let harness = makeHarness()
+        addTeardownBlock { await harness.pipeline.stop() }
+        harness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { harness.demux.snapshot().startedURLs.count == 1 }
+        let base = PlaybackFakeMedia.tracks()
+        let unknown = DemuxTrackSet(selectedProgramID: 1,
+            video: VideoTrackDescriptor(streamIndex: 100, codec: .h264,
+                timeBase: MediaRational(num: 1, den: 90_000)!, width: 0, height: 0,
+                videoDelay: 0, extradata: Data(), frameRate: MediaRational(num: 1_000, den: 1)),
+            audio: base.audio)
+        harness.demux.emit(.tracks(unknown))
+        try await eventually { (await harness.pipeline.debugSnapshot()).hasTracks }
+        XCTAssertFalse(harness.events.snapshot().contains { if case .mediaInformation = $0 { return true }; return false })
+        let format = try PlaybackFakeMedia.videoFormat()
+        let fingerprint = MediaFormatFingerprint(bytes: Data([0x57]))
+        for _ in 0..<64 { harness.pipeline.receive(video: .format(format, fingerprint)) }
+        _ = await harness.pipeline.debugSnapshot()
+        let snapshots = harness.events.snapshot().compactMap { event -> PlaybackMediaInformation? in
+            if case let .mediaInformation(value, _) = event { return value }
+            return nil
+        }
+        XCTAssertEqual(snapshots.count, 1, "Duplicate provisional facts must not flood the bounded event relay")
+        let information = try XCTUnwrap(snapshots.first)
+        XCTAssertTrue(information.isSourceProbe)
+        XCTAssertEqual(information.width, 1_920)
+        XCTAssertEqual(information.height, 1_080)
+        XCTAssertNil(information.sourceFrameRate)
+        XCTAssertNil(information.scanMode)
+        XCTAssertNil(information.outputFrameRate)
+    }
+
     func testVideoReadinessWaitsForClassificationAndMediaInformation() async throws {
         let harness = makeHarness(
             classifierConfiguration: ScanClassifierConfiguration(
@@ -1507,7 +1669,7 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.processor.snapshot().metadata.count, 0)
         XCTAssertFalse(harness.events.snapshot().contains(.ready(readinessCycle: 0)))
         XCTAssertFalse(harness.events.snapshot().contains {
-            if case .mediaInformation = $0 { return true }
+            if case let .mediaInformation(value?, _) = $0 { return !value.isSourceProbe }
             return false
         })
 
@@ -1535,7 +1697,7 @@ final class PlaybackPipelineTests: XCTestCase {
 
         let events = harness.events.snapshot()
         let informationIndex = try XCTUnwrap(events.firstIndex {
-            if case let .mediaInformation(information, _) = $0 { return information != nil }
+            if case let .mediaInformation(information?, _) = $0 { return !information.isSourceProbe }
             return false
         })
         let readyIndex = try XCTUnwrap(events.firstIndex(of: .ready(readinessCycle: 0)))
@@ -1877,8 +2039,17 @@ final class PlaybackPipelineTests: XCTestCase {
     }
 
     func testDecoderSessionRestartClearsMediaInformationAndPreservesTimelineCadence() async throws {
+        try await assertDecoderRestartMetadata(sourceFrameRate: nil)
+    }
+
+    func testSource25ProbeProgressesToOutput50WithoutDowngrade() async throws {
+        try await assertDecoderRestartMetadata(sourceFrameRate: MediaRational(num: 25, den: 1))
+    }
+
+    private func assertDecoderRestartMetadata(sourceFrameRate: MediaRational?) async throws {
         let harness = makeHarness(automaticallyCompleteDecoderSubmissions: false)
-        let generation = try await configure(harness)
+        let generation = try await configure(harness, tracks: PlaybackFakeMedia.tracks(
+            videoFrameRate: sourceFrameRate))
         harness.audio.setReady(true)
         harness.pipeline.receive(audio: .frame(PlaybackFakeMedia.audioFrame(
             id: 1,
@@ -1901,7 +2072,7 @@ final class PlaybackPipelineTests: XCTestCase {
         try await eventually {
             harness.events.snapshot().contains { event in
                 if case let .mediaInformation(information, eventGeneration) = event {
-                    return information != nil && eventGeneration == generation
+                    return information?.isSourceProbe == false && eventGeneration == generation
                 }
                 return false
             }
@@ -1914,6 +2085,24 @@ final class PlaybackPipelineTests: XCTestCase {
             return nil
         }.last)
         XCTAssertEqual(try XCTUnwrap(oldInformation.outputFrameRate), 50, accuracy: 0.001)
+        XCTAssertEqual(oldInformation.sourceFrameRate, sourceFrameRate)
+        XCTAssertFalse(oldInformation.isSourceProbe)
+        XCTAssertTrue(harness.events.snapshot().contains { event in
+            if case let .mediaInformation(value?, eventGeneration) = event {
+                return eventGeneration == generation && value.isSourceProbe &&
+                    value.sourceFrameRate == sourceFrameRate && value.outputFrameRate == nil
+            }
+            return false
+        })
+        let beforeRepeatedFormat = harness.events.snapshot().count
+        harness.pipeline.receive(video: .format(try PlaybackFakeMedia.videoFormat(), MediaFormatFingerprint(bytes: Data([1]))))
+        _ = await harness.pipeline.debugSnapshot()
+        XCTAssertFalse(harness.events.snapshot().dropFirst(beforeRepeatedFormat).contains { event in
+            if case let .mediaInformation(value?, eventGeneration) = event {
+                return eventGeneration == generation && value.isSourceProbe
+            }
+            return false
+        }, "Repeated source facts cannot downgrade confirmed 25→50 output")
 
         harness.pipeline.receive(decoder: harness.submissionFailureEvent(
             .malfunction(kVTVideoDecoderMalfunctionErr),
@@ -1954,7 +2143,7 @@ final class PlaybackPipelineTests: XCTestCase {
         try await eventually {
             harness.events.snapshot().contains { event in
                 if case let .mediaInformation(information, eventGeneration) = event {
-                    return information != nil && eventGeneration == restartedGeneration
+                    return information?.isSourceProbe == false && eventGeneration == restartedGeneration
                 }
                 return false
             }
@@ -1969,7 +2158,7 @@ final class PlaybackPipelineTests: XCTestCase {
         })
         let rebuiltIndex = try XCTUnwrap(events.firstIndex { event in
             if case let .mediaInformation(information, eventGeneration) = event {
-                return information != nil && eventGeneration == restartedGeneration
+                return information?.isSourceProbe == false && eventGeneration == restartedGeneration
             }
             return false
         })
@@ -2008,7 +2197,7 @@ final class PlaybackPipelineTests: XCTestCase {
         try await eventually {
             information = harness.events.snapshot().compactMap { event -> PlaybackMediaInformation? in
                 if case let .mediaInformation(information, eventGeneration) = event,
-                   eventGeneration == generation {
+                   eventGeneration == generation, information?.isSourceProbe == false {
                     return information
                 }
                 return nil

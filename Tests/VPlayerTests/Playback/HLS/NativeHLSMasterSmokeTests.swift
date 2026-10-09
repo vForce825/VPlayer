@@ -97,11 +97,15 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertTrue(result.progressed, "The unmodified full source must actually progress")
                 XCTAssertNil(result.errorDomain)
             } else {
+                #if os(tvOS)
                 // Exact tvOS 27 reproduction for this unchanged TS/master, not
                 // a blanket claim that HLS trimming is unsupported by AVPlayer.
                 XCTAssertFalse(result.progressed)
                 XCTAssertEqual(result.errorDomain, "CoreMediaErrorDomain")
                 XCTAssertEqual(result.errorCode, -12865)
+                #else
+                print("IOS_NATIVE_ENDPOINT_CONTROL boundary=\(boundary) progressed=\(result.progressed) error=\(result.errorCode ?? 0)")
+                #endif
             }
         }
     }
@@ -280,9 +284,24 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         }
     }
 
+    func testNativeEOSStableOvershootKeepsOriginalItemAndAuthority() async throws {
+        let clock = ExactMediaTime(value: 20_000_395_041, timescale: 250_000_000)
+        for rate in [Float(1), Float(0)] {
+            try await verifyNativeEOSSettlement(firstRate: rate, outcome: .settled, observedClock: clock)
+        }
+    }
+
+    func testNativeEOSOvershootCannotBypassTransportOrAuthorityFailures() async throws {
+        let clock = ExactMediaTime(value: 20_000_395_041, timescale: 250_000_000)
+        for outcome in [NativeEOSSettlementOutcome.positiveRate, .playingControl, .changedClock,
+                        .staleRevision, .supersededInstall, .cancelled, .failedToEnd] {
+            try await verifyNativeEOSSettlement(firstRate: 1, outcome: outcome, observedClock: clock)
+        }
+    }
+
     func testNativeEOSOriginalDeadlineRejectsUnsettledTransportAndInvalidEvidence() async throws {
         for outcome in [NativeEOSSettlementOutcome.positiveRate, .playingControl, .changedClock,
-                        .earlyClock, .staleRevision, .supersededInstall] {
+                        .earlyClock, .fullFrameEarly, .staleRevision, .supersededInstall] {
             try await verifyNativeEOSSettlement(firstRate: 1, outcome: outcome)
         }
     }
@@ -504,7 +523,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
 
     /// Deterministic SDK-observation ordering controls, not real media-end
     /// acceptance. The unmodified 80-second test above supplies that evidence.
-    private func verifyNativeEOSSettlement(firstRate: Float, outcome: NativeEOSSettlementOutcome) async throws {
+    private func verifyNativeEOSSettlement(firstRate: Float, outcome: NativeEOSSettlementOutcome,
+                                          observedClock: ExactMediaTime? = nil) async throws {
         let origin = try makeOrigin(bytes: fixtureBytes(), managed: false)
         let player = NativeEOSObservationPlayer()
         let deadlines = NativeEOSManualDeadlineScheduler()
@@ -525,6 +545,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let activation = try XCTUnwrap(coordinator.currentActivation)
                 let physical = try XCTUnwrap(player.currentItem)
                 let endpoint = try ExactMediaTime(physical.duration)
+                XCTAssertEqual(endpoint, ExactMediaTime(value: 80, timescale: 1))
                 XCTAssertFalse(physical.forwardPlaybackEndTime.isValid,
                     "This regression must exercise the native untrimmed path, not constrained AAC")
                 XCTAssertEqual(deadlines.count, 0)
@@ -535,6 +556,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertEqual(deadlines.count, 0)
                 let clock: CMTime
                 if outcome == .earlyClock { clock = .zero }
+                else if outcome == .fullFrameEarly { clock = try endpoint.subtracting(.init(value: 1, timescale: 30)).cmTime }
+                else if let observedClock { clock = observedClock.cmTime }
                 else { clock = try endpoint.subtracting(ExactMediaTime(value: 1, timescale: 60)).cmTime }
                 player.observation = .init(time: clock, rate: firstRate, control: .playing)
                 // Deliver through the installed private observer, which owns
@@ -626,8 +649,19 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     if outcome == .settled || outcome == .progressPoll {
                         XCTAssertTrue(coordinator.naturalEndVerifiedForTesting)
                         let terminal = try XCTUnwrap(driver.naturalEndObservation)
+                        XCTAssertEqual(terminal.item, coordinator.item)
+                        XCTAssertEqual(terminal.expectedEndpoint, endpoint)
+                        XCTAssertEqual(terminal.constrainedEndpoint, endpoint)
                         XCTAssertEqual(terminal.firstCurrentTime, terminal.stableCurrentTime)
+                        XCTAssertEqual(terminal.stableCurrentTime, try ExactMediaTime(clock))
+                        XCTAssertTrue(factory.backend === backend)
+                        XCTAssertTrue(backend.nativeCoordinatorForTesting === coordinator)
+                        XCTAssertTrue(backend.nativeSystemDriverForTesting === driver)
                         XCTAssertTrue(player.currentItem === physical)
+                        XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
+                        XCTAssertEqual(coordinator.currentActivation, activation)
+                        XCTAssertEqual(registry.outputResourceContextSnapshot()?.activation, activation)
+                        XCTAssertNil(coordinator.firstFailureDiagnosticForTesting)
                     } else {
                         XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
                         let expected = outcome == .changedClock ? "unstableDirectRead" : "endpointMismatch"
@@ -637,7 +671,7 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         case .changedClock: predicate = "confirm.stableClock"
                         case .positiveRate: predicate = "confirm.rate"
                         case .playingControl: predicate = "confirm.control"
-                        case .earlyClock: predicate = "confirm.finalClock"
+                        case .earlyClock, .fullFrameEarly: predicate = "confirm.finalClock"
                         case .staleRevision, .supersededInstall: predicate = "confirm.quantum.revision"
                         default: predicate = nil
                         }
@@ -931,7 +965,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertFalse(quantum.isCurrent(item: coordinator.item, physical: physical),
                     "A revision change revokes timing even when every SDK object is unchanged")
                 XCTAssertFalse(coordinator.naturalEndVerifiedForTesting)
+                // Inject an unexpected native pause, rather than a PiP intent.
+                #if os(iOS)
+                if let controlled = player as? IOSControlledAVPlayer {
+                    controlled.performDriverMutation { player.pause() }
+                } else { player.pause() }
+                #else
                 player.pause()
+                #endif
                 XCTAssertEqual(player.rate, 0)
                 XCTAssertEqual(player.timeControlStatus, .paused)
                 let early = try ExactMediaTime(player.currentTime())
@@ -1009,8 +1050,9 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 XCTAssertEqual(observation.constrainedEndpoint, endpoint)
                 XCTAssertEqual(observation.firstCurrentTime, stable)
                 let lower = try endpoint.subtracting(quantum.period)
+                // A settled output clock may be beyond duration. Its value
+                // cannot alter the exact untrimmed source endpoint above.
                 XCTAssertGreaterThan(CMTimeCompare(stable.cmTime, lower.cmTime), 0)
-                XCTAssertLessThanOrEqual(CMTimeCompare(stable.cmTime, endpoint.cmTime), 0)
                 XCTAssertTrue(player.currentItem === physical)
                 XCTAssertEqual(player.rate, 0)
                 XCTAssertEqual(player.timeControlStatus, .paused)
@@ -1336,7 +1378,7 @@ private enum NativeEndpointControl: String, CaseIterable {
 }
 
 private enum NativeEOSSettlementOutcome: Equatable {
-    case settled, positiveRate, playingControl, changedClock, earlyClock, staleRevision, supersededInstall, cancelled, failedToEnd, progressPoll
+    case settled, positiveRate, playingControl, changedClock, earlyClock, fullFrameEarly, staleRevision, supersededInstall, cancelled, failedToEnd, progressPoll
 }
 
 private enum NativeRefreshReturnMode: Equatable { case once, mixed, exhausted, bindingChanged, revoked }

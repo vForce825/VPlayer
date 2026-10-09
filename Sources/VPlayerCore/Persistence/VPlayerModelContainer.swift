@@ -63,8 +63,13 @@ public enum VPlayerModelContainer {
     /// The library is a rebuildable mirror of the remote playlist and EPG, so a
     /// system purge under storage pressure costs a refresh, not user data.
     static func persistentStoreRootURL(fileManager: FileManager = .default) throws -> URL {
-        try fileManager.url(
-            for: .cachesDirectory,
+        #if os(iOS)
+        let directory: FileManager.SearchPathDirectory = .applicationSupportDirectory
+        #else
+        let directory: FileManager.SearchPathDirectory = .cachesDirectory
+        #endif
+        return try fileManager.url(
+            for: directory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true

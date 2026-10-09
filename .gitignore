@@ -12,5 +12,6 @@ xcuserdata/
 # Reproducible FFmpeg build outputs
 /Vendor/FFmpeg/Work/
 /Vendor/FFmpeg/Artifacts/
+/Vendor/FFmpeg/Artifacts-iOS/
 build/
 *.log

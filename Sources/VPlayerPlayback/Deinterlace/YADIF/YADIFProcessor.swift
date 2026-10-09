@@ -123,6 +123,11 @@ final class YADIFSystemCommandSubmitter: YADIFCommandSubmitting, @unchecked Send
             }
         }
         commandBuffer.commit()
+        #if os(iOS)
+        // Adaptive submission holds the app GPU admission gate through this
+        // scheduling fence. Completion/resource retirement remains asynchronous.
+        commandBuffer.waitUntilScheduled()
+        #endif
     }
 }
 
@@ -241,11 +246,16 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         maximumPendingFrames: Int = 4,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
     ) throws {
-        let submitter = try YADIFSystemCommandSubmitter(
+        let gpuSubmitter = try YADIFSystemCommandSubmitter(
             device: device,
             commandQueue: commandQueue,
             textureCache: textureCache
         )
+        #if os(iOS)
+        let submitter: any YADIFCommandSubmitting = AdaptiveYADIFCommandSubmitter(gpu: gpuSubmitter)
+        #else
+        let submitter = gpuSubmitter
+        #endif
         try self.init(
             commandSubmitter: submitter,
             surfacePool: ProgressiveSurfacePool(),
@@ -269,11 +279,16 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         maximumPendingFrames: Int = 4,
         dropSink: @escaping @Sendable (YADIFDropEvent) -> Void = { _ in }
     ) throws {
-        let submitter = try YADIFSystemCommandSubmitter(
+        let gpuSubmitter = try YADIFSystemCommandSubmitter(
             device: device,
             commandQueue: commandQueue,
             textureCache: textureCache
         )
+        #if os(iOS)
+        let submitter: any YADIFCommandSubmitting = AdaptiveYADIFCommandSubmitter(gpu: gpuSubmitter)
+        #else
+        let submitter = gpuSubmitter
+        #endif
         try self.init(
             commandSubmitter: submitter,
             surfacePool: ProgressiveSurfacePool(
@@ -348,6 +363,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     public func reset(to generation: MediaGeneration) {
         var actions: [UserAction] = []
         lock.lock()
+        commandSubmitter.cancelPendingWork()
         resetLocked(to: generation, actions: &actions)
         enqueueUserActionsLocked(actions)
         lock.unlock()

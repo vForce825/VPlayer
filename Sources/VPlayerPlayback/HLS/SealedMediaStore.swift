@@ -92,6 +92,45 @@ struct SealedCoverageInput: @unchecked Sendable {
     let initialization: CompletedBodyEvidenceSnapshot
 }
 
+/// The precharge and physical allocation use the same malloc API. Swift typed
+/// allocation may use an aligned allocator with different size classes, so it
+/// cannot be bounded by ordinary malloc_good_size alone. This value owns the
+/// original block; its aligned interior is only a typed access view.
+struct PausedWorkspaceBuffer<Element> {
+    let owner: UnsafeMutableRawPointer
+    let values: UnsafeMutablePointer<Element>
+    let count: Int
+
+    private static func requestedBytes(count: Int) throws -> Int {
+        guard count > 0 else { throw CompletedMediaEvidenceError.capacityExceeded }
+        let payload = try HLSChecked.multiply(count, MemoryLayout<Element>.stride)
+        return try HLSChecked.add(payload, MemoryLayout<Element>.alignment - 1)
+    }
+    static func reservationBytes(count: Int) throws -> Int {
+        let requested = try requestedBytes(count: count)
+        let rounded = malloc_good_size(requested)
+        guard rounded >= requested else { throw CompletedMediaEvidenceError.capacityExceeded }
+        return rounded
+    }
+    init(count: Int, repeating value: Element,
+         allocator: (Int) -> UnsafeMutableRawPointer? = { malloc($0) }) throws {
+        let requested = try Self.requestedBytes(count: count)
+        guard let owner = allocator(requested) else { throw LoopbackHTTPReservationError.hardCapacityExceeded }
+        let alignment = MemoryLayout<Element>.alignment
+        let remainder = Int(UInt(bitPattern: owner) % UInt(alignment))
+        let offset = remainder == 0 ? 0 : alignment - remainder
+        self.owner = owner
+        self.count = count
+        values = owner.advanced(by: offset).bindMemory(to: Element.self, capacity: count)
+        values.initialize(repeating: value, count: count)
+    }
+    var actualBytes: Int { malloc_size(owner) }
+    func destroy(deallocator: (UnsafeMutableRawPointer) -> Void = { free($0) }) {
+        values.deinitialize(count: count)
+        deallocator(owner)
+    }
+}
+
 /// Capacity for one paused lease's exact pinned map set. This owns no current
 /// source/finality/native authority. Only its store's linearization domain may
 /// mutate its cursors; keeping this object across waits keeps admission live.
@@ -123,9 +162,12 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     private let reservation: PlaybackResourceContextReservation
     let mapCount: Int
     let sampleCount: Int
-    private let ordinals: UnsafeMutablePointer<UInt16>
-    private let cursors: UnsafeMutablePointer<MapCursor>
-    private let heap: UnsafeMutablePointer<UInt8>
+    private let ordinalStorage: PausedWorkspaceBuffer<UInt16>
+    private let cursorStorage: PausedWorkspaceBuffer<MapCursor>
+    private let heapStorage: PausedWorkspaceBuffer<UInt8>
+    private var ordinals: UnsafeMutablePointer<UInt16> { ordinalStorage.values }
+    private var cursors: UnsafeMutablePointer<MapCursor> { cursorStorage.values }
+    private var heap: UnsafeMutablePointer<UInt8> { heapStorage.values }
     private var heapCount = 0
     private var inUse = false
     let reservationBytes: Int
@@ -136,9 +178,9 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
             throw CompletedMediaEvidenceError.capacityExceeded
         }
         return .init(root: malloc_good_size(class_getInstanceSize(Self.self)),
-            ordinals: malloc_good_size(sampleCount * MemoryLayout<UInt16>.stride),
-            cursors: malloc_good_size(mapCount * MemoryLayout<MapCursor>.stride),
-            heap: malloc_good_size(mapCount * MemoryLayout<UInt8>.stride),
+            ordinals: try PausedWorkspaceBuffer<UInt16>.reservationBytes(count: sampleCount),
+            cursors: try PausedWorkspaceBuffer<MapCursor>.reservationBytes(count: mapCount),
+            heap: try PausedWorkspaceBuffer<UInt8>.reservationBytes(count: mapCount),
             context: malloc_good_size(class_getInstanceSize(PlaybackResourceContextReservation.self)),
             application: malloc_good_size(class_getInstanceSize(PlaybackApplicationChargeReservation.self)))
     }
@@ -147,8 +189,8 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
         guard let tokens = PlaybackResourceContextLedger.shared.reservationAllocationBytes(for: reservation)
             else { return nil }
         return .init(root: malloc_size(UnsafeRawPointer(Unmanaged.passUnretained(self).toOpaque())),
-            ordinals: malloc_size(UnsafeRawPointer(ordinals)),
-            cursors: malloc_size(UnsafeRawPointer(cursors)), heap: malloc_size(UnsafeRawPointer(heap)),
+            ordinals: ordinalStorage.actualBytes,
+            cursors: cursorStorage.actualBytes, heap: heapStorage.actualBytes,
             context: tokens.context, application: tokens.application)
     }
 
@@ -180,7 +222,9 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     }
 
     /// Called while the store domain is held, before any HTTP completion freeze.
-    fileprivate static func reserve(store: SealedMediaStore, owner: PausedWindowCoverageLease) throws -> Self {
+    fileprivate static func reserve(store: SealedMediaStore, owner: PausedWindowCoverageLease,
+        allocator: (Int) -> UnsafeMutableRawPointer? = { malloc($0) },
+        deallocator: (UnsafeMutableRawPointer) -> Void = { free($0) }) throws -> Self {
         guard owner.metadataStore === store else { throw CompletedMediaEvidenceError.identityMismatch }
         var maps = 0
         var samples = 0
@@ -196,8 +240,9 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
         let reservation = try PlaybackResourceContextLedger.shared.reserve(
             allocationIdentity: .stable(UUID()), bytes: limits.total)
         do {
-            let workspace = Self(store: store, owner: owner, reservation: reservation,
-                mapCount: maps, sampleCount: samples, reservationBytes: limits.total)
+            let workspace = try Self(store: store, owner: owner, reservation: reservation,
+                mapCount: maps, sampleCount: samples, reservationBytes: limits.total,
+                allocator: allocator, deallocator: deallocator)
             try PlaybackResourceContextLedger.shared.rebind(reservation,
                 to: .object(ObjectIdentifier(workspace)))
             guard let actual = workspace.actualAllocationBytes,
@@ -228,19 +273,27 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
 
     private init(store: SealedMediaStore, owner: PausedWindowCoverageLease,
                  reservation: PlaybackResourceContextReservation, mapCount: Int,
-                 sampleCount: Int, reservationBytes: Int) {
+                 sampleCount: Int, reservationBytes: Int,
+                 allocator: (Int) -> UnsafeMutableRawPointer?,
+                 deallocator: (UnsafeMutableRawPointer) -> Void) throws {
+        // Hooks are borrowed only during construction; no allocator closure or
+        // uncharged owner object survives the pre-admitted allocation scope.
+        let ordinals = try PausedWorkspaceBuffer<UInt16>(count: sampleCount, repeating: 0, allocator: allocator)
+        let cursors: PausedWorkspaceBuffer<MapCursor>
+        do { cursors = try .init(count: mapCount, repeating: MapCursor(), allocator: allocator) }
+        catch { ordinals.destroy(deallocator: deallocator); throw error }
+        let heap: PausedWorkspaceBuffer<UInt8>
+        do { heap = try .init(count: mapCount, repeating: 0, allocator: allocator) }
+        catch { cursors.destroy(deallocator: deallocator); ordinals.destroy(deallocator: deallocator); throw error }
         self.store = store
         self.owner = owner
         self.reservation = reservation
         self.mapCount = mapCount
         self.sampleCount = sampleCount
         self.reservationBytes = reservationBytes
-        ordinals = .allocate(capacity: sampleCount)
-        ordinals.initialize(repeating: 0, count: sampleCount)
-        cursors = .allocate(capacity: mapCount)
-        cursors.initialize(repeating: MapCursor(), count: mapCount)
-        heap = .allocate(capacity: mapCount)
-        heap.initialize(repeating: 0, count: mapCount)
+        ordinalStorage = ordinals
+        cursorStorage = cursors
+        heapStorage = heap
     }
 
     private func validateMembership() throws {
@@ -439,9 +492,9 @@ final class PausedCoverageWorkspace: @unchecked Sendable {
     }
 
     deinit {
-        heap.deinitialize(count: mapCount); heap.deallocate()
-        cursors.deinitialize(count: mapCount); cursors.deallocate()
-        ordinals.deinitialize(count: sampleCount); ordinals.deallocate()
+        heapStorage.destroy()
+        cursorStorage.destroy()
+        ordinalStorage.destroy()
         PlaybackResourceContextLedger.shared.release(reservation)
     }
 }
@@ -1419,8 +1472,11 @@ final class SealedMediaStore: @unchecked Sendable {
 
     /// This admission is only for the exact pinned sealed maps. It is valid
     /// before completion freezes and conveys no playback or publication authority.
-    func reservePausedCoverageWorkspace(owner: PausedWindowCoverageLease) throws -> PausedCoverageWorkspace {
-        try domain.sync { try PausedCoverageWorkspace.reserve(store: self, owner: owner) }
+    func reservePausedCoverageWorkspace(owner: PausedWindowCoverageLease,
+        allocator: (Int) -> UnsafeMutableRawPointer? = { malloc($0) },
+        deallocator: (UnsafeMutableRawPointer) -> Void = { free($0) }) throws -> PausedCoverageWorkspace {
+        try domain.sync { try PausedCoverageWorkspace.reserve(store: self, owner: owner,
+            allocator: allocator, deallocator: deallocator) }
     }
 
     /// The authenticated server chooses membership; the store pins only maps

@@ -6,7 +6,14 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 work="$root/Vendor/FFmpeg/Work"
-artifacts="$root/Vendor/FFmpeg/Artifacts"
+source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
+platform=tvos
+if [[ $# -ne 0 ]]; then
+  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/promote-ffmpeg-artifact.sh [--platform tvos|ios]' >&2; exit 64; }
+  platform="$2"
+fi
+ffmpeg_select_platform "$platform"
+artifacts="$root/Vendor/FFmpeg/$ffmpeg_artifact_directory"
 lock_dir="$work/.build-lock"
 final="$artifacts/FFmpeg.xcframework"
 candidate=""
@@ -17,7 +24,6 @@ fail() {
   exit 1
 }
 
-[[ $# -eq 0 ]] || fail "this helper accepts no path overrides"
 [[ -d "$lock_dir" && ! -L "$lock_dir" ]] || fail "the current build lock is missing or unsafe"
 for state_file in owner-pid token candidate; do
   [[ -f "$lock_dir/$state_file" && ! -L "$lock_dir/$state_file" ]] || \
@@ -106,7 +112,11 @@ lock_is_current || fail "the current build lock changed before audit"
 
 identity_before="$(/usr/bin/stat -f '%d:%i' "$candidate")"
 fingerprint_before="$(tree_fingerprint "$candidate")"
-"$root/Scripts/audit-ffmpeg.sh" "$candidate"
+if [[ "$platform" == "tvos" ]]; then
+  "$root/Scripts/audit-ffmpeg.sh" "$candidate"
+else
+  "$root/Scripts/audit-ffmpeg.sh" --platform ios "$candidate"
+fi
 lock_is_current || fail "the current build lock changed during audit"
 [[ -d "$candidate" && ! -L "$candidate" ]] || fail "candidate identity changed during audit"
 identity_after="$(/usr/bin/stat -f '%d:%i' "$candidate")"

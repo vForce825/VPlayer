@@ -4785,21 +4785,124 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testReview2LoopbackTerminalRenditionConflictAutomaticallyStartsRegistrySingleFlightStopAndReprepare()
         async throws {
-        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
-        let harness = try await Task21Harness()
-        let owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
-        addTeardownBlock { try await owner.tearDown() }
-        _ = try await harness.prepare()
-        _ = try await harness.activate()
-        harness.evidence.completedRenditions.append(.init(rawValue: 202))
+        // Both a quiescent suspend and a requiresRetirement result use the same
+        // registered runner. Pin each immediately after retirement claim, before
+        // its owner validation, so terminal takeover cannot depend on scheduling.
+        for requiresRetirement in [false, true] {
+            let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
+            let applicationBaseline = PlaybackApplicationChargeLedger.shared.chargedBytes
+            let owner: Task21OwnedTestHarness
+            do {
+                let harness = try await Task21Harness()
+                owner = Task21OwnedTestHarness(harness, resourceBaseline: resourceBaseline)
+                let claimed = expectation(description: "Original replacement retirement claimed")
+                let gate = Task21RetirementClaimGate(claimed: claimed)
+                harness.backend.retirementClaimGate = gate
+                harness.backend.requireRetirementAfterSuccessfulSuspend = requiresRetirement
+                harness.backend.allowRetirementCompletion()
+                addTeardownBlock { gate.release(); try await owner.tearDown() }
+                _ = try await harness.prepare()
+                _ = try await harness.activate()
+                harness.evidence.completedRenditions.append(.init(rawValue: 202))
 
-        for _ in 0..<32 { await Task.yield() }
+                await fulfillment(of: [claimed], timeout: 2)
+                let original = try XCTUnwrap(gate.snapshot)
+                let registry = harness.graph.registry
+                let before = try XCTUnwrap(registry.outputResourceContextSnapshot())
+                XCTAssertEqual(harness.coordinator.phase, .stopping)
+                XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+                XCTAssertEqual(harness.backend.suspendCallCount, 1)
+                XCTAssertEqual(harness.backend.retireCallCount, 0)
+                XCTAssertEqual(before.owner, original.owner)
+                XCTAssertEqual(before.retirement, original.task)
+                XCTAssertEqual(registry.phase(of: original.task), .running)
+                let terminal = try XCTUnwrap(harness.graph.coordinator.begin(
+                    contextNonce: before.contextNonce, reason: .stop,
+                    at: registry.clock.nowNanoseconds, teardown: true))
+                XCTAssertNotEqual(terminal, original.owner)
+                let adopted = try XCTUnwrap(registry.outputResourceContextSnapshot())
+                XCTAssertEqual(adopted.reservation, before.reservation)
+                XCTAssertEqual(adopted.retirement, before.retirement)
+                XCTAssertEqual(adopted.suspend, before.suspend)
+                gate.release()
+                let joined = await registry.joinOutputBackendOperation(
+                    try XCTUnwrap(before.suspend).task)
+                switch joined {
+                case .canceled where requiresRetirement: break
+                case .failed(.backendPublicationReplacementRejected) where !requiresRetirement: break
+                default: XCTFail("The superseded replacement must exit without preparing a successor")
+                }
+                let returned = try XCTUnwrap(registry.outputResourceContextSnapshot())
+                XCTAssertEqual(returned.owner, terminal)
+                XCTAssertEqual(returned.contextNonce, adopted.contextNonce)
+                XCTAssertEqual(returned.reservation, adopted.reservation)
+                XCTAssertEqual(returned.suspend, adopted.suspend)
+                XCTAssertEqual(returned.budget, adopted.budget)
+                XCTAssertEqual(returned.suspendTimedOut, adopted.suspendTimedOut)
+                XCTAssertEqual(returned.suspendConfirmed, adopted.suspendConfirmed)
+                XCTAssertEqual(returned.suspendRequiresRetirement, adopted.suspendRequiresRetirement)
+                XCTAssertEqual(registry.phase(of: original.task), .queued,
+                    "Only the never-invoked retirement claim returns to the terminal owner")
+                XCTAssertEqual(harness.backend.retireCallCount, 0)
+                let stale = OutputBackendCleanupInvocation(task: original.task,
+                    owner: original.owner, contextNonce: original.contextNonce,
+                    backend: harness.backend, lifecycle: original.lifecycle, suspendInvocation: nil)
+                let rejectedBeforeTerminalClaim = await registry.performOutputRetirement(stale)
+                XCTAssertEqual(rejectedBeforeTerminalClaim, .unconfirmed)
+                XCTAssertEqual(harness.backend.retireCallCount, 0)
+                XCTAssertEqual(registry.phase(of: original.task), .queued)
+                let afterReplay = try XCTUnwrap(registry.outputResourceContextSnapshot())
+                XCTAssertEqual(afterReplay.owner, returned.owner)
+                XCTAssertEqual(afterReplay.contextNonce, returned.contextNonce)
+                XCTAssertEqual(afterReplay.retirement, returned.retirement)
+                XCTAssertEqual(afterReplay.reservation, returned.reservation)
+                XCTAssertEqual(afterReplay.budget, returned.budget)
+                XCTAssertEqual(afterReplay.suspend, returned.suspend)
+                XCTAssertEqual(afterReplay.retirementConfirmed, returned.retirementConfirmed)
+                let receiver = Task21FinalEOSCleanupReceiver(registry: registry,
+                    audioLane: harness.graph.lane)
+                XCTAssertTrue(registry.startOwnedTerminalCleanup(owner: terminal,
+                    receiver: receiver, terminalState: .stopped))
+                await registry.joinOwnedTerminalCleanup(session: before.sessionIdentity)
+                try receiver.result()
 
-        XCTAssertEqual(harness.coordinator.phase, .stopping,
-                       "Loopback send terminal 的冲突必须自动关闭 readiness/activation")
-        XCTAssertNotNil(harness.graph.registry.outputResourceContextSnapshot()?.suspend,
-                        "冲突必须进入共享 Registry 的单飞 stop/reprepare 链")
-        XCTAssertEqual(harness.coordinator.stopTaskCount, 1)
+                XCTAssertEqual(gate.claimCount, 1)
+                XCTAssertEqual(harness.backend.suspendCallCount, 1)
+                XCTAssertEqual(harness.backend.retireCallCount, 1)
+                XCTAssertNil(registry.outputResourceContextSnapshot())
+                XCTAssertNil(registry.ownedResourceSnapshot())
+                XCTAssertNil(registry.cleanupReservationSnapshot())
+                XCTAssertNil(harness.coordinator.currentItemIdentity)
+                XCTAssertEqual(harness.coordinator.phase, .quiescent)
+                let replay = await registry.performOutputRetirement(stale)
+                XCTAssertEqual(replay, .unconfirmed)
+                XCTAssertEqual(harness.backend.retireCallCount, 1,
+                    "A late original invocation must not repeat physical retirement")
+                gate.release()
+                harness.backend.retirementClaimGate = nil
+            }
+            try await owner.tearDown()
+            XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline)
+            XCTAssertEqual(PlaybackApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+        }
+    }
+
+    func testRetirementClaimGateCancellationAndLateReleaseDoNotRetainWaiters() async {
+        for cancelBeforeEntry in [false, true] {
+            let entered = expectation(description: "Test gate continuation installed")
+            let gate = Task21RetirementClaimGate(claimed:
+                XCTestExpectation(description: "No registry claim in gate cancellation test"))
+            let task = Task {
+                if cancelBeforeEntry { withUnsafeCurrentTask { $0?.cancel() } }
+                await gate.waitForRelease { entered.fulfill() }
+            }
+            await fulfillment(of: [entered], timeout: 2)
+            task.cancel()
+            gate.release()
+            gate.release()
+            await task.value
+            XCTAssertFalse(gate.hasWaiter)
+        }
     }
 
     func testReview2EveryAACParticipantRequiresWriterEndpointAuthorityWhileExplicitNonAACMayProceed()
@@ -7001,7 +7104,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     private func withInstalledReview3Driver(outputNonce: UInt64,
         _ body: @MainActor (SystemAVPlayerDriver, AVPlayerItemInstanceIdentity) async throws -> Void) async throws {
-        let driver = try SystemAVPlayerDriver.make()
+        let driver = try SystemAVPlayerDriver.make(player: AVPlayer())
         let item = AVPlayerItemInstanceIdentity(
             outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: outputNonce),
             itemGeneration: 1)
@@ -9941,6 +10044,19 @@ private final class Task21RegistryBackend: PlaybackBackend,
     private var suspendCallCountValue = 0
     private var retireCallCountValue = 0
     private var lastRetiredEpochValue: OutputLifecycleEpoch?
+    private var retirementClaimGateValue: Task21RetirementClaimGate?
+    private var requireRetirementAfterSuccessfulSuspendValue = false
+    var retirementClaimGate: Task21RetirementClaimGate? {
+        get { lock.withLock { retirementClaimGateValue } }
+        set { lock.withLock { retirementClaimGateValue = newValue } }
+    }
+    var requireRetirementAfterSuccessfulSuspend: Bool {
+        get { lock.withLock { requireRetirementAfterSuccessfulSuspendValue } }
+        set { lock.withLock { requireRetirementAfterSuccessfulSuspendValue = newValue } }
+    }
+    func didClaimOutputRetirementForTesting(_ invocation: OutputBackendCleanupInvocation) async {
+        await retirementClaimGate?.hold(invocation)
+    }
     var returnCallerForgedQuiescence = false
     var beforeActivation: ((ControlTaskRegistry.BackendPositiveRateInvocation) -> Void)?
     private(set) var lastProof: ControlTaskRegistry.BackendQuiescenceProof?
@@ -10079,7 +10195,7 @@ private final class Task21RegistryBackend: PlaybackBackend,
                 lastProof = proof
                 lastSuspendInvocation = invocation
             }
-            return .quiescent(proof)
+            return requireRetirementAfterSuccessfulSuspend ? .requiresRetirement : .quiescent(proof)
         } catch {
             print("NATIVE_ADMISSION suspend-failed error=\(error) contextBytes=\(PlaybackResourceContextLedger.shared.chargedBytes) callbackCount=\(AVPlayerSDKCallbackLease.occupiedCount)")
             lock.withLock { errorValue = error }
@@ -10149,6 +10265,66 @@ private final class Task21RegistryBackend: PlaybackBackend,
         guard unloaded else { return .unconfirmed }
         lock.withLock { lastRetiredEpochValue = epoch }
         return .confirmedLocalOutputStopped
+    }
+}
+
+#if DEBUG
+extension Task21RegistryBackend: OutputRetirementClaimObservingForTesting {}
+#endif
+
+private final class Task21RetirementClaimGate: @unchecked Sendable {
+    struct Snapshot: Sendable {
+        let task: ControlTaskTicket
+        let owner: OutputTransitionOwnerTicket
+        let contextNonce: UInt64
+        let lifecycle: OutputLifecycleEpoch?
+    }
+    private let lock = NSLock()
+    private let claimed: XCTestExpectation
+    private var released = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var snapshotValue: Snapshot?
+    private var claimCountValue = 0
+    var snapshot: Snapshot? { lock.withLock { snapshotValue } }
+    var claimCount: Int { lock.withLock { claimCountValue } }
+    var hasWaiter: Bool { lock.withLock { waiter != nil } }
+
+    init(claimed: XCTestExpectation) { self.claimed = claimed }
+
+    func hold(_ invocation: OutputBackendCleanupInvocation) async {
+        let first = lock.withLock {
+            claimCountValue += 1
+            guard snapshotValue == nil else { return false }
+            snapshotValue = .init(task: invocation.task, owner: invocation.owner,
+                contextNonce: invocation.contextNonce, lifecycle: invocation.lifecycle)
+            return true
+        }
+        if first { claimed.fulfill() }
+        await waitForRelease()
+    }
+
+    func waitForRelease(onWaiting: @Sendable () -> Void = {}) async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let resumeNow = lock.withLock {
+                    guard !released else { return true }
+                    precondition(waiter == nil)
+                    waiter = continuation
+                    return false
+                }
+                onWaiting()
+                if resumeNow { continuation.resume() }
+            }
+        } onCancel: { release() }
+    }
+
+    func release() {
+        let continuation = lock.withLock {
+            released = true
+            defer { waiter = nil }
+            return waiter
+        }
+        continuation?.resume()
     }
 }
 
@@ -10289,7 +10465,7 @@ private final class Task21FinalEOSCleanupReceiver: PlaybackOwnedCleanupReceiving
                       let lifecycle = cleanup.lifecycle else {
                     throw AVPlayerItemCoordinatorFailure.operationInFlight
                 }
-                let retirement = await cleanup.backend.retireOutput(epoch: lifecycle)
+                let retirement = await registry.performOutputRetirement(cleanup)
                 guard retirement == .confirmedLocalOutputStopped,
                       coordinator.completeRetirement(ticket, lifecycle: lifecycle) else {
                     throw AVPlayerItemCoordinatorFailure.operationInFlight

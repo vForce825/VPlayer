@@ -169,6 +169,13 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         presentationMountOwnership = nil
     }
 
+    /// A shared engine may replay a predecessor's unqualified terminal state.
+    /// Only this request's accepted activity (or explicit local stop) owns close.
+    var hasStoppedCurrentRequest: Bool {
+        guard case .stopped = state else { return false }
+        return stopped || receivedRequestState
+    }
+
     var isPaused: Bool {
         if case .paused = state { return true }
         return false

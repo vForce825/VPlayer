@@ -358,6 +358,189 @@ final class YADIFGoldenPixelTests: XCTestCase {
         try await verifyP010Golden(order: .bottom, stem: "bff")
     }
 
+    #if os(iOS)
+    #if !DEBUG
+    func testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification() throws {
+        for (width, height) in [(1_920, 1_080), (3_840, 2_160)] {
+            for depth in [8, 10] {
+                let context = "width=\(width) height=\(height) depth=\(depth)"
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=setup_begin")
+                let setupStart = ContinuousClock.now
+                let format = depth == 8 ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange : kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                let inputs = try (0..<3).map { seed in
+                    var buffer: CVPixelBuffer?
+                    let status = CVPixelBufferCreate(nil, width, height, format,
+                        [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer)
+                    XCTAssertEqual(status, kCVReturnSuccess)
+                    let pixel = try XCTUnwrap(buffer)
+                    XCTAssertEqual(CVPixelBufferLockBaseAddress(pixel, []), kCVReturnSuccess)
+                    defer { CVPixelBufferUnlockBaseAddress(pixel, []) }
+                    for plane in 0..<2 {
+                        let base = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(pixel, plane))
+                        let rows = CVPixelBufferGetHeightOfPlane(pixel, plane)
+                        let stride = CVPixelBufferGetBytesPerRowOfPlane(pixel, plane)
+                        fillCPUBenchmarkPlane(base, width: width, rows: rows,
+                            stride: stride, depth: depth, seed: seed)
+                    }
+                    return pixel
+                }
+                let setupMilliseconds = cpuBenchmarkMilliseconds(since: setupStart)
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=setup_end setup_ms=\(setupMilliseconds)")
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=output_begin")
+                let outputStart = ContinuousClock.now
+                let outputs = try ProgressiveSurfacePool().allocatePair(matching: inputs[1])
+                let job = YADIFJob(previous: normalized(inputs[0], id: 1),
+                    current: normalized(inputs[1], id: 2), next: normalized(inputs[2], id: 3),
+                    order: resolved(.top), spatialOnly: false)
+                let outputMilliseconds = cpuBenchmarkMilliseconds(since: outputStart)
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=output_end output_ms=\(outputMilliseconds)")
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=warmup_begin")
+                let warmupStart = ContinuousClock.now
+                try CPUVideoProcessing.yadif(job: job, outputs: outputs)
+                let warmupMilliseconds = cpuBenchmarkMilliseconds(since: warmupStart)
+                emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=warmup_end warmup_ms=\(warmupMilliseconds)")
+                var milliseconds: [Double] = []
+                for sample in 0..<5 {
+                    emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=sample_begin sample=\(sample)")
+                    let start = ContinuousClock.now
+                    try CPUVideoProcessing.yadif(job: job, outputs: outputs)
+                    let elapsed = cpuBenchmarkMilliseconds(since: start)
+                    milliseconds.append(elapsed)
+                    emitCPUBenchmark("IOS_CPU_YADIF_PHASE \(context) phase=sample_end sample=\(sample) pair_ms=\(elapsed)")
+                }
+                #if targetEnvironment(simulator)
+                let environment = "simulator-not-iphone-hardware"
+                #else
+                let environment = "device-short-run-not-thermal-qualification"
+                #endif
+                emitCPUBenchmark("IOS_CPU_YADIF_BENCH \(context) workers=\(min(4, ProcessInfo.processInfo.activeProcessorCount)) setup_ms=\(setupMilliseconds) output_ms=\(outputMilliseconds) warmup_ms=\(warmupMilliseconds) pair_ms=\(milliseconds) environment=\(environment) configuration=release")
+            }
+        }
+    }
+
+    private func cpuBenchmarkMilliseconds(since start: ContinuousClock.Instant) -> Double {
+        let elapsed = start.duration(to: .now).components
+        return Double(elapsed.seconds) * 1_000 + Double(elapsed.attoseconds) / 1e15
+    }
+
+    private func emitCPUBenchmark(_ message: String) {
+        // Write directly to the descriptor so a watchdog termination cannot
+        // strand the last phase in a buffered print/stdio stream.
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+    }
+    #endif
+
+    func testCPUBenchmarkPeriodicFillMatchesOriginalFormulaAndPreservesPadding() throws {
+        for depth in [8, 10] {
+            let bytesPerComponent = depth == 8 ? 1 : 2
+            // Cross both sample periods and row-phase wraps. Odd strides also
+            // prove that P010 bulk copies never require an aligned row address.
+            for (width, rows) in [(1, 1), (7, 3), (257, 5), (1_025, 3), (7, 1_025)] {
+                for padding in [0, 1, 13] {
+                    let stride = width * bytesPerComponent + padding
+                    for seed in 0..<3 {
+                        let guardBytes = 16
+                        var actual = [UInt8](repeating: 0xA5,
+                            count: guardBytes + stride * rows + guardBytes)
+                        var expected = actual
+                        try actual.withUnsafeMutableBytes { storage in
+                            let base = try XCTUnwrap(storage.baseAddress).advanced(by: guardBytes)
+                            fillCPUBenchmarkPlane(base, width: width, rows: rows,
+                                stride: stride, depth: depth, seed: seed)
+                        }
+                        try expected.withUnsafeMutableBytes { storage in
+                            let base = try XCTUnwrap(storage.baseAddress).advanced(by: guardBytes)
+                            for y in 0..<rows {
+                                let row = base.advanced(by: y * stride)
+                                for x in 0..<width {
+                                    if depth == 8 {
+                                        row.storeBytes(of: UInt8(truncatingIfNeeded: x * 13 + y * 17 + seed * 31),
+                                            toByteOffset: x, as: UInt8.self)
+                                    } else {
+                                        let code = UInt16((x * 13 + y * 17 + seed * 31) & 1_023) << 6
+                                        withUnsafeBytes(of: code) { sample in
+                                            row.advanced(by: x * 2).copyMemory(
+                                                from: sample.baseAddress!, byteCount: 2)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        XCTAssertEqual(actual, expected,
+                            "depth=\(depth) width=\(width) rows=\(rows) padding=\(padding) seed=\(seed)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func fillCPUBenchmarkPlane(
+        _ base: UnsafeMutableRawPointer, width: Int, rows: Int,
+        stride: Int, depth: Int, seed: Int
+    ) {
+        precondition(depth == 8 || depth == 10)
+        let bytesPerComponent = depth == 8 ? 1 : 2
+        precondition(width > 0 && rows > 0 && stride >= width * bytesPerComponent)
+        precondition((0..<3).contains(seed))
+        let period = depth == 8 ? 256 : 1_024
+        let inverse = depth == 8 ? 197 : 709
+        // 13 * inverse == 1 (mod period). Rotating the x-only template by
+        // (17*y + 31*seed)*inverse gives exactly the original scalar formula.
+        // The doubled template makes every rotated period contiguous.
+        func copyTemplate(_ template: UnsafeRawBufferPointer) {
+            guard let source = template.baseAddress else { preconditionFailure("Empty CPU fixture template") }
+            for y in 0..<rows {
+                let offset = ((y * 17 + seed * 31) * inverse) & (period - 1)
+                let origin = source.advanced(by: offset * bytesPerComponent)
+                let row = base.advanced(by: y * stride)
+                var x = 0
+                while x < width {
+                    let count = min(period, width - x)
+                    row.advanced(by: x * bytesPerComponent).copyMemory(
+                        from: origin, byteCount: count * bytesPerComponent)
+                    x += count
+                }
+            }
+        }
+        if depth == 8 {
+            let template = (0..<(period * 2)).map { UInt8(truncatingIfNeeded: $0 * 13) }
+            template.withUnsafeBytes(copyTemplate)
+        } else {
+            let template = (0..<(period * 2)).map { UInt16(($0 * 13) & 1_023) << 6 }
+            template.withUnsafeBytes(copyTemplate)
+        }
+    }
+
+    func testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly() throws {
+        for (format, name, bytesPerFrame) in [
+            (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, "nv12", Self.nv12BytesPerFrame),
+            (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, "p010", Self.p010BytesPerFrame),
+        ] {
+            for (order, stem) in [(FieldParity.top, "tff"), (FieldParity.bottom, "bff")] {
+                let inputBytes = try fixture("yadif-\(name)-\(stem)-input.bin")
+                let expected = try fixture("yadif-\(name)-\(stem).bin")
+                let inputs = try (0..<5).map { index in
+                    try makePixelBuffer(pixelFormat: format,
+                        bytes: inputBytes.subdata(in: index * bytesPerFrame..<(index + 1) * bytesPerFrame))
+                }
+                let pool = ProgressiveSurfacePool()
+                var actual = Data()
+                for center in 1...3 {
+                    let outputs = try pool.allocatePair(matching: inputs[center])
+                    try CPUVideoProcessing.yadif(job: YADIFJob(
+                        previous: normalized(inputs[center - 1], id: UInt64(center)),
+                        current: normalized(inputs[center], id: UInt64(center + 1)),
+                        next: normalized(inputs[center + 1], id: UInt64(center + 2)),
+                        order: resolved(order), spatialOnly: false), outputs: outputs)
+                    actual.append(try packedBytes(outputs.first))
+                    actual.append(try packedBytes(outputs.second))
+                }
+                XCTAssertEqual(actual, expected, "\(name) \(stem) CPU adapter")
+            }
+        }
+    }
+    #endif
+
     func testMapperSelectsExactNV12AndP010PlaneFormatsForVideoAndFullRange() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("Metal device unavailable")
@@ -787,7 +970,7 @@ final class YADIFGoldenPixelTests: XCTestCase {
                     sourcePTS90k: nil
                 ),
                 formatMetadata: VideoFormatMetadata(
-                    dimensions: .init(width: 64, height: 36),
+                    dimensions: .init(width: Int32(CVPixelBufferGetWidth(pixelBuffer)), height: Int32(CVPixelBufferGetHeight(pixelBuffer))),
                     bitDepth: tenBit ? 10 : 8,
                     range: .video,
                     matrix: .bt709,

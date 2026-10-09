@@ -8,6 +8,14 @@ import Foundation
 import ObjectiveC
 import VPlayerCore
 
+#if DEBUG
+/// The test backend may hold the original registered runner after its exact
+/// retirement claim. No hook or test owner is retained by the registry.
+protocol OutputRetirementClaimObservingForTesting: AnyObject, Sendable {
+    func didClaimOutputRetirementForTesting(_ invocation: OutputBackendCleanupInvocation) async
+}
+#endif
+
 /// executor外部同步入口的固定34槽映射；值类型本身不分配数组或第二张运行时表。
 struct PlaybackExternalSyncProducerReservation: Sendable, Equatable {
     struct Slot: Sendable, Equatable, Hashable {
@@ -4335,7 +4343,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                                 result = .canceled
                                 break
                             }
-                            let retired = await performOutputRetirement(cleanup)
+                            let retired = await performOwnedSuspendRetirement(cleanup,
+                                suspendTicket: ticket, suspendRunner: runner)
                             result = retired == .confirmedLocalOutputStopped &&
                                 completeOutputRetirement(retirement, lifecycle: invocation.lifecycle)
                                 ? .succeeded : .canceled
@@ -4440,7 +4449,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
                         ticket: suspendTicket, runner: suspendRunner)
                     return
                 }
-                let retirementResult = await performOutputRetirement(cleanup)
+                let retirementResult = await performOwnedSuspendRetirement(cleanup,
+                    suspendTicket: suspendTicket, suspendRunner: suspendRunner)
                 guard retirementResult == .confirmedLocalOutputStopped,
                       completeOutputRetirement(retirement, lifecycle: pending.retiredLifecycle) else {
                     finishFailedBackendPublicationReplacement(
@@ -8510,11 +8520,81 @@ final class ControlTaskRegistry: @unchecked Sendable {
     /// to the already claimed retirement stack using the original signed ticket.
     /// Neither cancellation nor a successful late stop commits quiescence here.
     func performOutputRetirement(_ invocation: OutputBackendCleanupInvocation) async -> BackendTeardownResult {
+        switch await performOutputRetirementResult(invocation) {
+        case .notInvoked: .unconfirmed
+        case .returned(let result): result
+        }
+    }
+
+    private enum OutputRetirementExecutionResult: Sendable {
+        case notInvoked
+        case returned(BackendTeardownResult)
+    }
+
+    private func performOwnedSuspendRetirement(_ invocation: OutputBackendCleanupInvocation,
+        suspendTicket: ControlTaskTicket, suspendRunner: OwnedPlaybackBackendOperation) async
+        -> BackendTeardownResult {
+        #if DEBUG
+        await (invocation.backend as? any OutputRetirementClaimObservingForTesting)?
+            .didClaimOutputRetirementForTesting(invocation)
+        #endif
+        switch await performOutputRetirementResult(invocation) {
+        case .returned(let result):
+            // The physical backend leaf already ran. An unconfirmed result is
+            // never permission to retry it or manufacture a retirement receipt.
+            return result
+        case .notInvoked:
+            returnUninvokedRetirementToTerminalOwner(invocation,
+                suspendTicket: suspendTicket, suspendRunner: suspendRunner)
+            return .unconfirmed
+        }
+    }
+
+    private func returnUninvokedRetirementToTerminalOwner(_ invocation: OutputBackendCleanupInvocation,
+        suspendTicket: ControlTaskTicket, suspendRunner: OwnedPlaybackBackendOperation) {
+        _ = try? transaction { _ in
+            guard let context = authority.outputContext, let owner = context.owner,
+                  owner != invocation.owner, owner.reason.releasesLease,
+                  owner.reason.rawValue > invocation.owner.reason.rawValue,
+                  context.disposition == .releaseAfterTeardown, context.teardownRequested,
+                  let reservation = authority.cleanupReservation,
+                  reservation.ticket == context.reservation, reservation.terminal,
+                  reservation.terminalOwner == owner.identity,
+                  invocation.owner.identity.resourceIdentity == owner.identity.resourceIdentity,
+                  context.contextNonce == invocation.contextNonce,
+                  context.retirement == invocation.task,
+                  invocation.task == reservation.task(for: .retirement),
+                  context.suspend?.task == suspendTicket,
+                  context.suspend?.lifecycle == invocation.lifecycle,
+                  context.suspendConfirmed || context.suspendRequiresRetirement,
+                  !context.retirementConfirmed,
+                  let original = authority.commands.first(where: {
+                      $0?.controlTaskTicket == suspendTicket
+                  }) ?? nil,
+                  original.groupTicket == reservation.ticket.ownerGroup,
+                  original.slot == .suspend, original.backendOperation === suspendRunner,
+                  suspendRunner.result == nil,
+                  let index = authority.commands.firstIndex(where: {
+                      $0?.controlTaskTicket == invocation.task
+                  }), let record = authority.commands[index],
+                  record.slot == .retirement, record.phase == .running, record.payload == nil,
+                  let resource = authority.ownedBackendResources,
+                  resource.object === invocation.backend, resource.identity == invocation.backend.identity,
+                  let lifecycle = resource.lifecycle, lifecycle == invocation.lifecycle else { return }
+            // Only this original runner reaches this CAS, before either physical
+            // stopping leaf ran. Its successor must join the runner's tail before
+            // claiming this same ticket. No nonce, budget, receipt or lease changes.
+            authority.commands[index]?.phase = .queued
+        }
+    }
+
+    private func performOutputRetirementResult(_ invocation: OutputBackendCleanupInvocation) async
+        -> OutputRetirementExecutionResult {
         // A bare retirement claim is not proof that a forward Task has exited.
         // Exclude suspend/cleanup runners: this method may execute on that very
         // runner after its actual stop returned requiresRetirement.
         guard await joinOutputBackendOperations(owner: invocation.owner, retiring: invocation) else {
-            return .unconfirmed
+            return .notInvoked
         }
         let work: (lifecycle: OutputLifecycleEpoch, lateStop: BackendSuspendInvocation?)? = try? transaction { _ in
             guard matchesOutputRetirementLocked(invocation),
@@ -8533,13 +8613,13 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
             return (lifecycle, lateStop)
         }
-        guard let work else { return .unconfirmed }
+        guard let work else { return .notInvoked }
         if let lateStop = work.lateStop {
             _ = await invocation.backend.suspendOutput(invocation: lateStop)
         }
         // Pre-install preparation has no coordinator to suspend. Its authentic
         // producer-only retirement proof must still reach the normal backend leaf.
-        return await invocation.backend.retireOutput(epoch: work.lifecycle)
+        return .returned(await invocation.backend.retireOutput(epoch: work.lifecycle))
     }
 
     private func matchesOutputRetirementLocked(_ invocation: OutputBackendCleanupInvocation) -> Bool {
