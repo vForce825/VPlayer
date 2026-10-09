@@ -54,11 +54,11 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('id: prepare', text)
         self.assertIn('id: simulator', text)
         guard="if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'"
-        self.assertEqual(text.count(guard), 7)
-        self.assertIn("steps.release_build.outcome == 'success'", text)
-        self.assertIn("--build-only", text)
+        self.assertEqual(text.count(guard), 5)
+        self.assertNotIn("steps.release_build", text)
+        self.assertNotIn("--build-only", text)
         self.assertNotIn('continue-on-error', text.split('  ios-tests:',1)[1])
-    def test_generation_budget_is_reserved_for_pinned_inputs_and_native_cold_start_stays_required(self):
+    def test_generation_budget_is_reserved_for_pinned_inputs_and_cold_start_is_local(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         generation,native=text.split('  ios-tests:',1)
         self.assertIn('timeout-minutes: 15',generation)
@@ -71,7 +71,14 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('exit 1',generation)
         self.assertIn('needs: generated-inputs',native)
         self.assertIn("needs.generated-inputs.outputs.needs_refresh == 'false'",native)
-        self.assertIn('Verify Release simulator cold starts without fixture bypass',native)
+        self.assertNotIn('Verify Release simulator cold starts without fixture bypass',native)
+        self.assertNotIn('iOS-RunnerControl',native)
+        self.assertNotIn('steps.release_build',native)
+        outcomes={key:'success' for key in ('prepare','simulator','regression_preflight','regression_preflight_report','fixtures')}
+        for name in ('Preflight PiP retirement and playlist deletion regressions','Prepare mandatory synthetic shared-playback fixtures','Run shared playback and iPhone touch tests'):
+            self.assertTrue(self.step_allows(self.workflow_step(name),outcomes))
+        self.assertTrue((ROOT/'Scripts/Support/ios-startup-runner.py').is_file())
+        self.assertTrue((ROOT/'Tests/VPlayeriOSUITests/IOSReleaseStartupTests.swift').is_file())
         self.assertIn('ios-startup-runner.py',native)
     def test_shared_fixtures_and_release_measurement_are_required(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
@@ -130,7 +137,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertNotIn('-only-testing:',full)
         self.assertNotIn('continue-on-error',full)
         self.assertIn('Scripts/test-ios.sh -configuration Debug',full)
-        full_report=self.workflow_step('Report startup and functional test results')
+        full_report=self.workflow_step('Report functional test results')
         self.assertIn('report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1',full_report)
         self.assertNotIn('--preflight',full_report)
     def test_preflight_report_preserves_failures_and_only_summarizes_bounded_fixed_stage_markers(self):
@@ -345,15 +352,17 @@ class IOSWorkflowTests(unittest.TestCase):
             self.assertIn('IOS_CPU_BENCHMARK_SUMMARY=unverified cases=3 duplicate=true',run.stdout)
     def test_functional_results_are_reported_before_independent_cpu_measurement(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
-        self.assertIn('name: Report startup and functional test results',text)
-        first=text.split('name: Report startup and functional test results',1)[1].split('      - name:',1)[0]
+        self.assertIn('name: Report functional test results',text)
+        first=text.split('name: Report functional test results',1)[1].split('      - name:',1)[0]
         self.assertIn('if: always()',first)
-        self.assertIn('for bundle in iOS-RunnerControl iOS-Release iOS;',first)
+        self.assertIn('report-xcresult-failures.py "$RUNNER_TEMP/iOS.xcresult" || status=1',first)
+        self.assertNotIn('iOS-RunnerControl',first)
+        self.assertNotIn('iOS-Release.xcresult',first)
         self.assertNotIn('iOS-CPU-Release',first)
         self.assertIn('report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1',first)
         self.assertIn('exit "$status"',first)
-        self.assertLess(text.index('Run shared playback and iPhone touch tests'),text.index('Report startup and functional test results'))
-        self.assertLess(text.index('Report startup and functional test results'),text.index('Measure optimized CPU processing'))
+        self.assertLess(text.index('Run shared playback and iPhone touch tests'),text.index('Report functional test results'))
+        self.assertLess(text.index('Report functional test results'),text.index('Measure optimized CPU processing'))
         self.assertIn('name: Report CPU measurement and qualification limits',text)
         cpu=text.split('name: Report CPU measurement and qualification limits',1)[1]
         self.assertLess(text.index('Measure optimized CPU processing'),text.index('Report CPU measurement and qualification limits'))

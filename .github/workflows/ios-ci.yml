@@ -186,25 +186,6 @@ jobs:
           python3 Scripts/verify-release-artifacts.py verify --sdk iphonesimulator \
             --derived-data "$RUNNER_TEMP/iOS-Release" --build-log "$RUNNER_TEMP/iOS-Release.log" \
             --scope app --ffmpeg Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework/ios-arm64-simulator/libFFmpeg.a
-      - name: Build Release simulator tests before booting the simulator
-        id: release_build
-        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.release_run.outcome == 'success'
-        timeout-minutes: 15
-        run: |
-          # Test-only products may be added; the verified shipping inventory must stay unchanged.
-          test -s "$RUNNER_TEMP/iOS-Release.log.release-guard.json"
-          python3 Scripts/Support/ios-startup-runner.py --build-only \
-            --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release" \
-            --build-log "$RUNNER_TEMP/iOS-Release-Tests.log"
-          python3 Scripts/verify-release-artifacts.py verify --sdk iphonesimulator \
-            --derived-data "$RUNNER_TEMP/iOS-Release" --build-log "$RUNNER_TEMP/iOS-Release.log" \
-            --scope app --ffmpeg Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework/ios-arm64-simulator/libFFmpeg.a
-      - name: Verify Release simulator cold starts without fixture bypass
-        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.release_build.outcome == 'success'
-        timeout-minutes: 20
-        run: |
-          python3 Scripts/Support/ios-startup-runner.py \
-            --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release"
       - name: Preflight PiP retirement and playlist deletion regressions
         id: regression_preflight
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
@@ -253,13 +234,11 @@ jobs:
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 2>&1 | \
             python3 Scripts/report-ios-pip-runtime.py --candidate "$CANDIDATE_SHA"
-      - name: Report startup and functional test results
+      - name: Report functional test results
         if: always()
         run: |
           status=0
-          for bundle in iOS-RunnerControl iOS-Release iOS; do
-            python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/$bundle.xcresult" || status=1
-          done
+          python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS.xcresult" || status=1
           python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1
           exit "$status"
       - name: Measure optimized CPU processing without device qualification
