@@ -54,7 +54,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('id: prepare', text)
         self.assertIn('id: simulator', text)
         guard="if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'"
-        self.assertEqual(text.count(guard), 6)
+        self.assertEqual(text.count(guard), 7)
         self.assertIn("steps.release_build.outcome == 'success'", text)
         self.assertIn("--build-only", text)
         self.assertNotIn('continue-on-error', text.split('  ios-tests:',1)[1])
@@ -78,7 +78,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('prepare-hls-ci-fixtures.sh --verify-committed',text)
         self.assertIn("steps.fixtures.outcome == 'success'",text)
         self.assertIn('synthetic-hlg50-ac3-64s.ts',text)
-        self.assertIn('-configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO',text)
+        self.assertIn('-configuration Release ENABLE_TESTABILITY=YES',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmark',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',text)
         self.assertEqual(text.count('Scripts/report-ios-test-status.py'),3)
@@ -163,13 +163,22 @@ class IOSWorkflowTests(unittest.TestCase):
                 self.assertEqual(lines,['existing summary']+[marker]*30)
                 self.assertTrue(all(len(line)<=240 for line in lines[1:]))
                 self.assertNotIn(private,summary.read_text())
-    def run_cpu_measurement(self, native_exit=0, settings_mode='normal'):
+    def install_guard_fixture(self, directory):
+        # The artifact guard has its own native/portable controls. Here only
+        # replace unavailable Apple artifact inspection, retaining real capture.
+        (directory/'Scripts/verify-release-artifacts.py').write_text(
+            'import os,runpy,sys\n'
+            'if sys.argv[1] == "verify": sys.exit(int(os.environ.get("GUARD_EXIT", "0")))\n'
+            + 'runpy.run_path(' + repr(str(ROOT/'Scripts/report-ios-clang-evidence.py'))
+            + ',run_name="__main__")\n')
+
+    def run_cpu_measurement(self, native_exit=0, settings_mode='normal', guard_exit=0):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         step=text.split('name: Measure optimized CPU processing without device qualification',1)[1].split('      - name:',1)[0]
         script=textwrap.dedent(step.split('        run: |\n',1)[1])
         with tempfile.TemporaryDirectory() as directory:
             directory=Path(directory);(directory/'bin').mkdir();(directory/'Scripts').mkdir()
-            (directory/'Scripts/report-ios-clang-evidence.py').symlink_to(ROOT/'Scripts/report-ios-clang-evidence.py')
+            self.install_guard_fixture(directory)
             native=directory/'bin/xcodebuild'
             native.write_text(textwrap.dedent('''\
                 #!/usr/bin/env python3
@@ -200,7 +209,7 @@ class IOSWorkflowTests(unittest.TestCase):
             run=subprocess.run(['bash','-e','-o','pipefail','-c',script],cwd=directory,
                 env=dict(os.environ,PATH=str(directory/'bin')+os.pathsep+os.environ['PATH'],
                     RUNNER_TEMP=str(directory),IOS_TEST_DESTINATION='platform=iOS Simulator,id=unit-test',
-                    XCODE_ARGS_LOG=str(args_log),NATIVE_EXIT=str(native_exit),SETTINGS_MODE=settings_mode),
+                    XCODE_ARGS_LOG=str(args_log),NATIVE_EXIT=str(native_exit),SETTINGS_MODE=settings_mode,GUARD_EXIT=str(guard_exit)),
                 capture_output=True,text=True,timeout=3)
             calls=[json.loads(line) for line in args_log.read_text().splitlines()]
             log=directory/'iOS-CPU-Release.log'
@@ -216,17 +225,17 @@ class IOSWorkflowTests(unittest.TestCase):
                 self.assertEqual(query[query.index('-sdk')+1],'iphonesimulator')
                 self.assertNotIn('-destination',query)
                 self.assertIn('ARCHS=arm64',query)
-                self.assertIn('CLANG_ENABLE_CODE_COVERAGE=NO',query)
+                self.assertFalse(any('COVERAGE' in arg for arg in query))
                 self.assertNotIn('-enableCodeCoverage',query)
                 for args in calls:
                     self.assertEqual(args[args.index('-configuration')+1],'Release')
                     self.assertIn('ENABLE_TESTABILITY=YES',args)
                     self.assertIn('CODE_SIGNING_ALLOWED=NO',args)
                 self.assertEqual(native[:5],['test','-project','VPlayer.xcodeproj','-scheme','VPlayeriOSBenchmarks'])
-                self.assertEqual(native[native.index('-enableCodeCoverage')+1],'NO')
+                self.assertNotIn('-enableCodeCoverage',native)
                 self.assertEqual(native[native.index('-default-test-execution-time-allowance')+1],'120')
                 self.assertEqual(native[native.index('-maximum-test-execution-time-allowance')+1],'300')
-                self.assertEqual(sum(arg.startswith('-only-testing:') for arg in native),9)
+                self.assertEqual(sum(arg.startswith('-only-testing:') for arg in native),3)
                 lines=[line for line in run.stdout.splitlines() if line.startswith('IOS_CPU_BUILD_SETTINGS=')]
                 self.assertEqual(len(lines),1)
                 self.assertEqual(json.loads(lines[0].split('=',1)[1]),{'GCC_OPTIMIZATION_LEVEL':'s',
@@ -234,6 +243,12 @@ class IOSWorkflowTests(unittest.TestCase):
                 self.assertNotIn('must-not-publish',run.stdout+run.stderr)
                 self.assertIn('IOS_CPU_YADIF_BENCH width=1920',log)
                 self.assertIn('native stderr',log)
+    def test_successful_native_benchmark_does_not_mask_artifact_guard_failure(self):
+        run,calls,log=self.run_cpu_measurement(guard_exit=9)
+        self.assertEqual(run.returncode,9,run.stderr)
+        self.assertEqual(len(calls),2)
+        self.assertIn('native stderr',log)
+
     def test_cpu_settings_diagnostic_failure_cannot_block_native_measurement_or_dump_settings(self):
         for mode in ['missing','duplicate','query_failed']:
             with self.subTest(settings_mode=mode):
@@ -255,7 +270,7 @@ class IOSWorkflowTests(unittest.TestCase):
         script=script.split("python3 - <<'PYICON'",1)[0]
         with tempfile.TemporaryDirectory() as directory:
             directory=Path(directory);(directory/'bin').mkdir();(directory/'Scripts').mkdir()
-            (directory/'Scripts/report-ios-clang-evidence.py').symlink_to(ROOT/'Scripts/report-ios-clang-evidence.py')
+            self.install_guard_fixture(directory)
             native=directory/'bin/xcodebuild'
             native.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGS_LOG"\nprintf "native stdout\\n"\nprintf "native stderr\\n" >&2\nexit "$NATIVE_EXIT"\n')
             native.chmod(0o755)
@@ -291,39 +306,29 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('python3 Scripts/Tests/test_cpu_worker_service_contract.py',text)
         measure=self.workflow_step('Measure optimized CPU processing without device qualification')
         self.assertIn('set -o pipefail',measure)
-        self.assertIn('report-ios-clang-evidence.py capture --log "$RUNNER_TEMP/iOS-CPU-Release.log"',measure)
-        for name in [
-                'testCPUYADIFScalarVersusNEONBenchmarkReportsPairedPatternMeasurements',
-                'testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
-                'testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
-                'testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
-                'testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
-                'testCPUNEONGuardPagesPreserveBounds',
-                'testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane']:
-            self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/'+name,measure)
+        self.assertIn('verify-release-artifacts.py capture --log "$RUNNER_TEMP/iOS-CPU-Release.log"',measure)
+        self.assertNotIn('NEON',measure)
+        self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease',measure)
     def test_cpu_benchmark_summary_only_accepts_bounded_complete_numeric_rows(self):
         step=self.workflow_step('Report CPU measurement and qualification limits')
         self.assertIn("<<'PYBENCH'",step)
         body=textwrap.dedent(step.split("<<'PYBENCH'",1)[1].split("\n",1)[1].split('          PYBENCH',1)[0])
         def original(width,height,depth):
             return f'IOS_CPU_YADIF_BENCH width={width} height={height} depth={depth} workers=4 setup_ms=1.0 output_ms=2.0 warmup_ms=3.0 pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0] environment=simulator-not-iphone-hardware configuration=release'
-        def paired(depth,pattern):
-            return f'IOS_CPU_YADIF_AB_BENCH width=1920 height=1080 depth={depth} pattern={pattern} seed=9390103823151792129 scalar_pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] neon_pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] vector_blocks=123 order=alternating samples=7 workers=1 backend=direct-c flags=same-translation-unit compiler=swift-ge-6.2 os=27.0.0 environment=simulator-not-iphone-hardware configuration=release'
         original_rows=[original(w,h,d) for w,h in [(1920,1080),(3840,2160)] for d in [8,10]]
-        paired_rows=[paired(d,p) for d in [8,10] for p in ['random','direction-changing','tie-heavy','gradient']]
         private='must-not-publish'
         with tempfile.TemporaryDirectory() as directory:
             log=Path(directory)/'benchmark.log'
-            noise=[private, paired_rows[0]+' '+private, paired_rows[0].replace('vector_blocks=123','vector_blocks=0'),
-                paired_rows[0].replace('pattern=random','pattern='+private), 'x'*10000]
+            noise=[private, original_rows[0]+' '+private, original_rows[0].replace('workers=4','workers=0'),
+                original_rows[0].replace('width=1920','width=1280'), 'x'*10000]
             def capture(text):
                 log.write_text(text)
                 Path(str(log)+'.capture.json').write_text(json.dumps({'complete':True,'truncated':False,
                     'bytes':log.stat().st_size,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()}))
-            capture('\n'.join(noise+original_rows+paired_rows)+'\n')
+            capture('\n'.join(noise+original_rows)+'\n')
             run=subprocess.run(['python3','-c',body,str(log)],capture_output=True,text=True,timeout=3)
             self.assertEqual(run.returncode,0,run.stderr)
-            self.assertEqual(run.stdout.splitlines(),original_rows+paired_rows+['IOS_CPU_BENCHMARK_SUMMARY=verified original=4 paired=8'])
+            self.assertEqual(run.stdout.splitlines(),original_rows+['IOS_CPU_BENCHMARK_SUMMARY=verified cases=4'])
             self.assertNotIn(private,run.stdout)
             self.assertLess(len(run.stdout),10000)
             state=Path(str(log)+'.capture.json')
@@ -333,11 +338,11 @@ class IOSWorkflowTests(unittest.TestCase):
             self.assertEqual(truncated.returncode,0,truncated.stderr)
             self.assertNotIn('SUMMARY=verified',truncated.stdout)
             self.assertIn('SUMMARY=unverified',truncated.stdout)
-            capture('\n'.join(original_rows+paired_rows[:-1]+[paired_rows[0]]*50)+'\n')
+            capture('\n'.join(original_rows[:-1]+[original_rows[0]]*50)+'\n')
             run=subprocess.run(['python3','-c',body,str(log)],capture_output=True,text=True,timeout=3)
             self.assertEqual(run.returncode,0,run.stderr)
-            self.assertEqual(len(run.stdout.splitlines()),12)
-            self.assertIn('IOS_CPU_BENCHMARK_SUMMARY=unverified original=4 paired=7 duplicate=true',run.stdout)
+            self.assertEqual(len(run.stdout.splitlines()),4)
+            self.assertIn('IOS_CPU_BENCHMARK_SUMMARY=unverified cases=3 duplicate=true',run.stdout)
     def test_functional_results_are_reported_before_independent_cpu_measurement(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('name: Report startup and functional test results',text)

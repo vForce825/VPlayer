@@ -158,7 +158,10 @@ def sample_owned_processes(process,directory,command,deadline=None):
             emit_diagnostic_file(diagnostic)
             emit_diagnostic_file(sample)
     if observe_owned_identity(process,directory,deadline) is False:return
-    sample_pid(process.pid)
+    launched=getattr(process,'args',None)
+    wrapped_build=(build and isinstance(launched,(list,tuple)) and len(launched)>1
+        and Path(launched[1])==Path(__file__).with_name('capture-release-build.py'))
+    if not wrapped_build:sample_pid(process.pid)
     if not build:return
     remaining=diagnostic_remaining(deadline,5)
     if not remaining:return
@@ -171,6 +174,11 @@ def sample_owned_processes(process,directory,command,deadline=None):
         return
     owned=owned_process_rows(result.stdout,process.pid,derived_data)
     print('IOS_STARTUP_OWNED_PROCESS_STATE='+json.dumps(owned[:24]),flush=True)
+    if wrapped_build:
+        native=[row for row in owned if row[1]==str(process.pid)
+                and row[2]==str(process.pid) and Path(row[6]).name=='xcodebuild']
+        if len(native)==1:sample_pid(native[0][0])
+        else:print('IOS_STARTUP_NATIVE_BUILD_SAMPLE_UNVERIFIED=missing_or_ambiguous',flush=True)
     # Service-spawned compiler processes outside this owned group are not
     # enumerated or claimed retired; no global ps dependency in native diagnosis.
     for row in owned:
@@ -278,8 +286,14 @@ def retire_owned_group(process,graces=((signal.SIGINT,10),(signal.SIGTERM,5),(si
     # no later PID/PGID query or signal can target a reused numerical identity.
     process.wait(timeout=5)
 
-def run_command(label,command,timeout,directory,diagnostics):
-    path=directory/(label+'.log')
+def run_command(label,command,timeout,directory,diagnostics,capture_log=None):
+    path=capture_log if capture_log is not None else directory/(label+'.log')
+    output_path=directory/(label+'.supervisor.log') if capture_log is not None else path
+    native_command=command
+    if capture_log is not None:
+        path.touch(exist_ok=False)
+        helper=Path(__file__).with_name('capture-release-build.py')
+        native_command=[sys.executable,str(helper),'--log',str(path),'--']+command
     print('IOS_STARTUP_PHASE_BEGIN='+label,flush=True)
     expired=False
     before_interrupt=b''
@@ -290,8 +304,8 @@ def run_command(label,command,timeout,directory,diagnostics):
         # child. simctl may override stdio itself, so empty output stays unknown.
         environment=dict(os.environ,STDBUF1='0',_STDBUF_O='0')
         print('IOS_STARTUP_CHILD_STDOUT_BUFFERING=apple_libc_unbuffered_requested',flush=True)
-    with path.open('wb') as output:
-        process=subprocess.Popen(command,stdout=output,stderr=subprocess.STDOUT,start_new_session=True,env=environment)
+    with output_path.open('wb') as output:
+        process=subprocess.Popen(native_command,stdout=output,stderr=subprocess.STDOUT,start_new_session=True,env=environment)
         try:code=process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             expired=True
@@ -329,8 +343,10 @@ def main():
     parser=argparse.ArgumentParser()
     parser.add_argument('--simulator')
     parser.add_argument('--derived-data',type=Path)
+    parser.add_argument('--build-log',type=Path)
     modes=parser.add_mutually_exclusive_group()
     modes.add_argument('--build-only',action='store_true')
+    modes.add_argument('--build-shipping',action='store_true')
     modes.add_argument('--boot-only',action='store_true')
     args=parser.parse_args()
     if not args.boot_only and (not args.simulator or not args.derived_data):
@@ -366,10 +382,12 @@ def main():
         small(['xcrun','simctl','spawn',args.simulator,'log','show','--last','2m','--style','compact',
                '--predicate','process == "VPlayer" OR process == "VPlayeriOSUITests-Runner" OR process == "testmanagerd"'],deadline)
     overall_deadline=time.monotonic()+(4*60 if args.boot_only else 17*60)
-    def run(label,command,timeout):
+    def run(label,command,timeout,capture_log=None):
         remaining=overall_deadline-time.monotonic()-60
         if remaining<=0:
             diagnostics(time.monotonic()+25);return 124,b''
+        if capture_log is not None:
+            return run_command(label,command,min(timeout,remaining),directory,diagnostics,capture_log=capture_log)
         return run_command(label,command,min(timeout,remaining),directory,diagnostics)
     inventory=json.loads(subprocess.check_output(['xcrun','simctl','list','devices','available','-j'],timeout=15))
     runtime_id='com.apple.CoreSimulator.SimRuntime.iOS-27-0'
@@ -393,12 +411,15 @@ def main():
         code,_=run('first-launch-status',['xcodebuild','-checkFirstLaunchStatus'],10)
         print('IOS_BOOT_PROBE_FIRST_LAUNCH_STATUS='+json.dumps({'exit':code}),flush=True)
         if code==124:return boot_result('unverified_preflight_timeout','first-launch-status',code)
-    build_common=['-project','VPlayer.xcodeproj','-scheme','VPlayeriOSReleaseStartup',
+    build_scheme='VPlayeriOSRelease' if args.build_shipping else 'VPlayeriOSReleaseStartup'
+    build_common=['-project','VPlayer.xcodeproj','-scheme',build_scheme,
                   '-configuration','Release','-derivedDataPath',str(args.derived_data),
                   'CODE_SIGNING_ALLOWED=NO']
-    if args.build_only:
-        code,_=run('build',['xcodebuild','build-for-testing']+build_common+[
-            '-destination','generic/platform=iOS Simulator'],480)
+    if args.build_only or args.build_shipping:
+        action='build' if args.build_shipping else 'build-for-testing'
+        code,_=run('build',['xcodebuild',action]+build_common+[
+            '-destination','generic/platform=iOS Simulator'],480,
+            capture_log=args.build_log or directory/'build.log')
         return code
     code,data=run('resolve-simctl',['/usr/bin/xcrun','--find','simctl'],5)
     try:candidate=data.decode('utf-8').strip()

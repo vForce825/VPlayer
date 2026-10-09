@@ -17,7 +17,7 @@ SCRIPT = ROOT / 'Scripts/test-release-startup.sh'
 
 
 class ReleaseStartupDiagnosticsTests(unittest.TestCase):
-    def run_build(self, command, *, cancel=False, broken_tee=False, existing_product=False):
+    def run_build(self, command, *, cancel=False, broken_tee=False, existing_product=False, reused_log=False, guard_status=0):
         # Exercise the actual build invocation, stopping before SDK-dependent
         # artifact inspection. Only the unavailable Apple commands are replaced.
         source = SCRIPT.read_text().split('\napp="$derived_data/')[0]
@@ -28,6 +28,24 @@ class ReleaseStartupDiagnosticsTests(unittest.TestCase):
             fixture = Path(temporary)
             runner = fixture / 'runner.sh'
             runner.write_text(initialization + r'''
+python3() {
+    if [[ "$1" == */Support/capture-release-build.py ]]; then
+        shift
+        command python3 "$BUILD_CAPTURE_TOOL" "$@" || return "$?"
+        return "$CAPTURE_STATUS"
+    elif [[ "$1" == */verify-release-artifacts.py ]]; then
+        shift
+        if [[ "$1" == capture ]]; then
+            shift
+            command python3 "$CAPTURE_TOOL" capture "$@"
+        else
+            printf 'GUARD_ARG=%s\n' "$@"
+            return "$GUARD_STATUS"
+        fi
+    else
+        command python3 "$@"
+    fi
+}
 xcrun() {
     printf '%s\n' '{"devices":{"com.apple.CoreSimulator.SimRuntime.tvOS-27-0":[{"udid":"build-test-udid","name":"Apple TV 4K (3rd generation)","isAvailable":true,"state":"Booted","dataPath":"/unused-simulator"}]}}'
 }
@@ -42,17 +60,30 @@ xcodebuild() {
     fi
     printf 'selected build stdout\n'
     printf 'selected build stderr\n' >&2
-''' + command + '\n}\n' +
-                ('tee() { command tee "$@"; return 19; }\n' if broken_tee else '') +
+''' + command + '\n}\nexport -f xcodebuild\n' +
                 boundary + build + "\nprintf 'BUILD_STAGE_COMPLETE\\n'\n")
+            (fixture / 'bin').mkdir()
+            native = fixture / 'bin/xcodebuild'
+            native.write_text('#!/usr/bin/env bash\nxcodebuild "$@"\n')
+            native.chmod(0o755)
             env = {**os.environ, 'TMPDIR': temporary,
-                   'TVOS_SIMULATOR_UDID': 'build-test-udid'}
+                   'PATH': str(fixture / 'bin') + os.pathsep + os.environ['PATH'],
+                   'BUILD_CAPTURE_TOOL': str(ROOT / 'Scripts/Support/capture-release-build.py'),
+                   'CAPTURE_STATUS': '19' if broken_tee else '0',
+                   'TVOS_SIMULATOR_UDID': 'build-test-udid',
+                   'CAPTURE_TOOL': str(ROOT / 'Scripts/report-ios-clang-evidence.py'),
+                   'GUARD_STATUS': str(guard_status)}
             if existing_product:
                 derived = fixture / 'ReleaseStartup'
                 app = derived / 'Build/Products/Release-appletvsimulator/VPlayer.app'
                 app.mkdir(parents=True)
                 (app / 'Info.plist').write_text('existing product is not build approval')
                 env['VPLAYER_STARTUP_DERIVED_DATA'] = str(derived)
+            if reused_log:
+                original = fixture / 'original.log'
+                original.write_text('complete fresh compile')
+                Path(str(original)+'.release-guard.json').write_text('previous verified inventory')
+                env['VPLAYER_STARTUP_BUILD_LOG'] = str(original)
             output = fixture / 'ci.log'
             with output.open('w') as stdout:
                 process = subprocess.Popen(['bash', str(runner)], env=env,
@@ -83,8 +114,15 @@ xcodebuild() {
                         os.killpg(process.pid, signal.SIGKILL)
                         process.communicate(timeout=5)
             build_logs = list(fixture.glob('vplayer-release-startup.*/build.log'))
-            self.assertEqual(len(build_logs), 1)
-            return process.returncode, output.read_text(), stderr, build_logs[0].read_text()
+            self.assertEqual(len(build_logs), 0 if existing_product else 1)
+            return process.returncode, output.read_text(), stderr, build_logs[0].read_text() if build_logs else ''
+
+    def test_build_enters_bounded_capture_before_starting_native_command(self):
+        source=SCRIPT.read_text()
+        self.assertIn('capture-release-build.py" --tee --log "$build_log" --',source)
+        self.assertNotIn('tee "$evidence/build.log"',source)
+        self.assertNotIn('< "$evidence/build.log"',source)
+        self.assertLess(source.index('capture-release-build.py'),source.index('xcodebuild build '))
 
     def test_build_forwards_both_streams_and_keeps_complete_local_log(self):
         status, output, stderr, saved = self.run_build('return 0')
@@ -94,23 +132,31 @@ xcodebuild() {
             self.assertIn(text, output)
             self.assertIn(text, saved)
 
-    def test_existing_product_still_requires_exact_cold_build_and_its_success(self):
+    def test_existing_product_without_full_compile_evidence_is_rejected_before_build(self):
         status, output, stderr, _ = self.run_build(
             r'''printf 'BUILD_ARG=%s\n' "$@"; return 65''', existing_product=True)
         self.assertEqual(status, 1)
-        self.assertIn('模拟器构建失败', stderr)
+        self.assertIn('必须使用全新构建目录或已验证的完整构建日志', stderr)
+        self.assertNotIn('BUILD_ARG=', output)
         self.assertNotIn('BUILD_STAGE_COMPLETE', output)
-        args = [line.removeprefix('BUILD_ARG=') for line in output.splitlines()
-                if line.startswith('BUILD_ARG=')]
-        self.assertEqual(args[:2], ['build', '-project'])
-        self.assertTrue(args[2].endswith('/VPlayer.xcodeproj'))
-        self.assertEqual(args[3:12], [
-            '-scheme', 'VPlayerReleaseStartupTests', '-configuration', 'Release', '-sdk', 'appletvsimulator',
-            '-destination', 'platform=tvOS Simulator,id=build-test-udid', '-derivedDataPath'])
-        self.assertTrue(args[12].endswith('/ReleaseStartup'))
-        self.assertEqual(args[13:], [
-            'ONLY_ACTIVE_ARCH=YES',
-            'CLANG_ENABLE_CODE_COVERAGE=NO', 'CODE_SIGNING_ALLOWED=NO'])
+
+    def test_guard_failure_blocks_startup_before_app_inspection(self):
+        status, output, stderr, _ = self.run_build('return 0', guard_status=9)
+        self.assertEqual(status,1)
+        self.assertIn('Release 产物验证失败',stderr)
+        self.assertNotIn('BUILD_STAGE_COMPLETE',output)
+        self.assertIn('GUARD_ARG=verify',output)
+        self.assertIn('GUARD_ARG=appletvsimulator',output)
+
+    def test_existing_verified_compile_is_rechecked_without_rebuilding(self):
+        status, output, stderr, _ = self.run_build(
+            r'''printf 'BUILD_ARG=%s\n' "$@"; return 65''', existing_product=True, reused_log=True)
+        self.assertEqual(status,0,stderr)
+        self.assertNotIn('BUILD_ARG=',output)
+        self.assertIn('GUARD_ARG=verify',output)
+        self.assertIn('GUARD_ARG=--build-log',output)
+        self.assertIn('original.log',output)
+        self.assertIn('BUILD_STAGE_COMPLETE',output)
 
     def test_fresh_build_uses_selected_architecture_without_swift_coverage(self):
         status, output, stderr, _ = self.run_build(
@@ -122,10 +168,10 @@ xcodebuild() {
         self.assertEqual(args[args.index('-destination') + 1],
                          'platform=tvOS Simulator,id=build-test-udid')
         self.assertIn('ONLY_ACTIVE_ARCH=YES', args)
-        # CLANG_ENABLE_CODE_COVERAGE alone leaves Swift coverage enabled by the
-        # VPlayer scheme. Build must use a coverage-disabled production scheme;
-        # xcodebuild accepts -enableCodeCoverage only for testing actions.
+        # The committed Release defaults and scheme must disable coverage.
+        # Command-line overrides would hide a regression in those defaults.
         self.assertNotIn('-enableCodeCoverage', args)
+        self.assertFalse(any('COVERAGE=' in arg for arg in args))
         scheme_name = args[args.index('-scheme') + 1]
         self.assertEqual(scheme_name, 'VPlayerReleaseStartupTests')
         schemes = ROOT / 'VPlayer.xcodeproj/xcshareddata/xcschemes'

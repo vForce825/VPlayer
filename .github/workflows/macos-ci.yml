@@ -131,6 +131,8 @@ jobs:
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         timeout-minutes: 20
         run: |
+          set -o pipefail
+          test ! -e "$RUNNER_TEMP/ReleaseBoundary"
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
             -configuration Release ENABLE_TESTABILITY=YES \
             -derivedDataPath "$RUNNER_TEMP/ReleaseBoundary" \
@@ -138,17 +140,55 @@ jobs:
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
-            -maximum-test-execution-time-allowance 300
+            -maximum-test-execution-time-allowance 300 \
+            2>&1 | tee /dev/stderr | \
+            python3 Scripts/verify-release-artifacts.py capture --log "$RUNNER_TEMP/ReleaseBoundary.log"
+          python3 Scripts/verify-release-artifacts.py verify --sdk appletvsimulator \
+            --derived-data "$RUNNER_TEMP/ReleaseBoundary" --build-log "$RUNNER_TEMP/ReleaseBoundary.log" \
+            --scope frameworks --ffmpeg Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64_x86_64-simulator/libFFmpeg.a
       - name: Report optimized boundary failures
         if: ${{ always() }}
         timeout-minutes: 3
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseBoundary.xcresult"
-      - name: Run production-configuration Release startup UI tests
+      - name: Build and verify clean tvOS Release simulator Run
+        id: release_run
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         timeout-minutes: 15
         run: |
-          xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
-            -configuration Release ONLY_ACTIVE_ARCH=YES -enableCodeCoverage NO \
+          set -o pipefail
+          test ! -e "$RUNNER_TEMP/ReleaseStartup"
+          xcodebuild build -project VPlayer.xcodeproj -scheme VPlayerRelease \
+            -configuration Release ONLY_ACTIVE_ARCH=YES \
+            -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee /dev/stderr | \
+            python3 Scripts/verify-release-artifacts.py capture --log "$RUNNER_TEMP/ReleaseStartup.log"
+          python3 Scripts/verify-release-artifacts.py verify --sdk appletvsimulator \
+            --derived-data "$RUNNER_TEMP/ReleaseStartup" --build-log "$RUNNER_TEMP/ReleaseStartup.log" \
+            --scope app --ffmpeg Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64_x86_64-simulator/libFFmpeg.a
+      - name: Build and verify clean tvOS Release simulator artifacts
+        id: release_build
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.release_run.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          # Adding UI test products must not change any verified shipping object or binary.
+          test -s "$RUNNER_TEMP/ReleaseStartup.log.release-guard.json"
+          xcodebuild build-for-testing -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
+            -configuration Release ONLY_ACTIVE_ARCH=YES \
+            -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
+            -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee /dev/stderr | \
+            python3 Scripts/verify-release-artifacts.py capture --log "$RUNNER_TEMP/ReleaseStartup-Tests.log"
+          python3 Scripts/verify-release-artifacts.py verify --sdk appletvsimulator \
+            --derived-data "$RUNNER_TEMP/ReleaseStartup" --build-log "$RUNNER_TEMP/ReleaseStartup.log" \
+            --scope app --ffmpeg Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64_x86_64-simulator/libFFmpeg.a
+      - name: Run production-configuration Release startup UI tests
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.release_build.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          xcodebuild test-without-building -project VPlayer.xcodeproj -scheme VPlayerReleaseStartupTests \
+            -configuration Release ONLY_ACTIVE_ARCH=YES \
             -derivedDataPath "$RUNNER_TEMP/ReleaseStartup" \
             -resultBundlePath "$RUNNER_TEMP/ReleaseStartup.xcresult" \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
@@ -160,7 +200,7 @@ jobs:
         timeout-minutes: 3
         run: python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/ReleaseStartup.xcresult"
       - name: Check six Release cold starts including allocator accounting
-        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' && steps.release_build.outcome == 'success' }}
         timeout-minutes: 15
         run: |
           # Refuse ambiguous selection rather than choosing an arbitrary device.
@@ -175,10 +215,42 @@ jobs:
             xcrun simctl boot "$TVOS_SIMULATOR_UDID"
           fi
           xcrun simctl bootstatus "$TVOS_SIMULATOR_UDID" -b
-          # Reuse only this job's build data. The script still runs its exact
-          # build command so Xcode validates current inputs and build settings.
+          # Reuse this job's verified fresh compile and test-without-building product.
           VPLAYER_STARTUP_DERIVED_DATA="$RUNNER_TEMP/ReleaseStartup" \
+            VPLAYER_STARTUP_BUILD_LOG="$RUNNER_TEMP/ReleaseStartup.log" \
             ./Scripts/test-release-startup.sh
+      - name: Verify clean tvOS Release device Run
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          test ! -e "$RUNNER_TEMP/tvOS-Device"
+          xcodebuild build -project VPlayer.xcodeproj -scheme VPlayerRelease \
+            -configuration Release -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$RUNNER_TEMP/tvOS-Device" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /dev/stderr | \
+            python3 Scripts/verify-release-artifacts.py capture --log "$RUNNER_TEMP/tvOS-Device.log"
+          python3 Scripts/verify-release-artifacts.py verify --sdk appletvos \
+            --derived-data "$RUNNER_TEMP/tvOS-Device" --build-log "$RUNNER_TEMP/tvOS-Device.log" \
+            --scope app \
+            --ffmpeg Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64/libFFmpeg.a
+      - name: Verify clean tvOS Release Archive
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          test ! -e "$RUNNER_TEMP/tvOS-Archive"
+          test ! -e "$RUNNER_TEMP/tvOS-Archive.xcarchive"
+          xcodebuild archive -project VPlayer.xcodeproj -scheme VPlayerRelease \
+            -configuration Release -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$RUNNER_TEMP/tvOS-Archive" \
+            -archivePath "$RUNNER_TEMP/tvOS-Archive.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee /dev/stderr | \
+            python3 Scripts/verify-release-artifacts.py capture --log "$RUNNER_TEMP/tvOS-Archive.log"
+          python3 Scripts/verify-release-artifacts.py verify --sdk appletvos \
+            --derived-data "$RUNNER_TEMP/tvOS-Archive" --build-log "$RUNNER_TEMP/tvOS-Archive.log" \
+            --scope app --archive "$RUNNER_TEMP/tvOS-Archive.xcarchive" \
+            --ffmpeg Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64/libFFmpeg.a
 
   sanitizer-validation:
     name: Existing physical-storage Address Sanitizer subset
@@ -324,6 +396,12 @@ jobs:
           python3 Scripts/Tests/test_xcresult_failure_report.py
           python3 Scripts/Tests/test_card_focus_progress_report.py
           python3 Scripts/Tests/test_release_startup_diagnostics.py
+          python3 Scripts/Tests/test_release_workflow_gates.py
+          python3 Scripts/Tests/test_release_build_capture.py
+          python3 Scripts/Tests/test_release_instrumentation_config.py
+          python3 Scripts/Tests/test_release_launch_configuration.py
+          python3 Scripts/Tests/test_generated_input_transfer.py
+          python3 Scripts/Tests/test_release_artifacts.py
           python3 Scripts/Tests/test_persistent_hls_acceptance.py
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
           python3 Scripts/Tests/test_airplay_output_mode_contract.py
@@ -549,3 +627,6 @@ jobs:
           # The script checks exact Swift identity, report bounds and both
           # configurations. Success does not establish app slab/peak allocation.
           bash Scripts/run-paused-async-context-controls.sh
+      - name: Reject instrumented native Release control artifacts
+        timeout-minutes: 5
+        run: bash Scripts/run-release-artifact-controls.sh
