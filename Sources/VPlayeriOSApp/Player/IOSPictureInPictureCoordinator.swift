@@ -100,13 +100,22 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored private var state: PlaybackState = .idle
     @ObservationIgnored private var paused = true
     nonisolated private let snapshot = PiPPlaybackSnapshot()
+    @ObservationIgnored private let supportsPictureInPicture: @MainActor () -> Bool
+    @ObservationIgnored private let setPictureInPicture: @MainActor (Bool) -> Void
 
     #if DEBUG
     /// Read-only native state for hosted integration tests, not a transport authority.
     var nativeControllerForTesting: AVPictureInPictureController? { controller }
     #endif
 
-    init(target: any NowPlayingPlaybackTarget) { self.target = target; super.init() }
+    init(target: any NowPlayingPlaybackTarget,
+         supportsPictureInPicture: @escaping @MainActor () -> Bool = { AVPictureInPictureController.isPictureInPictureSupported() },
+         setPictureInPicture: @escaping @MainActor (Bool) -> Void = PlaybackVideoProcessingActivity.setPictureInPicture) {
+        self.target = target
+        self.supportsPictureInPicture = supportsPictureInPicture
+        self.setPictureInPicture = setPictureInPicture
+        super.init()
+    }
 
     func install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer, identity: PresentationIdentity) {
         install(.init(sampleBufferDisplayLayer: sampleBufferDisplayLayer, playbackDelegate: self), identity: identity)
@@ -138,7 +147,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
     }
     private func install(_ source: AVPictureInPictureController.ContentSource, identity: PresentationIdentity) {
         guard !closed, presentationIdentity != identity else { return }
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+        guard supportsPictureInPicture() else {
             message = "当前设备不支持画中画。后台音频仍由系统播放策略管理。"
             return
         }
@@ -170,7 +179,13 @@ final class IOSPictureInPictureCoordinator: NSObject,
         } else {
             current.delegate = nil
             current.contentSource = nil
+            // Native state can become inactive before its queued didStop actor
+            // hop. Retiring the identity makes that callback stale, so retire
+            // its processing policy here as well. Do not stop the replacement session.
             starting = false
+            isActive = false
+            restoring = false
+            setPictureInPicture(false)
         }
     }
     private func installPendingIfPossible() {
@@ -204,7 +219,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         snapshot.clearRestoreIntent()
         starting = true
         // Close GPU admission before asking AVKit to start its transition.
-        PlaybackVideoProcessingActivity.setPictureInPicture(true)
+        setPictureInPicture(true)
         controller.startPictureInPicture()
     }
     func stopForRestoration() {
@@ -240,7 +255,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         controller = nil; retiring = nil; presentationIdentity = nil
         isActive = false; isPossible = false; starting = false
         updateSnapshot()
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
     }
     private func didStart(_ identity: ObjectIdentifier) {
         guard !closed else { return }
@@ -250,7 +265,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         }
         guard currentID == identity else { return }
         starting = false; isActive = true
-        PlaybackVideoProcessingActivity.setPictureInPicture(true)
+        setPictureInPicture(true)
         onStarted?()
     }
     private func didStop(_ identity: ObjectIdentifier) {
@@ -260,13 +275,13 @@ final class IOSPictureInPictureCoordinator: NSObject,
             retiring?.contentSource = nil
             retiring = nil
             starting = false; isActive = false
-            PlaybackVideoProcessingActivity.setPictureInPicture(false)
+            setPictureInPicture(false)
             installPendingIfPossible()
             return
         }
         guard currentID == identity else { return }
         starting = false; isActive = false
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
         let restored = snapshot.consumeRestoreIntent(identity)
         if !restoring && !restored { onStopped?() }
         restoring = false
@@ -280,7 +295,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         guard currentID == identity else { return }
         starting = false; isActive = false; restoring = false
         snapshot.clearRestoreIntent()
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
         message = "暂时无法进入画中画，播放会继续。请返回全屏后重试。"
     }
     private func restore(_ identity: ObjectIdentifier, reply: PiPRestoreReply) {

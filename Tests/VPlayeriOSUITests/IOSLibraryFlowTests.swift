@@ -105,6 +105,66 @@ final class IOSLibraryFlowTests: XCTestCase {
             require(add, in: app, stage: "source-cycle-\(cycle)-after-cancel", timeout: 5)
         }
     }
+    func testPlaylistEditOpensExistingSourceWithoutDeletingIt() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "edit-seeded-channel", timeout: 15)
+        app.tabBars.buttons["播放列表"].tap()
+
+        // Query the visible controls so this exercises the same List row touch
+        // handling as a person tapping Edit, including on the unfixed app.
+        let edit = app.buttons["编辑"]
+        require(edit, in: app, stage: "edit-source-control", timeout: 5, hittable: true)
+        for cycle in 1...2 {
+            edit.tap()
+            let name = app.textFields["source.editor.name"]
+            require(name, in: app, stage: "edit-existing-source-\(cycle)", timeout: 5, hittable: true)
+            XCTAssertEqual(name.value as? String, "测试播放列表")
+            XCTAssertEqual(app.textFields["source.editor.m3u"].value as? String,
+                           "https://fixture.invalid/playlist.m3u")
+            XCTAssertFalse(app.staticTexts["已导入的频道和节目单会一并移除。"].exists,
+                           "Tapping Edit must not also request deletion.")
+            app.buttons["source.editor.cancel"].tap()
+            require(edit, in: app, stage: "edit-cancelled-\(cycle)", timeout: 5, hittable: true)
+            XCTAssertTrue(app.staticTexts["测试播放列表"].exists)
+        }
+
+        app.tabBars.buttons["频道"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "edit-preserved-channel", timeout: 5,
+                hittable: true)
+    }
+    func testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "delete-seeded-channel", timeout: 15)
+        app.tabBars.buttons["播放列表"].tap()
+
+        let delete = app.buttons["删除"]
+        require(delete, in: app, stage: "delete-source-control", timeout: 5, hittable: true)
+        delete.tap()
+        let dialog = app.sheets.firstMatch
+        require(dialog.buttons["取消"], in: app, stage: "delete-cancel-confirmation", timeout: 5,
+                hittable: true)
+        XCTAssertTrue(dialog.staticTexts["已导入的频道和节目单会一并移除。"].exists)
+        XCTAssertFalse(app.textFields["source.editor.name"].exists,
+                       "Tapping Delete must not also open the editor.")
+        dialog.buttons["取消"].tap()
+        require(delete, in: app, stage: "delete-cancelled", timeout: 5, hittable: true)
+        XCTAssertTrue(app.staticTexts["测试播放列表"].exists)
+        app.tabBars.buttons["频道"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "delete-cancel-preserved-channel", timeout: 5)
+
+        app.tabBars.buttons["播放列表"].tap()
+        delete.tap()
+        require(dialog.buttons["删除"], in: app, stage: "delete-explicit-confirmation", timeout: 5,
+                hittable: true)
+        // Only the isolated in-memory seeded source is ever confirmed for deletion.
+        dialog.buttons["删除"].tap()
+        require(app.staticTexts["还没有播放列表"], in: app, stage: "delete-source-removed", timeout: 5)
+        XCTAssertFalse(app.staticTexts["测试播放列表"].exists)
+        app.tabBars.buttons["频道"].tap()
+        XCTAssertFalse(app.buttons["channel.http"].exists)
+    }
     func testRotationAndPlaybackSettingsKeepPlayerSession() {
         let app = launch()
         defer { app.terminate() }

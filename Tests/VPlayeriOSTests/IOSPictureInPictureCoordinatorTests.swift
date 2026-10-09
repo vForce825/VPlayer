@@ -8,10 +8,97 @@ import XCTest
 import SwiftUI
 import UIKit
 @testable import VPlayer
-import VPlayerPlayback
+@testable import VPlayerPlayback
+
+@MainActor
+final class IOSVideoProcessingLifecycleTests: XCTestCase {
+    func testApplicationNotificationsSynchronouslyCloseAndRestoreActualGPUAdmission() throws {
+        let notifications = NotificationCenter()
+        let gate = GPUVideoProcessingGate()
+        let lifecycle = IOSVideoProcessingLifecycle(notifications: notifications,
+            initiallyForeground: true, setForeground: { gate.setForeground($0) })
+        defer { withExtendedLifetime(lifecycle) {} }
+        for _ in 0..<20 {
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+            notifications.post(name: UIApplication.willResignActiveNotification, object: nil)
+            XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Inactivity must fence GPU before delivery returns") })
+            notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() }, "Foreground must immediately restore admission")
+        }
+    }
+
+    func testForegroundNotificationCannotOverrideAnActivePiPLease() throws {
+        let notifications = NotificationCenter()
+        let gate = GPUVideoProcessingGate()
+        let lifecycle = IOSVideoProcessingLifecycle(notifications: notifications,
+            initiallyForeground: false, setForeground: { gate.setForeground($0) })
+        defer { withExtendedLifetime(lifecycle) {} }
+        gate.setPictureInPicture(true)
+        notifications.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+        XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Still in PiP") })
+        gate.setPictureInPicture(false)
+        XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+    }
+}
 
 @MainActor
 final class IOSPictureInPictureCoordinatorTests: XCTestCase {
+    func testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU() async throws {
+        for replacesPresentation in [false, true] {
+            let target = PiPTestTarget()
+            let gate = GPUVideoProcessingGate()
+            gate.setForeground(true)
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) })
+            defer { coordinator.close() }
+            var sessionStops = 0
+            coordinator.onStopped = { sessionStops += 1 }
+            let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
+            let backend = PlaybackBackendIdentity(sessionIdentity: session, backendGeneration: 1)
+            func identity(_ nonce: UInt64) -> PresentationIdentity {
+                .init(sessionIdentity: session, backendIdentity: backend,
+                    outputLifecycleEpoch: .init(backendIdentity: backend, outputNonce: nonce),
+                    itemGeneration: .init(rawValue: nonce), presentationNonce: nonce)
+            }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: identity(1))
+            let old = try XCTUnwrap(coordinator.nativeControllerForTesting)
+            // Drive only delegate ordering; this is not a claim of native PiP support.
+            coordinator.pictureInPictureControllerDidStartPictureInPicture(old)
+            await flushDelegateDelivery()
+            XCTAssertTrue(coordinator.isActive)
+            XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("PiP admission must be closed") })
+            XCTAssertFalse(old.isPictureInPictureActive)
+            coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
+            // Native active=false can precede the queued main-actor didStop callback.
+            // Retire/replace synchronously before that callback is allowed to run.
+            if replacesPresentation {
+                coordinator.install(playerLayer: AVPlayerLayer(), identity: identity(2))
+            } else {
+                coordinator.retire(identity: identity(1))
+            }
+            XCTAssertFalse(coordinator.isActive)
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() }, "Retired PiP must not strand foreground work on CPU")
+            await flushDelegateDelivery()
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+            XCTAssertEqual(sessionStops, 0, "Retiring a presentation cannot stop its replacement session")
+            if replacesPresentation {
+                let replacement = try XCTUnwrap(coordinator.nativeControllerForTesting)
+                coordinator.pictureInPictureControllerDidStartPictureInPicture(replacement)
+                await flushDelegateDelivery()
+                coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
+                await flushDelegateDelivery()
+                XCTAssertTrue(coordinator.isActive, "A late old stop cannot retire replacement PiP")
+                XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Replacement PiP still owns activity") })
+            }
+        }
+    }
+
+    private func flushDelegateDelivery() async {
+        await withCheckedContinuation { (reply: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { reply.resume() }
+        }
+    }
+
     func testRestoreIntentIsConsumedBeforeTheNextAutomaticPiPCycle() {
         let snapshot = PiPPlaybackSnapshot()
         let object = NSObject()
