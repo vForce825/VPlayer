@@ -2931,6 +2931,9 @@ final class HLSAVPlayerBackendTests: XCTestCase {
     }
 
     func testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously() async throws {
+        // Initialize the permanent resource-ledger bootstrap charge before
+        // measuring graph-owned allocations against the application baseline.
+        let resourceBaseline = PlaybackResourceContextLedger.shared.chargedBytes
         let baseline = HLSDeliveryApplicationChargeLedger.shared.chargedBytes
         let probe = HLSWriterAcceptanceProbe()
         var failure: (any Error)?
@@ -2938,12 +2941,15 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         catch { failure = error }
         try await assertLargeIDRNativeOwnersRetired(probe)
         let deadline = ContinuousClock.now + .seconds(2)
-        while HLSDeliveryApplicationChargeLedger.shared.chargedBytes > baseline,
+        while (HLSDeliveryApplicationChargeLedger.shared.chargedBytes > baseline
+               || PlaybackResourceContextLedger.shared.chargedBytes > resourceBaseline),
               ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(10))
         }
         XCTAssertLessThanOrEqual(HLSDeliveryApplicationChargeLedger.shared.chargedBytes, baseline,
             "The production shared ledger must release the owned source and every graph tail")
+        XCTAssertLessThanOrEqual(PlaybackResourceContextLedger.shared.chargedBytes, resourceBaseline,
+            "The production resource ledger must release every graph-owned allocation")
         if let failure { throw failure }
     }
 
