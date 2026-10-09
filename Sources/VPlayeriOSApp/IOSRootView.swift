@@ -90,18 +90,18 @@ struct IOSRootView: View {
                     .id(active.id)
                     .interactiveDismissDisabled()
                     #if DEBUG
-                    .overlay(alignment: .topLeading) { routeProbe }
+                    .overlay(alignment: .topLeading) { routeProbe(identifier: "ios.playback.route.presented") }
                     #endif
             }
         }
         #if DEBUG
-        .overlay(alignment: .topLeading) { routeProbe }
+        .overlay(alignment: .topLeading) { routeProbe() }
         #endif
     }
     #if DEBUG
-    @ViewBuilder private var routeProbe: some View {
+    @ViewBuilder private func routeProbe(identifier: String = "ios.playback.route") -> some View {
         if IOSPlaybackRouteDiagnostics.isEnabled {
-            IOSPlaybackRouteProbe {
+            IOSPlaybackRouteProbe(identifier: identifier) {
                 IOSPlaybackRouteDiagnostics.snapshot(request: model.presentedPlaybackRequest,
                     session: session, isLoading: model.isLoading)
             }
@@ -191,11 +191,12 @@ enum IOSPlaybackRouteDiagnostics {
 /// evaluation. The closure reads the root's live State storage, not a session
 /// captured while the initial library screen is loading.
 private struct IOSPlaybackRouteProbe: UIViewRepresentable {
+    let identifier: String
     let snapshot: @MainActor () -> String
     func makeUIView(context: Context) -> IOSPlaybackRouteProbeView {
         let view = IOSPlaybackRouteProbeView()
         view.isAccessibilityElement = true
-        view.accessibilityIdentifier = "ios.playback.route"
+        view.accessibilityIdentifier = identifier
         view.accessibilityLabel = "Playback route diagnostics"
         view.snapshot = snapshot
         return view

@@ -89,7 +89,11 @@ struct IOSFullScreenPlayerView: View {
                 .foregroundStyle(.white)
             }
         }
-        .toolbarVisibility(areControlsVisible ? .visible : .hidden, for: .statusBar)
+        .statusBarHidden(!areControlsVisible)
+        .background {
+            IOSStatusBarAppearanceRefresh(isHidden: !areControlsVisible)
+                .frame(width: 0, height: 0).accessibilityHidden(true)
+        }
         // Preserve individual control labels/actions. VoiceOver pins the bars,
         // and its escape gesture remains an explicit, accessible close action.
         .accessibilityElement(children: .contain)
@@ -164,6 +168,47 @@ struct IOSFullScreenPlayerView: View {
     private func updateIdleTimer() {
         UIApplication.shared.isIdleTimerDisabled = scenePhase == .active &&
             PlaybackIdleTimerPolicy.isDisabled(for: model.state)
+    }
+}
+
+/// Request UIKit's appearance pass after SwiftUI changes the status-bar
+/// preference inside a full-screen presentation. Update only on visibility
+/// transitions, rather than on playback model refreshes.
+private struct IOSStatusBarAppearanceRefresh: UIViewRepresentable {
+    let isHidden: Bool
+    func makeUIView(context: Context) -> IOSStatusBarAppearanceRefreshView {
+        let view = IOSStatusBarAppearanceRefreshView()
+        view.isUserInteractionEnabled = false
+        return view
+    }
+    func updateUIView(_ view: IOSStatusBarAppearanceRefreshView, context: Context) {
+        view.requestAppearanceUpdate(isHidden: isHidden)
+    }
+}
+
+private final class IOSStatusBarAppearanceRefreshView: UIView {
+    private var lastHidden: Bool?
+    func requestAppearanceUpdate(isHidden: Bool) {
+        guard lastHidden != isHidden else { return }
+        lastHidden = isHidden
+        invalidateAppearance()
+    }
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { invalidateAppearance() }
+    }
+    private func invalidateAppearance() {
+        // Let SwiftUI finish propagating the preference before UIKit reads it.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.window != nil else { return }
+            // The nearest responder can be SwiftUI's containing controller;
+            // the presented controller owns the full-screen status preference.
+            var controller = self.window?.rootViewController
+            while let current = controller {
+                current.setNeedsStatusBarAppearanceUpdate()
+                controller = current.presentedViewController
+            }
+        }
     }
 }
 

@@ -86,7 +86,9 @@ final class IOSLibraryFlowTests: XCTestCase {
             .withOffset(CGVector(dx: point.x - appFrame.minX, dy: point.y - appFrame.minY)).tap()
     }
     private func failureDetails(in app: XCUIApplication, stage: String) -> String {
-        let route = app.descendants(matching: .any)
+        let presented = app.descendants(matching: .any)
+            .matching(identifier: "ios.playback.route.presented").firstMatch
+        let route = presented.exists ? presented : app.descendants(matching: .any)
             .matching(identifier: "ios.playback.route").firstMatch
         let snapshot = route.exists ? (route.value as? String ?? "value-unavailable") : "probe-unavailable"
         let channel = app.buttons["channel.http"]
@@ -204,14 +206,16 @@ final class IOSLibraryFlowTests: XCTestCase {
         screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
     private func assertSystemStatusBar(_ expected: String, in app: XCUIApplication,
+                                       isPresented: Bool = true,
                                        screenshot: Bool = false,
                                        file: StaticString = #filePath, line: UInt = #line) {
         let probe = app.descendants(matching: .any)
-            .matching(identifier: "ios.playback.route").firstMatch
+            .matching(identifier: isPresented ? "ios.playback.route.presented" : "ios.playback.route").firstMatch
         let suffix = " statusBar=\(expected)"
+        let observed = probe.exists ? (probe.value as? String ?? "value-unavailable") : "probe-unavailable"
         // Check the current UIKit value first: XCTWaiter inserts a polling delay
         // even when already true, consuming the real three-second idle interval.
-        if !probe.exists || !(probe.value as? String ?? "").hasSuffix(suffix) {
+        if !observed.hasSuffix(suffix) {
             let expectation = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == true AND value ENDSWITH %@", suffix), object: probe)
             XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 2), .completed,
@@ -233,8 +237,9 @@ final class IOSLibraryFlowTests: XCTestCase {
     }
     private func assertPlayerSession(_ identity: String, in app: XCUIApplication) {
         XCTAssertEqual(playerSessionIdentity(in: app), identity, "Controls must not replace the playback session")
-        let route = app.descendants(matching: .any).matching(identifier: "ios.playback.route").firstMatch
-        let snapshot = route.value as? String ?? ""
+        let presented = app.descendants(matching: .any).matching(identifier: "ios.playback.route.presented").firstMatch
+        XCTAssertTrue(presented.exists, "The presented playback route probe must exist")
+        let snapshot = presented.exists ? (presented.value as? String ?? "") : ""
         for expected in ["session=true", "matching=true", "closing=false", "fullScreen=true"] {
             XCTAssertTrue(snapshot.contains(expected), failureDetails(in: app, stage: "controls-session-preserved"))
         }
@@ -243,7 +248,7 @@ final class IOSLibraryFlowTests: XCTestCase {
     func testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession() {
         let app = launch()
         defer { app.terminate() }
-        assertSystemStatusBar("visible", in: app, screenshot: true)
+        assertSystemStatusBar("visible", in: app, isPresented: false, screenshot: true)
         require(app.buttons["channel.http"], in: app, stage: "controls-channel", timeout: 15)
         app.buttons["channel.http"].tap()
         let back = app.buttons["player-back"]
