@@ -211,7 +211,7 @@ class IOSSelectedStatusTests(unittest.TestCase):
         self.assertNotIn(BENCHMARK, m.DEFAULT_TESTS)
         self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK, RELEASE_GOLDEN))
         self.assertTrue(any('/IOSPlaybackSessionTests/' in x for x in m.DEFAULT_TESTS))
-        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 5)
+        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 6)
         self.assertEqual(len(m.DEFAULT_TESTS), len(set(m.DEFAULT_TESTS)))
 
     def test_manifest_includes_all_budget_fixture_and_fill_regressions(self):
@@ -233,7 +233,25 @@ class IOSSelectedStatusTests(unittest.TestCase):
             'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',
         ):
             expected.add('VPlayeriOSTests/LoopbackHTTPServerTests/' + method)
-        self.assertEqual(len(m.DEFAULT_TESTS), 55)
+        self.assertEqual(len(m.DEFAULT_TESTS), 63)
+        self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+
+    def test_manifest_includes_native_factory_and_observation_regressions(self):
+        m = self.module()
+        expected = {
+            'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/' + method for method in (
+                'testActiveAndStartingRetirementWaitForStopBeforeCreatingSuccessor',
+                'testFactoryFailureClearsPresentationAndProcessingActivity',
+                'testNativeFactoryCannotBypassActualRuntimeCapability',
+                'testPlaybackInvalidationOnlyTargetsSampleBufferContent',
+            )
+        }
+        expected.update('VPlayeriOSTests/HLSAVPlayerBackendTests/' + method for method in (
+            'testHandoffMediaObservationWaitsThroughProbeAndClearForCurrentOutput',
+            'testHandoffMediaObservationRejectsMissingOutputFailureAndChangedIdentity',
+            'testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer',
+        ))
+        expected.add('VPlayeriOSUITests/IOSLibraryFlowTests/testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace')
         self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
 
     def test_manifest_includes_native_eof_boundary_regressions(self):
@@ -256,11 +274,11 @@ class IOSSelectedStatusTests(unittest.TestCase):
     def test_full_default_manifest_fits_output_and_summary_without_omitting_cases(self):
         m = self.module()
         rows = m.analyze(schema(), {'testNodes': [case(test) for test in m.DEFAULT_TESTS]})
-        self.assertEqual(len(rows), 55)
+        self.assertEqual(len(rows), 63)
         self.assertTrue(all(row['status'] == 'Passed' for row in rows))
         lines = m.report_lines(rows, 'functional_unit_and_ui')
         summary = m.job_summary(lines)
-        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 55)
+        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 63)
         self.assertNotIn('TRUNCATED', '\n'.join(lines) + summary)
         self.assertLessEqual(len(('\n'.join(lines) + '\n').encode()), m.MAX_OUTPUT)
         self.assertLessEqual(len(summary.encode()), m.MAX_OUTPUT)
@@ -269,7 +287,7 @@ class IOSSelectedStatusTests(unittest.TestCase):
         m = self.module()
         self.assertEqual(getattr(m, 'PREFLIGHT_TESTS', None), PREFLIGHT)
         self.assertTrue(set(PREFLIGHT).issubset(m.DEFAULT_TESTS))
-        self.assertEqual(len(m.DEFAULT_TESTS), 55)
+        self.assertEqual(len(m.DEFAULT_TESTS), 63)
 
     def test_preflight_requires_both_passed_and_never_accepts_skipped_or_missing_tests(self):
         m = self.module()

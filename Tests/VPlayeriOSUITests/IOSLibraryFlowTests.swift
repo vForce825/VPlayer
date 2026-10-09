@@ -9,9 +9,81 @@ final class IOSLibraryFlowTests: XCTestCase {
     private func identified(_ identifier: String, in query: XCUIElementQuery) -> XCUIElementQuery {
         query.matching(NSPredicate(format: "identifier == %@", identifier))
     }
-    private func deletionConfirmationButtons(in app: XCUIApplication) -> XCUIElementQuery {
-        app.buttons.matching(NSPredicate(format: "label == %@ AND NOT (identifier BEGINSWITH %@)",
-                                        "删除", "source.delete."))
+    private func deletionConfirmationButtons(in element: XCUIElement) -> XCUIElementQuery {
+        element.buttons.matching(NSPredicate(format: "label == %@ AND NOT (identifier BEGINSWITH %@)",
+                                            "删除", "source.delete."))
+    }
+    private func cancellationPoint(appFrame: CGRect, sheetFrame: CGRect) -> CGPoint? {
+        guard !appFrame.isEmpty, !sheetFrame.isEmpty, !appFrame.isInfinite, !sheetFrame.isInfinite,
+              [appFrame.minX, appFrame.minY, appFrame.maxX, appFrame.maxY,
+               sheetFrame.minX, sheetFrame.minY, sheetFrame.maxX, sheetFrame.maxY].allSatisfy({ $0.isFinite }),
+              appFrame.intersects(sheetFrame) else { return nil }
+        let safeApp = appFrame.insetBy(dx: 44, dy: 44)
+        guard safeApp.size.width >= 44, safeApp.size.height >= 44 else { return nil }
+        let excluded = sheetFrame.insetBy(dx: -22, dy: -22)
+        let regions = [
+            CGRect(x: safeApp.minX, y: safeApp.minY, width: safeApp.width, height: excluded.minY - safeApp.minY),
+            CGRect(x: safeApp.minX, y: excluded.maxY, width: safeApp.width, height: safeApp.maxY - excluded.maxY),
+            CGRect(x: safeApp.minX, y: safeApp.minY, width: excluded.minX - safeApp.minX, height: safeApp.height),
+            CGRect(x: excluded.maxX, y: safeApp.minY, width: safeApp.maxX - excluded.maxX, height: safeApp.height)
+        ]
+        return regions.filter { $0.size.width >= 44 && $0.size.height >= 44 }
+            .sorted { $0.width * $0.height > $1.width * $1.height }
+            .map { CGPoint(x: $0.midX, y: $0.midY) }
+            .first { safeApp.contains($0) && !excluded.contains($0) }
+    }
+    private func cancelDeletionConfirmation(in app: XCUIApplication) {
+        let cancel = app.buttons["取消"]
+        if cancel.exists {
+            require(cancel, in: app, stage: "delete-cancel-confirmation", timeout: 5, hittable: true)
+            cancel.tap()
+            return
+        }
+
+        // Popover action sheets omit Cancel; outside dismissal cancels them.
+        // Every fallback must first identify the actual confirmation sheet.
+        let sheet = app.sheets.firstMatch
+        guard app.sheets.count == 1,
+              sheet.staticTexts["已导入的频道和节目单会一并移除。"].exists,
+              deletionConfirmationButtons(in: sheet).count == 1 else {
+            XCTFail(failureDetails(in: app, stage: "delete-cancel-sheet-identity"))
+            return
+        }
+        let appFrame = app.frame
+        let sheetFrame = sheet.frame
+        let noticeFrame = sheet.staticTexts["已导入的频道和节目单会一并移除。"].frame
+        let confirmFrame = deletionConfirmationButtons(in: sheet).firstMatch.frame
+        guard !appFrame.isEmpty, !sheetFrame.isEmpty, !appFrame.isInfinite, !sheetFrame.isInfinite,
+              !noticeFrame.isEmpty, !confirmFrame.isEmpty,
+              [appFrame.minX, appFrame.minY, appFrame.maxX, appFrame.maxY,
+               sheetFrame.minX, sheetFrame.minY, sheetFrame.maxX, sheetFrame.maxY].allSatisfy({ $0.isFinite }),
+              appFrame.intersects(sheetFrame), sheetFrame.contains(noticeFrame), sheetFrame.contains(confirmFrame) else {
+            XCTFail(failureDetails(in: app, stage: "delete-cancel-sheet-geometry"))
+            return
+        }
+        let safeApp = appFrame.insetBy(dx: 44, dy: 44)
+        let excluded = sheetFrame.insetBy(dx: -22, dy: -22)
+        let dismissRegions = identified("PopoverDismissRegion", in: app.descendants(matching: .any))
+        if dismissRegions.count == 1 {
+            let dismiss = dismissRegions.firstMatch
+            let frame = dismiss.frame
+            if !frame.isEmpty, !frame.isInfinite,
+               [frame.minX, frame.minY, frame.maxX, frame.maxY].allSatisfy({ $0.isFinite }),
+               safeApp.contains(frame), !excluded.intersects(frame), dismiss.isHittable {
+                print("IOS_DELETE_CANCEL method=system-dismiss appFrame=\(appFrame) sheetFrame=\(sheetFrame) dismissFrame=\(frame)")
+                dismiss.tap()
+                return
+            }
+        }
+        // Derive an exterior point from live frames, with margins from both the
+        // app edges and sheet. No coordinates are guessed from a device model.
+        guard let point = cancellationPoint(appFrame: appFrame, sheetFrame: sheetFrame) else {
+            XCTFail(failureDetails(in: app, stage: "delete-cancel-no-observed-exterior"))
+            return
+        }
+        print("IOS_DELETE_CANCEL method=observed-exterior appFrame=\(appFrame) sheetFrame=\(sheetFrame) point=\(point)")
+        app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: point.x - appFrame.minX, dy: point.y - appFrame.minY)).tap()
     }
     private func failureDetails(in app: XCUIApplication, stage: String) -> String {
         let route = app.descendants(matching: .any)
@@ -42,10 +114,16 @@ final class IOSLibraryFlowTests: XCTestCase {
         }.joined(separator: ";")
         let deletionNotice = app.staticTexts["已导入的频道和节目单会一并移除。"]
         let deletionNoticeDetails = deletionNotice.exists ? "frame=\(deletionNotice.frame)" : "absent"
+        let sheetFrames = app.sheets.allElementsBoundByIndex.prefix(2).map { "\($0.frame)" }.joined(separator: ";")
+        let dismissRegions = identified("PopoverDismissRegion", in: app.descendants(matching: .any))
+        let dismissControls = dismissRegions.allElementsBoundByIndex.prefix(2).map { element in
+            "role=\(element.elementType.rawValue):hit=\(element.isHittable):frame=\(element.frame)"
+        }.joined(separator: ";")
         return "IOS_UI_STAGE=\(stage) IOS_UI_ROUTE=\(snapshot) " +
             "playerBack=\(playerExists) playerContainer=\(playerContainerExists) miniPlayer=\(miniPlayerExists) " +
             "row=channel.http exists=\(channelExists) hittable=\(channelExists && channel.isHittable) " +
             "channelNavigation=\(channelNavigationExists) alerts=\(app.alerts.count) sheets=\(app.sheets.count) " +
+            "appFrame=\(app.frame) sheetFrames=[\(sheetFrames)] dismissRegions=[\(dismissControls)] " +
             "deletionNotice=\(deletionNoticeDetails) editor=\(app.textFields["source.editor.name"].exists) " +
             "cancelButtons=\(cancellationButtons.count) cancellationControls=[\(cancellationControls)] " +
             "confirmDeleteButtons=\(confirmationButtons.count) confirmationControls=[\(confirmationControls)] " +
@@ -169,9 +247,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertEqual(confirmations.count, 1, failureDetails(in: app, stage: "delete-confirmation-identity"))
         XCTAssertFalse(app.textFields["source.editor.name"].exists,
                        "Tapping Delete must not also open the editor.")
-        let cancel = app.buttons["取消"]
-        require(cancel, in: app, stage: "delete-cancel-confirmation", timeout: 5, hittable: true)
-        cancel.tap()
+        cancelDeletionConfirmation(in: app)
         XCTAssertTrue(notice.waitForNonExistence(timeout: 5),
                       failureDetails(in: app, stage: "delete-confirmation-dismissed"))
         require(delete, in: app, stage: "delete-cancelled", timeout: 5, hittable: true)
@@ -190,6 +266,33 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertFalse(app.staticTexts["测试播放列表"].exists)
         app.tabBars.buttons["频道"].tap()
         XCTAssertFalse(app.buttons["channel.http"].exists)
+    }
+    func testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace() throws {
+        let appFrame = CGRect(x: 11, y: 17, width: 400, height: 860)
+        let sheets = [
+            CGRect(x: 91, y: 717, width: 240, height: 140),
+            CGRect(x: 91, y: 37, width: 240, height: 140),
+            CGRect(x: 11, y: 17, width: 140, height: 860),
+            CGRect(x: 271, y: 17, width: 140, height: 860)
+        ]
+        for sheet in sheets {
+            let point = try XCTUnwrap(cancellationPoint(appFrame: appFrame, sheetFrame: sheet))
+            XCTAssertTrue(appFrame.insetBy(dx: 44, dy: 44).contains(point))
+            XCTAssertFalse(sheet.insetBy(dx: -22, dy: -22).contains(point))
+        }
+        for sheet in [appFrame, appFrame.insetBy(dx: 10, dy: 10), .zero, .null, .infinite,
+                      CGRect(x: 1_000, y: 1_000, width: 100, height: 100)] {
+            XCTAssertNil(cancellationPoint(appFrame: appFrame, sheetFrame: sheet))
+        }
+        XCTAssertNil(cancellationPoint(appFrame: .zero, sheetFrame: sheets[0]))
+        XCTAssertNil(cancellationPoint(appFrame: .infinite, sheetFrame: sheets[0]))
+        XCTAssertNil(cancellationPoint(appFrame: CGRect(x: 0, y: 0, width: 120, height: 120),
+            sheetFrame: CGRect(x: 40, y: 40, width: 40, height: 40)))
+        // The remaining gap must fit a full 44-point region after both margins.
+        XCTAssertNil(cancellationPoint(appFrame: appFrame,
+            sheetFrame: CGRect(x: 11, y: 126, width: 400, height: 751)))
+        XCTAssertNotNil(cancellationPoint(appFrame: appFrame,
+            sheetFrame: CGRect(x: 11, y: 127, width: 400, height: 750)))
     }
     func testRotationAndPlaybackSettingsKeepPlayerSession() {
         let app = launch()

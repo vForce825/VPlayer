@@ -38,6 +38,10 @@ _FUNCTIONAL_SUITES = (
         'testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession',)),
     ('VPlayeriOSTests', 'IOSPictureInPictureCoordinatorTests', (
         'testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+        'testActiveAndStartingRetirementWaitForStopBeforeCreatingSuccessor',
+        'testFactoryFailureClearsPresentationAndProcessingActivity',
+        'testNativeFactoryCannotBypassActualRuntimeCapability',
+        'testPlaybackInvalidationOnlyTargetsSampleBufferContent',
         'testRestoreIntentIsConsumedBeforeTheNextAutomaticPiPCycle',
         'testCallbackReferencePinsIdentityUntilTheActorHopFinishes',
         'testUnavailablePiPDoesNotStopThePlaybackTarget',
@@ -86,7 +90,10 @@ _FUNCTIONAL_SUITES = (
         'testPausedWorkspaceRollbackKeepsExactChargeWhenAnUnrelated16KiBOwnerRetires',
         'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',)),
     ('VPlayeriOSTests', 'HLSAVPlayerBackendTests', (
-        'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',)),
+        'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',
+        'testHandoffMediaObservationWaitsThroughProbeAndClearForCurrentOutput',
+        'testHandoffMediaObservationRejectsMissingOutputFailureAndChangedIdentity',
+        'testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer',)),
     ('VPlayeriOSTests', 'NativeHLSAdapterLifecycleTests', (
         'testNativeFinalQuantumAcceptsObservedClocksAndRejectsPrematureOrMissingEvidence',
         'testNativeFinalQuantumPreservesAtOrAfterEndpointClocks',
@@ -101,6 +108,7 @@ _FUNCTIONAL_SUITES = (
         'testSourceEditorCancelAndReopen',
         'testPlaylistEditOpensExistingSourceWithoutDeletingIt',
         'testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
+        'testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace',
         'testRotationAndPlaybackSettingsKeepPlayerSession',)),
 )
 DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'

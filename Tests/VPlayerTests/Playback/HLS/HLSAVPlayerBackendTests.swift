@@ -1771,12 +1771,95 @@ final class HLSAVPlayerBackendTests: XCTestCase {
         }
     }
 
+    func testHandoffMediaObservationWaitsThroughProbeAndClearForCurrentOutput() throws {
+        let (request, identity, output) = handoffMediaObservationFixture()
+        let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let probe = PlaybackMediaInformation(sourceWidth: 1_280, sourceHeight: 720,
+            scanMode: .progressive, sourceFrameRate: MediaRational(num: 25, den: 1))
+        values.append(nil) // Old HLS output was retired.
+        values.append(probe)
+        let probed = values.snapshot
+        XCTAssertTrue(probed.contains(where: { $0 == nil }) && probed.last.flatMap({ $0 }) != nil,
+            "The former wait condition returns at the source probe, before output exists")
+        XCTAssertNil(identity.mediaInformation(in: probed, stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity))
+
+        // Advance only after each observation, so stream coalescing and scheduling
+        // cannot hide the probe -> nil -> output sequence this regression covers.
+        values.append(nil)
+        let cleared = values.snapshot
+        XCTAssertNil(identity.mediaInformation(in: cleared, stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity))
+        values.append(output)
+        let rendered = values.snapshot
+        let accepted = try XCTUnwrap(identity.mediaInformation(in: rendered,
+            stateBefore: .playing(request), stateAfter: .playing(request),
+            request: request, identityAfter: identity))
+        XCTAssertEqual(accepted, output)
+
+        values.append(nil)
+        XCTAssertEqual(accepted, output, "Keep the candidate from the checked snapshot")
+        let retiredAgain = values.snapshot
+        XCTAssertNil(identity.mediaInformation(in: retiredAgain, stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity),
+            "Historical output cannot satisfy a new observation after a clear")
+    }
+
+    func testHandoffMediaObservationRejectsMissingOutputFailureAndChangedIdentity() {
+        let (request, identity, output) = handoffMediaObservationFixture()
+        XCTAssertNil(identity.mediaInformation(in: [nil, nil], stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity))
+        XCTAssertNil(identity.mediaInformation(in: [output], stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity),
+            "Output without the retirement clear is insufficient")
+        let failed = PlaybackState.failed(.init(code: "fixture", userMessage: "Fixture failed"))
+        let failedSnapshots: [[PlaybackMediaInformation?]] = [[nil], [nil, output]]
+        for snapshot in failedSnapshots {
+            XCTAssertNil(identity.mediaInformation(in: snapshot, stateBefore: .playing(request),
+                stateAfter: failed, request: request, identityAfter: identity))
+        }
+        let changed = HLSHandoffOutputIdentity(contextNonce: identity.contextNonce + 1,
+            interval: identity.interval)
+        XCTAssertNil(identity.mediaInformation(in: [nil, output], stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: changed))
+        XCTAssertNil(identity.mediaInformation(in: [nil, output], stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: nil))
+        XCTAssertNil(identity.mediaInformation(in: [nil, output.withAirPlayOutputMode(.remux)],
+            stateBefore: .playing(request), stateAfter: .playing(request),
+            request: request, identityAfter: identity))
+        let wrongSize = PlaybackMediaInformation(width: 640, height: 360, scanMode: .progressive,
+            sourceFrameRate: nil, outputFrameRate: nil, isSmoothMotionEnhanced: false)
+        XCTAssertNil(identity.mediaInformation(in: [nil, wrongSize], stateBefore: .playing(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity))
+        XCTAssertNil(identity.mediaInformation(in: [nil, output], stateBefore: .recovering(request),
+            stateAfter: .playing(request), request: request, identityAfter: identity))
+    }
+
+    private func handoffMediaObservationFixture()
+        -> (PlaybackRequest, HLSHandoffOutputIdentity, PlaybackMediaInformation) {
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "handoff-observation",
+            streamURL: URL(string: "http://127.0.0.1/fixture.ts")!, title: "Fixture")
+        let session = PlaybackSessionIdentity(sessionID: 1, requestID: request.id)
+        let backend = PlaybackBackendIdentity(sessionIdentity: session, backendGeneration: 2)
+        let lifecycle = OutputLifecycleEpoch(backendIdentity: backend, outputNonce: 3)
+        let activation = ActivationEpoch(outputLifecycleEpoch: lifecycle,
+            audioAdmissionFenceRevision: 4, activationNonce: 5)
+        let identity = HLSHandoffOutputIdentity(contextNonce: 6, interval: .init(
+            backendObjectNonce: 7, backendIdentity: backend, outputLifecycle: lifecycle,
+            itemGeneration: nil, activation: activation))
+        let output = PlaybackMediaInformation(width: 1_280, height: 720, scanMode: .progressive,
+            sourceFrameRate: MediaRational(num: 25, den: 1), outputFrameRate: 25,
+            isSmoothMotionEnhanced: false)
+        return (request, identity, output)
+    }
+
     func testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer() async throws {
         let fixture = try makeProductionFixture(named: "task22-progressive-h264-aac-16s.ts")
         defer { fixture.server?.stop() }
         try await withProductionMediaController { controller, registry, _, sdk in
-            await controller.play(.init(sourceProfileID: UUID(), channelID: "metadata-route",
-                streamURL: fixture.source, title: "Route metadata"))
+            let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "metadata-route",
+                streamURL: fixture.source, title: "Route metadata")
+            await controller.play(request)
             let startupDiagnostic = await self.mediaControllerDiagnostic(controller, registry: registry)
             let old = try XCTUnwrap(registry.outputResourceContextSnapshot()?.interval?.outputLifecycle,
                 startupDiagnostic)
@@ -1784,22 +1867,59 @@ final class HLSAVPlayerBackendTests: XCTestCase {
             let values = PlaybackStreamRecorder<PlaybackMediaInformation?>()
             let collector = Task { for await value in stream { values.append(value) } }
             defer { collector.cancel() }
+            let handoffStartIndex = values.snapshot.count
             sdk.lock.withLock { sdk.initialPorts = .hdmi }
             await controller.requestRouteHandoff(to: .sampleBuffer)
             let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-            while !(values.snapshot.contains(where: { $0 == nil }) && values.snapshot.last.flatMap({ $0 }) != nil),
-                  ContinuousClock.now < deadline {
+            var observed: [PlaybackMediaInformation?] = []
+            var stateBefore: PlaybackState = .idle
+            var stateAfter: PlaybackState = .idle
+            var contextBefore: OutputResourceContext?
+            var contextAfter: OutputResourceContext?
+            var accepted: PlaybackMediaInformation?
+            var acceptedIdentity: HLSHandoffOutputIdentity?
+            while ContinuousClock.now < deadline {
+                contextBefore = registry.outputResourceContextSnapshot()
+                stateBefore = await controller.currentStateForTesting
+                // Each poll evaluates one immutable recorder snapshot. The last
+                // value must be output facts, not an earlier source probe.
+                observed = Array(values.snapshot.dropFirst(handoffStartIndex))
+                stateAfter = await controller.currentStateForTesting
+                contextAfter = registry.outputResourceContextSnapshot()
+                let before = HLSHandoffOutputIdentity.current(contextBefore, retired: old)
+                let after = HLSHandoffOutputIdentity.current(contextAfter, retired: old)
+                if let before, ContinuousClock.now < deadline,
+                   let candidate = before.mediaInformation(in: observed, stateBefore: stateBefore,
+                       stateAfter: stateAfter, request: request, identityAfter: after) {
+                    accepted = candidate
+                    acceptedIdentity = before
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(10))
             }
-            XCTAssertEqual(registry.outputResourceContextSnapshot()?.desiredBackendKind, .sampleBuffer)
-            XCTAssertTrue(values.snapshot.contains(where: { $0 == nil }), "Route retirement must clear the old facts")
-            let local = try XCTUnwrap(values.snapshot.last.flatMap { $0 })
+            let diagnostic = HLSHandoffOutputIdentity.diagnostic(observed,
+                stateBefore: stateBefore, stateAfter: stateAfter,
+                contextBefore: contextBefore, contextAfter: contextAfter)
+            XCTAssertEqual(contextAfter?.desiredBackendKind, .sampleBuffer, diagnostic)
+            XCTAssertTrue(observed.contains(where: { $0 == nil }), "Route retirement must clear the old facts; \(diagnostic)")
+            let local = try XCTUnwrap(accepted, diagnostic)
+            let localIdentity = try XCTUnwrap(acceptedIdentity, diagnostic)
+            XCTAssertFalse(local.isSourceProbe)
             XCTAssertEqual(local.width, 1_280)
             XCTAssertNil(local.airPlayOutputMode, "The AirPlay field must clear on the HDMI/sample-buffer path")
+            // End the original consumer before the existing final current-value
+            // read creates a subscription. Cancellation terminates AsyncStream's
+            // next(); this collector has no other suspending work to join.
+            collector.cancel()
+            await collector.value
             await controller.refreshPreparedMediaInformation(for: old)
             await controller.invalidatePreparedMediaInformation(for: old)
             let afterStaleCallbacks = await self.currentMediaInformation(controller)
             XCTAssertEqual(afterStaleCallbacks, local)
+            let finalState = await controller.currentStateForTesting
+            XCTAssertEqual(finalState, .playing(request))
+            XCTAssertEqual(HLSHandoffOutputIdentity.current(registry.outputResourceContextSnapshot(),
+                retired: old), localIdentity)
             XCTAssertNil(registry.preparedHLSMediaInformation(for: old))
         }
     }
@@ -3660,6 +3780,74 @@ private final class Task22SelectedLiveWakeGate: @unchecked Sendable {
     }
 
     func release() { condition.withLock { released = true; condition.broadcast() } }
+}
+
+private struct HLSHandoffOutputIdentity: Equatable {
+    let contextNonce: UInt64
+    let interval: PotentiallyAudibleOutputIntervalKey
+
+    static func current(_ context: OutputResourceContext?, retired: OutputLifecycleEpoch) -> Self? {
+        guard let context, context.phase == .installed, context.prepared,
+              context.owner == nil, context.pendingReset == nil,
+              !context.poisoned, !context.teardownRequested,
+              context.desiredBackendKind == .sampleBuffer,
+              context.sessionIdentity == retired.backendIdentity.sessionIdentity,
+              let interval = context.interval,
+              interval.backendIdentity != retired.backendIdentity,
+              interval.backendIdentity == context.candidateBackendIdentity,
+              interval.backendObjectNonce == context.backendObjectNonce,
+              interval.outputLifecycle.backendIdentity == interval.backendIdentity,
+              interval.activation == context.activation else { return nil }
+        return .init(contextNonce: context.contextNonce, interval: interval)
+    }
+
+    func mediaInformation(in snapshot: [PlaybackMediaInformation?], stateBefore: PlaybackState,
+        stateAfter: PlaybackState, request: PlaybackRequest, identityAfter: Self?) -> PlaybackMediaInformation? {
+        guard identityAfter == self,
+              interval.backendIdentity.sessionIdentity.requestID == request.id,
+              stateBefore == .playing(request), stateAfter == .playing(request),
+              snapshot.contains(where: { $0 == nil }),
+              let latest = snapshot.last.flatMap({ $0 }),
+              !latest.isSourceProbe, latest.width == 1_280,
+              latest.airPlayOutputMode == nil else { return nil }
+        return latest
+    }
+
+    // Bounded, test-only facts. Never include the request URL, arbitrary errors,
+    // or a second stream subscription in a failed wait's diagnostic.
+    static func diagnostic(_ snapshot: [PlaybackMediaInformation?], stateBefore: PlaybackState,
+        stateAfter: PlaybackState, contextBefore: OutputResourceContext?, contextAfter: OutputResourceContext?) -> String {
+        let stages = snapshot.suffix(12).map { information -> String in
+            guard let information else { return "nil" }
+            return "\(information.isSourceProbe ? "probe" : "output"):\(information.width)"
+                + ":airPlay=\(information.airPlayOutputMode != nil)"
+        }.joined(separator: ",")
+        return "HANDOFF_MEDIA samples=\(snapshot.count) last12=[\(stages)] "
+            + "state=\(stateName(stateBefore))->\(stateName(stateAfter)) "
+            + "before={\(contextDescription(contextBefore))} after={\(contextDescription(contextAfter))}"
+    }
+
+    private static func stateName(_ state: PlaybackState) -> String {
+        switch state {
+        case .idle: "idle"
+        case .preparing: "preparing"
+        case .buffering: "buffering"
+        case .recovering: "recovering"
+        case .playing: "playing"
+        case .paused: "paused"
+        case .stopped: "stopped"
+        case .failed: "failed"
+        }
+    }
+
+    private static func contextDescription(_ context: OutputResourceContext?) -> String {
+        guard let context else { return "none" }
+        return "phase=\(context.phase),context=\(context.contextNonce),session=\(context.sessionIdentity.sessionID),"
+            + "backend=\(context.candidateBackendIdentity?.backendGeneration ?? 0),object=\(context.backendObjectNonce),"
+            + "output=\(context.interval?.outputLifecycle.outputNonce ?? 0),"
+            + "activation=\(context.interval?.activation.activationNonce ?? 0),"
+            + "sampleBuffer=\(context.desiredBackendKind == .sampleBuffer),prepared=\(context.prepared),owner=\(context.owner != nil)"
+    }
 }
 
 /// Send a packet-aligned 3/4 prefix (or all but one packet) and withhold real EOF.

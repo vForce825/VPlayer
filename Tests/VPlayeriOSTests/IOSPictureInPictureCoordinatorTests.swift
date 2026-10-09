@@ -54,8 +54,14 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
             let target = PiPTestTarget()
             let gate = GPUVideoProcessingGate()
             gate.setForeground(true)
+            var handles: [FakePiPControllerHandle] = []
             let coordinator = IOSPictureInPictureCoordinator(target: target,
-                supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) })
+                supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) },
+                makeController: { source, _ in
+                    let handle = FakePiPControllerHandle(source: source)
+                    handles.append(handle)
+                    return handle
+                })
             defer {
                 phase("before-close")
                 coordinator.close()
@@ -73,17 +79,17 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
             phase("before-initial-install")
             coordinator.install(playerLayer: AVPlayerLayer(), identity: identity(1))
             phase("after-initial-install")
-            let old = try XCTUnwrap(coordinator.nativeControllerForTesting)
-            // Drive only delegate ordering; this is not a claim of native PiP support.
+            let old = try XCTUnwrap(handles.first)
+            XCTAssertNil(coordinator.nativeControllerForTesting, "A fake is never native PiP evidence")
             phase("before-start-hop")
-            coordinator.pictureInPictureControllerDidStartPictureInPicture(old)
+            coordinator.receiveDidStart(old.callbackObject)
             await flushDelegateDelivery()
             phase("after-start-hop")
             XCTAssertTrue(coordinator.isActive)
             XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("PiP admission must be closed") })
             XCTAssertFalse(old.isPictureInPictureActive)
             phase("before-stop-hop")
-            coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
+            coordinator.receiveDidStop(old.callbackObject)
             // Native active=false can precede the queued main-actor didStop callback.
             // Retire/replace synchronously before that callback is allowed to run.
             phase("before-retirement")
@@ -100,13 +106,14 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
             XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
             XCTAssertEqual(sessionStops, 0, "Retiring a presentation cannot stop its replacement session")
             if replacesPresentation {
-                let replacement = try XCTUnwrap(coordinator.nativeControllerForTesting)
+                let replacement = try XCTUnwrap(handles.last)
+                XCTAssertEqual(handles.count, 2)
                 phase("before-replacement-start-hop")
-                coordinator.pictureInPictureControllerDidStartPictureInPicture(replacement)
+                coordinator.receiveDidStart(replacement.callbackObject)
                 await flushDelegateDelivery()
                 phase("after-replacement-start-hop")
                 phase("before-stale-stop-hop")
-                coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
+                coordinator.receiveDidStop(old.callbackObject)
                 await flushDelegateDelivery()
                 phase("after-stale-stop-hop")
                 XCTAssertTrue(coordinator.isActive, "A late old stop cannot retire replacement PiP")
@@ -155,40 +162,216 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
     func testUnownedControllerCannotPauseOrRestoreAnotherSession() async {
         let target = PiPTestTarget()
         let coordinator = IOSPictureInPictureCoordinator(target: target)
-        let player = AVPlayer()
-        let controller = AVPictureInPictureController(contentSource: .init(playerLayer: AVPlayerLayer(player: player)))
-        coordinator.pictureInPictureController(controller, setPlaying: false)
+        let controller = FakePiPControllerHandle(source: .init(playerLayer: AVPlayerLayer()))
+        coordinator.receiveTransport(controller.callbackObject, playing: false)
         let restored: Bool = await withCheckedContinuation { continuation in
-            coordinator.pictureInPictureController(controller,
-                restoreUserInterfaceForPictureInPictureStopWithCompletionHandler: {
-                    continuation.resume(returning: $0)
-                })
+            coordinator.receiveRestore(controller.callbackObject) { continuation.resume(returning: $0) }
         }
         XCTAssertFalse(restored)
-        XCTAssertTrue(coordinator.pictureInPictureControllerIsPlaybackPaused(controller))
-        XCTAssertFalse(coordinator.pictureInPictureControllerTimeRangeForPlayback(controller).isValid)
+        XCTAssertTrue(coordinator.isPlaybackPaused(for: controller.callbackObject))
+        XCTAssertFalse(coordinator.playbackTimeRange(for: controller.callbackObject).isValid)
         XCTAssertTrue(target.pauseRequests.isEmpty)
         XCTAssertEqual(target.stopCount, 0)
         coordinator.close()
     }
     func testCloseIsIdempotentAndLateDelegateStopDoesNotReopenSession() async {
         let target = PiPTestTarget()
-        let coordinator = IOSPictureInPictureCoordinator(target: target)
+        let controller = FakePiPControllerHandle(source: .init(playerLayer: AVPlayerLayer()))
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { true }, makeController: { _, _ in controller })
         var stopped = 0
         coordinator.onStopped = { stopped += 1 }
-        let controller = AVPictureInPictureController(contentSource: .init(playerLayer: AVPlayerLayer()))
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
         coordinator.close()
         coordinator.close()
-        coordinator.pictureInPictureControllerDidStopPictureInPicture(controller)
+        coordinator.receiveDidStop(controller.callbackObject)
         let restored: Bool = await withCheckedContinuation { continuation in
-            coordinator.pictureInPictureController(controller,
-                restoreUserInterfaceForPictureInPictureStopWithCompletionHandler: {
-                    continuation.resume(returning: $0)
-                })
+            coordinator.receiveRestore(controller.callbackObject) { continuation.resume(returning: $0) }
         }
         XCTAssertFalse(restored)
         XCTAssertEqual(stopped, 0)
         XCTAssertFalse(coordinator.isActive)
+        XCTAssertEqual(controller.cancelObservationCount, 1)
+        XCTAssertEqual(controller.detachCount, 1)
+        XCTAssertFalse(controller.detachedWhileObserving)
+    }
+
+    func testActiveAndStartingRetirementWaitForStopBeforeCreatingSuccessor() async throws {
+        for startingOnly in [false, true] {
+            let target = PiPTestTarget()
+            let gate = GPUVideoProcessingGate()
+            gate.setForeground(true)
+            var handles: [FakePiPControllerHandle] = []
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) },
+                makeController: { source, _ in
+                    let handle = FakePiPControllerHandle(source: source)
+                    handles.append(handle)
+                    return handle
+                })
+            defer { coordinator.close() }
+            var stopped = 0
+            coordinator.onStopped = { stopped += 1 }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+            await flushDelegateDelivery()
+            let old = try XCTUnwrap(handles.first)
+            if startingOnly {
+                coordinator.start()
+                XCTAssertEqual(old.startCount, 1)
+            } else {
+                old.isPictureInPictureActive = true
+                coordinator.receiveDidStart(old.callbackObject)
+                await flushDelegateDelivery()
+            }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+            XCTAssertEqual(handles.count, 1, "Factory must wait for the retiring controller")
+            XCTAssertEqual(old.stopCount, 1)
+            XCTAssertEqual(old.cancelObservationCount, 1)
+            XCTAssertEqual(old.detachCount, 0)
+            XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Retiring PiP still owns activity") })
+            old.isPictureInPictureActive = false
+            coordinator.receiveDidStop(old.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertEqual(handles.count, 2)
+            XCTAssertEqual(old.detachCount, 1)
+            XCTAssertFalse(old.detachedWhileObserving)
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+            let replacement = try XCTUnwrap(handles.last)
+            coordinator.receiveDidStart(replacement.callbackObject)
+            await flushDelegateDelivery()
+            coordinator.receiveDidStart(old.callbackObject)
+            coordinator.receiveDidStop(old.callbackObject)
+            coordinator.receiveFailure(old.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertTrue(coordinator.isActive)
+            XCTAssertEqual(replacement.stopCount, 0)
+            XCTAssertEqual(stopped, 0)
+            XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Replacement PiP still owns activity") })
+        }
+    }
+
+    func testFactoryFailureClearsPresentationAndProcessingActivity() async throws {
+        for failsInitially in [false, true] {
+            let target = PiPTestTarget()
+            let gate = GPUVideoProcessingGate()
+            gate.setForeground(true)
+            var factoryCalls = 0
+            var old: FakePiPControllerHandle?
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) },
+                makeController: { source, _ in
+                    factoryCalls += 1
+                    guard !failsInitially, factoryCalls == 1 else { return nil }
+                    let handle = FakePiPControllerHandle(source: source)
+                    old = handle
+                    return handle
+                })
+            defer { coordinator.close() }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+            if !failsInitially {
+                let old = try XCTUnwrap(old)
+                old.isPictureInPictureActive = true
+                coordinator.receiveDidStart(old.callbackObject)
+                await flushDelegateDelivery()
+                coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+                XCTAssertEqual(factoryCalls, 1)
+                old.isPictureInPictureActive = false
+                coordinator.receiveDidStop(old.callbackObject)
+                await flushDelegateDelivery()
+                XCTAssertEqual(factoryCalls, 2)
+                XCTAssertEqual(old.detachCount, 1)
+            }
+            XCTAssertFalse(coordinator.isActive)
+            XCTAssertFalse(coordinator.isPossible)
+            XCTAssertNil(coordinator.nativeControllerForTesting)
+            XCTAssertNotNil(coordinator.message)
+            coordinator.start()
+            coordinator.requestPlayerTransport(paused: false, identity: makeIdentity(failsInitially ? 1 : 2))
+            await flushDelegateDelivery()
+            XCTAssertTrue(target.pauseRequests.isEmpty, "A failed factory cannot retain presentation authority")
+            XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+        }
+    }
+
+    func testNativeFactoryCannotBypassActualRuntimeCapability() {
+        let supported = AVPictureInPictureController.isPictureInPictureSupported()
+        let target = PiPTestTarget()
+        let coordinator = IOSPictureInPictureCoordinator(target: target, supportsPictureInPicture: { true })
+        defer { coordinator.close() }
+        coordinator.install(playerLayer: AVPlayerLayer(player: AVPlayer()), identity: makeIdentity(1))
+        let created = coordinator.nativeControllerForTesting != nil
+        FileHandle.standardOutput.write(Data(
+            "IOS_PIP_FACTORY_CAPABILITY supported=\(supported) controller=\(created) evidence=construction_guard_only\n".utf8))
+        XCTAssertEqual(created, supported)
+        if !supported {
+            XCTAssertFalse(coordinator.isPossible)
+            XCTAssertNotNil(coordinator.message)
+        }
+    }
+
+    func testPlaybackInvalidationOnlyTargetsSampleBufferContent() throws {
+        for sampleBuffer in [false, true] {
+            let target = PiPTestTarget()
+            var handle: FakePiPControllerHandle?
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, makeController: { source, _ in
+                    let created = FakePiPControllerHandle(source: source)
+                    handle = created
+                    return created
+                })
+            defer { coordinator.close() }
+            if sampleBuffer {
+                coordinator.install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(), identity: makeIdentity(1))
+            } else {
+                coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+            }
+            let created = try XCTUnwrap(handle)
+            XCTAssertEqual(created.invalidationCount, sampleBuffer ? 1 : 0)
+            coordinator.update(state: .idle, paused: true)
+            XCTAssertEqual(created.invalidationCount, sampleBuffer ? 2 : 0)
+        }
+    }
+
+    private func makeIdentity(_ nonce: UInt64) -> PresentationIdentity {
+        let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
+        let backend = PlaybackBackendIdentity(sessionIdentity: session, backendGeneration: 1)
+        return .init(sessionIdentity: session, backendIdentity: backend,
+            outputLifecycleEpoch: .init(backendIdentity: backend, outputNonce: nonce),
+            itemGeneration: .init(rawValue: nonce), presentationNonce: nonce)
+    }
+}
+
+@MainActor
+private final class FakePiPControllerHandle: PiPControllerHandle {
+    let callbackObject: AnyObject = NSObject()
+    var nativeController: AVPictureInPictureController? { nil }
+    var contentSource: AVPictureInPictureController.ContentSource?
+    var isPictureInPictureActive = false
+    private var possibleChange: (@Sendable (Bool) -> Void)?
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var invalidationCount = 0
+    private(set) var cancelObservationCount = 0
+    private(set) var detachCount = 0
+    private(set) var detachedWhileObserving = false
+    init(source: AVPictureInPictureController.ContentSource) { contentSource = source }
+    func observePossibility(_ change: @escaping @Sendable (Bool) -> Void) {
+        possibleChange = change
+        change(true)
+    }
+    func cancelObservation() {
+        guard possibleChange != nil else { return }
+        possibleChange = nil
+        cancelObservationCount += 1
+    }
+    func startPictureInPicture() { startCount += 1 }
+    func stopPictureInPicture() { stopCount += 1 }
+    func invalidatePlaybackState() { invalidationCount += 1 }
+    func detach() {
+        detachedWhileObserving = possibleChange != nil
+        cancelObservation()
+        detachCount += 1
+        contentSource = nil
     }
 }
 
