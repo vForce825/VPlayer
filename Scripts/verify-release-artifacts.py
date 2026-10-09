@@ -313,6 +313,15 @@ def expand_responses(arguments, derived, cwd, evidence=None):
         for token in tokens:
             if token.startswith('@'):
                 path = Path(token[1:]); path = (path if path.is_absolute() else cwd / path).resolve()
+                previous = expanded[-1:] if expanded[-1:] != ['-Xlinker'] else expanded[-2:-1]
+                if (previous and previous[0] in ('-install_name', '-rpath')
+                        and token.startswith(('@rpath/', '@loader_path/', '@executable_path/'))):
+                    # Mach-O loader names are literal linker operands, not
+                    # response files. Reject a real file collision as ambiguous.
+                    require(not path.exists(), 'loader_response_collision')
+                    expanded.append(token)
+                    require(len(expanded) <= 65536, 'argument_limit')
+                    continue
                 require(path.is_relative_to(derived.resolve()), 'response_outside_derived_data')
                 require(path not in stack and len(stack) < 8, 'response_cycle_or_depth')
                 count += 1

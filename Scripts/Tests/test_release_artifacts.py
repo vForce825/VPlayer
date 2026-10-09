@@ -282,6 +282,31 @@ class ReleaseArtifactTests(unittest.TestCase):
                 with self.subTest(tokens=tokens), self.assertRaises(self.guard.GuardError):
                     self.guard.expand_responses(tokens, root, root)
 
+    def test_loader_paths_are_literals_only_in_linker_operand_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            for option in ('-install_name', '-rpath'):
+                for loader in ('@rpath/Frameworks', '@executable_path/Frameworks', '@loader_path/Frameworks'):
+                    for tokens in ([option, loader], ['-Xlinker', option, '-Xlinker', loader]):
+                        with self.subTest(tokens=tokens):
+                            self.assertEqual(self.guard.expand_responses(tokens, root, root), tokens)
+                    for tokens in ([loader], ['-I', loader], [option, '-O2', loader]):
+                        with self.subTest(tokens=tokens), self.assertRaises(self.guard.GuardError):
+                            self.guard.expand_responses(tokens, root, root)
+            # An actual response keeps its boundary checks even as a linker operand.
+            with self.assertRaisesRegex(self.guard.GuardError, 'response_outside_derived_data'):
+                self.guard.expand_responses(['-rpath', '@/outside/args.rsp'], root, root)
+            response = root / 'link.rsp'
+            response.write_text('-install_name @rpath/Frameworks')
+            evidence = []
+            self.assertEqual(self.guard.expand_responses(['@' + str(response)], root, root, evidence),
+                             ['-install_name', '@rpath/Frameworks'])
+            self.assertEqual(len(evidence), 1)
+            (root / 'rpath').mkdir()
+            (root / 'rpath/Frameworks').write_text('-fprofile-instr-generate')
+            with self.assertRaises(self.guard.GuardError):
+                self.guard.expand_responses(['-install_name', '@rpath/Frameworks'], root, root)
+
     def test_rejected_cli_never_prints_private_symbol_path_or_raw_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             artifact = Path(tmp) / 'private-user-original-video-secret.o'
