@@ -45,12 +45,22 @@ final class IOSVideoProcessingLifecycleTests: XCTestCase {
 final class IOSPictureInPictureCoordinatorTests: XCTestCase {
     func testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU() async throws {
         for replacesPresentation in [false, true] {
+            let variant = replacesPresentation ? "replace" : "retire"
+            func phase(_ stage: String) {
+                FileHandle.standardOutput.write(Data(
+                    "IOS_PIP_RETIREMENT_STAGE=\(variant).\(stage)\n".utf8))
+            }
+            phase("begin")
             let target = PiPTestTarget()
             let gate = GPUVideoProcessingGate()
             gate.setForeground(true)
             let coordinator = IOSPictureInPictureCoordinator(target: target,
                 supportsPictureInPicture: { true }, setPictureInPicture: { gate.setPictureInPicture($0) })
-            defer { coordinator.close() }
+            defer {
+                phase("before-close")
+                coordinator.close()
+                phase("after-close")
+            }
             var sessionStops = 0
             coordinator.onStopped = { sessionStops += 1 }
             let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID())
@@ -60,33 +70,45 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
                     outputLifecycleEpoch: .init(backendIdentity: backend, outputNonce: nonce),
                     itemGeneration: .init(rawValue: nonce), presentationNonce: nonce)
             }
+            phase("before-initial-install")
             coordinator.install(playerLayer: AVPlayerLayer(), identity: identity(1))
+            phase("after-initial-install")
             let old = try XCTUnwrap(coordinator.nativeControllerForTesting)
             // Drive only delegate ordering; this is not a claim of native PiP support.
+            phase("before-start-hop")
             coordinator.pictureInPictureControllerDidStartPictureInPicture(old)
             await flushDelegateDelivery()
+            phase("after-start-hop")
             XCTAssertTrue(coordinator.isActive)
             XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("PiP admission must be closed") })
             XCTAssertFalse(old.isPictureInPictureActive)
+            phase("before-stop-hop")
             coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
             // Native active=false can precede the queued main-actor didStop callback.
             // Retire/replace synchronously before that callback is allowed to run.
+            phase("before-retirement")
             if replacesPresentation {
                 coordinator.install(playerLayer: AVPlayerLayer(), identity: identity(2))
             } else {
                 coordinator.retire(identity: identity(1))
             }
+            phase("after-retirement")
             XCTAssertFalse(coordinator.isActive)
             XCTAssertNil(try gate.withGPUAdmission { $0.finish() }, "Retired PiP must not strand foreground work on CPU")
             await flushDelegateDelivery()
+            phase("after-stop-hop")
             XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
             XCTAssertEqual(sessionStops, 0, "Retiring a presentation cannot stop its replacement session")
             if replacesPresentation {
                 let replacement = try XCTUnwrap(coordinator.nativeControllerForTesting)
+                phase("before-replacement-start-hop")
                 coordinator.pictureInPictureControllerDidStartPictureInPicture(replacement)
                 await flushDelegateDelivery()
+                phase("after-replacement-start-hop")
+                phase("before-stale-stop-hop")
                 coordinator.pictureInPictureControllerDidStopPictureInPicture(old)
                 await flushDelegateDelivery()
+                phase("after-stale-stop-hop")
                 XCTAssertTrue(coordinator.isActive, "A late old stop cannot retire replacement PiP")
                 XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("Replacement PiP still owns activity") })
             }

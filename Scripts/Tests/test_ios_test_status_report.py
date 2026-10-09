@@ -22,6 +22,10 @@ NATIVE = 'VPlayeriOSTests/IOSNativePictureInPictureTests/testRealSampleBufferPiP
 NATIVE_URL = 'test://com.apple.xcode/VPlayer/' + NATIVE + '()'
 BENCHMARK = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification'
 RELEASE_GOLDEN = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly'
+PREFLIGHT = (
+    'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+    'VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
+)
 
 
 def schema():
@@ -260,6 +264,31 @@ class IOSSelectedStatusTests(unittest.TestCase):
         self.assertNotIn('TRUNCATED', '\n'.join(lines) + summary)
         self.assertLessEqual(len(('\n'.join(lines) + '\n').encode()), m.MAX_OUTPUT)
         self.assertLessEqual(len(summary.encode()), m.MAX_OUTPUT)
+
+    def test_preflight_manifest_is_exact_and_remains_required_in_full_suite(self):
+        m = self.module()
+        self.assertEqual(getattr(m, 'PREFLIGHT_TESTS', None), PREFLIGHT)
+        self.assertTrue(set(PREFLIGHT).issubset(m.DEFAULT_TESTS))
+        self.assertEqual(len(m.DEFAULT_TESTS), 55)
+
+    def test_preflight_requires_both_passed_and_never_accepts_skipped_or_missing_tests(self):
+        m = self.module()
+        self.assertTrue(hasattr(m, 'PREFLIGHT_TESTS'), 'A separate preflight manifest is required')
+        for result, missing in [('Passed', False), ('Failed', False), ('Skipped', False),
+                                ('Expected Failure', False), ('Passed', True)]:
+            with self.subTest(result=result, missing=missing), tempfile.TemporaryDirectory() as temp:
+                bundle = Path(temp) / 'preflight.xcresult'; bundle.mkdir()
+                tree = [case(PREFLIGHT[0])]
+                if not missing:
+                    tree.append(case(PREFLIGHT[1], result=result))
+                replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': tree})]
+                output = io.StringIO()
+                with patch.object(m, 'run_bounded', side_effect=replies), \
+                        patch.object(m, 'enrich_skip_reasons'), contextlib.redirect_stdout(output):
+                    status = m.main([str(bundle), '--preflight'])
+                self.assertEqual(status, int(result != 'Passed' or missing))
+                self.assertIn('IOS_SELECTED_TEST_SCOPE=regression_preflight', output.getvalue())
+                self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in output.getvalue().splitlines()), 2)
 
     def test_allowlist_methods_exist_under_exact_source_classes(self):
         import re

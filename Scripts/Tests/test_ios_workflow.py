@@ -5,12 +5,28 @@
 from pathlib import Path
 import json
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
 import unittest
 ROOT=Path(__file__).resolve().parents[2]
 class IOSWorkflowTests(unittest.TestCase):
+    def workflow_step(self, name):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        marker='      - name: '+name+'\n'
+        self.assertIn(marker,text)
+        return text.split(marker,1)[1].split('      - name:',1)[0]
+    def step_allows(self, step, outcomes):
+        expression=re.search(r'^        if: (.+)$',step,re.MULTILINE).group(1)
+        for clause in expression.split(' && '):
+            if clause in ('always()','!cancelled()'):
+                continue
+            match=re.fullmatch(r"steps\.(\w+)\.outcome == 'success'",clause)
+            self.assertIsNotNone(match,'Unexpected acceptance condition: '+clause)
+            if outcomes.get(match.group(1)) != 'success':
+                return False
+        return True
     def test_separate_workflow_preserves_exact_head_and_no_push_trigger(self):
         path=ROOT/'.github/workflows/ios-ci.yml'
         self.assertTrue(path.exists(),'iOS native validation workflow is missing')
@@ -37,7 +53,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('id: prepare', text)
         self.assertIn('id: simulator', text)
         guard="if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'"
-        self.assertEqual(text.count(guard), 5)
+        self.assertEqual(text.count(guard), 6)
         self.assertIn("steps.release_build.outcome == 'success'", text)
         self.assertIn("--build-only", text)
         self.assertNotIn('continue-on-error', text.split('  ios-tests:',1)[1])
@@ -81,7 +97,88 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('-configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmark',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',text)
-        self.assertEqual(text.count('Scripts/report-ios-test-status.py'),2)
+        self.assertEqual(text.count('Scripts/report-ios-test-status.py'),3)
+    def test_preflight_runs_exact_failed_cases_with_shared_debug_build_and_preserves_stderr_exit(self):
+        step=self.workflow_step('Preflight PiP retirement and playlist deletion regressions')
+        self.assertIn('id: regression_preflight',step)
+        self.assertIn('timeout-minutes: 20',step)
+        self.assertNotIn('continue-on-error',step)
+        script=textwrap.dedent(step.split('        run: |\n',1)[1])
+        self.assertIn('set -o pipefail',script)
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);(directory/'Scripts').mkdir()
+            native=directory/'Scripts/test-ios.sh'
+            native.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGS_LOG"\nprintf "native stdout\\n"\nprintf "IOS_PIP_RETIREMENT_STAGE=before_install\\n" >&2\nexit "$NATIVE_EXIT"\n')
+            native.chmod(0o755)
+            args_log=directory/'args'
+            expected=['-configuration','Debug','-derivedDataPath',str(directory/'iOS-Simulator'),
+                '-resultBundlePath',str(directory/'iOS-Regressions.xcresult'),'-parallel-testing-enabled','NO',
+                '-collect-test-diagnostics','never','-test-timeouts-enabled','YES',
+                '-default-test-execution-time-allowance','120','-maximum-test-execution-time-allowance','300',
+                '-only-testing:VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+                '-only-testing:VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation']
+            for code in [0,7]:
+                run=subprocess.run(['bash','-e','-o','pipefail','-c',script],cwd=directory,
+                    env=dict(os.environ,RUNNER_TEMP=str(directory),ARGS_LOG=str(args_log),NATIVE_EXIT=str(code)),
+                    capture_output=True,text=True,timeout=3)
+                self.assertEqual(run.returncode,code,run.stderr)
+                self.assertEqual(args_log.read_text().splitlines(),expected)
+                self.assertIn('native stdout',run.stdout)
+                self.assertIn('IOS_PIP_RETIREMENT_STAGE=before_install',run.stdout)
+                self.assertEqual((directory/'iOS-Regressions.log').read_text(),run.stdout)
+    def test_preflight_failure_blocks_expensive_steps_but_success_still_requires_full_suite(self):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        fixtures=self.workflow_step('Prepare mandatory synthetic shared-playback fixtures')
+        full=self.workflow_step('Run shared playback and iPhone touch tests')
+        report=self.workflow_step('Report PiP retirement and playlist deletion preflight')
+        self.assertIn('id: regression_preflight_report',report)
+        self.assertIn('if: always()',report)
+        self.assertNotIn('continue-on-error',report)
+        outcomes={key:'success' for key in ('prepare','simulator','regression_preflight','regression_preflight_report','fixtures')}
+        for step in (fixtures,full):
+            self.assertTrue(self.step_allows(step,outcomes))
+            for failed in ('regression_preflight','regression_preflight_report'):
+                for outcome in ('failure','cancelled','skipped'):
+                    self.assertFalse(self.step_allows(step,dict(outcomes,**{failed:outcome})),
+                        f'{failed}={outcome} must block fixtures and full testing')
+        self.assertLess(text.index('Preflight PiP retirement'),text.index('Prepare mandatory synthetic'))
+        self.assertLess(text.index('Report PiP retirement'),text.index('Prepare mandatory synthetic'))
+        self.assertNotIn('-only-testing:',full)
+        self.assertNotIn('continue-on-error',full)
+        self.assertIn('Scripts/test-ios.sh -configuration Debug',full)
+        full_report=self.workflow_step('Report startup and functional test results')
+        self.assertIn('report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1',full_report)
+        self.assertNotIn('--preflight',full_report)
+    def test_preflight_report_preserves_failures_and_only_summarizes_bounded_fixed_stage_markers(self):
+        step=self.workflow_step('Report PiP retirement and playlist deletion preflight')
+        script=textwrap.dedent(step.split('        run: |\n',1)[1])
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);(directory/'bin').mkdir()
+            reporter=directory/'bin/python3'
+            reporter.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$REPORT_ARGS_LOG"\ncase "$1" in\nScripts/report-xcresult-failures.py) exit "$FAILURE_REPORT_EXIT" ;;\nScripts/report-ios-test-status.py) exit "$STATUS_REPORT_EXIT" ;;\n*) exit 99 ;;\nesac\n')
+            reporter.chmod(0o755)
+            marker='IOS_PIP_RETIREMENT_STAGE=retire.before-initial-install'
+            private='must-not-publish'
+            (directory/'iOS-Regressions.log').write_text('\n'.join([
+                private,'IOS_PIP_RETIREMENT_STAGE=retire.'+private,
+                marker+' '+private,'IOS_PIP_RETIREMENT_STAGE='+('x'*10000),
+                'native stderr '+private,*([marker]*45)])+'\n')
+            for failure_code,status_code in [(0,0),(1,0),(0,1)]:
+                summary=directory/'summary';summary.write_text('existing summary\n')
+                args_log=directory/'report-args';args_log.write_text('')
+                run=subprocess.run(['bash','-e','-o','pipefail','-c',script],cwd=directory,
+                    env=dict(os.environ,PATH=str(directory/'bin')+os.pathsep+os.environ['PATH'],
+                        RUNNER_TEMP=str(directory),GITHUB_STEP_SUMMARY=str(summary),
+                        REPORT_ARGS_LOG=str(args_log),FAILURE_REPORT_EXIT=str(failure_code),
+                        STATUS_REPORT_EXIT=str(status_code)),capture_output=True,text=True,timeout=3)
+                self.assertEqual(run.returncode,int(bool(failure_code or status_code)),run.stderr)
+                self.assertEqual(args_log.read_text().splitlines(),[
+                    f'Scripts/report-xcresult-failures.py {directory}/iOS-Regressions.xcresult',
+                    f'Scripts/report-ios-test-status.py {directory}/iOS-Regressions.xcresult --preflight'])
+                lines=summary.read_text().splitlines()
+                self.assertEqual(lines,['existing summary']+[marker]*30)
+                self.assertTrue(all(len(line)<=240 for line in lines[1:]))
+                self.assertNotIn(private,summary.read_text())
     def run_cpu_measurement(self, native_exit=0, settings_mode='normal'):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         step=text.split('name: Measure optimized CPU processing without device qualification',1)[1].split('      - name:',1)[0]

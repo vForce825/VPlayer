@@ -166,9 +166,35 @@ jobs:
         run: |
           python3 Scripts/Support/ios-startup-runner.py \
             --simulator "$IOS_SIMULATOR_UDID" --derived-data "$RUNNER_TEMP/iOS-Release"
+      - name: Preflight PiP retirement and playlist deletion regressions
+        id: regression_preflight
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          Scripts/test-ios.sh -configuration Debug \
+            -derivedDataPath "$RUNNER_TEMP/iOS-Simulator" \
+            -resultBundlePath "$RUNNER_TEMP/iOS-Regressions.xcresult" \
+            -parallel-testing-enabled NO -collect-test-diagnostics never \
+            -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            -only-testing:VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU \
+            -only-testing:VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation \
+            2>&1 | tee "$RUNNER_TEMP/iOS-Regressions.log"
+      - name: Report PiP retirement and playlist deletion preflight
+        id: regression_preflight_report
+        if: always()
+        run: |
+          status=0
+          python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS-Regressions.xcresult" || status=1
+          python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS-Regressions.xcresult" --preflight || status=1
+          if [ -f "$RUNNER_TEMP/iOS-Regressions.log" ]; then
+            awk '/^IOS_PIP_RETIREMENT_STAGE=(retire|replace)\.(begin|before-initial-install|after-initial-install|before-start-hop|after-start-hop|before-stop-hop|before-retirement|after-retirement|after-stop-hop|before-close|after-close|before-replacement-start-hop|after-replacement-start-hop|before-stale-stop-hop|after-stale-stop-hop)$/ && count++ < 30 {print substr($0, 1, 240)}' "$RUNNER_TEMP/iOS-Regressions.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$status"
       - name: Prepare mandatory synthetic shared-playback fixtures
         id: fixtures
-        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.regression_preflight.outcome == 'success' && steps.regression_preflight_report.outcome == 'success'
         timeout-minutes: 40
         run: |
           brew install pkgconf x264 x265 nasm
@@ -177,7 +203,7 @@ jobs:
           ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           test -s Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
       - name: Run shared playback and iPhone touch tests
-        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.fixtures.outcome == 'success'
+        if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.regression_preflight.outcome == 'success' && steps.regression_preflight_report.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 60
         run: |
           set -o pipefail

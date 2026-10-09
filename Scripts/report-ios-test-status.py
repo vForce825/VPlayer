@@ -5,8 +5,10 @@
 """Report selected iOS XCTest results, never logs, activities or attachments.
 
 Default: functional unit/UI coverage. --benchmark: only the separate CPU benchmark.
-Exit 0 means evidence was read completely, not that every test passed. Missing or
-unverified evidence exits 1. Skips and expected failures are never counted as passes.
+For those modes, exit 0 means evidence was read completely, not that every test
+passed. --preflight returns 0 only when both fixed regression tests are Passed.
+Missing or unverified evidence exits 1. Skips and expected failures are never
+counted as passes.
 """
 import argparse
 import html
@@ -106,6 +108,10 @@ DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'
 BENCHMARK_TESTS = (
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+)
+PREFLIGHT_TESTS = (
+    'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+    'VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
 )
 
 
@@ -502,10 +508,14 @@ def schema_shape(document):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bundle', type=Path)
-    parser.add_argument('--benchmark', action='store_true', help='Report only the separate Release CPU benchmark')
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument('--benchmark', action='store_true', help='Report only the separate Release CPU benchmark')
+    scope.add_argument('--preflight', action='store_true', help='Require both fixed regression preflight tests to pass')
     args = parser.parse_args(argv)
     manifest = BENCHMARK_TESTS if args.benchmark else DEFAULT_TESTS
     mode = 'cpu_benchmark' if args.benchmark else 'functional_unit_and_ui'
+    if args.preflight:
+        manifest, mode = PREFLIGHT_TESTS, 'regression_preflight'
     schema, shape = None, None
     try:
         if args.bundle.suffix != '.xcresult' or not args.bundle.is_dir():
@@ -528,6 +538,8 @@ def main(argv=None):
         reason = str(error) if isinstance(error, (ValueError, RuntimeError)) and re_safe(str(error)) else type(error).__name__
         rows = [{'test': identifier, 'status': 'Unverified', 'reason': reason} for identifier in manifest]
     emit(rows, mode, shape)
+    if args.preflight:
+        return int(any(row['status'] != 'Passed' for row in rows))
     return int(any(row['status'] == 'Unverified' for row in rows))
 
 

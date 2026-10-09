@@ -9,6 +9,10 @@ final class IOSLibraryFlowTests: XCTestCase {
     private func identified(_ identifier: String, in query: XCUIElementQuery) -> XCUIElementQuery {
         query.matching(NSPredicate(format: "identifier == %@", identifier))
     }
+    private func deletionConfirmationButtons(in app: XCUIApplication) -> XCUIElementQuery {
+        app.buttons.matching(NSPredicate(format: "label == %@ AND NOT (identifier BEGINSWITH %@)",
+                                        "删除", "source.delete."))
+    }
     private func failureDetails(in app: XCUIApplication, stage: String) -> String {
         let route = app.descendants(matching: .any)
             .matching(identifier: "ios.playback.route").firstMatch
@@ -28,10 +32,23 @@ final class IOSLibraryFlowTests: XCTestCase {
             return "role=\(element.elementType.rawValue):id=\(identifier):hit=\(element.isHittable):frame=\(element.frame)"
         }.joined(separator: ";")
         let screenIDButtons = identified("player-full-screen", in: app.buttons).count
+        let cancellationButtons = app.buttons.matching(NSPredicate(format: "label == %@", "取消"))
+        let cancellationControls = cancellationButtons.allElementsBoundByIndex.prefix(3).map { element in
+            "role=\(element.elementType.rawValue):hit=\(element.isHittable):frame=\(element.frame)"
+        }.joined(separator: ";")
+        let confirmationButtons = deletionConfirmationButtons(in: app)
+        let confirmationControls = confirmationButtons.allElementsBoundByIndex.prefix(3).map { element in
+            "role=\(element.elementType.rawValue):hit=\(element.isHittable):frame=\(element.frame)"
+        }.joined(separator: ";")
+        let deletionNotice = app.staticTexts["已导入的频道和节目单会一并移除。"]
+        let deletionNoticeDetails = deletionNotice.exists ? "frame=\(deletionNotice.frame)" : "absent"
         return "IOS_UI_STAGE=\(stage) IOS_UI_ROUTE=\(snapshot) " +
             "playerBack=\(playerExists) playerContainer=\(playerContainerExists) miniPlayer=\(miniPlayerExists) " +
             "row=channel.http exists=\(channelExists) hittable=\(channelExists && channel.isHittable) " +
-            "channelNavigation=\(channelNavigationExists) alerts=\(app.alerts.count) " +
+            "channelNavigation=\(channelNavigationExists) alerts=\(app.alerts.count) sheets=\(app.sheets.count) " +
+            "deletionNotice=\(deletionNoticeDetails) editor=\(app.textFields["source.editor.name"].exists) " +
+            "cancelButtons=\(cancellationButtons.count) cancellationControls=[\(cancellationControls)] " +
+            "confirmDeleteButtons=\(confirmationButtons.count) confirmationControls=[\(confirmationControls)] " +
             "screenIDButtons=\(screenIDButtons) closeLabelMatches=\(closeByLabel.count) closeElements=[\(closeElements)]"
     }
     private func require(_ element: XCUIElement, in app: XCUIApplication, stage: String,
@@ -142,13 +159,21 @@ final class IOSLibraryFlowTests: XCTestCase {
         let delete = app.buttons["删除"]
         require(delete, in: app, stage: "delete-source-control", timeout: 5, hittable: true)
         delete.tap()
-        let dialog = app.sheets.firstMatch
-        require(dialog.buttons["取消"], in: app, stage: "delete-cancel-confirmation", timeout: 5,
-                hittable: true)
-        XCTAssertTrue(dialog.staticTexts["已导入的频道和节目单会一并移除。"].exists)
+        // A system confirmation dialog need not expose an AX sheet container.
+        // Verify its warning and distinct destructive action before cancelling.
+        let notice = app.staticTexts["已导入的频道和节目单会一并移除。"]
+        require(notice, in: app, stage: "delete-confirmation-warning", timeout: 5)
+        let confirmations = deletionConfirmationButtons(in: app)
+        let confirm = confirmations.firstMatch
+        require(confirm, in: app, stage: "delete-confirmation-control", timeout: 5, hittable: true)
+        XCTAssertEqual(confirmations.count, 1, failureDetails(in: app, stage: "delete-confirmation-identity"))
         XCTAssertFalse(app.textFields["source.editor.name"].exists,
                        "Tapping Delete must not also open the editor.")
-        dialog.buttons["取消"].tap()
+        let cancel = app.buttons["取消"]
+        require(cancel, in: app, stage: "delete-cancel-confirmation", timeout: 5, hittable: true)
+        cancel.tap()
+        XCTAssertTrue(notice.waitForNonExistence(timeout: 5),
+                      failureDetails(in: app, stage: "delete-confirmation-dismissed"))
         require(delete, in: app, stage: "delete-cancelled", timeout: 5, hittable: true)
         XCTAssertTrue(app.staticTexts["测试播放列表"].exists)
         app.tabBars.buttons["频道"].tap()
@@ -156,10 +181,11 @@ final class IOSLibraryFlowTests: XCTestCase {
 
         app.tabBars.buttons["播放列表"].tap()
         delete.tap()
-        require(dialog.buttons["删除"], in: app, stage: "delete-explicit-confirmation", timeout: 5,
-                hittable: true)
+        require(notice, in: app, stage: "delete-second-confirmation-warning", timeout: 5)
+        require(confirm, in: app, stage: "delete-explicit-confirmation", timeout: 5, hittable: true)
+        XCTAssertEqual(confirmations.count, 1, failureDetails(in: app, stage: "delete-explicit-identity"))
         // Only the isolated in-memory seeded source is ever confirmed for deletion.
-        dialog.buttons["删除"].tap()
+        confirm.tap()
         require(app.staticTexts["还没有播放列表"], in: app, stage: "delete-source-removed", timeout: 5)
         XCTAssertFalse(app.staticTexts["测试播放列表"].exists)
         app.tabBars.buttons["频道"].tap()
