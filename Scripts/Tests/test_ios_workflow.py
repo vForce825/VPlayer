@@ -79,6 +79,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('synthetic-hlg50-ac3-64s.ts',text)
         self.assertIn('-configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO',text)
         self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmark',text)
+        self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',text)
         self.assertEqual(text.count('Scripts/report-ios-test-status.py'),2)
     def test_functional_results_are_reported_before_independent_cpu_measurement(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()

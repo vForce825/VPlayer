@@ -29,9 +29,13 @@ KNOWN_RESULTS = frozenset({'Passed', 'Failed', 'Skipped', 'Expected Failure'})
 
 # Immutable, explicit identities: missing tests remain visible in the report.
 _FUNCTIONAL_SUITES = (
+    ('VPlayeriOSTests', 'IOSVideoProcessingLifecycleTests', (
+        'testApplicationNotificationsSynchronouslyCloseAndRestoreActualGPUAdmission',
+        'testForegroundNotificationCannotOverrideAnActivePiPLease',)),
     ('VPlayeriOSTests', 'IOSNativePictureInPictureTests', (
         'testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession',)),
     ('VPlayeriOSTests', 'IOSPictureInPictureCoordinatorTests', (
+        'testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
         'testRestoreIntentIsConsumedBeforeTheNextAutomaticPiPCycle',
         'testCallbackReferencePinsIdentityUntilTheActorHopFinishes',
         'testUnavailablePiPDoesNotStopThePlaybackTarget',
@@ -39,6 +43,13 @@ _FUNCTIONAL_SUITES = (
         'testCloseIsIdempotentAndLateDelegateStopDoesNotReopenSession',)),
     ('VPlayeriOSTests', 'IOSPlaybackSessionTests', (
         'testMinimizingAndRestoringKeepsSameModelAndRemoteStopRetiresSession',)),
+    ('VPlayeriOSTests', 'AdaptiveYADIFDiagnosticsTests', (
+        'testOneSecondWindowAndModeChangeFlushHaveExactCountsAndWallTimes',
+        'testManyCompletionsCollapseIntoOneWindowAndExplicitFlushResetsIt',
+        'testCPUPhaseCallbackRunsOnceWithSeparateNonnegativeWallTimes',)),
+    ('VPlayeriOSTests', 'AdaptiveYADIFHandoffTests', (
+        'testDelayedGPUThenCPUThenForegroundGPUPreservesCompletionOrderAndPixels',
+        'testCancellationDuringGPUFenceRetiresEachJobOnceAndRestoresAllThreeSlots',)),
     ('VPlayeriOSTests', 'VideoProcessingHandoffTests', (
         'testBackgroundClosesGPUAdmissionAndFenceJoinsActualCompletion',
         'testSecondBackgroundTransitionStillJoinsUnfinishedEarlierGPUWork',
@@ -86,12 +97,16 @@ _FUNCTIONAL_SUITES = (
     ('VPlayeriOSUITests', 'IOSLibraryFlowTests', (
         'testTouchChannelSelectionCloseAndReopen',
         'testSourceEditorCancelAndReopen',
+        'testPlaylistEditOpensExistingSourceWithoutDeletingIt',
+        'testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
         'testRotationAndPlaybackSettingsKeepPlayerSession',)),
 )
 DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'
                       for target, suite, methods in _FUNCTIONAL_SUITES for method in methods)
-BENCHMARK_TESTS = ('VPlayeriOSBenchmarks/YADIFGoldenPixelTests/'
-                   'testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',)
+BENCHMARK_TESTS = (
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+)
 
 
 def run_bounded(command, timeout=30, limit=MAX_JSON):

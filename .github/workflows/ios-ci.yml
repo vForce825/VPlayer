@@ -201,6 +201,11 @@ jobs:
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 30
         run: |
+          xcodebuild -showBuildSettings -json -project VPlayer.xcodeproj -scheme VPlayeriOSBenchmarks \
+            -configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO \
+            -destination "$IOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
+            > "$RUNNER_TEMP/iOS-CPU-Release-settings.json"
+          python3 -c 'import json,sys; rows=json.load(open(sys.argv[1])); row=next(r for r in rows if r["target"] == "VPlayerPlaybackiOS"); keys=("GCC_OPTIMIZATION_LEVEL","OTHER_CFLAGS","SWIFT_OPTIMIZATION_LEVEL","ENABLE_TESTABILITY"); print("IOS_CPU_BUILD_SETTINGS="+json.dumps({k:row["buildSettings"].get(k) for k in keys},sort_keys=True))' "$RUNNER_TEMP/iOS-CPU-Release-settings.json"
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayeriOSBenchmarks \
             -configuration Release ENABLE_TESTABILITY=YES -enableCodeCoverage NO \
             -destination "$IOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \
@@ -209,13 +214,18 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 \
-            -only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification
+            -only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification \
+            -only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly \
+            2>&1 | tee "$RUNNER_TEMP/iOS-CPU-Release.log"
       - name: Report CPU measurement and qualification limits
         if: always()
         run: |
           status=0
           python3 Scripts/report-xcresult-failures.py "$RUNNER_TEMP/iOS-CPU-Release.xcresult" || status=1
           python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS-CPU-Release.xcresult" --benchmark || status=1
+          if [ -f "$RUNNER_TEMP/iOS-CPU-Release.log" ]; then
+            awk '/IOS_CPU_YADIF_BENCH width=/ && count++ < 4 {print}' "$RUNNER_TEMP/iOS-CPU-Release.log" >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
           exit "$status"

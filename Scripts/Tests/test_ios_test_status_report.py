@@ -21,6 +21,7 @@ REPORTER = ROOT / 'Scripts/report-ios-test-status.py'
 NATIVE = 'VPlayeriOSTests/IOSNativePictureInPictureTests/testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession'
 NATIVE_URL = 'test://com.apple.xcode/VPlayer/' + NATIVE + '()'
 BENCHMARK = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification'
+RELEASE_GOLDEN = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly'
 
 
 def schema():
@@ -204,9 +205,9 @@ class IOSSelectedStatusTests(unittest.TestCase):
         m = self.module()
         self.assertIsInstance(m.DEFAULT_TESTS, tuple)
         self.assertNotIn(BENCHMARK, m.DEFAULT_TESTS)
-        self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK,))
+        self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK, RELEASE_GOLDEN))
         self.assertTrue(any('/IOSPlaybackSessionTests/' in x for x in m.DEFAULT_TESTS))
-        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 3)
+        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 5)
         self.assertEqual(len(m.DEFAULT_TESTS), len(set(m.DEFAULT_TESTS)))
 
     def test_manifest_includes_all_budget_fixture_and_fill_regressions(self):
@@ -228,7 +229,7 @@ class IOSSelectedStatusTests(unittest.TestCase):
             'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',
         ):
             expected.add('VPlayeriOSTests/LoopbackHTTPServerTests/' + method)
-        self.assertEqual(len(m.DEFAULT_TESTS), 45)
+        self.assertEqual(len(m.DEFAULT_TESTS), 55)
         self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
 
     def test_manifest_includes_native_eof_boundary_regressions(self):
@@ -251,11 +252,11 @@ class IOSSelectedStatusTests(unittest.TestCase):
     def test_full_default_manifest_fits_output_and_summary_without_omitting_cases(self):
         m = self.module()
         rows = m.analyze(schema(), {'testNodes': [case(test) for test in m.DEFAULT_TESTS]})
-        self.assertEqual(len(rows), 45)
+        self.assertEqual(len(rows), 55)
         self.assertTrue(all(row['status'] == 'Passed' for row in rows))
         lines = m.report_lines(rows, 'functional_unit_and_ui')
         summary = m.job_summary(lines)
-        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 45)
+        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 55)
         self.assertNotIn('TRUNCATED', '\n'.join(lines) + summary)
         self.assertLessEqual(len(('\n'.join(lines) + '\n').encode()), m.MAX_OUTPUT)
         self.assertLessEqual(len(summary.encode()), m.MAX_OUTPUT)
@@ -294,7 +295,7 @@ class IOSSelectedStatusTests(unittest.TestCase):
 
     def test_runtime_discovers_schema_and_reads_only_tests_json(self):
         m = self.module()
-        replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': [case(BENCHMARK)]})]
+        replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': [case(BENCHMARK), case(RELEASE_GOLDEN)]})]
         with tempfile.TemporaryDirectory() as temp:
             bundle = Path(temp) / 'bench.xcresult'; bundle.mkdir()
             with patch.object(m, 'run_bounded', side_effect=replies) as run, contextlib.redirect_stdout(io.StringIO()):

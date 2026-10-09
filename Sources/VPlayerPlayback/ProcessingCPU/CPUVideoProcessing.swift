@@ -38,27 +38,53 @@ private final class CPUVideoResult: @unchecked Sendable {
     var succeeded: Bool { lock.withLock { !failed } }
 }
 
+struct CPUYADIFProcessingTimings: Sendable {
+    var validationMilliseconds: Double = 0
+    var inputLockMilliseconds: Double = 0
+    var outputLockMilliseconds: Double = 0
+    var parallelMilliseconds: Double = 0
+    var unlockMilliseconds: Double = 0
+}
+
 enum CPUVideoProcessing {
-    static func yadif(job: YADIFJob, outputs: (first: CVPixelBuffer, second: CVPixelBuffer)) throws(YADIFFailure) {
+    /// Timings are wall-clock observations, including synchronization/scheduling.
+    /// They do not establish whether Core Video copied a surface. The optional
+    /// callback runs synchronously, after all pixel buffers have been unlocked.
+    static func yadif(job: YADIFJob, outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
+                      timing: ((CPUYADIFProcessingTimings) -> Void)? = nil) throws(YADIFFailure) {
+        var timings = CPUYADIFProcessingTimings()
+        var locked: [(buffer: CVPixelBuffer, flags: CVPixelBufferLockFlags)] = []
+        defer {
+            let started = ProcessInfo.processInfo.systemUptime
+            for entry in locked.reversed() { CVPixelBufferUnlockBaseAddress(entry.buffer, entry.flags) }
+            timings.unlockMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+            timing?(timings)
+        }
         let inputs = [job.previous.frame.pixelBuffer, job.current.frame.pixelBuffer, job.next.frame.pixelBuffer]
         let outputBuffers = [outputs.first, outputs.second]
         let expected = YADIFSurfaceDescription(pixelBuffer: inputs[1])
-        try YADIFSurfaceValidator.validate(expected)
-        for buffer in inputs + outputBuffers {
-            guard YADIFSurfaceDescription(pixelBuffer: buffer) == expected else { throw .invalidPlaneLayout }
+        try measure(into: &timings.validationMilliseconds) { () throws(YADIFFailure) in
+            try YADIFSurfaceValidator.validate(expected)
+            for buffer in inputs + outputBuffers {
+                guard YADIFSurfaceDescription(pixelBuffer: buffer) == expected else { throw .invalidPlaneLayout }
+            }
+            guard outputs.first !== outputs.second,
+                  !inputs.contains(where: { $0 === outputs.first || $0 === outputs.second }) else {
+                throw .invalidPlaneLayout
+            }
         }
-        guard outputs.first !== outputs.second,
-              !inputs.contains(where: { $0 === outputs.first || $0 === outputs.second }) else { throw .invalidPlaneLayout }
-        var locked: [(buffer: CVPixelBuffer, flags: CVPixelBufferLockFlags)] = []
-        defer { for entry in locked.reversed() { CVPixelBufferUnlockBaseAddress(entry.buffer, entry.flags) } }
-        for buffer in inputs {
-            if locked.contains(where: { $0.buffer === buffer }) { continue }
-            guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { throw .invalidPlaneLayout }
-            locked.append((buffer, .readOnly))
+        try measure(into: &timings.inputLockMilliseconds) { () throws(YADIFFailure) in
+            for buffer in inputs {
+                if locked.contains(where: { $0.buffer === buffer }) { continue }
+                guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { throw .invalidPlaneLayout }
+                locked.append((buffer, .readOnly))
+            }
         }
-        for buffer in outputBuffers {
-            guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { throw .invalidPlaneLayout }
-            locked.append((buffer, []))
+        try measure(into: &timings.outputLockMilliseconds) { () throws(YADIFFailure) in
+            for buffer in outputBuffers {
+                guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { throw .invalidPlaneLayout }
+                locked.append((buffer, []))
+            }
         }
         let depth: Int32 = expected.pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
             expected.pixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange ? 10 : 8
@@ -86,10 +112,19 @@ enum CPUVideoProcessing {
         let work = operations
         let workers = max(1, min(4, ProcessInfo.processInfo.activeProcessorCount))
         let result = CPUVideoResult()
+        let parallelStartedAt = ProcessInfo.processInfo.systemUptime
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
             for operation in work where !operation.run(worker: worker, workers: workers) { result.recordFailure() }
         }
+        timings.parallelMilliseconds = (ProcessInfo.processInfo.systemUptime - parallelStartedAt) * 1_000
         guard result.succeeded else { throw .commandFailed }
+    }
+
+    private static func measure(into milliseconds: inout Double,
+                                _ operation: () throws(YADIFFailure) -> Void) throws(YADIFFailure) {
+        let started = ProcessInfo.processInfo.systemUptime
+        defer { milliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 }
+        try operation()
     }
 
     static func scan(current: CVPixelBuffer, previous: CVPixelBuffer) throws(LumaScanProbeFailure) -> ContentProbeSample {

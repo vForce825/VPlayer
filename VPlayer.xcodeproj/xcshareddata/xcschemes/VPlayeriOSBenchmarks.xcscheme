@@ -80,6 +80,9 @@
             </BuildableReference>
             <SelectedTests>
                <Test
+                  Identifier = "YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly">
+               </Test>
+               <Test
                   Identifier = "YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification">
                </Test>
             </SelectedTests>

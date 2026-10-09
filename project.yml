@@ -495,4 +495,5 @@ schemes:
         - name: VPlayeriOSBenchmarks
           parallelizable: false
           selectedTests:
+            - YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly
             - YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification
