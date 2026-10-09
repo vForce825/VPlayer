@@ -27,12 +27,6 @@ final class PlaybackSignpostLifetime: @unchecked Sendable {
     private let lock = NSLock()
     private var finishOperation: (@Sendable () -> Void)?
 
-    init(signposts: PlaybackSignposts?, token: PlaybackSignpostToken?) {
-        if let signposts, let token {
-            finishOperation = { signposts.end(token) }
-        }
-    }
-
     init(_ finishOperation: @escaping @Sendable () -> Void) {
         self.finishOperation = finishOperation
     }
@@ -51,17 +45,34 @@ final class PlaybackSignpostLifetime: @unchecked Sendable {
 }
 
 final class PlaybackSignposts: @unchecked Sendable {
-    private let signposter = OSSignposter(
-        subsystem: "org.vplayer.playback",
-        category: "Playback"
-    )
+    private let signposter: OSSignposter
     private let channelIdentifier: PlaybackDiagnosticsChannelID
 
-    init(channelIdentifier: PlaybackDiagnosticsChannelID) {
+    init(
+        channelIdentifier: PlaybackDiagnosticsChannelID,
+        signposter: OSSignposter = OSSignposter(
+            subsystem: "org.vplayer.playback",
+            category: "Playback"
+        )
+    ) {
         self.channelIdentifier = channelIdentifier
+        self.signposter = signposter
     }
 
-    func begin(_ span: PlaybackSignpostSpan, correlation: UInt64) -> PlaybackSignpostToken {
+    /// Keep ordinary Release playback free of per-frame diagnostic work while
+    /// retaining Instruments intervals in Debug and explicitly profiled builds.
+    static func makeForCurrentBuild(
+        channelIdentifier: PlaybackDiagnosticsChannelID
+    ) -> PlaybackSignposts? {
+        #if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        return PlaybackSignposts(channelIdentifier: channelIdentifier)
+        #else
+        return nil
+        #endif
+    }
+
+    func begin(_ span: PlaybackSignpostSpan, correlation: UInt64) -> PlaybackSignpostToken? {
+        guard signposter.isEnabled else { return nil }
         let identifier = signposter.makeSignpostID()
         let channel = channelIdentifier.value
         let boundedCorrelation = PlaybackDiagnosticsCorrelationID(
@@ -132,6 +143,14 @@ final class PlaybackSignposts: @unchecked Sendable {
             )
         }
         return PlaybackSignpostToken(span: span, state: state)
+    }
+
+    func beginLifetime(
+        _ span: PlaybackSignpostSpan,
+        correlation: UInt64
+    ) -> PlaybackSignpostLifetime? {
+        guard let token = begin(span, correlation: correlation) else { return nil }
+        return PlaybackSignpostLifetime { self.end(token) }
     }
 
     func end(_ token: PlaybackSignpostToken) {

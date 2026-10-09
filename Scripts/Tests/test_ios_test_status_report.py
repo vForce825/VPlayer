@@ -209,8 +209,8 @@ class IOSSelectedStatusTests(unittest.TestCase):
         m = self.module()
         self.assertIsInstance(m.DEFAULT_TESTS, tuple)
         self.assertNotIn(BENCHMARK, m.DEFAULT_TESTS)
-        self.assertEqual(m.BENCHMARK_TESTS[:2], (BENCHMARK, RELEASE_GOLDEN))
-        self.assertEqual(len(m.BENCHMARK_TESTS), 9)
+        self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK, RELEASE_GOLDEN,
+            'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease'))
         self.assertTrue(any('/IOSPlaybackSessionTests/' in x for x in m.DEFAULT_TESTS))
         self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 11)
         self.assertEqual(len(m.DEFAULT_TESTS), len(set(m.DEFAULT_TESTS)))
@@ -277,19 +277,30 @@ class IOSSelectedStatusTests(unittest.TestCase):
         ))
         self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
 
-    def test_manifest_includes_exact_neon_and_worker_service_evidence(self):
+    def test_manifest_includes_inactive_signpost_regressions(self):
         m = self.module()
-        parity = (
-            'testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
-            'testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
-            'testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
-            'testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
-            'testCPUNEONGuardPagesPreserveBounds',
-            'testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane',
-        )
-        self.assertTrue({f'VPlayeriOSTests/YADIFGoldenPixelTests/{method}' for method in parity}.issubset(m.DEFAULT_TESTS))
-        self.assertTrue({f'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/{method}' for method in parity}.issubset(m.BENCHMARK_TESTS))
-        self.assertIn('VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFScalarVersusNEONBenchmarkReportsPairedPatternMeasurements', m.BENCHMARK_TESTS)
+        expected = {'VPlayeriOSTests/PlaybackMetricsTests/' + method for method in (
+            'testInactiveSignpostsDoNotCreateIntervalsOrAsyncLifetimes',
+            'testSignpostFactoryOnlyEnablesDiagnosticBuilds',
+            'testSignpostLifetimeFinishesExactlyOnceAcrossConcurrentCallbacks',
+        )}
+        self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+        self.assertIn('VPlayeriOSTests/AdaptiveYADIFHandoffTests/testCPUProcessingTimingCallbackFollowsBuildConfiguration', m.DEFAULT_TESTS)
+
+    def test_release_scheme_selectors_match_the_required_report(self):
+        m = self.module()
+        spec = (ROOT / 'project.yml').read_text()
+        scheme = spec.split('\n  VPlayeriOSBenchmarks:\n')[-1]
+        selected = {line.strip()[2:] for line in scheme.splitlines()
+                    if line.strip().startswith('- YADIFGoldenPixelTests/')}
+        self.assertEqual(selected, {identifier.split('/', 1)[1] for identifier in m.BENCHMARK_TESTS})
+
+    def test_manifest_includes_release_launch_hook_exclusion(self):
+        m = self.module()
+        self.assertIn('VPlayeriOSTests/VPlayerAppStartupTests/testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds', m.DEFAULT_TESTS)
+
+    def test_manifest_includes_worker_service_evidence(self):
+        m = self.module()
         workers = (
             'testWorkerSummarySeparatesCPUServiceFromHeterogeneousWallTimesAndRequestedQoS',
             'testMissingWorkerCPUClockAndMissingSlotStayUnverifiedInsteadOfZeroService',

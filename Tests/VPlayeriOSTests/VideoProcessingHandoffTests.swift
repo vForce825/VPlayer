@@ -262,6 +262,26 @@ private struct HandoffYADIFWork {
 }
 
 final class AdaptiveYADIFHandoffTests: XCTestCase {
+    func testCPUProcessingTimingCallbackFollowsBuildConfiguration() throws {
+        let work = try HandoffYADIFWork(id: 1)
+        var callbacks = 0
+        try CPUVideoProcessing.yadif(job: work.job, outputs: work.outputs) { _ in
+            callbacks += 1
+        }
+        try work.assertOutput(73)
+        XCTAssertThrowsError(try CPUVideoProcessing.yadif(job: work.job,
+            outputs: (work.outputs.first, work.outputs.first)) { _ in
+                callbacks += 1
+            }) { error in
+                XCTAssertEqual(error as? YADIFFailure, .invalidPlaneLayout)
+            }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        XCTAssertEqual(callbacks, 2, "Diagnostic builds observe both completed and rejected work")
+#else
+        XCTAssertEqual(callbacks, 0, "Shipping Release compiles out even explicitly supplied timing callbacks")
+#endif
+    }
+
     func testDelayedGPUThenCPUThenForegroundGPUPreservesCompletionOrderAndPixels() throws {
         let firstGPU = expectation(description: "first GPU submission")
         let cpuWaiting = expectation(description: "CPU selected and joining GPU fence")
@@ -325,8 +345,12 @@ final class AdaptiveYADIFHandoffTests: XCTestCase {
             }
             return nil
         }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
         XCTAssertEqual(cpuTimes.count, 1)
         XCTAssertGreaterThan(try XCTUnwrap(cpuTimes.first), 0)
+#else
+        XCTAssertTrue(cpuTimes.isEmpty, "Shipping Release observer events must not trigger CPU timing")
+#endif
     }
 
     func testCancellationDuringGPUFenceRetiresEachJobOnceAndRestoresAllThreeSlots() throws {
@@ -419,6 +443,7 @@ final class AdaptiveYADIFHandoffTests: XCTestCase {
     }
 }
 
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
 private final class HandoffLogRecords: @unchecked Sendable {
     private let lock = NSLock()
     private var records: [AdaptiveYADIFLogRecord] = []
@@ -700,3 +725,4 @@ final class AdaptiveYADIFDiagnosticsTests: XCTestCase {
         XCTAssertNil(rejected.context)
     }
 }
+#endif

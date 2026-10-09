@@ -4,7 +4,9 @@
 
 #if os(iOS)
 import CoreVideo
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
 import Darwin
+#endif
 import Foundation
 
 private struct CPUPlaneOperation: @unchecked Sendable {
@@ -39,6 +41,7 @@ private final class CPUVideoResult: @unchecked Sendable {
     var succeeded: Bool { lock.withLock { !failed } }
 }
 
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
 enum CPUYADIFThreadClock {
     /// Calling-thread user + kernel service time. Failure is missing evidence,
     /// never a successful zero. This clock does not identify a physical core.
@@ -204,8 +207,12 @@ struct CPUYADIFProcessingContext: Sendable, Equatable {
     let workers: Int
     let activeProcessors: Int
 }
+#endif
 
+/// The timing callback is active only in Debug or explicitly enabled diagnostic
+/// builds. Shipping Release compiles out its storage, clocks and callbacks.
 struct CPUYADIFProcessingTimings: Sendable {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
     var validationMilliseconds: Double = 0
     var inputLockMilliseconds: Double = 0
     var outputLockMilliseconds: Double = 0
@@ -213,28 +220,41 @@ struct CPUYADIFProcessingTimings: Sendable {
     var unlockMilliseconds: Double = 0
     var workers: CPUYADIFWorkerSummary?
     var context: CPUYADIFProcessingContext?
+#endif
 }
 
 enum CPUVideoProcessing {
     /// Phase timings are wall-clock observations, including scheduling. Optional
     /// worker diagnostics additionally measure calling-thread CPU service. Their
     /// clock/QoS sampling has overhead and is disabled when timing is nil.
-    /// They do not establish whether Core Video copied a surface. The optional
-    /// callback runs synchronously, after all pixel buffers have been unlocked.
+    /// All measurements are compiled out of shipping Release.
+    /// They do not establish whether Core Video copied a surface. In diagnostic
+    /// builds the callback runs synchronously after all buffers are unlocked;
+    /// shipping Release never invokes it, including when a callback is supplied.
     static func yadif(job: YADIFJob, outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
                       timing: ((CPUYADIFProcessingTimings) -> Void)? = nil) throws(YADIFFailure) {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
         var timings = CPUYADIFProcessingTimings()
+#endif
         var locked: [(buffer: CVPixelBuffer, flags: CVPixelBufferLockFlags)] = []
         defer {
-            let started = ProcessInfo.processInfo.systemUptime
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+            let started = timing == nil ? nil : ProcessInfo.processInfo.systemUptime
+#endif
             for entry in locked.reversed() { CVPixelBufferUnlockBaseAddress(entry.buffer, entry.flags) }
-            timings.unlockMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+            if let started { timings.unlockMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 }
             timing?(timings)
+#endif
         }
         let inputs = [job.previous.frame.pixelBuffer, job.current.frame.pixelBuffer, job.next.frame.pixelBuffer]
         let outputBuffers = [outputs.first, outputs.second]
         let expected = YADIFSurfaceDescription(pixelBuffer: inputs[1])
-        try measure(into: &timings.validationMilliseconds) { () throws(YADIFFailure) in
+        do {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+            let started = timing == nil ? nil : ProcessInfo.processInfo.systemUptime
+            defer { if let started { timings.validationMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 } }
+#endif
             try YADIFSurfaceValidator.validate(expected)
             for buffer in inputs + outputBuffers {
                 guard YADIFSurfaceDescription(pixelBuffer: buffer) == expected else { throw .invalidPlaneLayout }
@@ -244,14 +264,22 @@ enum CPUVideoProcessing {
                 throw .invalidPlaneLayout
             }
         }
-        try measure(into: &timings.inputLockMilliseconds) { () throws(YADIFFailure) in
+        do {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+            let started = timing == nil ? nil : ProcessInfo.processInfo.systemUptime
+            defer { if let started { timings.inputLockMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 } }
+#endif
             for buffer in inputs {
                 if locked.contains(where: { $0.buffer === buffer }) { continue }
                 guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else { throw .invalidPlaneLayout }
                 locked.append((buffer, .readOnly))
             }
         }
-        try measure(into: &timings.outputLockMilliseconds) { () throws(YADIFFailure) in
+        do {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+            let started = timing == nil ? nil : ProcessInfo.processInfo.systemUptime
+            defer { if let started { timings.outputLockMilliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 } }
+#endif
             for buffer in outputBuffers {
                 guard CVPixelBufferLockBaseAddress(buffer, []) == kCVReturnSuccess else { throw .invalidPlaneLayout }
                 locked.append((buffer, []))
@@ -283,15 +311,20 @@ enum CPUVideoProcessing {
         let work = operations
         let activeProcessors = ProcessInfo.processInfo.activeProcessorCount
         let workers = max(1, min(4, activeProcessors))
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
         let observations = timing == nil ? nil : CPUYADIFWorkerSlots(count: workers)
         if timing != nil {
             timings.context = CPUYADIFProcessingContext(width: expected.width, height: expected.height,
                 pixelFormat: expected.pixelFormat, depth: Int(depth), workers: workers,
                 activeProcessors: activeProcessors)
         }
+#endif
         let result = CPUVideoResult()
-        let parallelStartedAt = ProcessInfo.processInfo.systemUptime
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        let parallelStartedAt = timing == nil ? nil : ProcessInfo.processInfo.systemUptime
+#endif
         DispatchQueue.concurrentPerform(iterations: workers) { worker in
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
             guard let observations else {
                 for operation in work where !operation.run(worker: worker, workers: workers) { result.recordFailure() }
                 return
@@ -306,18 +339,18 @@ enum CPUVideoProcessing {
             observations.record(CPUYADIFWorkerObservation(startedAt: startedAt, endedAt: endedAt,
                 cpuMilliseconds: CPUYADIFThreadClock.elapsedMilliseconds(start: cpuStart, end: cpuEnd),
                 requestedQoSStart: requestedQoSStart, requestedQoSEnd: requestedQoSEnd), worker: worker)
+#else
+            for operation in work where !operation.run(worker: worker, workers: workers) { result.recordFailure() }
+#endif
         }
-        let parallelEndedAt = ProcessInfo.processInfo.systemUptime
-        timings.parallelMilliseconds = (parallelEndedAt - parallelStartedAt) * 1_000
-        timings.workers = observations?.summary(parallelStartedAt: parallelStartedAt, parallelEndedAt: parallelEndedAt)
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        if let parallelStartedAt {
+            let parallelEndedAt = ProcessInfo.processInfo.systemUptime
+            timings.parallelMilliseconds = (parallelEndedAt - parallelStartedAt) * 1_000
+            timings.workers = observations?.summary(parallelStartedAt: parallelStartedAt, parallelEndedAt: parallelEndedAt)
+        }
+#endif
         guard result.succeeded else { throw .commandFailed }
-    }
-
-    private static func measure(into milliseconds: inout Double,
-                                _ operation: () throws(YADIFFailure) -> Void) throws(YADIFFailure) {
-        let started = ProcessInfo.processInfo.systemUptime
-        defer { milliseconds = (ProcessInfo.processInfo.systemUptime - started) * 1_000 }
-        try operation()
     }
 
     static func scan(current: CVPixelBuffer, previous: CVPixelBuffer) throws(LumaScanProbeFailure) -> ContentProbeSample {

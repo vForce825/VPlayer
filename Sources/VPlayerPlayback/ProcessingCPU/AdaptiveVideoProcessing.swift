@@ -5,7 +5,9 @@
 #if os(iOS)
 import CoreVideo
 import Foundation
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
 import OSLog
+#endif
 
 private final class CPUWorkLimiter: @unchecked Sendable {
     private let lock = NSLock()
@@ -93,6 +95,7 @@ enum AdaptiveVideoProcessingMode: Sendable, Equatable {
 /// locks. Observers must be thread-safe, fast and nonblocking: never wait for
 /// this submitter's lane or GPU fence. This seam owns no queue or retained media.
 /// A nil mode means cancellation before choosing an execution backend.
+/// CPU elapsed time is nil when performance diagnostics are compiled out.
 enum AdaptiveYADIFHandoffEvent: Sendable {
     case modeSelected(id: UInt64, mode: AdaptiveVideoProcessingMode)
     case fenceWaitBegan(id: UInt64)
@@ -101,14 +104,17 @@ enum AdaptiveYADIFHandoffEvent: Sendable {
 }
 
 private struct AdaptiveYADIFCompletion: Sendable {
-    let completion: YADIFCommandCompletion
+    var completion: YADIFCommandCompletion
     let mode: AdaptiveVideoProcessingMode?
+    var cpuProcessingMilliseconds: Double? = nil
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
     var queueMilliseconds: Double = 0
     var fenceMilliseconds: Double = 0
-    var cpuProcessingMilliseconds: Double? = nil
     var phases: CPUYADIFProcessingTimings? = nil
+#endif
 }
 
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
 struct AdaptiveYADIFDurations: Sendable {
     var totalMilliseconds: Double = 0
     var maximumMilliseconds: Double = 0
@@ -294,6 +300,7 @@ final class AdaptiveYADIFDiagnostics: @unchecked Sendable {
         return snapshot
     }
 }
+#endif
 
 /// A serial handoff lane does not replace the YADIF scheduler/window. It orders
 /// admission to its existing GPU submitter or the identical CPU kernel. CPU
@@ -305,21 +312,29 @@ final class AdaptiveYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Se
     private let lane = DispatchQueue(label: "com.vplayer.yadif-handoff", qos: .userInitiated)
     private let limiter = CPUWorkLimiter(maximum: 3)
     private let observer: (@Sendable (AdaptiveYADIFHandoffEvent) -> Void)?
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
     private let diagnostics = AdaptiveYADIFDiagnostics()
+#endif
     init(gpu: any YADIFCommandSubmitting, gate: GPUVideoProcessingGate = .shared,
          observer: (@Sendable (AdaptiveYADIFHandoffEvent) -> Void)? = nil) {
         self.gpu = gpu; self.gate = gate; self.observer = observer
     }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
     deinit { diagnostics.flush(at: ProcessInfo.processInfo.systemUptime) }
+#endif
     func cancelPendingWork() { limiter.cancel() }
     func submit(job: YADIFJob, outputs: (first: CVPixelBuffer, second: CVPixelBuffer),
                 completion: @escaping @Sendable (YADIFCommandCompletion) -> Void) throws(YADIFFailure) {
         guard let revision = limiter.admit() else { throw .commandBufferAllocationFailed }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
         let admittedAt = ProcessInfo.processInfo.systemUptime
+        let diagnostics = self.diagnostics
+#endif
         let id = job.current.frame.accessUnitID
         let work = CPUWorkSlot(CPUYADIFWork(job: job, outputs: outputs))
-        let finish = CPUOneShot<AdaptiveYADIFCompletion> { [limiter, observer, diagnostics] result in
+        let finish = CPUOneShot<AdaptiveYADIFCompletion> { [limiter, observer] result in
             limiter.retire()
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
             let now = ProcessInfo.processInfo.systemUptime
             if result.mode == .cpu {
                 diagnostics.completeCPU(success: result.completion.result == .completed,
@@ -327,15 +342,17 @@ final class AdaptiveYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Se
                     processing: result.cpuProcessingMilliseconds, total: (now - admittedAt) * 1_000,
                     phases: result.phases, at: now)
             }
+#endif
             observer?(.completed(id: id, mode: result.mode, result: result.completion.result,
                                  cpuProcessingMilliseconds: result.cpuProcessingMilliseconds))
             completion(result.completion)
         }
         lane.async { [self, work] in
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
             let queueMilliseconds = (ProcessInfo.processInfo.systemUptime - admittedAt) * 1_000
+#endif
             guard limiter.isCurrent(revision) else {
-                work.clear(); finish.call(.init(completion: .init(result: .failed), mode: nil,
-                                               queueMilliseconds: queueMilliseconds)); return
+                work.clear(); finish.call(.init(completion: .init(result: .failed), mode: nil)); return
             }
             do {
                 var gpuCompletion: GPUSubmissionReturn<YADIFCommandCompletion>?
@@ -350,41 +367,63 @@ final class AdaptiveYADIFCommandSubmitter: YADIFCommandSubmitting, @unchecked Se
                     }
                 }
                 if let gpuCompletion {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                     diagnostics.select(.gpu, at: ProcessInfo.processInfo.systemUptime)
+#endif
                     observer?(.modeSelected(id: id, mode: .gpu))
                     work.clear()
                     gpuCompletion.submissionReturned()
                     return
                 }
                 guard let fence else { preconditionFailure("Missing GPU completion owner") }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                 diagnostics.select(.cpu, at: ProcessInfo.processInfo.systemUptime)
+#endif
                 observer?(.modeSelected(id: id, mode: .cpu))
                 observer?(.fenceWaitBegan(id: id))
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                 let fenceStartedAt = ProcessInfo.processInfo.systemUptime
+#endif
                 let joined = fence.wait(timeout: .now() + .seconds(5))
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                 let fenceMilliseconds = (ProcessInfo.processInfo.systemUptime - fenceStartedAt) * 1_000
+#endif
+                var cpuCompletion = AdaptiveYADIFCompletion(completion: .init(result: .failed), mode: .cpu)
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+                cpuCompletion.queueMilliseconds = queueMilliseconds
+                cpuCompletion.fenceMilliseconds = fenceMilliseconds
+#endif
                 guard joined, limiter.isCurrent(revision) else {
-                    work.clear(); finish.call(.init(completion: .init(result: .failed), mode: .cpu,
-                        queueMilliseconds: queueMilliseconds, fenceMilliseconds: fenceMilliseconds)); return
+                    work.clear(); finish.call(cpuCompletion); return
                 }
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                 // Includes validation, pixel-buffer locking, parallel dispatch,
                 // C processing and unlocking; excludes queueing and GPU wait.
                 let startedAt = ProcessInfo.processInfo.systemUptime
-                let result: YADIFCommandResult
                 var phases: CPUYADIFProcessingTimings?
+#endif
+                let result: YADIFCommandResult
                 do {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                     try CPUVideoProcessing.yadif(job: work.value!.job, outputs: work.value!.outputs) {
                         phases = $0
                     }
+#else
+                    try CPUVideoProcessing.yadif(job: work.value!.job, outputs: work.value!.outputs)
+#endif
                     result = .completed
                 } catch { result = .failed }
-                let elapsed = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+                cpuCompletion.cpuProcessingMilliseconds = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+                cpuCompletion.phases = phases
+#endif
+                cpuCompletion.completion = .init(result: result)
                 work.clear()
-                finish.call(.init(completion: .init(result: result), mode: .cpu,
-                    queueMilliseconds: queueMilliseconds, fenceMilliseconds: fenceMilliseconds,
-                    cpuProcessingMilliseconds: elapsed, phases: phases))
+                finish.call(cpuCompletion)
             } catch {
+#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
                 diagnostics.select(.gpu, at: ProcessInfo.processInfo.systemUptime)
+#endif
                 observer?(.modeSelected(id: id, mode: .gpu))
                 work.clear(); finish.call(.init(completion: .init(result: .failed), mode: .gpu))
             }

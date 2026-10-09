@@ -57,6 +57,12 @@ _FUNCTIONAL_SUITES = (
         'testCloseIsIdempotentAndLateDelegateStopDoesNotReopenSession',)),
     ('VPlayeriOSTests', 'IOSPlaybackSessionTests', (
         'testMinimizingAndRestoringKeepsSameModelAndRemoteStopRetiresSession',)),
+    ('VPlayeriOSTests', 'VPlayerAppStartupTests', (
+        'testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds',)),
+    ('VPlayeriOSTests', 'PlaybackMetricsTests', (
+        'testInactiveSignpostsDoNotCreateIntervalsOrAsyncLifetimes',
+        'testSignpostFactoryOnlyEnablesDiagnosticBuilds',
+        'testSignpostLifetimeFinishesExactlyOnceAcrossConcurrentCallbacks',)),
     ('VPlayeriOSTests', 'AdaptiveYADIFDiagnosticsTests', (
         'testOneSecondWindowAndModeChangeFlushHaveExactCountsAndWallTimes',
         'testManyCompletionsCollapseIntoOneWindowAndExplicitFlushResetsIt',
@@ -67,6 +73,7 @@ _FUNCTIONAL_SUITES = (
         'testWorkerWindowMarksMixedSurfaceContextsAndDoesNotInventMissingTelemetry',
         'testNativeThreadCPUClockProvidesValidNonnegativeElapsedService',)),
     ('VPlayeriOSTests', 'AdaptiveYADIFHandoffTests', (
+        'testCPUProcessingTimingCallbackFollowsBuildConfiguration',
         'testDelayedGPUThenCPUThenForegroundGPUPreservesCompletionOrderAndPixels',
         'testCancellationDuringGPUFenceRetiresEachJobOnceAndRestoresAllThreeSlots',)),
     ('VPlayeriOSTests', 'VideoProcessingHandoffTests', (
@@ -84,13 +91,8 @@ _FUNCTIONAL_SUITES = (
         'testDelayedGPUCompletionPublishesBeforeWaitingCPUSuccessor',)),
     ('VPlayeriOSTests', 'YADIFGoldenPixelTests', (
         'testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+        'testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease',
         'testCPUBenchmarkPeriodicFillMatchesOriginalFormulaAndPreservesPadding',
-        'testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
-        'testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
-        'testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
-        'testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
-        'testCPUNEONGuardPagesPreserveBounds',
-        'testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane',
         'testNV12TFFMatchesPinnedOracleAndExactFieldRules',
         'testNV12BFFMatchesPinnedOracleAndExactFieldRules',
         'testP010TFFMatchesPinnedOracleAndExactStorageRules',
@@ -140,13 +142,7 @@ DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'
 BENCHMARK_TESTS = (
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFScalarVersusNEONBenchmarkReportsPairedPatternMeasurements',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONGuardPagesPreserveBounds',
-    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease',
 )
 PREFLIGHT_TESTS = (
     'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',

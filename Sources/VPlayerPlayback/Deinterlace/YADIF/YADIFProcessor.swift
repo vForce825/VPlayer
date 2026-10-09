@@ -162,7 +162,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
     private struct InFlightJob: @unchecked Sendable {
         let ready: ReadyJob
         let outputs: YADIFAllocatedOutputs
-        let signpostLifetime: PlaybackSignpostLifetime
+        let signpostLifetime: PlaybackSignpostLifetime?
     }
 
     private struct SubmissionAttempt: @unchecked Sendable {
@@ -273,7 +273,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
         commandQueue: any MTLCommandQueue,
         textureCache: CVMetalTextureCache,
         clock: any PlaybackClock,
-        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts?),
         recommendedPixelBufferAttributes: CVPixelBufferAttributes = .init(rawAttributes: [:]),
         maximumInFlight: Int = 3,
         maximumPendingFrames: Int = 4,
@@ -714,12 +714,9 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             lock.unlock()
             return
         }
-        let signpostLifetime = PlaybackSignpostLifetime(
-            signposts: signposts,
-            token: signposts?.begin(
-                .yadifCommandBuffer,
-                correlation: attempt.ready.job.current.frame.accessUnitID
-            )
+        let signpostLifetime = signposts?.beginLifetime(
+            .yadifCommandBuffer,
+            correlation: attempt.ready.job.current.frame.accessUnitID
         )
         inFlightJobs[identifier] = InFlightJob(
             ready: attempt.ready,
@@ -761,7 +758,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             commandSubmissionsInProgress.removeValue(forKey: identifier)
             var rolledBack = inFlightJobs.removeValue(forKey: identifier)
             if let job = rolledBack {
-                job.signpostLifetime.finish()
+                job.signpostLifetime?.finish()
                 if isCurrentLocked(job.ready) {
                     counters.submitted -= 1
                     actions.append(.complete(
@@ -825,7 +822,7 @@ public final class YADIFProcessor: VideoFrameProcessing, @unchecked Sendable {
             return
         }
         let isCurrent = isCurrentLocked(completed!.ready)
-        completed!.signpostLifetime.finish()
+        completed!.signpostLifetime?.finish()
         if case let .completedWithGPUInterval(interval) = completion.result,
            let duration = interval.durationMilliseconds {
             metrics?.recordGPUDuration(milliseconds: duration)
