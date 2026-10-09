@@ -140,6 +140,19 @@ jobs:
           xcodebuild build -project VPlayer.xcodeproj -scheme VPlayeriOS \
             -configuration Release -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/iOS-Device" CODE_SIGNING_ALLOWED=NO
+          python3 - <<'PYICON'
+          import os, pathlib, plistlib
+          app=pathlib.Path(os.environ['RUNNER_TEMP'])/'iOS-Device/Build/Products/Release-iphoneos/VPlayer.app'
+          info=plistlib.loads((app/'Info.plist').read_bytes())
+          assert info['CFBundleIdentifier']=='com.vforce.vplayer', 'Unexpected iPhone app identity'
+          primary=info['CFBundleIcons']['CFBundlePrimaryIcon']
+          assert primary['CFBundleIconName']=='AppIcon', 'iPhone AppIcon was not selected'
+          assert primary['CFBundleIconFiles'], 'Compiled iPhone icon list is empty'
+          for name in primary['CFBundleIconFiles']:
+              assert any(p.stat().st_size for p in app.glob(name+'*.png')), 'Compiled icon image missing: '+name
+          assert (app/'Assets.car').stat().st_size>0, 'Compiled asset catalog is missing'
+          print('IOS_APP_IDENTITY_AND_ICON=passed')
+          PYICON
       - name: Build Release simulator tests before booting the simulator
         id: release_build
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'

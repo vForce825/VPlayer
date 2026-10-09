@@ -5340,7 +5340,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = iphoneos;
@@ -5416,7 +5416,7 @@
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 2.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer.ios;
+				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = iphoneos;
