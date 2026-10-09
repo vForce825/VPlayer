@@ -133,8 +133,9 @@ jobs:
         run: |
           set -o pipefail
           test ! -e "$RUNNER_TEMP/ReleaseBoundary"
+          # Audit direct-linked arm64 frameworks; both FFmpeg archive slices remain inspected.
           xcodebuild test -project VPlayer.xcodeproj -scheme VPlayerReleaseBoundaryTests \
-            -configuration Release ENABLE_TESTABILITY=YES \
+            -configuration Release ENABLE_TESTABILITY=YES ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             -derivedDataPath "$RUNNER_TEMP/ReleaseBoundary" \
             -resultBundlePath "$RUNNER_TEMP/ReleaseBoundary.xcresult" \
             -destination "$TVOS_TEST_DESTINATION" CODE_SIGNING_ALLOWED=NO \

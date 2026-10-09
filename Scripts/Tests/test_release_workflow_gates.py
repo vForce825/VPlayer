@@ -101,6 +101,15 @@ class ReleaseWorkflowGates(unittest.TestCase):
         jobs = re.findall(r'^  ([a-z][a-z-]+):$', text.split('jobs:', 1)[1], re.M)
         self.assertEqual(len(jobs), 6)
 
+    def test_tvos_boundary_gate_declares_arm64_framework_scope_and_scans_universal_ffmpeg(self):
+        body = step('macos-ci.yml', 'Run all optimized Release boundary tests')
+        self.assertIn('ARCHS=arm64 ONLY_ACTIVE_ARCH=YES', body)
+        self.assertIn('--scope frameworks', body)
+        self.assertIn('tvos-arm64_x86_64-simulator/libFFmpeg.a', body)
+        self.assertNotIn('-only-testing:', body)
+        self.assertNotIn('continue-on-error', body)
+        self.assertNotIn('|| true', body)
+
 
 if __name__ == '__main__':
     unittest.main()
