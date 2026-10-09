@@ -8,79 +8,51 @@
       runPostActionsOnFailure = "NO">
       <BuildActionEntries>
          <BuildActionEntry
-            buildForTesting = "YES"
+            buildForTesting = "NO"
             buildForRunning = "YES"
             buildForProfiling = "YES"
             buildForArchiving = "YES"
             buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
-               BuildableName = "VPlayerCore.framework"
-               BlueprintName = "VPlayerCoreiOS"
-               ReferencedContainer = "container:VPlayer.xcodeproj">
-            </BuildableReference>
-         </BuildActionEntry>
-         <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "2B46C7BA7F9C0CB4785D3DEA"
-               BuildableName = "VPlayerPlayback.framework"
-               BlueprintName = "VPlayerPlaybackiOS"
-               ReferencedContainer = "container:VPlayer.xcodeproj">
-            </BuildableReference>
-         </BuildActionEntry>
-         <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+               BlueprintIdentifier = "85B283C3DBE5D33E81DBACDE"
                BuildableName = "VPlayer.app"
-               BlueprintName = "VPlayeriOS"
+               BlueprintName = "VPlayer"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
          <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "NO"
-            buildForProfiling = "NO"
-            buildForArchiving = "NO"
-            buildForAnalyzing = "NO">
+            buildForTesting = "NO"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "E723C02BBA5DEBF8E25DFC48"
-               BuildableName = "VPlayeriOSTests.xctest"
-               BlueprintName = "VPlayeriOSTests"
+               BlueprintIdentifier = "577E83D115BAEF7CAC5C21C8"
+               BuildableName = "VPlayerCore.framework"
+               BlueprintName = "VPlayerCore"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
          <BuildActionEntry
-            buildForTesting = "YES"
-            buildForRunning = "NO"
-            buildForProfiling = "NO"
-            buildForArchiving = "NO"
-            buildForAnalyzing = "NO">
+            buildForTesting = "NO"
+            buildForRunning = "YES"
+            buildForProfiling = "YES"
+            buildForArchiving = "YES"
+            buildForAnalyzing = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
-               BlueprintIdentifier = "6C3114383BF842E301328C34"
-               BuildableName = "VPlayeriOSUITests.xctest"
-               BlueprintName = "VPlayeriOSUITests"
+               BlueprintIdentifier = "C601188C6545FD7063A7DDB7"
+               BuildableName = "VPlayerPlayback.framework"
+               BlueprintName = "VPlayerPlayback"
                ReferencedContainer = "container:VPlayer.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction
-      buildConfiguration = "Debug"
+      buildConfiguration = "Release"
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
@@ -88,61 +60,38 @@
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BlueprintIdentifier = "85B283C3DBE5D33E81DBACDE"
             BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintName = "VPlayer"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
       <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "E723C02BBA5DEBF8E25DFC48"
-               BuildableName = "VPlayeriOSTests.xctest"
-               BlueprintName = "VPlayeriOSTests"
-               ReferencedContainer = "container:VPlayer.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "6C3114383BF842E301328C34"
-               BuildableName = "VPlayeriOSUITests.xctest"
-               BlueprintName = "VPlayeriOSUITests"
-               ReferencedContainer = "container:VPlayer.xcodeproj">
-            </BuildableReference>
-            <SkippedTests>
-               <Test
-                  Identifier = "IOSReleaseStartupTests">
-               </Test>
-            </SkippedTests>
-         </TestableReference>
       </Testables>
       <CommandLineArguments>
       </CommandLineArguments>
    </TestAction>
    <LaunchAction
-      buildConfiguration = "Debug"
-      selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
-      selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
+      buildConfiguration = "Release"
+      selectedDebuggerIdentifier = ""
+      selectedLauncherIdentifier = "Xcode.IDEFoundation.Launcher.PosixSpawn"
+      disableMainThreadChecker = "YES"
+      disablePerformanceAntipatternChecker = "YES"
       launchStyle = "0"
       useCustomWorkingDirectory = "NO"
       ignoresPersistentStateOnLaunch = "NO"
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
+      enableGPUFrameCaptureMode = "3"
+      enableGPUValidationMode = "1"
       allowLocationSimulation = "YES">
       <BuildableProductRunnable
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BlueprintIdentifier = "85B283C3DBE5D33E81DBACDE"
             BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintName = "VPlayer"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -159,9 +108,9 @@
          runnableDebuggingMode = "0">
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
+            BlueprintIdentifier = "85B283C3DBE5D33E81DBACDE"
             BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintName = "VPlayer"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -169,7 +118,7 @@
       </CommandLineArguments>
    </ProfileAction>
    <AnalyzeAction
-      buildConfiguration = "Debug">
+      buildConfiguration = "Release">
    </AnalyzeAction>
    <ArchiveAction
       buildConfiguration = "Release"

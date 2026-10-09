@@ -9,10 +9,10 @@
       <BuildActionEntries>
          <BuildActionEntry
             buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
@@ -23,10 +23,10 @@
          </BuildActionEntry>
          <BuildActionEntry
             buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "2B46C7BA7F9C0CB4785D3DEA"
@@ -37,10 +37,10 @@
          </BuildActionEntry>
          <BuildActionEntry
             buildForTesting = "YES"
-            buildForRunning = "YES"
-            buildForProfiling = "YES"
-            buildForArchiving = "YES"
-            buildForAnalyzing = "YES">
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "NO">
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
@@ -84,13 +84,14 @@
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES"
+      codeCoverageEnabled = "YES"
       onlyGenerateCoverageForSpecifiedTargets = "NO">
       <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
-            BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
+            BuildableName = "VPlayerCore.framework"
+            BlueprintName = "VPlayerCoreiOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
       </MacroExpansion>
@@ -136,18 +137,15 @@
       debugDocumentVersioning = "YES"
       debugServiceExtension = "internal"
       allowLocationSimulation = "YES">
-      <BuildableProductRunnable
-         runnableDebuggingMode = "0">
+      <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
-            BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
+            BuildableName = "VPlayerCore.framework"
+            BlueprintName = "VPlayerCoreiOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
-      </BuildableProductRunnable>
-      <CommandLineArguments>
-      </CommandLineArguments>
+      </MacroExpansion>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
@@ -155,18 +153,15 @@
       savedToolIdentifier = ""
       useCustomWorkingDirectory = "NO"
       debugDocumentVersioning = "YES">
-      <BuildableProductRunnable
-         runnableDebuggingMode = "0">
+      <MacroExpansion>
          <BuildableReference
             BuildableIdentifier = "primary"
-            BlueprintIdentifier = "C731374532D14C6EDEA5DCDD"
-            BuildableName = "VPlayer.app"
-            BlueprintName = "VPlayeriOS"
+            BlueprintIdentifier = "07BB19ADD27DD8F9FB9F442E"
+            BuildableName = "VPlayerCore.framework"
+            BlueprintName = "VPlayerCoreiOS"
             ReferencedContainer = "container:VPlayer.xcodeproj">
          </BuildableReference>
-      </BuildableProductRunnable>
-      <CommandLineArguments>
-      </CommandLineArguments>
+      </MacroExpansion>
    </ProfileAction>
    <AnalyzeAction
       buildConfiguration = "Debug">
