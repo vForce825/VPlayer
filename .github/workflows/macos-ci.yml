@@ -402,6 +402,7 @@ jobs:
           python3 Scripts/Tests/test_release_launch_configuration.py
           python3 Scripts/Tests/test_generated_input_transfer.py
           python3 Scripts/Tests/test_release_artifacts.py
+          python3 Scripts/Tests/test_ci_post_clone.py
           python3 Scripts/Tests/test_persistent_hls_acceptance.py
           python3 Scripts/Tests/test_hls_acceptance_workflows.py
           python3 Scripts/Tests/test_airplay_output_mode_contract.py

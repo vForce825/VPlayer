@@ -101,6 +101,7 @@ jobs:
           python3 Scripts/Tests/test_release_launch_configuration.py
           python3 Scripts/Tests/test_generated_input_transfer.py
           python3 Scripts/Tests/test_release_artifacts.py
+          python3 Scripts/Tests/test_ci_post_clone.py
           python3 Scripts/Tests/test_ios_clang_evidence.py
           python3 Scripts/Tests/test_ios_startup_runner.py
           python3 Scripts/Tests/test_paused_workspace_malloc.py
