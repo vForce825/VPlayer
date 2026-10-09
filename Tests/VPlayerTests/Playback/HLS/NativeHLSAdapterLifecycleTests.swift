@@ -582,24 +582,51 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
-    func testNativeFinalQuantumAcceptsObservedClocksAndRejectsOutsideOrMissingEvidence() throws {
+    func testNativeFinalQuantumAcceptsObservedClocksAndRejectsPrematureOrMissingEvidence() throws {
         let end = ExactMediaTime(value: 80, timescale: 1)
         let quantum = ExactMediaTime(value: 1, timescale: 30)
         let first = try end.subtracting(quantum)
         // One real source timebase tick keeps the 1/30 boundary exact within
         // CMTime's Int32 timescale; a nanosecond offset needs scale3,000,000,000.
         let tick = ExactMediaTime(value: 1, timescale: 90_000)
-        for time in [end, ExactMediaTime(value: 79_996_292_617, timescale: 1_000_000_000),
+        for time in [end, try first.adding(tick), ExactMediaTime(value: 79_996_292_617, timescale: 1_000_000_000),
                      ExactMediaTime(value: 79_991_747_177, timescale: 1_000_000_000)] {
             XCTAssertTrue(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum))
         }
-        for time in [first, try first.subtracting(tick), ExactMediaTime(value: 1, timescale: 1), try end.adding(tick)] {
+        for time in [first, try first.subtracting(tick), ExactMediaTime(value: 1, timescale: 1)] {
             XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum))
         }
         XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(try end.subtracting(tick), expected: end, quantum: nil))
         XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(end, expected: end, quantum: .init(value: 0, timescale: 1)))
         XCTAssertFalse(AVPlayerPlaybackEndBoundary.constrained.containsFinalClock(try end.subtracting(tick), expected: end, quantum: quantum))
         XCTAssertTrue(AVPlayerPlaybackEndBoundary.constrained.containsFinalClock(end, expected: end, quantum: nil))
+    }
+
+    func testNativeFinalQuantumPreservesAtOrAfterEndpointClocks() throws {
+        let end = ExactMediaTime(value: 80, timescale: 1)
+        let quantum = ExactMediaTime(value: 1, timescale: 30)
+        // The second value is the exact stable clock from the native tvOS
+        // managed-route failure. It is an observation, not a new tolerance.
+        for time in [end, ExactMediaTime(value: 20_000_395_041, timescale: 250_000_000),
+                     try end.adding(.init(value: 1, timescale: 90_000)), try end.adding(quantum)] {
+            XCTAssertTrue(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: nil))
+            XCTAssertTrue(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum),
+                "Validated final-frame evidence must preserve the existing at-or-after-end clock rule")
+            XCTAssertTrue(AVPlayerPlaybackEndBoundary.constrained.containsFinalClock(time, expected: end, quantum: quantum))
+        }
+    }
+
+    func testNativeFinalQuantumRejectsMalformedPeriodsAtAndAfterEndpoint() throws {
+        let end = ExactMediaTime(value: 80, timescale: 1)
+        let invalid = [ExactMediaTime(value: 0, timescale: 1), .init(value: -1, timescale: 30),
+                       end, try end.adding(.init(value: 1, timescale: 30))]
+        for time in [end, ExactMediaTime(value: 20_000_395_041, timescale: 250_000_000),
+                     try end.adding(.init(value: 1, timescale: 30))] {
+            for quantum in invalid {
+                XCTAssertFalse(AVPlayerPlaybackEndBoundary.natural.containsFinalClock(time, expected: end, quantum: quantum),
+                    "Reaching the endpoint cannot bypass validation of present timing evidence")
+            }
+        }
     }
 
     func testNativeFullSourceUsesObservationWithoutExplicitTrimMutation() async throws {

@@ -69,9 +69,11 @@ enum AVPlayerPlaybackEndBoundary: Sendable {
         guard let quantum else { return CMTimeCompare(current.cmTime, expected.cmTime) >= 0 }
         guard quantum.value > 0, CMTimeCompare(quantum.cmTime, expected.cmTime) < 0,
               let lower = try? expected.subtracting(quantum) else { return false }
-        // Native presentation recognition only. Strictly inside the final
-        // quantum: a complete missing frame at the lower boundary is rejected.
-        return CMTimeCompare(current.cmTime, lower.cmTime) > 0 && CMTimeCompare(current.cmTime, expected.cmTime) <= 0
+        // Preserve at-or-after-end clocks; validated presentation timing also
+        // recognizes clocks strictly inside the final frame. A complete missing
+        // frame at the lower boundary is still rejected. This does not change
+        // the separately verified source endpoint or prove sample coverage.
+        return CMTimeCompare(current.cmTime, lower.cmTime) > 0
     }
 
     func observedEndpoint(forwardEnd: CMTime, duration: CMTime) -> ExactMediaTime? {

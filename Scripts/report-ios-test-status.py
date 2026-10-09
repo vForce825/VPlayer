@@ -74,6 +74,15 @@ _FUNCTIONAL_SUITES = (
         'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',)),
     ('VPlayeriOSTests', 'HLSAVPlayerBackendTests', (
         'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',)),
+    ('VPlayeriOSTests', 'NativeHLSAdapterLifecycleTests', (
+        'testNativeFinalQuantumAcceptsObservedClocksAndRejectsPrematureOrMissingEvidence',
+        'testNativeFinalQuantumPreservesAtOrAfterEndpointClocks',
+        'testNativeFinalQuantumRejectsMalformedPeriodsAtAndAfterEndpoint',)),
+    ('VPlayeriOSTests', 'NativeHLSMasterSmokeTests', (
+        'testRealNativeAndManagedHLSReachVerifiedUntrimmedEOF',
+        'testNativeEOSStableOvershootKeepsOriginalItemAndAuthority',
+        'testNativeEOSOvershootCannotBypassTransportOrAuthorityFailures',
+        'testNativeEOSOriginalDeadlineRejectsUnsettledTransportAndInvalidEvidence',)),
     ('VPlayeriOSUITests', 'IOSLibraryFlowTests', (
         'testTouchChannelSelectionCloseAndReopen',
         'testSourceEditorCancelAndReopen',
