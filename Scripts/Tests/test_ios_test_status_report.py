@@ -224,20 +224,21 @@ class IOSSelectedStatusTests(unittest.TestCase):
             'testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion',
             'testPausedWorkspaceMallocBuffersRespectAlignmentAndPhysicalPrechargeBoundaries',
             'testPausedWorkspacePartialAllocationFailureFreesEveryRawOwnerAndReservation',
+            'testPausedWorkspaceRollbackKeepsExactChargeWhenAnUnrelated16KiBOwnerRetires',
             'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',
         ):
             expected.add('VPlayeriOSTests/LoopbackHTTPServerTests/' + method)
-        self.assertEqual(len(m.DEFAULT_TESTS), 37)
+        self.assertEqual(len(m.DEFAULT_TESTS), 38)
         self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
 
     def test_full_default_manifest_fits_output_and_summary_without_omitting_cases(self):
         m = self.module()
         rows = m.analyze(schema(), {'testNodes': [case(test) for test in m.DEFAULT_TESTS]})
-        self.assertEqual(len(rows), 37)
+        self.assertEqual(len(rows), 38)
         self.assertTrue(all(row['status'] == 'Passed' for row in rows))
         lines = m.report_lines(rows, 'functional_unit_and_ui')
         summary = m.job_summary(lines)
-        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 37)
+        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 38)
         self.assertNotIn('TRUNCATED', '\n'.join(lines) + summary)
         self.assertLessEqual(len(('\n'.join(lines) + '\n').encode()), m.MAX_OUTPUT)
         self.assertLessEqual(len(summary.encode()), m.MAX_OUTPUT)

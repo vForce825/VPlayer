@@ -331,21 +331,50 @@ final class LoopbackHTTPServerTests: XCTestCase {
     }
 
     func testPausedWorkspacePartialAllocationFailureFreesEveryRawOwnerAndReservation() async throws {
+        try await checkPausedWorkspacePartialAllocationFailure(releaseUnrelatedCharge: false)
+    }
+
+    func testPausedWorkspaceRollbackKeepsExactChargeWhenAnUnrelated16KiBOwnerRetires() async throws {
+        try await checkPausedWorkspacePartialAllocationFailure(releaseUnrelatedCharge: true)
+    }
+
+    private func checkPausedWorkspacePartialAllocationFailure(releaseUnrelatedCharge: Bool) async throws {
         let fixture = try await Task20HTTPFixture.start()
         defer { fixture.shutdown() }
         let store = fixture.task19.store
         let media = try XCTUnwrap(fixture.task19.publisher.visible?.media[1]?.resources.first)
+        let map = try XCTUnwrap(store.decodeCoverageMap(for: media))
+        let workspaceBytes = try PausedCoverageWorkspace.allocationLimits(
+            mapCount: 1, sampleCount: map.samples.count).total
         let owner = try PausedWindowCoverageLease.reserve()
         _ = try owner.retainMetadata(in: store, key: media)
+        let applicationLedger = PlaybackApplicationChargeLedger.shared
         for failureAt in 1...3 {
+            let unrelated = try (releaseUnrelatedCharge
+                ? applicationLedger.reserve(allocationIdentity: UUID(), bytes: 16 * 1_024) : nil)
+            defer { if let unrelated { applicationLedger.release(unrelated) } }
             let contextBaseline = PlaybackResourceContextLedger.shared.chargedBytes
-            let applicationBaseline = PlaybackApplicationChargeLedger.shared.chargedBytes
+            // Retain only pre-existing allocations. The workspace's later
+            // reservation remains outside this boundary, so a leak still fails.
+            let boundary = try applicationLedger.retainCurrentAllocationsForTesting()
+            defer {
+                boundary.reservations.forEach(applicationLedger.release)
+                XCTAssertEqual(applicationLedger.snapshot(ownedBy: boundary.reservations)
+                    .registeredReservationCount, 0)
+            }
             var attempts = 0
             var allocated: [UInt] = []
             var freed: [UInt] = []
             XCTAssertThrowsError(try store.reservePausedCoverageWorkspace(owner: owner, allocator: { bytes in
                 attempts += 1
-                guard attempts != failureAt else { return nil }
+                XCTAssertEqual(applicationLedger.chargedBytes, boundary.chargedBytes + workspaceBytes,
+                    "The workspace must own its full additional reservation before raw allocation")
+                guard attempts != failureAt else {
+                    // Force the unrelated release between sampling and rollback;
+                    // an unretained process-wide baseline would fall by 16 KiB.
+                    if let unrelated { applicationLedger.release(unrelated) }
+                    return nil
+                }
                 let pointer = malloc(bytes)
                 if let pointer { allocated.append(UInt(bitPattern: pointer)) }
                 return pointer
@@ -359,7 +388,10 @@ final class LoopbackHTTPServerTests: XCTestCase {
             XCTAssertEqual(freed.sorted(), allocated.sorted())
             XCTAssertEqual(Set(freed).count, freed.count)
             XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, contextBaseline)
-            XCTAssertEqual(PlaybackApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+            XCTAssertEqual(applicationLedger.chargedBytes, boundary.chargedBytes)
+            if let unrelated {
+                XCTAssertEqual(applicationLedger.snapshot(ownedBy: [unrelated]).registeredReservationCount, 0)
+            }
         }
     }
 
@@ -371,7 +403,15 @@ final class LoopbackHTTPServerTests: XCTestCase {
         let owner = try PausedWindowCoverageLease.reserve()
         _ = try owner.retainMetadata(in: store, key: media)
         let contextBaseline = PlaybackResourceContextLedger.shared.chargedBytes
-        let applicationBaseline = PlaybackApplicationChargeLedger.shared.chargedBytes
+        let applicationLedger = PlaybackApplicationChargeLedger.shared
+        // Capture before workspace admission, so the final workspace alias must
+        // still release its own distinct charge while unrelated owners retire.
+        let boundary = try applicationLedger.retainCurrentAllocationsForTesting()
+        defer {
+            boundary.reservations.forEach(applicationLedger.release)
+            XCTAssertEqual(applicationLedger.snapshot(ownedBy: boundary.reservations)
+                .registeredReservationCount, 0)
+        }
         var workspace: PausedCoverageWorkspace? = try store.reservePausedCoverageWorkspace(owner: owner)
         let limit = try PausedCoverageWorkspace.allocationLimits(
             mapCount: XCTUnwrap(workspace).mapCount, sampleCount: XCTUnwrap(workspace).sampleCount)
@@ -381,16 +421,18 @@ final class LoopbackHTTPServerTests: XCTestCase {
         XCTAssertLessThanOrEqual(actual.heap, limit.heap)
         let admittedCharge = PlaybackResourceContextLedger.shared.chargedBytes
         XCTAssertGreaterThan(admittedCharge, contextBaseline)
+        XCTAssertEqual(applicationLedger.chargedBytes, boundary.chargedBytes + limit.total)
         var alias = workspace
         weak let weakWorkspace = workspace
         workspace = nil
         XCTAssertNotNil(weakWorkspace)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, admittedCharge)
+        XCTAssertEqual(applicationLedger.chargedBytes, boundary.chargedBytes + limit.total)
         withExtendedLifetime(alias) {}
         alias = nil
         XCTAssertNil(weakWorkspace)
         XCTAssertEqual(PlaybackResourceContextLedger.shared.chargedBytes, contextBaseline)
-        XCTAssertEqual(PlaybackApplicationChargeLedger.shared.chargedBytes, applicationBaseline)
+        XCTAssertEqual(applicationLedger.chargedBytes, boundary.chargedBytes)
     }
 
     func testPausedCoverageWorkspaceReservesBeforeCompletionAndReleasesExactCharge() async throws {

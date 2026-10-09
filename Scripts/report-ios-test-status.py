@@ -70,6 +70,7 @@ _FUNCTIONAL_SUITES = (
         'testPausedCoverageWorkspaceFrozenMissingInitializationCannotGainLaterCompletion',
         'testPausedWorkspaceMallocBuffersRespectAlignmentAndPhysicalPrechargeBoundaries',
         'testPausedWorkspacePartialAllocationFailureFreesEveryRawOwnerAndReservation',
+        'testPausedWorkspaceRollbackKeepsExactChargeWhenAnUnrelated16KiBOwnerRetires',
         'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',)),
     ('VPlayeriOSTests', 'HLSAVPlayerBackendTests', (
         'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',)),
