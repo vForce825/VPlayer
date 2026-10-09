@@ -211,7 +211,15 @@ private struct IOSPlaybackRouteProbe: UIViewRepresentable {
 private final class IOSPlaybackRouteProbeView: UIView {
     var snapshot: (@MainActor () -> String)?
     override var accessibilityValue: String? {
-        get { snapshot?() }
+        get {
+            let statusBar: String
+            if let manager = window?.windowScene?.statusBarManager {
+                statusBar = manager.isStatusBarHidden ? "hidden" : "visible"
+            } else {
+                statusBar = "unknown"
+            }
+            return snapshot.map { $0() + " statusBar=\(statusBar)" }
+        }
         set {}
     }
 }

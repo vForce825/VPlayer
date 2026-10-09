@@ -201,6 +201,24 @@ final class IOSLibraryFlowTests: XCTestCase {
         // The observed center is outside the top bar and bottom transport card.
         screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
     }
+    private func assertSystemStatusBar(_ expected: String, in app: XCUIApplication,
+                                       screenshot: Bool = false,
+                                       file: StaticString = #filePath, line: UInt = #line) {
+        let probe = app.descendants(matching: .any)
+            .matching(identifier: "ios.playback.route").firstMatch
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "value ENDSWITH %@", " statusBar=\(expected)"),
+            object: probe)
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 2), .completed,
+            "Expected actual UIWindowScene status bar \(expected); probe=\(probe.value ?? "missing")",
+            file: file, line: line)
+        if screenshot {
+            let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            attachment.name = "System status bar \(expected)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+    }
     private func playerSessionIdentity(in app: XCUIApplication) -> String {
         let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
         let value = screen.value as? String ?? ""
@@ -219,6 +237,7 @@ final class IOSLibraryFlowTests: XCTestCase {
     func testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession() {
         let app = launch()
         defer { app.terminate() }
+        assertSystemStatusBar("visible", in: app, screenshot: true)
         require(app.buttons["channel.http"], in: app, stage: "controls-channel", timeout: 15)
         app.buttons["channel.http"].tap()
         let back = app.buttons["player-back"]
@@ -227,18 +246,20 @@ final class IOSLibraryFlowTests: XCTestCase {
         // First allow the real three-second task to hide both overlay bars.
         XCTAssertTrue(back.waitForNonExistence(timeout: 6), "The top bar must auto-hide during playback")
         XCTAssertFalse(app.buttons["player-play-pause"].exists)
-        XCTAssertFalse(app.statusBars.firstMatch.exists, "The system status bar follows the overlay")
+        assertSystemStatusBar("hidden", in: app, screenshot: true)
         assertPlayerSession(identity, in: app)
         tapPlayerBackground(in: app)
         require(back, in: app, stage: "controls-tap-show", timeout: 2, hittable: true)
+        assertSystemStatusBar("visible", in: app)
         tapPlayerBackground(in: app)
         XCTAssertTrue(back.waitForNonExistence(timeout: 2), "A second background tap hides immediately")
+        assertSystemStatusBar("hidden", in: app)
         tapPlayerBackground(in: app)
         require(app.buttons["player-play-pause"], in: app, stage: "controls-reshown", timeout: 2, hittable: true)
         app.buttons["player-play-pause"].tap()
         XCTAssertTrue(app.buttons["player-play-pause"].wait(for: \.label, toEqual: "播放", timeout: 3))
         XCTAssertFalse(back.waitForNonExistence(timeout: 4), "Paused controls stay visible")
-        XCTAssertTrue(app.statusBars.firstMatch.exists)
+        assertSystemStatusBar("visible", in: app, screenshot: true)
         assertPlayerSession(identity, in: app)
         back.tap()
     }
@@ -300,9 +321,15 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(back, in: app, stage: "foreground-controls-player", timeout: 5)
         let identity = playerSessionIdentity(in: app)
         XCTAssertTrue(back.waitForNonExistence(timeout: 6))
-        XCUIDevice.shared.press(.home)
-        let backgroundState = app.state
-        XCTAssertTrue(backgroundState == .runningBackground || backgroundState == .runningBackgroundSuspended)
+        // A second foreground application produces a real lifecycle transition;
+        // the hardware Home automation action can hang before returning on iOS 27.
+        let settings = XCUIApplication(bundleIdentifier: "com.apple.Preferences")
+        settings.activate()
+        let background = XCTNSPredicateExpectation(predicate: NSPredicate(format: "state IN %@",
+            [XCUIApplication.State.runningBackground.rawValue,
+             XCUIApplication.State.runningBackgroundSuspended.rawValue]), object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [background], timeout: 5), .completed,
+            "VPlayer must actually enter background, state=\(app.state.rawValue)")
         app.activate()
         require(back, in: app, stage: "foreground-controls-revealed", timeout: 2, hittable: true)
         XCTAssertEqual(playerSessionIdentity(in: app), identity)
