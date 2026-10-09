@@ -6,6 +6,7 @@ import AVFoundation
 import CoreMedia
 import UIKit
 import XCTest
+@testable import VPlayer
 @testable import VPlayerCore
 @testable import VPlayerPlayback
 
@@ -82,4 +83,114 @@ private final class DisplayModeRecorder: PlaybackDisplayModeControlling {
         rates.append(outputFrameRate)
     }
     func leaveFullScreen() {}
+}
+
+/// Deliver captured timeout tokens directly: these tests exercise the production
+/// reducer without relying on three-second sleeps or main-queue scheduling.
+final class IOSPlayerControlsVisibilityTests: XCTestCase {
+    func testCurrentIdleTimeoutHidesControlsAndLeavesNoTimer() throws {
+        var controls = IOSPlayerControlsVisibility()
+        XCTAssertTrue(controls.isVisible)
+        XCTAssertNil(controls.timeoutToken)
+        controls.setAutoHideAllowed(true)
+        XCTAssertEqual(IOSPlayerControlsVisibility.idleTimeout, .seconds(3))
+        let token = try XCTUnwrap(controls.timeoutToken)
+        controls.timeoutCompleted(token)
+        XCTAssertFalse(controls.isVisible)
+        XCTAssertNil(controls.timeoutToken)
+    }
+
+    func testBackgroundTapHidesAndRestoresControls() throws {
+        var controls = IOSPlayerControlsVisibility()
+        controls.setAutoHideAllowed(true)
+        let first = try XCTUnwrap(controls.timeoutToken)
+        controls.backgroundTapped()
+        XCTAssertFalse(controls.isVisible)
+        XCTAssertNil(controls.timeoutToken)
+        controls.backgroundTapped()
+        XCTAssertTrue(controls.isVisible)
+        let revealed = try XCTUnwrap(controls.timeoutToken)
+        XCTAssertNotEqual(first, revealed)
+        controls.timeoutCompleted(first)
+        XCTAssertTrue(controls.isVisible, "A canceled timeout cannot hide a newly revealed bar")
+        controls.timeoutCompleted(revealed)
+        XCTAssertFalse(controls.isVisible)
+    }
+
+    func testControlInteractionRefreshesTimeoutWithoutTogglingVisibility() throws {
+        var controls = IOSPlayerControlsVisibility()
+        controls.setAutoHideAllowed(true)
+        let first = try XCTUnwrap(controls.timeoutToken)
+        controls.userInteracted()
+        let refreshed = try XCTUnwrap(controls.timeoutToken)
+        XCTAssertNotEqual(first, refreshed)
+        controls.timeoutCompleted(first)
+        XCTAssertTrue(controls.isVisible)
+        controls.timeoutCompleted(refreshed)
+        XCTAssertFalse(controls.isVisible)
+        controls.userInteracted()
+        XCTAssertTrue(controls.isVisible)
+    }
+
+    func testPinningRevealsControlsAndRejectsTimeoutAcrossResume() throws {
+        var controls = IOSPlayerControlsVisibility()
+        controls.setAutoHideAllowed(true)
+        let old = try XCTUnwrap(controls.timeoutToken)
+        controls.backgroundTapped()
+        controls.setAutoHideAllowed(false)
+        XCTAssertTrue(controls.isVisible)
+        XCTAssertNil(controls.timeoutToken)
+        controls.backgroundTapped()
+        XCTAssertTrue(controls.isVisible, "Paused, settings, error and accessibility controls stay available")
+        controls.timeoutCompleted(old)
+        XCTAssertTrue(controls.isVisible)
+        controls.setAutoHideAllowed(true)
+        let resumed = try XCTUnwrap(controls.timeoutToken)
+        XCTAssertNotEqual(old, resumed)
+        controls.timeoutCompleted(old)
+        XCTAssertTrue(controls.isVisible, "Playing -> pinned -> playing must not reuse an old timeout")
+    }
+
+    func testRepeatedPlaybackUpdateDoesNotPostponeTimeout() throws {
+        var controls = IOSPlayerControlsVisibility()
+        controls.setAutoHideAllowed(true)
+        let token = try XCTUnwrap(controls.timeoutToken)
+        controls.setAutoHideAllowed(true)
+        XCTAssertEqual(controls.timeoutToken, token)
+        controls.timeoutCompleted(token)
+        controls.setAutoHideAllowed(true)
+        XCTAssertFalse(controls.isVisible)
+    }
+
+    func testDisappearanceInvalidatesTimeoutBeforeReappearance() throws {
+        var controls = IOSPlayerControlsVisibility()
+        controls.setAutoHideAllowed(true)
+        let old = try XCTUnwrap(controls.timeoutToken)
+        controls.setAutoHideAllowed(false)
+        controls.setAutoHideAllowed(true)
+        controls.timeoutCompleted(old)
+        XCTAssertTrue(controls.isVisible)
+        XCTAssertNotEqual(controls.timeoutToken, old)
+    }
+
+    func testOnlyUnobstructedActivePlaybackAllowsAutoHide() {
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "controls-fixture",
+            streamURL: URL(fileURLWithPath: "/controls-fixture"), title: "Controls fixture")
+        let pinned: [PlaybackState] = [.idle, .preparing(request), .buffering(request),
+            .recovering(request), .paused(request), .stopped,
+            .failed(.init(code: "fixture", userMessage: "Fixture failure"))]
+        for state in pinned {
+            XCTAssertFalse(IOSPlayerControlsVisibility.allowsAutoHide(state: state,
+                isPresentingSettings: false, isVoiceOverRunning: false,
+                isSceneActive: true, hasPlaybackMessage: false))
+        }
+        XCTAssertTrue(IOSPlayerControlsVisibility.allowsAutoHide(state: .playing(request),
+            isPresentingSettings: false, isVoiceOverRunning: false,
+            isSceneActive: true, hasPlaybackMessage: false))
+        for blocker in 0..<4 {
+            XCTAssertFalse(IOSPlayerControlsVisibility.allowsAutoHide(state: .playing(request),
+                isPresentingSettings: blocker == 0, isVoiceOverRunning: blocker == 1,
+                isSceneActive: blocker != 2, hasPlaybackMessage: blocker == 3))
+        }
+    }
 }

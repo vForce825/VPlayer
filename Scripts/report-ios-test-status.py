@@ -34,6 +34,14 @@ _FUNCTIONAL_SUITES = (
     ('VPlayeriOSTests', 'IOSVideoProcessingLifecycleTests', (
         'testApplicationNotificationsSynchronouslyCloseAndRestoreActualGPUAdmission',
         'testForegroundNotificationCannotOverrideAnActivePiPLease',)),
+    ('VPlayeriOSTests', 'IOSPlayerControlsVisibilityTests', (
+        'testCurrentIdleTimeoutHidesControlsAndLeavesNoTimer',
+        'testBackgroundTapHidesAndRestoresControls',
+        'testControlInteractionRefreshesTimeoutWithoutTogglingVisibility',
+        'testPinningRevealsControlsAndRejectsTimeoutAcrossResume',
+        'testRepeatedPlaybackUpdateDoesNotPostponeTimeout',
+        'testDisappearanceInvalidatesTimeoutBeforeReappearance',
+        'testOnlyUnobstructedActivePlaybackAllowsAutoHide',)),
     ('VPlayeriOSTests', 'IOSNativePictureInPictureTests', (
         'testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession',)),
     ('VPlayeriOSTests', 'IOSPictureInPictureCoordinatorTests', (
@@ -52,7 +60,12 @@ _FUNCTIONAL_SUITES = (
     ('VPlayeriOSTests', 'AdaptiveYADIFDiagnosticsTests', (
         'testOneSecondWindowAndModeChangeFlushHaveExactCountsAndWallTimes',
         'testManyCompletionsCollapseIntoOneWindowAndExplicitFlushResetsIt',
-        'testCPUPhaseCallbackRunsOnceWithSeparateNonnegativeWallTimes',)),
+        'testCPUPhaseCallbackRunsOnceWithSeparateNonnegativeWallTimes',
+        'testWorkerSummarySeparatesCPUServiceFromHeterogeneousWallTimesAndRequestedQoS',
+        'testMissingWorkerCPUClockAndMissingSlotStayUnverifiedInsteadOfZeroService',
+        'testWorkerWindowCountersExtremaAndContextResetAtOneSecondBoundary',
+        'testWorkerWindowMarksMixedSurfaceContextsAndDoesNotInventMissingTelemetry',
+        'testNativeThreadCPUClockProvidesValidNonnegativeElapsedService',)),
     ('VPlayeriOSTests', 'AdaptiveYADIFHandoffTests', (
         'testDelayedGPUThenCPUThenForegroundGPUPreservesCompletionOrderAndPixels',
         'testCancellationDuringGPUFenceRetiresEachJobOnceAndRestoresAllThreeSlots',)),
@@ -72,6 +85,12 @@ _FUNCTIONAL_SUITES = (
     ('VPlayeriOSTests', 'YADIFGoldenPixelTests', (
         'testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
         'testCPUBenchmarkPeriodicFillMatchesOriginalFormulaAndPreservesPadding',
+        'testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
+        'testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
+        'testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
+        'testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
+        'testCPUNEONGuardPagesPreserveBounds',
+        'testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane',
         'testNV12TFFMatchesPinnedOracleAndExactFieldRules',
         'testNV12BFFMatchesPinnedOracleAndExactFieldRules',
         'testP010TFFMatchesPinnedOracleAndExactStorageRules',
@@ -109,13 +128,25 @@ _FUNCTIONAL_SUITES = (
         'testPlaylistEditOpensExistingSourceWithoutDeletingIt',
         'testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
         'testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace',
-        'testRotationAndPlaybackSettingsKeepPlayerSession',)),
+        'testRotationAndPlaybackSettingsKeepPlayerSession',
+        'testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession',
+        'testPlaybackControlTapsAndSettingsDoNotToggleBackgroundOrStopSession',
+        'testHiddenPlaybackControlsCanBeRevealedAfterRotation',
+        'testForegroundReturnRevealsControlsAndStartsFreshIdleTimeout',
+        'testPlaybackFailureKeepsControlsAndExitVisible',)),
 )
 DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'
                       for target, suite, methods in _FUNCTIONAL_SUITES for method in methods)
 BENCHMARK_TESTS = (
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',
     'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFScalarVersusNEONBenchmarkReportsPairedPatternMeasurements',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONGuardPagesPreserveBounds',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane',
 )
 PREFLIGHT_TESTS = (
     'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',

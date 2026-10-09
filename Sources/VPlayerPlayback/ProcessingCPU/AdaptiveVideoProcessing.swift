@@ -118,6 +118,35 @@ struct AdaptiveYADIFDurations: Sendable {
     }
 }
 
+struct CPUYADIFWorkerWindow: Sendable {
+    var pairs: UInt64 = 0
+    var expectedWorkers: UInt64 = 0
+    var cpu = CPUYADIFMeasuredDurations()
+    var wall = CPUYADIFMeasuredDurations()
+    var startDelay = CPUYADIFMeasuredDurations()
+    var startSpread = CPUYADIFMeasuredDurations()
+    var joinTail = CPUYADIFMeasuredDurations()
+    var requestedQoSStart = CPUYADIFRequestedQoSCounts()
+    var requestedQoSEnd = CPUYADIFRequestedQoSCounts()
+
+    var cpuClockStatus: String {
+        guard cpu.count > 0 else { return "unverified" }
+        return cpu.count == expectedWorkers ? "verified" : "partial"
+    }
+
+    mutating func record(_ summary: CPUYADIFWorkerSummary) {
+        pairs += 1
+        expectedWorkers += summary.expectedWorkers
+        cpu.merge(summary.cpu)
+        wall.merge(summary.wall)
+        startDelay.merge(summary.startDelay)
+        if let value = summary.startSpreadMilliseconds { startSpread.record(value) }
+        if let value = summary.joinTailMilliseconds { joinTail.record(value) }
+        requestedQoSStart.merge(summary.requestedQoSStart)
+        requestedQoSEnd.merge(summary.requestedQoSEnd)
+    }
+}
+
 struct AdaptiveYADIFLogWindow: Sendable {
     var seconds: Double = 0
     var successfulPairs: UInt64 = 0
@@ -131,6 +160,13 @@ struct AdaptiveYADIFLogWindow: Sendable {
     var outputLock = AdaptiveYADIFDurations()
     var parallel = AdaptiveYADIFDurations()
     var unlock = AdaptiveYADIFDurations()
+    var workers = CPUYADIFWorkerWindow()
+    // Last observed surface context; transitions are counted so mixed windows
+    // cannot be mistaken for a measurement of one format/worker configuration.
+    var context: CPUYADIFProcessingContext?
+    var contextChanges: UInt64 = 0
+    var thermalAtLog = "unknown"
+    var lowPowerAtLog = false
     var hasCompletions: Bool { successfulPairs != 0 || failedPairs != 0 }
 }
 
@@ -161,6 +197,18 @@ final class AdaptiveYADIFDiagnostics: @unchecked Sendable {
                 func times(_ value: AdaptiveYADIFDurations) -> String {
                     "\(number(value.totalMilliseconds))/\(number(value.maximumMilliseconds))"
                 }
+                func workerTimes(_ value: CPUYADIFMeasuredDurations) -> String {
+                    guard let minimum = value.minimumMilliseconds else { return "unverified" }
+                    return "\(number(value.totalMilliseconds))/\(number(minimum))/\(number(value.maximumMilliseconds))"
+                }
+                let context: String
+                if let observed = window.context {
+                    context = "surface=\(observed.width)x\(observed.height) "
+                        + "pixel_format=\(String(format: "%08x", observed.pixelFormat)) depth=\(observed.depth) "
+                        + "workers=\(observed.workers) active_processors=\(observed.activeProcessors)"
+                } else {
+                    context = "surface=unverified pixel_format=unverified depth=unverified workers=unverified active_processors=unverified"
+                }
                 message = "IOS_VIDEO_CPU id=\(identifier) mode=cpu seconds=\(number(window.seconds)) "
                     + "pairs_ok=\(window.successfulPairs) pairs_failed=\(window.failedPairs) "
                     + "pair_budget_ms_25i=40 timings_ms=sum/max "
@@ -168,7 +216,16 @@ final class AdaptiveYADIFDiagnostics: @unchecked Sendable {
                     + "processing=\(times(window.processing)) total=\(times(window.total)) "
                     + "validation=\(times(window.validation)) input_lock=\(times(window.inputLock)) "
                     + "output_lock=\(times(window.outputLock)) parallel_wall=\(times(window.parallel)) "
-                    + "unlock=\(times(window.unlock))"
+                    + "unlock=\(times(window.unlock)) "
+                    + "worker_pairs=\(window.workers.pairs) worker_samples=\(window.workers.wall.count)/\(window.workers.expectedWorkers) "
+                    + "worker_cpu_clock=\(window.workers.cpuClockStatus) worker_cpu_valid=\(window.workers.cpu.count) "
+                    + "worker_times_ms=sum/min/max worker_cpu_ms=\(workerTimes(window.workers.cpu)) "
+                    + "worker_wall_ms=\(workerTimes(window.workers.wall)) worker_start_delay=\(workerTimes(window.workers.startDelay)) "
+                    + "worker_start_spread=\(workerTimes(window.workers.startSpread)) worker_join_tail=\(workerTimes(window.workers.joinTail)) "
+                    + "worker_join_valid=\(window.workers.joinTail.count) "
+                    + "requested_qos_order=interactive/initiated/default/utility/background/unspecified/unknown "
+                    + "requested_qos_start=\(window.workers.requestedQoSStart.logValue) requested_qos_end=\(window.workers.requestedQoSEnd.logValue) "
+                    + "\(context) context_changes=\(window.contextChanges) thermal_at_log=\(window.thermalAtLog) low_power_at_log=\(window.lowPowerAtLog ? 1 : 0)"
             }
             Self.logger.notice("\(message, privacy: .public)")
         }
@@ -201,6 +258,11 @@ final class AdaptiveYADIFDiagnostics: @unchecked Sendable {
                 window.outputLock.record(phases.outputLockMilliseconds)
                 window.parallel.record(phases.parallelMilliseconds)
                 window.unlock.record(phases.unlockMilliseconds)
+                if let workers = phases.workers { window.workers.record(workers) }
+                if let context = phases.context {
+                    if let previous = window.context, previous != context { window.contextChanges += 1 }
+                    window.context = context
+                }
             }
             guard now - (windowStartedAt ?? now) >= 1 else { return nil }
             return takeWindowLocked(at: now)
@@ -216,6 +278,16 @@ final class AdaptiveYADIFDiagnostics: @unchecked Sendable {
     private func takeWindowLocked(at now: TimeInterval) -> AdaptiveYADIFLogWindow? {
         guard window.hasCompletions else { return nil }
         window.seconds = max(0, now - (windowStartedAt ?? now))
+        // Device state is sampled only when emitting a bounded window, not per
+        // worker or pixel. It is context at emission, not a history of the run.
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: window.thermalAtLog = "nominal"
+        case .fair: window.thermalAtLog = "fair"
+        case .serious: window.thermalAtLog = "serious"
+        case .critical: window.thermalAtLog = "critical"
+        @unknown default: window.thermalAtLog = "unknown"
+        }
+        window.lowPowerAtLog = ProcessInfo.processInfo.isLowPowerModeEnabled
         let snapshot = window
         window = AdaptiveYADIFLogWindow()
         windowStartedAt = now

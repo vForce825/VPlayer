@@ -4,6 +4,7 @@
 # SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 from pathlib import Path
 import json
+import hashlib
 import os
 import re
 import subprocess
@@ -57,38 +58,21 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn("steps.release_build.outcome == 'success'", text)
         self.assertIn("--build-only", text)
         self.assertNotIn('continue-on-error', text.split('  ios-tests:',1)[1])
-    def test_fast_boot_probe_precedes_generation_and_cannot_relax_acceptance(self):
+    def test_generation_budget_is_reserved_for_pinned_inputs_and_native_cold_start_stays_required(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         generation,native=text.split('  ios-tests:',1)
-        self.assertIn('id: boot_probe',generation)
-        probe=generation.split('id: boot_probe',1)[1].split('      - name:',1)[0]
-        self.assertIn('timeout-minutes: 5',probe)
-        self.assertIn('continue-on-error: true',probe)
-        self.assertIn('ios-startup-runner.py --boot-only',probe)
-        self.assertLess(generation.index('--boot-only'),generation.index('brew install mint'))
-        self.assertEqual(generation.count('continue-on-error: true'),1)
-        for marker in ['IOS_BOOT_PROBE_HEAD','IOS_BOOT_PROBE_TREE','IOS_BOOT_PROBE_IMAGE','IOS_BOOT_PROBE_IMAGE_VERSION','IOS_BOOT_PROBE_APP_AND_XCTEST=not_run']:
-            self.assertIn(marker,generation)
-        self.assertIn('steps.boot_probe.outcome',generation)
-        self.assertIn('GITHUB_STEP_SUMMARY',generation)
-        self.assertIn('boot_ready_only',generation)
-        self.assertNotIn('boot_probe',native)
+        self.assertIn('timeout-minutes: 15',generation)
+        self.assertNotIn('boot_probe',generation)
+        self.assertNotIn('BOOT_PROBE',generation)
+        self.assertNotIn('--boot-only',generation)
+        self.assertNotIn('continue-on-error',generation)
+        self.assertIn('XcodeGen@2.44.1',generation)
+        self.assertIn("if: steps.generated.outputs.needs_refresh == 'true'",generation)
+        self.assertIn('exit 1',generation)
+        self.assertIn('needs: generated-inputs',native)
+        self.assertIn("needs.generated-inputs.outputs.needs_refresh == 'false'",native)
         self.assertIn('Verify Release simulator cold starts without fixture bypass',native)
-        self.assertIn('needs.generated-inputs.outputs.needs_refresh',native)
-    def test_probe_summary_classifies_raw_outcome_without_claiming_app_pass(self):
-        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
-        self.assertIn('name: Record diagnostic cold boot outcome',text)
-        step=text.split('name: Record diagnostic cold boot outcome',1)[1].split('      - name:',1)[0]
-        script=textwrap.dedent(step.split('        run: |\n',1)[1])
-        with tempfile.TemporaryDirectory() as directory:
-            for outcome,expected in [('success','boot_ready_only'),('failure','failed'),('skipped','unverified')]:
-                path=Path(directory)/outcome
-                run=subprocess.run(['bash','-e','-c',script],env=dict(os.environ,PROBE_OUTCOME=outcome,GITHUB_STEP_SUMMARY=str(path)),capture_output=True,text=True,timeout=3)
-                self.assertEqual(run.returncode,0,run.stderr)
-                self.assertIn('IOS_BOOT_PROBE_STEP_OUTCOME='+outcome,run.stdout)
-                self.assertIn('IOS_BOOT_PROBE_CLASSIFICATION='+expected,run.stdout)
-                self.assertIn('App and XCTest were not run',path.read_text())
-                self.assertLess(path.stat().st_size,512)
+        self.assertIn('ios-startup-runner.py',native)
     def test_shared_fixtures_and_release_measurement_are_required(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('prepare-hls-ci-fixtures.sh --verify-committed',text)
@@ -184,7 +168,8 @@ class IOSWorkflowTests(unittest.TestCase):
         step=text.split('name: Measure optimized CPU processing without device qualification',1)[1].split('      - name:',1)[0]
         script=textwrap.dedent(step.split('        run: |\n',1)[1])
         with tempfile.TemporaryDirectory() as directory:
-            directory=Path(directory);(directory/'bin').mkdir()
+            directory=Path(directory);(directory/'bin').mkdir();(directory/'Scripts').mkdir()
+            (directory/'Scripts/report-ios-clang-evidence.py').symlink_to(ROOT/'Scripts/report-ios-clang-evidence.py')
             native=directory/'bin/xcodebuild'
             native.write_text(textwrap.dedent('''\
                 #!/usr/bin/env python3
@@ -199,7 +184,7 @@ class IOSWorkflowTests(unittest.TestCase):
                     if os.environ['SETTINGS_MODE']=='query_failed': sys.exit(65)
                     target=args[args.index('-target')+1] if '-target' in args else 'VPlayeriOSBenchmarks'
                     row={'target':target,'buildSettings':{'GCC_OPTIMIZATION_LEVEL':'s',
-                        'OTHER_CFLAGS':'','SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES',
+                        'OTHER_CFLAGS':'-DPRIVATE=must-not-publish','SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES',
                         'PRIVATE_SOURCE':'must-not-publish'}}
                     rows=[row,{'target':'VPlayerCoreiOS','buildSettings':{'GCC_OPTIMIZATION_LEVEL':'0'}}]
                     if os.environ['SETTINGS_MODE']=='missing': rows=[]
@@ -241,11 +226,11 @@ class IOSWorkflowTests(unittest.TestCase):
                 self.assertEqual(native[native.index('-enableCodeCoverage')+1],'NO')
                 self.assertEqual(native[native.index('-default-test-execution-time-allowance')+1],'120')
                 self.assertEqual(native[native.index('-maximum-test-execution-time-allowance')+1],'300')
-                self.assertEqual(sum(arg.startswith('-only-testing:') for arg in native),2)
+                self.assertEqual(sum(arg.startswith('-only-testing:') for arg in native),9)
                 lines=[line for line in run.stdout.splitlines() if line.startswith('IOS_CPU_BUILD_SETTINGS=')]
                 self.assertEqual(len(lines),1)
                 self.assertEqual(json.loads(lines[0].split('=',1)[1]),{'GCC_OPTIMIZATION_LEVEL':'s',
-                    'OTHER_CFLAGS':'','SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES'})
+                    'SWIFT_OPTIMIZATION_LEVEL':'-O','ENABLE_TESTABILITY':'YES'})
                 self.assertNotIn('must-not-publish',run.stdout+run.stderr)
                 self.assertIn('IOS_CPU_YADIF_BENCH width=1920',log)
                 self.assertIn('native stderr',log)
@@ -261,6 +246,98 @@ class IOSWorkflowTests(unittest.TestCase):
                 self.assertNotIn('Traceback',run.stderr)
                 self.assertNotIn('must-not-publish',run.stdout+run.stderr)
                 self.assertIn('IOS_CPU_YADIF_BENCH width=1920',log)
+    def test_device_build_log_capture_preserves_native_failures_and_icon_acceptance(self):
+        step=self.workflow_step('Compile Release for a physical iPhone destination without signing')
+        script=textwrap.dedent(step.split('        run: |\n',1)[1])
+        self.assertIn('set -o pipefail',script)
+        self.assertIn('tee /dev/stderr',script)
+        self.assertIn("IOS_APP_IDENTITY_AND_ICON=passed",script)
+        script=script.split("python3 - <<'PYICON'",1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory);(directory/'bin').mkdir();(directory/'Scripts').mkdir()
+            (directory/'Scripts/report-ios-clang-evidence.py').symlink_to(ROOT/'Scripts/report-ios-clang-evidence.py')
+            native=directory/'bin/xcodebuild'
+            native.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGS_LOG"\nprintf "native stdout\\n"\nprintf "native stderr\\n" >&2\nexit "$NATIVE_EXIT"\n')
+            native.chmod(0o755)
+            args_log=directory/'args'
+            for code in [0,7]:
+                run=subprocess.run(['bash','-e','-o','pipefail','-c',script],cwd=directory,
+                    env=dict(os.environ,PATH=str(directory/'bin')+os.pathsep+os.environ['PATH'],
+                        RUNNER_TEMP=str(directory),ARGS_LOG=str(args_log),NATIVE_EXIT=str(code)),
+                    capture_output=True,text=True,timeout=3)
+                self.assertEqual(run.returncode,code,run.stderr)
+                args=args_log.read_text().splitlines()
+                self.assertEqual(args[args.index('-configuration')+1],'Release')
+                self.assertEqual(args[args.index('-destination')+1],'generic/platform=iOS')
+                self.assertEqual(args[args.index('-derivedDataPath')+1],str(directory/'iOS-Device'))
+                self.assertEqual((directory/'iOS-Device.log').read_text(),'native stdout\nnative stderr\n')
+                self.assertEqual(run.stderr,'native stdout\nnative stderr\n')
+    def test_compiler_evidence_uses_exact_build_roots_and_always_reports_advisory_uncertainty(self):
+        text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
+        for name,sdk,root in [
+                ('Report physical destination Release C compiler evidence','iphoneos','iOS-Device'),
+                ('Report CPU measurement and qualification limits','iphonesimulator','iOS-CPU-Release')]:
+            step=self.workflow_step(name)
+            self.assertIn('if: always()',step)
+            self.assertIn('xcrun --find clang',step)
+            self.assertIn('xcrun clang --version',step)
+            self.assertIn('report-ios-clang-evidence.py report',step)
+            self.assertIn('--sdk '+sdk,step)
+            self.assertIn('--log "$RUNNER_TEMP/'+root+'.log"',step)
+            self.assertIn('--derived-data "$RUNNER_TEMP/'+root+'"',step)
+            self.assertIn('tee -a "$GITHUB_STEP_SUMMARY"',step)
+            self.assertNotIn('upload-artifact',step)
+        self.assertIn('python3 Scripts/Tests/test_ios_clang_evidence.py',text)
+        self.assertIn('python3 Scripts/Tests/test_cpu_worker_service_contract.py',text)
+        measure=self.workflow_step('Measure optimized CPU processing without device qualification')
+        self.assertIn('set -o pipefail',measure)
+        self.assertIn('report-ios-clang-evidence.py capture --log "$RUNNER_TEMP/iOS-CPU-Release.log"',measure)
+        for name in [
+                'testCPUYADIFScalarVersusNEONBenchmarkReportsPairedPatternMeasurements',
+                'testCPUNativeBackendsMatchEveryPinnedNV12AndP010FieldExactly',
+                'testCPUNEONMatchesScalarAcrossStridesParitiesAndPatterns',
+                'testCPUNEONMatchesScalarForInputAliasesAndRandomRowPartitions',
+                'testCPURequiredNEONRejectsNoVectorWorkAndOutputOverlapWithoutWrites',
+                'testCPUNEONGuardPagesPreserveBounds',
+                'testCPUNEONPreservesStrictTiesAndNearGatedFarCandidatesInEveryLane']:
+            self.assertIn('-only-testing:VPlayeriOSBenchmarks/YADIFGoldenPixelTests/'+name,measure)
+    def test_cpu_benchmark_summary_only_accepts_bounded_complete_numeric_rows(self):
+        step=self.workflow_step('Report CPU measurement and qualification limits')
+        self.assertIn("<<'PYBENCH'",step)
+        body=textwrap.dedent(step.split("<<'PYBENCH'",1)[1].split("\n",1)[1].split('          PYBENCH',1)[0])
+        def original(width,height,depth):
+            return f'IOS_CPU_YADIF_BENCH width={width} height={height} depth={depth} workers=4 setup_ms=1.0 output_ms=2.0 warmup_ms=3.0 pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0] environment=simulator-not-iphone-hardware configuration=release'
+        def paired(depth,pattern):
+            return f'IOS_CPU_YADIF_AB_BENCH width=1920 height=1080 depth={depth} pattern={pattern} seed=9390103823151792129 scalar_pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] neon_pair_ms=[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] vector_blocks=123 order=alternating samples=7 workers=1 backend=direct-c flags=same-translation-unit compiler=swift-ge-6.2 os=27.0.0 environment=simulator-not-iphone-hardware configuration=release'
+        original_rows=[original(w,h,d) for w,h in [(1920,1080),(3840,2160)] for d in [8,10]]
+        paired_rows=[paired(d,p) for d in [8,10] for p in ['random','direction-changing','tie-heavy','gradient']]
+        private='must-not-publish'
+        with tempfile.TemporaryDirectory() as directory:
+            log=Path(directory)/'benchmark.log'
+            noise=[private, paired_rows[0]+' '+private, paired_rows[0].replace('vector_blocks=123','vector_blocks=0'),
+                paired_rows[0].replace('pattern=random','pattern='+private), 'x'*10000]
+            def capture(text):
+                log.write_text(text)
+                Path(str(log)+'.capture.json').write_text(json.dumps({'complete':True,'truncated':False,
+                    'bytes':log.stat().st_size,'sha256':hashlib.sha256(log.read_bytes()).hexdigest()}))
+            capture('\n'.join(noise+original_rows+paired_rows)+'\n')
+            run=subprocess.run(['python3','-c',body,str(log)],capture_output=True,text=True,timeout=3)
+            self.assertEqual(run.returncode,0,run.stderr)
+            self.assertEqual(run.stdout.splitlines(),original_rows+paired_rows+['IOS_CPU_BENCHMARK_SUMMARY=verified original=4 paired=8'])
+            self.assertNotIn(private,run.stdout)
+            self.assertLess(len(run.stdout),10000)
+            state=Path(str(log)+'.capture.json')
+            state.write_text(json.dumps({'complete':True,'truncated':True,'bytes':log.stat().st_size,
+                'sha256':hashlib.sha256(log.read_bytes()).hexdigest()}))
+            truncated=subprocess.run(['python3','-c',body,str(log)],capture_output=True,text=True,timeout=3)
+            self.assertEqual(truncated.returncode,0,truncated.stderr)
+            self.assertNotIn('SUMMARY=verified',truncated.stdout)
+            self.assertIn('SUMMARY=unverified',truncated.stdout)
+            capture('\n'.join(original_rows+paired_rows[:-1]+[paired_rows[0]]*50)+'\n')
+            run=subprocess.run(['python3','-c',body,str(log)],capture_output=True,text=True,timeout=3)
+            self.assertEqual(run.returncode,0,run.stderr)
+            self.assertEqual(len(run.stdout.splitlines()),12)
+            self.assertIn('IOS_CPU_BENCHMARK_SUMMARY=unverified original=4 paired=7 duplicate=true',run.stdout)
     def test_functional_results_are_reported_before_independent_cpu_measurement(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('name: Report startup and functional test results',text)

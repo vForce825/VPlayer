@@ -137,16 +137,24 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertTrue(found, found ? "" : failureDetails(in: app, stage: stage),
             file: file, line: line)
     }
-    private func launch() -> XCUIApplication {
+    private func launch(playbackFixture: String? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = ["-ui-fixture", "seeded", "-uiTestResetPlaybackSettings",
                                "-ui-playback-route-diagnostics"]
+        if let playbackFixture { app.launchArguments += ["-ui-playback-fixture", playbackFixture] }
         app.launch()
         return app
     }
     private func assertPlayerControls(in app: XCUIApplication, stage: String,
                                       file: StaticString = #filePath, line: UInt = #line) {
+        // Detailed accessibility queries can exceed the real idle timeout.
+        // Pause through the actual button before inspecting its sibling controls.
+        let pause = app.buttons["player-play-pause"]
+        if !pause.exists { tapPlayerBackground(in: app) }
+        require(pause, in: app, stage: stage + "-pause-for-inspection", timeout: 3, hittable: true)
+        if pause.label == "暂停" { pause.tap() }
+        XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3), file: file, line: line)
         let screens = identified("player-full-screen", in: app.descendants(matching: .any))
         XCTAssertEqual(screens.count, 1, failureDetails(in: app, stage: stage + "-screen-identity"),
             file: file, line: line)
@@ -186,6 +194,137 @@ final class IOSLibraryFlowTests: XCTestCase {
             XCTAssertFalse(identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch.exists,
                 failureDetails(in: app, stage: "touch-cycle-\(cycle)-player-dismissed"))
         }
+    }
+    private func tapPlayerBackground(in app: XCUIApplication) {
+        let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
+        require(screen, in: app, stage: "controls-background-screen", timeout: 5)
+        // The observed center is outside the top bar and bottom transport card.
+        screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+    }
+    private func playerSessionIdentity(in app: XCUIApplication) -> String {
+        let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
+        let value = screen.value as? String ?? ""
+        XCTAssertTrue(value.hasPrefix("session="), failureDetails(in: app, stage: "controls-session-identity"))
+        return value
+    }
+    private func assertPlayerSession(_ identity: String, in app: XCUIApplication) {
+        XCTAssertEqual(playerSessionIdentity(in: app), identity, "Controls must not replace the playback session")
+        let route = app.descendants(matching: .any).matching(identifier: "ios.playback.route").firstMatch
+        let snapshot = route.value as? String ?? ""
+        for expected in ["session=true", "matching=true", "closing=false", "fullScreen=true"] {
+            XCTAssertTrue(snapshot.contains(expected), failureDetails(in: app, stage: "controls-session-preserved"))
+        }
+        XCTAssertFalse(snapshot.contains("session-close:"), "Controls must not stop playback")
+    }
+    func testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "controls-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        let back = app.buttons["player-back"]
+        require(back, in: app, stage: "controls-initial", timeout: 5)
+        let identity = playerSessionIdentity(in: app)
+        // First allow the real three-second task to hide both overlay bars.
+        XCTAssertTrue(back.waitForNonExistence(timeout: 6), "The top bar must auto-hide during playback")
+        XCTAssertFalse(app.buttons["player-play-pause"].exists)
+        XCTAssertFalse(app.statusBars.firstMatch.exists, "The system status bar follows the overlay")
+        assertPlayerSession(identity, in: app)
+        tapPlayerBackground(in: app)
+        require(back, in: app, stage: "controls-tap-show", timeout: 2, hittable: true)
+        tapPlayerBackground(in: app)
+        XCTAssertTrue(back.waitForNonExistence(timeout: 2), "A second background tap hides immediately")
+        tapPlayerBackground(in: app)
+        require(app.buttons["player-play-pause"], in: app, stage: "controls-reshown", timeout: 2, hittable: true)
+        app.buttons["player-play-pause"].tap()
+        XCTAssertTrue(app.buttons["player-play-pause"].wait(for: \.label, toEqual: "播放", timeout: 3))
+        XCTAssertFalse(back.waitForNonExistence(timeout: 4), "Paused controls stay visible")
+        XCTAssertTrue(app.statusBars.firstMatch.exists)
+        assertPlayerSession(identity, in: app)
+        back.tap()
+    }
+    func testPlaybackControlTapsAndSettingsDoNotToggleBackgroundOrStopSession() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "control-taps-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        let pause = app.buttons["player-play-pause"]
+        require(pause, in: app, stage: "control-taps-playing", timeout: 5, hittable: true)
+        pause.tap()
+        XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3))
+        let identity = playerSessionIdentity(in: app)
+        tapPlayerBackground(in: app)
+        XCTAssertTrue(pause.exists, "A background tap cannot hide paused controls")
+        pause.tap()
+        XCTAssertTrue(pause.wait(for: \.label, toEqual: "暂停", timeout: 2),
+                      "Tapping Play must leave the transport visible, without a second background toggle")
+        app.buttons["player-settings"].tap()
+        let done = app.buttons["player.settings.done"]
+        require(done, in: app, stage: "control-taps-settings", timeout: 3, hittable: true)
+        XCTAssertFalse(done.waitForNonExistence(timeout: 4), "Settings remain open beyond the idle timeout")
+        done.tap()
+        require(pause, in: app, stage: "control-taps-settings-return", timeout: 2, hittable: true)
+        XCTAssertEqual(pause.label, "暂停")
+        pause.tap()
+        XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3))
+        assertPlayerSession(identity, in: app)
+        app.buttons["player-back"].tap()
+    }
+    func testHiddenPlaybackControlsCanBeRevealedAfterRotation() {
+        let app = launch()
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        require(app.buttons["channel.http"], in: app, stage: "hidden-rotation-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        let back = app.buttons["player-back"]
+        require(back, in: app, stage: "hidden-rotation-player", timeout: 5)
+        let identity = playerSessionIdentity(in: app)
+        XCTAssertTrue(back.waitForNonExistence(timeout: 6))
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertFalse(back.exists, "Rotation does not recreate the controls or their idle timer")
+        assertPlayerSession(identity, in: app)
+        tapPlayerBackground(in: app)
+        let pause = app.buttons["player-play-pause"]
+        require(pause, in: app, stage: "hidden-rotation-revealed", timeout: 2, hittable: true)
+        pause.tap()
+        XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3))
+        XCUIDevice.shared.orientation = .portrait
+        assertPlayerSession(identity, in: app)
+        require(back, in: app, stage: "hidden-rotation-exit", timeout: 3, hittable: true)
+        back.tap()
+    }
+    func testForegroundReturnRevealsControlsAndStartsFreshIdleTimeout() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "foreground-controls-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        let back = app.buttons["player-back"]
+        require(back, in: app, stage: "foreground-controls-player", timeout: 5)
+        let identity = playerSessionIdentity(in: app)
+        XCTAssertTrue(back.waitForNonExistence(timeout: 6))
+        XCUIDevice.shared.press(.home)
+        let backgroundState = app.state
+        XCTAssertTrue(backgroundState == .runningBackground || backgroundState == .runningBackgroundSuspended)
+        app.activate()
+        require(back, in: app, stage: "foreground-controls-revealed", timeout: 2, hittable: true)
+        XCTAssertEqual(playerSessionIdentity(in: app), identity)
+        XCTAssertTrue(back.waitForNonExistence(timeout: 6), "Foreground playback starts a fresh idle timeout")
+        assertPlayerSession(identity, in: app)
+        tapPlayerBackground(in: app)
+        require(back, in: app, stage: "foreground-controls-exit", timeout: 2, hittable: true)
+        back.tap()
+    }
+    func testPlaybackFailureKeepsControlsAndExitVisible() {
+        let app = launch(playbackFixture: "failed")
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "failure-controls-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        require(app.buttons["player-retry"], in: app, stage: "failure-controls-retry", timeout: 5)
+        let back = app.buttons["player-back"]
+        XCTAssertFalse(back.waitForNonExistence(timeout: 4), "Failure cannot hide the exit or settings")
+        tapPlayerBackground(in: app)
+        XCTAssertTrue(back.isHittable)
+        XCTAssertTrue(app.buttons["player-settings"].isHittable)
+        back.tap()
+        require(app.buttons["channel.http"], in: app, stage: "failure-controls-closed", timeout: 5, hittable: true)
     }
     func testSourceEditorCancelAndReopen() {
         let app = launch()

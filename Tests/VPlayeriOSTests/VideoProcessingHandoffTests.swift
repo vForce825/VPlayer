@@ -433,6 +433,145 @@ private final class HandoffLogRecords: @unchecked Sendable {
 }
 
 final class AdaptiveYADIFDiagnosticsTests: XCTestCase {
+    func testWorkerSummarySeparatesCPUServiceFromHeterogeneousWallTimesAndRequestedQoS() throws {
+        let summary = CPUYADIFWorkerSummary(observations: [
+            CPUYADIFWorkerObservation(startedAt: 10.002, endedAt: 10.022, cpuMilliseconds: 4,
+                requestedQoSStart: .userInitiated, requestedQoSEnd: .utility),
+            CPUYADIFWorkerObservation(startedAt: 10.008, endedAt: 10.048, cpuMilliseconds: 30,
+                requestedQoSStart: .background, requestedQoSEnd: .background)
+        ], workers: 2, parallelStartedAt: 10, parallelEndedAt: 10.05)
+        XCTAssertEqual(summary.expectedWorkers, 2)
+        XCTAssertEqual(summary.cpu.count, 2)
+        XCTAssertEqual(summary.cpu.totalMilliseconds, 34)
+        XCTAssertEqual(summary.cpu.minimumMilliseconds, 4)
+        XCTAssertEqual(summary.cpu.maximumMilliseconds, 30)
+        XCTAssertEqual(summary.wall.totalMilliseconds, 60, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(summary.wall.minimumMilliseconds), 20, accuracy: 0.000001)
+        XCTAssertEqual(summary.wall.maximumMilliseconds, 40, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(summary.startDelay.minimumMilliseconds), 2, accuracy: 0.000001)
+        XCTAssertEqual(summary.startDelay.maximumMilliseconds, 8, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(summary.startSpreadMilliseconds), 6, accuracy: 0.000001)
+        XCTAssertEqual(try XCTUnwrap(summary.joinTailMilliseconds), 2, accuracy: 0.000001)
+        XCTAssertEqual(summary.requestedQoSStart.userInitiated, 1)
+        XCTAssertEqual(summary.requestedQoSStart.background, 1)
+        XCTAssertEqual(summary.requestedQoSEnd.utility, 1)
+        XCTAssertEqual(summary.requestedQoSEnd.background, 1)
+    }
+
+    func testMissingWorkerCPUClockAndMissingSlotStayUnverifiedInsteadOfZeroService() throws {
+        XCTAssertNil(CPUYADIFThreadClock.elapsedMilliseconds(start: nil, end: 2))
+        XCTAssertNil(CPUYADIFThreadClock.elapsedMilliseconds(start: 1, end: nil))
+        XCTAssertNil(CPUYADIFThreadClock.elapsedMilliseconds(start: 2, end: 1))
+        XCTAssertNil(CPUYADIFThreadClock.elapsedMilliseconds(start: .nan, end: 2))
+        XCTAssertNil(CPUYADIFThreadClock.elapsedMilliseconds(start: 1, end: .infinity))
+        XCTAssertEqual(CPUYADIFThreadClock.elapsedMilliseconds(start: 2, end: 2), 0)
+        let missing = CPUYADIFWorkerSummary(observations: [
+            CPUYADIFWorkerObservation(startedAt: 1, endedAt: 1.01, cpuMilliseconds: nil,
+                requestedQoSStart: .unspecified, requestedQoSEnd: .unknown), nil
+        ], workers: 2, parallelStartedAt: 1, parallelEndedAt: 1.02)
+        var window = CPUYADIFWorkerWindow()
+        window.record(missing)
+        XCTAssertEqual(window.expectedWorkers, 2)
+        XCTAssertEqual(window.wall.count, 1)
+        XCTAssertEqual(window.cpu.count, 0)
+        XCTAssertNil(window.cpu.minimumMilliseconds)
+        XCTAssertEqual(window.cpuClockStatus, "unverified")
+        XCTAssertNil(missing.joinTailMilliseconds, "A missing finish cannot establish the join tail")
+        let partial = CPUYADIFWorkerSummary(observations: [
+            CPUYADIFWorkerObservation(startedAt: 2, endedAt: 2.01, cpuMilliseconds: 3,
+                requestedQoSStart: .default, requestedQoSEnd: .default)
+        ], workers: 1, parallelStartedAt: 2, parallelEndedAt: 2.02)
+        window.record(partial)
+        XCTAssertEqual(window.cpuClockStatus, "partial")
+        XCTAssertEqual(window.cpu.count, 1)
+        XCTAssertEqual(window.cpu.totalMilliseconds, 3)
+        XCTAssertEqual(window.expectedWorkers, 3)
+    }
+
+    func testWorkerWindowCountersExtremaAndContextResetAtOneSecondBoundary() throws {
+        let records = HandoffLogRecords()
+        let diagnostics = AdaptiveYADIFDiagnostics { records.append($0) }
+        let summary = CPUYADIFWorkerSummary(observations: [
+            CPUYADIFWorkerObservation(startedAt: 4.001, endedAt: 4.011, cpuMilliseconds: 2,
+                requestedQoSStart: .userInitiated, requestedQoSEnd: .userInitiated)
+        ], workers: 1, parallelStartedAt: 4, parallelEndedAt: 4.012)
+        let context = CPUYADIFProcessingContext(width: 1920, height: 1080,
+            pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, depth: 8,
+            workers: 1, activeProcessors: 6)
+        var phases = CPUYADIFProcessingTimings()
+        phases.workers = summary
+        phases.context = context
+        diagnostics.select(.cpu, at: 4)
+        for _ in 0..<10_000 {
+            diagnostics.completeCPU(success: true, queue: 0, fence: 0, processing: 12,
+                total: 12, phases: phases, at: 4.5)
+        }
+        XCTAssertTrue(records.windows.isEmpty)
+        diagnostics.completeCPU(success: false, queue: 0, fence: 0, processing: nil,
+            total: 0, phases: nil, at: 5)
+        let first = try XCTUnwrap(records.windows.first)
+        XCTAssertEqual(first.workers.pairs, 10_000)
+        XCTAssertEqual(first.workers.expectedWorkers, 10_000)
+        XCTAssertEqual(first.workers.cpu.count, 10_000)
+        XCTAssertEqual(first.workers.cpu.totalMilliseconds, 20_000)
+        XCTAssertEqual(first.workers.cpuClockStatus, "verified")
+        XCTAssertEqual(first.workers.wall.count, 10_000)
+        XCTAssertEqual(try XCTUnwrap(first.workers.wall.minimumMilliseconds), 10, accuracy: 0.000001)
+        XCTAssertEqual(first.workers.wall.maximumMilliseconds, 10, accuracy: 0.000001)
+        XCTAssertEqual(first.workers.requestedQoSStart.userInitiated, 10_000)
+        XCTAssertEqual(first.context, context)
+        XCTAssertEqual(first.contextChanges, 0)
+        diagnostics.completeCPU(success: true, queue: 0, fence: 0, processing: 12,
+            total: 12, phases: phases, at: 5.5)
+        diagnostics.flush(at: 5.5)
+        let tail = try XCTUnwrap(records.windows.last)
+        XCTAssertEqual(records.windows.count, 2)
+        XCTAssertEqual(tail.workers.pairs, 1)
+        XCTAssertEqual(tail.workers.cpu.count, 1)
+        XCTAssertEqual(tail.workers.cpu.totalMilliseconds, 2)
+        XCTAssertEqual(tail.workers.requestedQoSStart.userInitiated, 1)
+    }
+
+    func testWorkerWindowMarksMixedSurfaceContextsAndDoesNotInventMissingTelemetry() throws {
+        let records = HandoffLogRecords()
+        let diagnostics = AdaptiveYADIFDiagnostics { records.append($0) }
+        let first = CPUYADIFProcessingContext(width: 1920, height: 1080,
+            pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, depth: 8,
+            workers: 4, activeProcessors: 6)
+        let second = CPUYADIFProcessingContext(width: 3840, height: 2160,
+            pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, depth: 10,
+            workers: 2, activeProcessors: 2)
+        diagnostics.select(.cpu, at: 0)
+        for (index, context) in [first, first, second].enumerated() {
+            var phases = CPUYADIFProcessingTimings()
+            phases.context = context
+            diagnostics.completeCPU(success: true, queue: 0, fence: 0, processing: 1,
+                total: 1, phases: phases, at: Double(index) / 10)
+        }
+        diagnostics.flush(at: 0.5)
+        let mixed = try XCTUnwrap(records.windows.first)
+        XCTAssertEqual(mixed.context, second)
+        XCTAssertEqual(mixed.contextChanges, 1)
+        XCTAssertEqual(mixed.workers.pairs, 0)
+        XCTAssertEqual(mixed.workers.cpuClockStatus, "unverified")
+        XCTAssertNil(mixed.workers.cpu.minimumMilliseconds)
+        diagnostics.completeCPU(success: false, queue: 0, fence: 0, processing: nil,
+            total: 0, phases: nil, at: 0.75)
+        diagnostics.flush(at: 0.75)
+        let missing = try XCTUnwrap(records.windows.last)
+        XCTAssertNil(missing.context)
+        XCTAssertEqual(missing.contextChanges, 0)
+        XCTAssertEqual(missing.workers.cpuClockStatus, "unverified")
+    }
+
+    func testNativeThreadCPUClockProvidesValidNonnegativeElapsedService() throws {
+        let start = try XCTUnwrap(CPUYADIFThreadClock.milliseconds(), "Darwin thread CPU clock failed")
+        let end = try XCTUnwrap(CPUYADIFThreadClock.milliseconds(), "Darwin thread CPU clock failed")
+        let elapsed = try XCTUnwrap(CPUYADIFThreadClock.elapsedMilliseconds(start: start, end: end))
+        XCTAssertTrue(elapsed.isFinite)
+        XCTAssertGreaterThanOrEqual(elapsed, 0)
+    }
+
     func testOneSecondWindowAndModeChangeFlushHaveExactCountsAndWallTimes() throws {
         let records = HandoffLogRecords()
         let diagnostics = AdaptiveYADIFDiagnostics { records.append($0) }
@@ -525,6 +664,17 @@ final class AdaptiveYADIFDiagnosticsTests: XCTestCase {
         let total = (ProcessInfo.processInfo.systemUptime - started) * 1_000
         let timings = try XCTUnwrap(observed)
         XCTAssertEqual(callbackCount, 1)
+        let workers = try XCTUnwrap(timings.workers)
+        let context = try XCTUnwrap(timings.context)
+        XCTAssertEqual(context.width, 8)
+        XCTAssertEqual(context.height, 8)
+        XCTAssertEqual(context.pixelFormat, CVPixelBufferGetPixelFormatType(work.outputs.first))
+        XCTAssertEqual(context.depth, 8)
+        XCTAssertTrue((1...4).contains(context.workers))
+        XCTAssertEqual(context.workers, max(1, min(4, context.activeProcessors)))
+        XCTAssertEqual(workers.wall.count, UInt64(context.workers))
+        XCTAssertEqual(workers.cpu.count, UInt64(context.workers), "Every Darwin clock sample must report validity")
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(workers.joinTailMilliseconds), 0)
         let components = [timings.validationMilliseconds, timings.inputLockMilliseconds,
             timings.outputLockMilliseconds, timings.parallelMilliseconds, timings.unlockMilliseconds]
         XCTAssertTrue(components.allSatisfy { $0.isFinite && $0 >= 0 })
@@ -546,5 +696,7 @@ final class AdaptiveYADIFDiagnosticsTests: XCTestCase {
         XCTAssertEqual(rejected.inputLockMilliseconds, 0)
         XCTAssertEqual(rejected.outputLockMilliseconds, 0)
         XCTAssertEqual(rejected.parallelMilliseconds, 0)
+        XCTAssertNil(rejected.workers, "Rejected work cannot invent zero CPU service")
+        XCTAssertNil(rejected.context)
     }
 }
