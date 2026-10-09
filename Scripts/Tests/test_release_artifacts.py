@@ -246,7 +246,9 @@ class ReleaseArtifactTests(unittest.TestCase):
 
     def test_real_commands_must_cover_all_objects_and_swift_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            # macOS aliases /var to /private/var; production object discovery
+            # supplies resolved paths, so the fixture must do the same.
+            root = Path(tmp).resolve()
             cobject = root / 'VPlayerPlaybackiOS.build/VPVideoProcessingCPU.o'
             swiftobject = root / 'VPlayerPlaybackiOS.build/Playback.o'
             mapping = root / 'output.json'
