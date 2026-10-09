@@ -45,7 +45,8 @@ class CPUWorkerServiceContracts(unittest.TestCase):
         for source in (cpu, adaptive):
             for diagnostic in ('systemUptime', 'CPUYADIFThreadClock', 'qos_class_self()',
                                'CPUYADIFWorkerSlots', 'AdaptiveYADIFDiagnostics',
-                               'IOS_VIDEO_CPU', 'IOS_VIDEO_HANDOFF', 'import OSLog'):
+                               'IOS_VIDEO_CPU', 'IOS_VIDEO_HANDOFF', 'import OSLog',
+                               'thermalState', 'isLowPowerModeEnabled'):
                 self.assertNotIn(diagnostic, source)
         self.assertNotIn('var timings = CPUYADIFProcessingTimings()', cpu)
         self.assertNotIn('timing?(timings)', cpu)
