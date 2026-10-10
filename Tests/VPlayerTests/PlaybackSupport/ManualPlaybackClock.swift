@@ -13,6 +13,12 @@ final class ManualPlaybackClock: PlaybackMonotonicClock, @unchecked Sendable {
     private weak var deadlineTimer2: ManualPlaybackDeadlineTimer?
     private var timerDeliveryCount = 0
     private var handlerInstallationCount = 0
+    // Test target only; called after the clock lock is released.
+    private var scheduleObserver: (@Sendable (UInt64?) -> Void)?
+    var deadlineScheduleObserver: (@Sendable (UInt64?) -> Void)? {
+        get { lock.withLock { scheduleObserver } }
+        set { lock.withLock { scheduleObserver = newValue } }
+    }
 
     init(nowNanoseconds: UInt64) {
         instant = nowNanoseconds
@@ -96,6 +102,7 @@ final class ManualPlaybackClock: PlaybackMonotonicClock, @unchecked Sendable {
             }
             return prepareDeliveriesLocked(force: false)
         }
+        if let notAfterInstant { deadlineScheduleObserver?(notAfterInstant) }
         d1?.enqueue()
         d2?.enqueue()
     }
