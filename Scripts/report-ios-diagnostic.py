@@ -13,6 +13,48 @@ from pathlib import Path
 MAX_BYTES = 40 * 1024
 OUTCOMES = {'success', 'failure', 'skipped', 'cancelled', 'unavailable'}
 PHASES = set('early-eof-recovery early-eof-startup eos-ordering-error eos-ordering-first-read eos-ordering-progress eos-ordering-refresh eos-ordering-startup full-eof-completion full-eof-startup public-mime-media-startup quantum-owner-original quantum-owner-successor refresh-return-first-read refresh-return-startup selected-format-progress selected-format-startup'.split())
+SOURCE_AAC_PHASES = set('diagnostic-truncated fixture-begin fixture-return calibration-begin calibration-return calibration-pass-1-encoded calibration-pass-2-encoded calibration-pass-1-complete calibration-pass-2-complete calibration-tracks-loaded calibration-reader-create calibration-native-init calibration-dispose input-encode-begin input-encode-return input-copy-complete source-append-begin source-append-145-complete source-append-290-complete source-finish-begin source-finish-return source-publication-complete source-error-before-cleanup server-begin server-return http-request-begin http-request-return http-complete owner-error-before-retire watchdog-error-before-cleanup retire-begin retire-http-error retire-writer-join-begin retire-writer-join-return retire-return'.split())
+SOURCE_AAC_CATEGORIES = {'none', 'aac-framework', 'avfoundation', 'osstatus', 'cancelled', 'other'}
+
+def source_aac_stages(lines):
+    result = {'events': [], 'truncated': False, 'errors': []}
+    attempts = {1: [], 2: []}
+    first_errors, last_errors = {}, {}
+    pattern = (r'SOURCE_AAC_FIXTURE_STAGE attempt=([12]) stage=([a-z0-9-]{1,48}) index=(\d{1,2}) '
+               r'elapsed-ms=(\d{1,7}) category=([a-z-]{1,16}) code=(-?\d{1,10})')
+    for line in lines:
+        if not isinstance(line, str) or len(line) > 256:
+            continue
+        match = re.fullmatch(pattern, line.rstrip('\r\n'))
+        if not match:
+            continue
+        attempt, stage, index, elapsed, category, code = match.groups()
+        if (stage not in SOURCE_AAC_PHASES or category not in SOURCE_AAC_CATEGORIES
+                or not 0 <= int(index) <= 32 or not 0 <= int(elapsed) <= 3_600_000
+                or not -2_147_483_648 <= int(code) <= 2_147_483_647):
+            continue
+        event = {'attempt': int(attempt), 'stage': stage, 'index': int(index),
+            'elapsed_ms': int(elapsed), 'category': category, 'code': int(code)}
+        if stage == 'diagnostic-truncated':
+            result['truncated'] = True
+            continue
+        if category != 'none':
+            first_errors.setdefault(int(attempt), event)
+            last_errors[int(attempt)] = event
+        retained = attempts[int(attempt)]
+        if event in retained:
+            continue
+        if len(retained) == 64:
+            retained.pop(0)
+            result['truncated'] = True
+        retained.append(event)
+    for attempt in (1, 2):
+        result['events'].extend(attempts[attempt])
+        for error in (first_errors.get(attempt), last_errors.get(attempt)):
+            if error is not None and error not in result['errors']:
+                result['errors'].append(error)
+    return result
+
 RUNTIME = {'appState': (0, 2), 'protected': 'bool', 'idleDisabled': 'bool',
            'outputs': (0, 32), 'channels': (0, 64), 'rate': (0, 384000)}
 EVIDENCE = {**{k: 'bool' for k in ('same-coordinator', 'same-physical', 'original-prepared', 'original-verified')},
@@ -64,7 +106,8 @@ def base(candidate, run_id, kind, functional='unavailable', cpu='unavailable'):
         raise ValueError('invalid step outcome')
     return {'version': 1, 'kind': kind, 'candidate': candidate, 'run_id': run_id,
         'functional': functional, 'cpu': cpu, 'availability': 'unavailable', 'counts': {},
-        'failure_records': 0, 'failures': [], 'truncated': False, 'host': host_control('')}
+        'failure_records': 0, 'failures': [], 'truncated': False, 'host': host_control(''),
+        'source_aac_fixture': source_aac_stages(())}
 
 def probe(*, candidate, run_id):
     return base(candidate, run_id, 'delivery-probe')
@@ -135,6 +178,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--bundle', type=Path)
     parser.add_argument('--host', type=Path)
+    parser.add_argument('--fixture-log', type=Path)
     parser.add_argument('--functional', default='unavailable')
     parser.add_argument('--cpu', default='unavailable')
     args = parser.parse_args()
@@ -149,6 +193,17 @@ def main():
             summary = json.loads(module.run(['get', 'test-results', 'summary', '--path', str(args.bundle)]))
             result = collect(schema, summary, candidate=args.candidate, run_id=args.run_id,
                 functional=args.functional, cpu=args.cpu, host_text=host)
+    if args.mode == 'collect' and args.fixture_log and args.fixture_log.is_file():
+        # Keep raw output local. Bounded reads and strict fixed vocabulary prevent
+        # URLs, assertion text, UUIDs and arbitrary error domains reaching JSON.
+        with args.fixture_log.open(encoding='utf-8', errors='replace') as log:
+            result['source_aac_fixture'] = source_aac_stages(iter(lambda: log.readline(1025), ''))
+        while len(encode(result)) > MAX_BYTES and result['failures']:
+            result['failures'].pop()
+            result['truncated'] = True
+        while len(encode(result)) > MAX_BYTES and result['source_aac_fixture']['events']:
+            result['source_aac_fixture']['events'].pop(0)
+            result['source_aac_fixture']['truncated'] = True
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_bytes(encode(result))
     print('IOS_DIAGNOSTIC_JSON=written bytes=' + str(len(encode(result))))

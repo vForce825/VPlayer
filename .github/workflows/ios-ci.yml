@@ -271,6 +271,7 @@ jobs:
             -parallel-testing-enabled NO -collect-test-diagnostics never \
             -test-timeouts-enabled YES -default-test-execution-time-allowance 120 \
             -maximum-test-execution-time-allowance 300 2>&1 | \
+            tee "$RUNNER_TEMP/iOS-fixture-diagnostic.log" | \
             python3 Scripts/report-ios-pip-runtime.py --candidate "$CANDIDATE_SHA"
       - name: Report functional test results
         if: always()
@@ -392,6 +393,7 @@ jobs:
         run: |
           python3 Scripts/report-ios-diagnostic.py collect --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
             --bundle "$RUNNER_TEMP/iOS.xcresult" --host "$RUNNER_TEMP/iOS-host-control.log" \
+            --fixture-log "$RUNNER_TEMP/iOS-fixture-diagnostic.log" \
             --functional "$FUNCTIONAL_OUTCOME" --cpu "$CPU_OUTCOME" --output "$RUNNER_TEMP/iOS-diagnostic/diagnostic.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always() && !cancelled()

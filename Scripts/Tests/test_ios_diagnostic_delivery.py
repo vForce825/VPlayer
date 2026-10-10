@@ -39,6 +39,36 @@ def report(document=None):
         candidate=HEAD, run_id=123, functional="failure", cpu="success", host_text=HOST)
 
 class DiagnosticTests(unittest.TestCase):
+    def test_source_aac_phase_records_are_bounded_and_contain_only_fixed_scalars(self):
+        valid = "SOURCE_AAC_FIXTURE_STAGE attempt=1 stage=source-finish-begin index=0 elapsed-ms=6420 category=none code=0\n"
+        error = "SOURCE_AAC_FIXTURE_STAGE attempt=1 stage=source-error-before-cleanup index=0 elapsed-ms=6430 category=osstatus code=-12785\n"
+        events = REPORT.source_aac_stages([valid, error, valid + "PRIVATE", valid.replace("source-finish-begin", "PRIVATE")])
+        self.assertEqual(len(events['events']), 2)
+        self.assertEqual(events['events'][1]['code'], -12785)
+        self.assertNotIn('PRIVATE', json.dumps(events))
+        events = REPORT.source_aac_stages([valid.replace('elapsed-ms=6420', 'elapsed-ms=' + str(i)) for i in range(1000)])
+        self.assertEqual(len(events['events']), 64)
+        self.assertEqual(events['events'][-1]['elapsed_ms'], 999)
+        self.assertTrue(events['truncated'])
+        last_error = error.replace('code=-12785', 'code=-19').replace('elapsed-ms=6430', 'elapsed-ms=1100')
+        events = REPORT.source_aac_stages([error] + [valid.replace('elapsed-ms=6420', 'elapsed-ms=' + str(i)) for i in range(1000)] + [last_error])
+        self.assertEqual([e['code'] for e in events['errors']], [-12785, -19])
+        self.assertEqual(events['events'][-1], events['errors'][-1])
+        marker = valid.replace('source-finish-begin', 'diagnostic-truncated')
+        self.assertTrue(REPORT.source_aac_stages([marker])['truncated'])
+
+    def test_source_aac_phases_survive_exact_publication_readback(self):
+        x = report()
+        x['source_aac_fixture'] = REPORT.source_aac_stages([
+            "SOURCE_AAC_FIXTURE_STAGE attempt=2 stage=calibration-begin index=0 elapsed-ms=0 category=none code=0\n"])
+        body = PUBLISH.comment_body(x)
+        self.assertIn('calibration-begin', body)
+        def transport(method, path, value):
+            return {'id': 23} if method == 'POST' else {'id': 23, 'body': body}
+        self.assertEqual(PUBLISH.publish(x, 'vForce825/VPlayer', 12, transport)['comment_id'], 23)
+        x['source_aac_fixture']['events'][0]['stage'] = 'PRIVATE'
+        with self.assertRaises(ValueError): PUBLISH.comment_body(x)
+
     def test_xcode27_named_summary_schema_preserves_declared_count_types(self):
         x = REPORT.collect({'schemas': {'Summary': schema()}},
             {'failedTests': 2, 'passedTests': 3, 'testFailures': []},

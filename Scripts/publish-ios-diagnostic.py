@@ -54,6 +54,23 @@ def comment_body(payload):
             text = ' '.join(k + '=' + (str(v).lower() if type(v) is bool else str(v)) for k, v in values.items())
             if REPORT.scalars(text, rules) != values:
                 raise ValueError('invalid scalars')
+    fixture = payload['source_aac_fixture']
+    if (not isinstance(fixture, dict) or set(fixture) != {'events', 'truncated', 'errors'}
+            or type(fixture['truncated']) is not bool or not isinstance(fixture['events'], list)
+            or len(fixture['events']) > 128 or not isinstance(fixture['errors'], list)
+            or len(fixture['errors']) > 4):
+        raise ValueError('invalid source AAC fixture records')
+    for event in fixture['events'] + fixture['errors']:
+        if (not isinstance(event, dict) or set(event) != {'attempt', 'stage', 'index', 'elapsed_ms', 'category', 'code'}
+                or any(type(event[k]) is not int for k in ('attempt', 'index', 'elapsed_ms', 'code'))
+                or not isinstance(event['stage'], str) or not isinstance(event['category'], str)):
+            raise ValueError('invalid source AAC fixture event')
+        line = ('SOURCE_AAC_FIXTURE_STAGE attempt={attempt} stage={stage} index={index} '
+                'elapsed-ms={elapsed_ms} category={category} code={code}').format(**event)
+        if REPORT.source_aac_stages([line])['events'] != [event]:
+            raise ValueError('invalid source AAC fixture scalars')
+    if any(event['category'] == 'none' for event in fixture['errors']):
+        raise ValueError('invalid source AAC fixture error')
     host = payload['host']
     if host == REPORT.host_control(''):
         pass
