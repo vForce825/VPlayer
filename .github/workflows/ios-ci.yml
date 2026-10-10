@@ -227,6 +227,7 @@ jobs:
         timeout-minutes: 60
         run: |
           set -o pipefail
+          swift Scripts/report-host-audio-control.swift || echo 'HOST_AUDIO_CONTROL outcome=unverified reason=diagnostic_process_failed qualification=host-control-not-ios-acceptance'
           Scripts/test-ios.sh -configuration Debug \
             -derivedDataPath "$RUNNER_TEMP/iOS-Simulator" \
             -resultBundlePath "$RUNNER_TEMP/iOS.xcresult" \

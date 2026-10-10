@@ -380,6 +380,7 @@ class IOSWorkflowTests(unittest.TestCase):
         relay='python3 Scripts/report-ios-pip-runtime.py --candidate "$CANDIDATE_SHA"'
         self.assertIn('set -o pipefail',script)
         self.assertIn('2>&1 |',script)
+        self.assertIn('swift Scripts/report-host-audio-control.swift',script)
         self.assertEqual(text.count(relay),1)
         self.assertIn(relay,script)
         with tempfile.TemporaryDirectory() as directory:
@@ -387,21 +388,25 @@ class IOSWorkflowTests(unittest.TestCase):
             native=directory/'Scripts/test-ios.sh'
             native.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGS_LOG"\nprintf "native output\\n"\nexit "$NATIVE_EXIT"\n')
             native.chmod(0o755)
+            host=directory/'bin/swift'
+            host.write_text('#!/bin/bash\nexit "$HOST_EXIT"\n')
+            host.chmod(0o755)
             observer=directory/'bin/python3'
-            observer.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$RELAY_ARGS_LOG"\ncat\nexit 0\n')
+            observer.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$RELAY_ARGS_LOG"\ncat\nexit "$RELAY_EXIT"\n')
             observer.chmod(0o755)
             args_log=directory/'args';relay_args_log=directory/'relay-args'
             expected=['-configuration','Debug','-derivedDataPath',str(directory/'iOS-Simulator'),
                 '-resultBundlePath',str(directory/'iOS.xcresult'),'-parallel-testing-enabled','NO',
                 '-collect-test-diagnostics','never','-test-timeouts-enabled','YES',
                 '-default-test-execution-time-allowance','120','-maximum-test-execution-time-allowance','300']
-            for code in [0,7]:
+            for code,host_code,relay_code in [(n,h,r) for n in [0,7] for h in [0,9] for r in [0,11]]:
                 run=subprocess.run(['bash','-e','-c',script],cwd=directory,env=dict(os.environ,
                     PATH=str(directory/'bin')+os.pathsep+os.environ['PATH'],RUNNER_TEMP=str(directory),
                     CANDIDATE_SHA='a'*40,ARGS_LOG=str(args_log),RELAY_ARGS_LOG=str(relay_args_log),
-                    NATIVE_EXIT=str(code)),capture_output=True,text=True,timeout=3)
-                self.assertEqual(run.returncode,code,run.stderr)
-                self.assertEqual(run.stdout,'native output\n')
+                    NATIVE_EXIT=str(code),HOST_EXIT=str(host_code),RELAY_EXIT=str(relay_code)),capture_output=True,text=True,timeout=3)
+                self.assertEqual(run.returncode,relay_code or code,run.stderr)
+                diagnostic = '' if host_code == 0 else 'HOST_AUDIO_CONTROL outcome=unverified reason=diagnostic_process_failed qualification=host-control-not-ios-acceptance\n'
+                self.assertEqual(run.stdout,diagnostic+'native output\n')
                 self.assertEqual(args_log.read_text().splitlines(),expected)
                 self.assertEqual(relay_args_log.read_text().splitlines(),['Scripts/report-ios-pip-runtime.py','--candidate','a'*40])
 if __name__=='__main__':unittest.main()
