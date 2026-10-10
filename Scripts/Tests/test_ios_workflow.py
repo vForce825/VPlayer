@@ -43,7 +43,7 @@ class IOSWorkflowTests(unittest.TestCase):
     def test_short_generation_readback_gates_expensive_native_acceptance(self):
         text=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('  generated-inputs:',text)
-        self.assertIn('needs: generated-inputs',text)
+        self.assertIn('needs: [generated-inputs, diagnostic-probe]',text)
         self.assertIn("needs.generated-inputs.outputs.needs_refresh == 'false'",text)
         self.assertIn("if: steps.generated.outputs.needs_refresh == 'true'",text)
         self.assertLess(text.index('name: Fail closed until generated outputs are committed'),
@@ -69,7 +69,7 @@ class IOSWorkflowTests(unittest.TestCase):
         self.assertIn('XcodeGen@2.44.1',generation)
         self.assertIn("if: steps.generated.outputs.needs_refresh == 'true'",generation)
         self.assertIn('exit 1',generation)
-        self.assertIn('needs: generated-inputs',native)
+        self.assertIn('needs: [generated-inputs, diagnostic-probe]',native)
         self.assertIn("needs.generated-inputs.outputs.needs_refresh == 'false'",native)
         self.assertNotIn('Verify Release simulator cold starts without fixture bypass',native)
         self.assertNotIn('iOS-RunnerControl',native)

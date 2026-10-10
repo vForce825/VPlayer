@@ -55,9 +55,44 @@ jobs:
         run: |
           echo 'Commit the verified generated outputs before native acceptance.'
           exit 1
+  diagnostic-probe:
+    name: Verify bounded diagnostic delivery before native acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Validate bounded diagnostic contracts
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python3 Scripts/Tests/test_ios_diagnostic_delivery.py
+          python3 Scripts/report-ios-diagnostic.py probe --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --output "$RUNNER_TEMP/diagnostic-probe/diagnostic.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ios-diagnostic-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-probe/diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ios-diagnostic-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diagnostic-probe-readback
+      - name: Verify official artifact roundtrip
+        run: cmp "$RUNNER_TEMP/diagnostic-probe/diagnostic.json" "$RUNNER_TEMP/diagnostic-probe-readback/diagnostic.json"
+      - name: Publish probe and verify exact official comment readback
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DIAGNOSTIC_PR: ${{ github.event.pull_request.number }}
+        run: python3 Scripts/publish-ios-diagnostic.py --input "$RUNNER_TEMP/diagnostic-probe-readback/diagnostic.json" --repository "$GITHUB_REPOSITORY" --pr "$DIAGNOSTIC_PR"
   ios-tests:
     name: iPhone simulator tests and unsigned device build
-    needs: generated-inputs
+    needs: [generated-inputs, diagnostic-probe]
     if: ${{ needs.generated-inputs.outputs.needs_refresh == 'false' }}
     runs-on: xcode-27
     timeout-minutes: 180
@@ -223,11 +258,13 @@ jobs:
           ./Scripts/prepare-hls-ci-fixtures.sh --verify-committed
           test -s Tests/Fixtures/Video/synthetic-hlg50-ac3-64s.ts
       - name: Run shared playback and iPhone touch tests
+        id: functional
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success' && steps.regression_preflight.outcome == 'success' && steps.regression_preflight_report.outcome == 'success' && steps.fixtures.outcome == 'success'
         timeout-minutes: 60
         run: |
           set -o pipefail
-          swift Scripts/report-host-audio-control.swift || echo 'HOST_AUDIO_CONTROL outcome=unverified reason=diagnostic_process_failed qualification=host-control-not-ios-acceptance'
+          swift Scripts/report-host-audio-control.swift > "$RUNNER_TEMP/iOS-host-control.log" || echo 'HOST_AUDIO_CONTROL outcome=unverified reason=diagnostic_process_failed qualification=host-control-not-ios-acceptance' > "$RUNNER_TEMP/iOS-host-control.log"
+          cat "$RUNNER_TEMP/iOS-host-control.log"
           Scripts/test-ios.sh -configuration Debug \
             -derivedDataPath "$RUNNER_TEMP/iOS-Simulator" \
             -resultBundlePath "$RUNNER_TEMP/iOS.xcresult" \
@@ -243,6 +280,7 @@ jobs:
           python3 Scripts/report-ios-test-status.py "$RUNNER_TEMP/iOS.xcresult" || status=1
           exit "$status"
       - name: Measure optimized CPU processing without device qualification
+        id: cpu
         if: always() && !cancelled() && steps.prepare.outcome == 'success' && steps.simulator.outcome == 'success'
         timeout-minutes: 30
         run: |
@@ -346,3 +384,44 @@ jobs:
           echo 'PHYSICAL_IPHONE_PIP_AUDIO_THERMAL_AND_HANDOFF_QUALIFICATION=not_run'
           echo 'UNSIGNED_DEVICE_BUILD_IS_NOT_PHYSICAL_EXECUTION=true'
           exit "$status"
+      - name: Collect bounded redacted native diagnostics
+        if: always() && !cancelled()
+        env:
+          FUNCTIONAL_OUTCOME: ${{ steps.functional.outcome }}
+          CPU_OUTCOME: ${{ steps.cpu.outcome }}
+        run: |
+          python3 Scripts/report-ios-diagnostic.py collect --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" \
+            --bundle "$RUNNER_TEMP/iOS.xcresult" --host "$RUNNER_TEMP/iOS-host-control.log" \
+            --functional "$FUNCTIONAL_OUTCOME" --cpu "$CPU_OUTCOME" --output "$RUNNER_TEMP/iOS-diagnostic/diagnostic.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && !cancelled()
+        with:
+          name: ios-native-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/iOS-diagnostic/diagnostic.json
+          if-no-files-found: error
+          retention-days: 7
+  diagnostic-publish:
+    name: Publish bounded native diagnostics and verify readback
+    needs: ios-tests
+    if: always() && !cancelled() && needs.ios-tests.result != 'skipped' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ios-native-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/iOS-diagnostic-readback
+      - name: Publish native result and verify exact official comment readback
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DIAGNOSTIC_PR: ${{ github.event.pull_request.number }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          python3 Scripts/publish-ios-diagnostic.py --input "$RUNNER_TEMP/iOS-diagnostic-readback/diagnostic.json" --repository "$GITHUB_REPOSITORY" --pr "$DIAGNOSTIC_PR"
