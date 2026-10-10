@@ -4037,6 +4037,31 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
                              "消费后的 endpoint authority 不得重放或改写")
     }
 
+    func testNativeRegistryRetirementWaitsForOriginalDelayedLogReadBeforeReleasingFixture() async throws {
+        let reader = Task21HeldNativeLogReader()
+        var fixture: Task21RealIntegrationFixture? = try await .make(
+            startupPrefix: true, logReader: reader)
+        let owner = Task21RealIntegrationFixture.Owner(try XCTUnwrap(fixture))
+        addTeardownBlock {
+            await reader.release()
+            try await owner.tearDown()
+        }
+        _ = try await fixture?.prepare()
+        let readDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !reader.isHoldingReturn, ContinuousClock.now < readDeadline { await Task.yield() }
+        XCTAssertTrue(reader.isHoldingReturn, "The original SDK log read must reach its held return")
+        fixture = nil
+        let retirement = Task { try await owner.tearDown() }
+        defer { reader.release(); retirement.cancel() }
+        let confirmationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !owner.fixtureIsReleased, ContinuousClock.now < confirmationDeadline { await Task.yield() }
+        XCTAssertFalse(owner.fixtureIsReleased,
+                       "Registry retirement must join the original SDK log callback before releasing its fixture")
+        reader.release()
+        try await retirement.value
+        XCTAssertTrue(owner.cleanRetirementVerified)
+    }
+
     func testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero() async throws {
         let fixture = try await Task21RealIntegrationFixture.make(startupPrefix: true)
         let owner = Task21RealIntegrationFixture.Owner(fixture)
@@ -10263,6 +10288,9 @@ private final class Task21RegistryBackend: PlaybackBackend,
             }
         }
         guard unloaded else { return .unconfirmed }
+        // Match the production backend's physical callback fence. Detaching the
+        // item does not release a pending SDK log reader or its original escrow.
+        guard await cleanup.0.joinRetiredNativeCallbackTails() else { return .unconfirmed }
         lock.withLock { lastRetiredEpochValue = epoch }
         return .confirmedLocalOutputStopped
     }
@@ -10542,6 +10570,7 @@ private final class Task21RealIntegrationFixture {
         private let callbackBaseline: Int
         private let diagnosticScope: String
         private(set) var cleanRetirementVerified = false
+        var fixtureIsReleased: Bool { fixture == nil }
 
         init(_ fixture: Task21RealIntegrationFixture) {
             self.fixture = fixture
@@ -10746,7 +10775,8 @@ private final class Task21RealIntegrationFixture {
     }
 
     static func make(endList: Bool = true, includeVideo: Bool = false,
-                     startupPrefix: Bool = false, audioOutputProbe: Bool = false) async throws
+                     startupPrefix: Bool = false, audioOutputProbe: Bool = false,
+                     logReader: (any AVPlayerLogReading)? = nil) async throws
         -> Task21RealIntegrationFixture {
         // Registry 先冻结正式 output lifecycle；writer、publisher、server 与 item
         // 随后全部绑定这一身份，避免只比较 generation 的跨 lifecycle 拼接。
@@ -10784,7 +10814,7 @@ private final class Task21RealIntegrationFixture {
         let player = AVPlayer()
         let deadlineScheduler = FinalManualAVPlayerDeadlineScheduler()
         let driver = try SystemAVPlayerDriver.make(
-            player: player, deadlineScheduler: deadlineScheduler)
+            player: player, deadlineScheduler: deadlineScheduler, logReader: logReader)
         let snapshot = try XCTUnwrap(harness.publisher.visible)
         let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
         let coordinator = try AVPlayerItemCoordinator(
@@ -14861,5 +14891,38 @@ private final class Task21QueuedLogGateBackend: PlaybackBackend, @unchecked Send
             }
             return retired ? .confirmedLocalOutputStopped : .unconfirmed
         } catch { return .unconfirmed }
+    }
+}
+
+/// Delay one real SDK read's return while retaining its original driver callback lease.
+/// The gate never manufactures logs, callbacks, accounting credit, or a retirement receipt.
+@MainActor
+private final class Task21HeldNativeLogReader: AVPlayerLogReading {
+    private let native = SystemAVPlayerLogReader()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+    private var heldFirstReturn = false
+    private(set) var isHoldingReturn = false
+
+    func readAccessLog(item: AVPlayerItem, visitURI: @MainActor (String) -> Void) async -> Int {
+        let count = await native.readAccessLog(item: item, visitURI: visitURI)
+        if !heldFirstReturn {
+            heldFirstReturn = true
+            isHoldingReturn = true
+            if !releaseRequested {
+                await withCheckedContinuation { continuation = $0 }
+            }
+            isHoldingReturn = false
+        }
+        return count
+    }
+    func readErrorLogCount(item: AVPlayerItem) async -> Int {
+        await native.readErrorLogCount(item: item)
+    }
+    func release() {
+        releaseRequested = true
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
     }
 }
