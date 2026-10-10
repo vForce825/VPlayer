@@ -9,15 +9,22 @@ import VPlayerPlayback
 /// than in a later SwiftUI task, fences both scan and YADIF GPU submissions.
 @MainActor
 final class IOSVideoProcessingLifecycle: NSObject {
-    override init() {
+    private let notifications: NotificationCenter
+    private let setForeground: @MainActor (Bool) -> Void
+
+    init(notifications: NotificationCenter = .default,
+         initiallyForeground: Bool? = nil,
+         setForeground: @escaping @MainActor (Bool) -> Void = PlaybackVideoProcessingActivity.setForeground) {
+        self.notifications = notifications
+        self.setForeground = setForeground
         super.init()
-        PlaybackVideoProcessingActivity.setForeground(UIApplication.shared.applicationState == .active)
-        NotificationCenter.default.addObserver(self, selector: #selector(willResignActive),
+        setForeground(initiallyForeground ?? (UIApplication.shared.applicationState == .active))
+        notifications.addObserver(self, selector: #selector(willResignActive),
             name: UIApplication.willResignActiveNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(didBecomeActive),
+        notifications.addObserver(self, selector: #selector(didBecomeActive),
             name: UIApplication.didBecomeActiveNotification, object: nil)
     }
-    @objc private func willResignActive() { PlaybackVideoProcessingActivity.setForeground(false) }
-    @objc private func didBecomeActive() { PlaybackVideoProcessingActivity.setForeground(true) }
-    deinit { NotificationCenter.default.removeObserver(self) }
+    @objc private func willResignActive() { setForeground(false) }
+    @objc private func didBecomeActive() { setForeground(true) }
+    deinit { notifications.removeObserver(self) }
 }

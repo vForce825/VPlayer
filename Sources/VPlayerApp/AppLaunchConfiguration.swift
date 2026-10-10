@@ -77,11 +77,11 @@ struct AppLaunchConfiguration {
     let playbackFixture: String?
 
     init(arguments: [String]) {
+        #if DEBUG
         let fixtureFlags = arguments.indices.filter { arguments[$0] == "-ui-fixture" }
         let acceptanceFlags = arguments.indices.filter {
             arguments[$0] == "-acceptance-playback"
         }
-        #if DEBUG
         if AcceptanceLaunchSelection.isSelected(arguments: arguments) {
             mode = .acceptance
         } else if acceptanceFlags.isEmpty,
@@ -93,13 +93,6 @@ struct AppLaunchConfiguration {
         } else {
             mode = .live
         }
-        #else
-        // Release builds never honor test-only launch flags: seeded fixtures,
-        // the fake playback engine, and acceptance harness paths are DEBUG-only.
-        _ = fixtureFlags
-        _ = acceptanceFlags
-        mode = .live
-        #endif
         resetsPlaybackSettings = arguments.contains("-uiTestResetPlaybackSettings")
         let playbackFixtureFlags = arguments.indices.filter {
             arguments[$0] == "-ui-playback-fixture"
@@ -111,6 +104,12 @@ struct AppLaunchConfiguration {
         } else {
             playbackFixture = nil
         }
+        #else
+        // Release does not scan or honor fixture, reset, or acceptance flags.
+        mode = .live
+        resetsPlaybackSettings = false
+        playbackFixture = nil
+        #endif
     }
 }
 

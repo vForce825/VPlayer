@@ -5,8 +5,10 @@
 """Report selected iOS XCTest results, never logs, activities or attachments.
 
 Default: functional unit/UI coverage. --benchmark: only the separate CPU benchmark.
-Exit 0 means evidence was read completely, not that every test passed. Missing or
-unverified evidence exits 1. Skips and expected failures are never counted as passes.
+For those modes, exit 0 means evidence was read completely, not that every test
+passed. --preflight returns 0 only when both fixed regression tests are Passed.
+Missing or unverified evidence exits 1. Skips and expected failures are never
+counted as passes.
 """
 import argparse
 import html
@@ -29,9 +31,25 @@ KNOWN_RESULTS = frozenset({'Passed', 'Failed', 'Skipped', 'Expected Failure'})
 
 # Immutable, explicit identities: missing tests remain visible in the report.
 _FUNCTIONAL_SUITES = (
+    ('VPlayeriOSTests', 'IOSVideoProcessingLifecycleTests', (
+        'testApplicationNotificationsSynchronouslyCloseAndRestoreActualGPUAdmission',
+        'testForegroundNotificationCannotOverrideAnActivePiPLease',)),
+    ('VPlayeriOSTests', 'IOSPlayerControlsVisibilityTests', (
+        'testCurrentIdleTimeoutHidesControlsAndLeavesNoTimer',
+        'testBackgroundTapHidesAndRestoresControls',
+        'testControlInteractionRefreshesTimeoutWithoutTogglingVisibility',
+        'testPinningRevealsControlsAndRejectsTimeoutAcrossResume',
+        'testRepeatedPlaybackUpdateDoesNotPostponeTimeout',
+        'testDisappearanceInvalidatesTimeoutBeforeReappearance',
+        'testOnlyUnobstructedActivePlaybackAllowsAutoHide',)),
     ('VPlayeriOSTests', 'IOSNativePictureInPictureTests', (
         'testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession',)),
     ('VPlayeriOSTests', 'IOSPictureInPictureCoordinatorTests', (
+        'testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+        'testActiveAndStartingRetirementWaitForStopBeforeCreatingSuccessor',
+        'testFactoryFailureClearsPresentationAndProcessingActivity',
+        'testNativeFactoryCannotBypassActualRuntimeCapability',
+        'testPlaybackInvalidationOnlyTargetsSampleBufferContent',
         'testRestoreIntentIsConsumedBeforeTheNextAutomaticPiPCycle',
         'testCallbackReferencePinsIdentityUntilTheActorHopFinishes',
         'testUnavailablePiPDoesNotStopThePlaybackTarget',
@@ -39,6 +57,25 @@ _FUNCTIONAL_SUITES = (
         'testCloseIsIdempotentAndLateDelegateStopDoesNotReopenSession',)),
     ('VPlayeriOSTests', 'IOSPlaybackSessionTests', (
         'testMinimizingAndRestoringKeepsSameModelAndRemoteStopRetiresSession',)),
+    ('VPlayeriOSTests', 'VPlayerAppStartupTests', (
+        'testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds',)),
+    ('VPlayeriOSTests', 'PlaybackMetricsTests', (
+        'testInactiveSignpostsDoNotCreateIntervalsOrAsyncLifetimes',
+        'testSignpostFactoryOnlyEnablesDiagnosticBuilds',
+        'testSignpostLifetimeFinishesExactlyOnceAcrossConcurrentCallbacks',)),
+    ('VPlayeriOSTests', 'AdaptiveYADIFDiagnosticsTests', (
+        'testOneSecondWindowAndModeChangeFlushHaveExactCountsAndWallTimes',
+        'testManyCompletionsCollapseIntoOneWindowAndExplicitFlushResetsIt',
+        'testCPUPhaseCallbackRunsOnceWithSeparateNonnegativeWallTimes',
+        'testWorkerSummarySeparatesCPUServiceFromHeterogeneousWallTimesAndRequestedQoS',
+        'testMissingWorkerCPUClockAndMissingSlotStayUnverifiedInsteadOfZeroService',
+        'testWorkerWindowCountersExtremaAndContextResetAtOneSecondBoundary',
+        'testWorkerWindowMarksMixedSurfaceContextsAndDoesNotInventMissingTelemetry',
+        'testNativeThreadCPUClockProvidesValidNonnegativeElapsedService',)),
+    ('VPlayeriOSTests', 'AdaptiveYADIFHandoffTests', (
+        'testCPUProcessingTimingCallbackFollowsBuildConfiguration',
+        'testDelayedGPUThenCPUThenForegroundGPUPreservesCompletionOrderAndPixels',
+        'testCancellationDuringGPUFenceRetiresEachJobOnceAndRestoresAllThreeSlots',)),
     ('VPlayeriOSTests', 'VideoProcessingHandoffTests', (
         'testBackgroundClosesGPUAdmissionAndFenceJoinsActualCompletion',
         'testSecondBackgroundTransitionStillJoinsUnfinishedEarlierGPUWork',
@@ -54,6 +91,7 @@ _FUNCTIONAL_SUITES = (
         'testDelayedGPUCompletionPublishesBeforeWaitingCPUSuccessor',)),
     ('VPlayeriOSTests', 'YADIFGoldenPixelTests', (
         'testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+        'testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease',
         'testCPUBenchmarkPeriodicFillMatchesOriginalFormulaAndPreservesPadding',
         'testNV12TFFMatchesPinnedOracleAndExactFieldRules',
         'testNV12BFFMatchesPinnedOracleAndExactFieldRules',
@@ -73,7 +111,10 @@ _FUNCTIONAL_SUITES = (
         'testPausedWorkspaceRollbackKeepsExactChargeWhenAnUnrelated16KiBOwnerRetires',
         'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',)),
     ('VPlayeriOSTests', 'HLSAVPlayerBackendTests', (
-        'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',)),
+        'testSyntheticHLG50AC3OriginalAACFragmentsDecodeContinuously',
+        'testHandoffMediaObservationWaitsThroughProbeAndClearForCurrentOutput',
+        'testHandoffMediaObservationRejectsMissingOutputFailureAndChangedIdentity',
+        'testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer',)),
     ('VPlayeriOSTests', 'NativeHLSAdapterLifecycleTests', (
         'testNativeFinalQuantumAcceptsObservedClocksAndRejectsPrematureOrMissingEvidence',
         'testNativeFinalQuantumPreservesAtOrAfterEndpointClocks',
@@ -86,12 +127,27 @@ _FUNCTIONAL_SUITES = (
     ('VPlayeriOSUITests', 'IOSLibraryFlowTests', (
         'testTouchChannelSelectionCloseAndReopen',
         'testSourceEditorCancelAndReopen',
-        'testRotationAndPlaybackSettingsKeepPlayerSession',)),
+        'testPlaylistEditOpensExistingSourceWithoutDeletingIt',
+        'testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
+        'testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace',
+        'testRotationAndPlaybackSettingsKeepPlayerSession',
+        'testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession',
+        'testPlaybackControlTapsAndSettingsDoNotToggleBackgroundOrStopSession',
+        'testHiddenPlaybackControlsCanBeRevealedAfterRotation',
+        'testForegroundReturnRevealsControlsAndStartsFreshIdleTimeout',
+        'testPlaybackFailureKeepsControlsAndExitVisible',)),
 )
 DEFAULT_TESTS = tuple(f'{target}/{suite}/{method}'
                       for target, suite, methods in _FUNCTIONAL_SUITES for method in methods)
-BENCHMARK_TESTS = ('VPlayeriOSBenchmarks/YADIFGoldenPixelTests/'
-                   'testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',)
+BENCHMARK_TESTS = (
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly',
+    'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease',
+)
+PREFLIGHT_TESTS = (
+    'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+    'VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
+)
 
 
 def run_bounded(command, timeout=30, limit=MAX_JSON):
@@ -487,10 +543,14 @@ def schema_shape(document):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bundle', type=Path)
-    parser.add_argument('--benchmark', action='store_true', help='Report only the separate Release CPU benchmark')
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument('--benchmark', action='store_true', help='Report only the separate Release CPU benchmark')
+    scope.add_argument('--preflight', action='store_true', help='Require both fixed regression preflight tests to pass')
     args = parser.parse_args(argv)
     manifest = BENCHMARK_TESTS if args.benchmark else DEFAULT_TESTS
     mode = 'cpu_benchmark' if args.benchmark else 'functional_unit_and_ui'
+    if args.preflight:
+        manifest, mode = PREFLIGHT_TESTS, 'regression_preflight'
     schema, shape = None, None
     try:
         if args.bundle.suffix != '.xcresult' or not args.bundle.is_dir():
@@ -513,6 +573,8 @@ def main(argv=None):
         reason = str(error) if isinstance(error, (ValueError, RuntimeError)) and re_safe(str(error)) else type(error).__name__
         rows = [{'test': identifier, 'status': 'Unverified', 'reason': reason} for identifier in manifest]
     emit(rows, mode, shape)
+    if args.preflight:
+        return int(any(row['status'] != 'Passed' for row in rows))
     return int(any(row['status'] == 'Unverified' for row in rows))
 
 

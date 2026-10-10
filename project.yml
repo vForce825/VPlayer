@@ -14,6 +14,22 @@ settings:
     SWIFT_TREAT_WARNINGS_AS_ERRORS: true
     ENABLE_USER_SCRIPT_SANDBOXING: true
     CLANG_ENABLE_MODULES: true
+  configs:
+    Release:
+      # Scheme coverage also affects non-test builds. Protect Swift as well as
+      # Clang; CLANG_ENABLE_CODE_COVERAGE alone does not gate Swift coverage.
+      ENABLE_CODE_COVERAGE: false
+      CLANG_ENABLE_CODE_COVERAGE: false
+      CLANG_COVERAGE_MAPPING: false
+      CLANG_COVERAGE_MAPPING_LINKER_ARGS: false
+      CLANG_INSTRUMENT_FOR_OPTIMIZATION_PROFILING: false
+      GCC_INSTRUMENT_PROGRAM_FLOW_ARCS: false
+      GCC_GENERATE_TEST_COVERAGE_FILES: false
+      GENERATE_PROFILING_CODE: false
+      ENABLE_TESTABILITY: false
+      ENABLE_ADDRESS_SANITIZER: false
+      ENABLE_THREAD_SANITIZER: false
+      ENABLE_UNDEFINED_BEHAVIOR_SANITIZER: false
 targets:
   VPlayerCore:
     type: framework
@@ -382,7 +398,7 @@ schemes:
         VPlayerTests: [test]
         VPlayerUITests: [test]
     test:
-      gatherCoverageData: true
+      gatherCoverageData: false
       targets:
         - name: VPlayerTests
           parallelizable: true
@@ -390,6 +406,47 @@ schemes:
           parallelizable: false
     run:
       config: Debug
+    profile:
+      config: Release
+    archive:
+      config: Release
+  VPlayerCoverage:
+    build:
+      targets:
+        VPlayerCore: [test]
+        VPlayerPlayback: [test]
+        VPlayer: [test]
+        VPlayerTests: [test]
+        VPlayerUITests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - name: VPlayerTests
+          parallelizable: true
+        - name: VPlayerUITests
+          parallelizable: false
+  VPlayerRelease:
+    build:
+      targets:
+        VPlayerCore: [run, profile, analyze, archive]
+        VPlayerPlayback: [run, profile, analyze, archive]
+        VPlayer: [run, profile, analyze, archive]
+    test:
+      config: Release
+      gatherCoverageData: false
+    run:
+      config: Release
+      executable: VPlayer
+      debugEnabled: false
+      enableGPUFrameCaptureMode: disabled
+      enableGPUValidationMode: false
+      disableMainThreadChecker: true
+      disableThreadPerformanceChecker: true
+    profile:
+      config: Release
+    analyze:
+      config: Release
     archive:
       config: Release
   VPlayerReleaseBoundaryTests:
@@ -451,7 +508,7 @@ schemes:
         VPlayeriOSTests: [test]
         VPlayeriOSUITests: [test]
     test:
-      gatherCoverageData: true
+      gatherCoverageData: false
       targets:
         - name: VPlayeriOSTests
           parallelizable: false
@@ -462,6 +519,49 @@ schemes:
     run:
       config: Debug
       executable: VPlayeriOS
+    profile:
+      config: Release
+    archive:
+      config: Release
+  VPlayeriOSCoverage:
+    build:
+      targets:
+        VPlayerCoreiOS: [test]
+        VPlayerPlaybackiOS: [test]
+        VPlayeriOS: [test]
+        VPlayeriOSTests: [test]
+        VPlayeriOSUITests: [test]
+    test:
+      config: Debug
+      gatherCoverageData: true
+      targets:
+        - name: VPlayeriOSTests
+          parallelizable: false
+        - name: VPlayeriOSUITests
+          parallelizable: false
+          skippedTests:
+            - IOSReleaseStartupTests
+  VPlayeriOSRelease:
+    build:
+      targets:
+        VPlayerCoreiOS: [run, profile, analyze, archive]
+        VPlayerPlaybackiOS: [run, profile, analyze, archive]
+        VPlayeriOS: [run, profile, analyze, archive]
+    test:
+      config: Release
+      gatherCoverageData: false
+    run:
+      config: Release
+      executable: VPlayeriOS
+      debugEnabled: false
+      enableGPUFrameCaptureMode: disabled
+      enableGPUValidationMode: false
+      disableMainThreadChecker: true
+      disableThreadPerformanceChecker: true
+    profile:
+      config: Release
+    analyze:
+      config: Release
     archive:
       config: Release
   VPlayeriOSReleaseStartup:
@@ -495,4 +595,6 @@ schemes:
         - name: VPlayeriOSBenchmarks
           parallelizable: false
           selectedTests:
+            - YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly
+            - YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease
             - YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification

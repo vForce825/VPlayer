@@ -338,6 +338,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
             await play.value
             try await body(controller, registry, clock, factory, sdk)
         } catch {
+            factory.sourceAACDiagnostics?.record("watchdog-error-before-cleanup", error: error)
             print("WATCHDOG_E2E_FAILURE state=\(await controller.currentStateForTesting) "
                 + "context=\(String(describing: registry.outputResourceContextSnapshot())) "
                 + "builds=\(factory.builder?.buildCount ?? 0) "
@@ -3327,7 +3328,7 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
 
     func testGenuineSourceAACCoordinatorNearEOFPauseUsesCurrentHTTPRootAndRejectsRetirement() async throws {
         for retireBeforeResume in [false, true] {
-            let factory = WatchdogPlaybackFactory(sourceAAC: true)
+            let factory = WatchdogPlaybackFactory(sourceAAC: true, sourceAACAttempt: retireBeforeResume ? 2 : 1)
             try await withWatchdogController(factory: factory) { controller, registry, _, factory, _ in
                 let driver = try XCTUnwrap(factory.driver)
                 let source = try XCTUnwrap(factory.sourceAACBuilder?.fixture)
@@ -4035,6 +4036,31 @@ final class AVPlayerItemCoordinatorTests: XCTestCase {
         try await fixture.validateEndpointThroughCompletedSocketBodies()
         XCTAssertThrowsError(try fixture.validateEndpoint(),
                              "消费后的 endpoint authority 不得重放或改写")
+    }
+
+    func testNativeRegistryRetirementWaitsForOriginalDelayedLogReadBeforeReleasingFixture() async throws {
+        let reader = Task21HeldNativeLogReader()
+        var fixture: Task21RealIntegrationFixture? = try await .make(
+            startupPrefix: true, logReader: reader)
+        let owner = Task21RealIntegrationFixture.Owner(try XCTUnwrap(fixture))
+        addTeardownBlock {
+            await reader.release()
+            try await owner.tearDown()
+        }
+        _ = try await fixture?.prepare()
+        let readDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !reader.isHoldingReturn, ContinuousClock.now < readDeadline { await Task.yield() }
+        XCTAssertTrue(reader.isHoldingReturn, "The original SDK log read must reach its held return")
+        fixture = nil
+        let retirement = Task { try await owner.tearDown() }
+        defer { reader.release(); retirement.cancel() }
+        let confirmationDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !owner.fixtureIsReleased, ContinuousClock.now < confirmationDeadline { await Task.yield() }
+        XCTAssertFalse(owner.fixtureIsReleased,
+                       "Registry retirement must join the original SDK log callback before releasing its fixture")
+        reader.release()
+        try await retirement.value
+        XCTAssertTrue(owner.cleanRetirementVerified)
     }
 
     func testRealAVPlayerLoopbackRequestsPlaylistInitMediaAndPreparesAtRateZero() async throws {
@@ -9464,7 +9490,11 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
     private(set) var builder: WatchdogPlaybackBundleBuilder?
     private(set) var sourceAACBuilder: SourceAACCoordinatorBundleBuilder?
     private let usesSourceAAC: Bool
-    init(sourceAAC: Bool = false) { usesSourceAAC = sourceAAC }
+    let sourceAACDiagnostics: SourceAACFixtureDiagnostics?
+    init(sourceAAC: Bool = false, sourceAACAttempt: Int = 1) {
+        usesSourceAAC = sourceAAC
+        sourceAACDiagnostics = sourceAAC ? SourceAACFixtureDiagnostics(attempt: sourceAACAttempt) : nil
+    }
     private(set) var maximumAudibleOutputs = 0
     var driver: Task21FakeDriver? { drivers.last }
 
@@ -9489,7 +9519,7 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
         drivers.append(driver)
         let builder: any HLSOutputItemBundleBuilding
         if usesSourceAAC {
-            let source = SourceAACCoordinatorBundleBuilder()
+            let source = SourceAACCoordinatorBundleBuilder(diagnostics: sourceAACDiagnostics)
             sourceAACBuilder = source; builder = source
         } else {
             let ordinary = WatchdogPlaybackBundleBuilder(eventSink: eventSink, resetClock: {
@@ -9523,9 +9553,11 @@ private final class WatchdogPlaybackFactory: PlaybackBackendFactory {
 private final class SourceAACCoordinatorBundleBuilder: HLSOutputItemBundleBuilding, @unchecked Sendable {
     private let lock = NSLock()
     private var current: SourceAACCoordinatorBundleOwner?
+    private let diagnostics: SourceAACFixtureDiagnostics?
+    init(diagnostics: SourceAACFixtureDiagnostics? = nil) { self.diagnostics = diagnostics }
     var fixture: SourceAACPublicationFixture? { lock.withLock { current?.fixture } }
     func makeBundle(invocation: ControlTaskRegistry.BackendPrepareInvocation) async throws -> HLSOutputItemBundle {
-        let owner = SourceAACCoordinatorBundleOwner(lifecycle: invocation.outputLifecycleEpoch)
+        let owner = SourceAACCoordinatorBundleOwner(lifecycle: invocation.outputLifecycleEpoch, diagnostics: diagnostics)
         lock.withLock { current = owner }
         return HLSOutputItemBundle(startProducer: { try await owner.start() }, retireProducer: { await owner.retire() })
     }
@@ -9537,17 +9569,28 @@ private final class SourceAACCoordinatorBundleOwner: @unchecked Sendable {
     private var serverValue: LoopbackHTTPServer?
     private var evidenceValue: LoopbackAVPlayerPreparationEvidenceSource?
     var fixture: SourceAACPublicationFixture? { lock.withLock { fixtureValue } }
-    init(lifecycle: OutputLifecycleEpoch) { self.lifecycle = lifecycle }
+    private let diagnostics: SourceAACFixtureDiagnostics?
+    init(lifecycle: OutputLifecycleEpoch, diagnostics: SourceAACFixtureDiagnostics? = nil) {
+        self.lifecycle = lifecycle; self.diagnostics = diagnostics
+    }
     func start() async throws -> AVPlayerItemReplacementBundle {
+        do { return try await startObserved() }
+        catch { diagnostics?.record("owner-error-before-retire", error: error); throw error }
+    }
+    private func startObserved() async throws -> AVPlayerItemReplacementBundle {
+        diagnostics?.record("fixture-begin")
         let original = Task19.binding(id: 2, writer: 989_123)
         let binding = FMP4WriterBinding(outputLifecycleEpoch: lifecycle, itemGeneration: original.itemGeneration,
             mediaEpoch: original.mediaEpoch, publicationParticipantID: original.publicationParticipantID,
             renditionIdentity: original.renditionIdentity, writerIdentity: original.writerIdentity)
-        let source = try await SourceAACPublicationFixture.make(binding: binding)
+        let source = try await SourceAACPublicationFixture.make(binding: binding, diagnostics: diagnostics)
+        diagnostics?.record("fixture-return")
         lock.withLock { fixtureValue = source }
         let snapshot = try XCTUnwrap(source.publisher.visible)
+        diagnostics?.record("server-begin")
         let server = try await LoopbackHTTPServer.start(store: source.store, declaration: source.declaration,
             publishedSnapshot: snapshot, sessionCapability: source.session, now: { 1_000_000_000 }, logger: { _ in })
+        diagnostics?.record("server-return")
         lock.withLock { serverValue = server }
         let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
         lock.withLock { evidenceValue = evidence }
@@ -9560,18 +9603,22 @@ private final class SourceAACCoordinatorBundleOwner: @unchecked Sendable {
         })
         let client = URLSession(configuration: .ephemeral)
         defer { client.invalidateAndCancel() }
-        for url in urls {
+        for (index, url) in urls.enumerated() {
+            diagnostics?.record("http-request-begin", index: index)
             var get = URLRequest(url: url); get.setValue("close", forHTTPHeaderField: "Connection")
             let response = try await client.data(for: get)
+            diagnostics?.record("http-request-return", index: index)
             guard (response.1 as? HTTPURLResponse)?.statusCode == 200, !response.0.isEmpty else { throw HLSSourceError.network }
         }
         let completionDeadline = ContinuousClock.now + .seconds(2)
         while !resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }),
               ContinuousClock.now < completionDeadline { try await Task.sleep(for: .milliseconds(5)) }
         guard resources.allSatisfy({ server.completedEvidence(for: $0)?.isComplete == true }) else { throw HLSSourceError.incompleteEvidence }
+        diagnostics?.record("http-complete")
         return .init(request: request, evidenceSource: evidence)
     }
     func retire() async -> Bool {
+        diagnostics?.record("retire-begin")
         let held = lock.withLock { (fixtureValue, serverValue, evidenceValue) }
         held.2?.retirePreparation()
         if let server = held.1 {
@@ -9580,11 +9627,16 @@ private final class SourceAACCoordinatorBundleOwner: @unchecked Sendable {
             while (server.usage.connections != 0 || server.usage.activeResponses != 0 || FrozenPreparationOwner.activeHistoryServer === server),
                   ContinuousClock.now < deadline { try? await Task.sleep(for: .milliseconds(5)) }
             do { try server.drain(cleanupTicket: ticket); try server.retire(cleanupTicket: ticket) }
-            catch { return false }
+            catch { diagnostics?.record("retire-http-error", error: error); return false }
         }
         held.0?.close()
-        if let writer = held.0?.writer { _ = await writer.cancelAwaitingCompletion() }
+        if let writer = held.0?.writer {
+            diagnostics?.record("retire-writer-join-begin")
+            _ = await writer.cancelAwaitingCompletion()
+            diagnostics?.record("retire-writer-join-return")
+        }
         lock.withLock { fixtureValue = nil; serverValue = nil; evidenceValue = nil }
+        diagnostics?.record("retire-return")
         return true
     }
 }
@@ -10263,6 +10315,9 @@ private final class Task21RegistryBackend: PlaybackBackend,
             }
         }
         guard unloaded else { return .unconfirmed }
+        // Match the production backend's physical callback fence. Detaching the
+        // item does not release a pending SDK log reader or its original escrow.
+        guard await cleanup.0.joinRetiredNativeCallbackTails() else { return .unconfirmed }
         lock.withLock { lastRetiredEpochValue = epoch }
         return .confirmedLocalOutputStopped
     }
@@ -10542,6 +10597,7 @@ private final class Task21RealIntegrationFixture {
         private let callbackBaseline: Int
         private let diagnosticScope: String
         private(set) var cleanRetirementVerified = false
+        var fixtureIsReleased: Bool { fixture == nil }
 
         init(_ fixture: Task21RealIntegrationFixture) {
             self.fixture = fixture
@@ -10746,7 +10802,8 @@ private final class Task21RealIntegrationFixture {
     }
 
     static func make(endList: Bool = true, includeVideo: Bool = false,
-                     startupPrefix: Bool = false, audioOutputProbe: Bool = false) async throws
+                     startupPrefix: Bool = false, audioOutputProbe: Bool = false,
+                     logReader: (any AVPlayerLogReading)? = nil) async throws
         -> Task21RealIntegrationFixture {
         // Registry 先冻结正式 output lifecycle；writer、publisher、server 与 item
         // 随后全部绑定这一身份，避免只比较 generation 的跨 lifecycle 拼接。
@@ -10784,7 +10841,7 @@ private final class Task21RealIntegrationFixture {
         let player = AVPlayer()
         let deadlineScheduler = FinalManualAVPlayerDeadlineScheduler()
         let driver = try SystemAVPlayerDriver.make(
-            player: player, deadlineScheduler: deadlineScheduler)
+            player: player, deadlineScheduler: deadlineScheduler, logReader: logReader)
         let snapshot = try XCTUnwrap(harness.publisher.visible)
         let evidence = try LoopbackAVPlayerPreparationEvidenceSource.make(server: server)
         let coordinator = try AVPlayerItemCoordinator(
@@ -14861,5 +14918,38 @@ private final class Task21QueuedLogGateBackend: PlaybackBackend, @unchecked Send
             }
             return retired ? .confirmedLocalOutputStopped : .unconfirmed
         } catch { return .unconfirmed }
+    }
+}
+
+/// Delay one real SDK read's return while retaining its original driver callback lease.
+/// The gate never manufactures logs, callbacks, accounting credit, or a retirement receipt.
+@MainActor
+private final class Task21HeldNativeLogReader: AVPlayerLogReading {
+    private let native = SystemAVPlayerLogReader()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var releaseRequested = false
+    private var heldFirstReturn = false
+    private(set) var isHoldingReturn = false
+
+    func readAccessLog(item: AVPlayerItem, visitURI: @MainActor (String) -> Void) async -> Int {
+        let count = await native.readAccessLog(item: item, visitURI: visitURI)
+        if !heldFirstReturn {
+            heldFirstReturn = true
+            isHoldingReturn = true
+            if !releaseRequested {
+                await withCheckedContinuation { continuation = $0 }
+            }
+            isHoldingReturn = false
+        }
+        return count
+    }
+    func readErrorLogCount(item: AVPlayerItem) async -> Int {
+        await native.readErrorLogCount(item: item)
+    }
+    func release() {
+        releaseRequested = true
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
     }
 }

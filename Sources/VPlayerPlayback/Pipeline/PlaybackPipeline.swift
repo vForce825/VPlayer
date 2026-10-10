@@ -3920,7 +3920,7 @@ final class SystemPlaybackPipelineFactory: PlaybackPipelineFactory, @unchecked S
         let metrics = PlaybackMetrics(
             channelID: channelID
         )
-        let signposts = PlaybackSignposts(channelIdentifier: metrics.channelIdentifier)
+        let signposts = PlaybackSignposts.makeForCurrentBuild(channelIdentifier: metrics.channelIdentifier)
         let executor = PlaybackSerialExecutor()
         let demuxExecutor = PlaybackSerialExecutor(label: "org.vplayer.playback.demux.delivery")
         let synchronizer = Self.makeSynchronizer()

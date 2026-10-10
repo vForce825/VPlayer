@@ -115,7 +115,7 @@ class WorkflowContracts(unittest.TestCase):
         # Match the cold build's selected simulator architecture and disable
         # scheme-level Swift coverage without changing Release optimization.
         self.assertIn('ONLY_ACTIVE_ARCH=YES',startup)
-        self.assertIn('-enableCodeCoverage NO',startup)
+        self.assertNotIn('-enableCodeCoverage',startup)
         self.assertNotIn('ENABLE_TESTABILITY=',startup)
         self.assertNotIn('SWIFT_OPTIMIZATION_LEVEL=',startup)
         self.assertIn('        timeout-minutes: 15\n',cold)

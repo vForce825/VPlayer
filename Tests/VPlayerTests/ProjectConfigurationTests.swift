@@ -489,13 +489,55 @@ final class ProjectConfigurationTests: XCTestCase {
             try String(contentsOf: $0, encoding: .utf8)
         }.joined(separator: "\n")
 
-        XCTAssertFalse(source.contains("thermalState"))
+        let releaseSource = try sourceURLs.map { url in
+            let text = try String(contentsOf: url, encoding: .utf8)
+            return url.pathExtension == "swift" ? sourceWithoutPerformanceDiagnostics(text) : text
+        }.joined(separator: "\n")
+        XCTAssertFalse(releaseSource.contains("thermalState"),
+            "Ordinary Release must not sample thermal state or use it to control quality or scheduling")
         XCTAssertFalse(source.contains("waitUntilCompleted"))
         let deinterlace = try sourceURLs
             .filter { $0.path.contains("/Deinterlace/") }
             .map { try String(contentsOf: $0, encoding: .utf8) }
             .joined(separator: "\n")
         XCTAssertFalse(deinterlace.contains("CVPixelBufferLockBaseAddress"))
+    }
+
+    private func sourceWithoutPerformanceDiagnostics(_ source: String) -> String {
+        // This conservative source contract includes both branches of unknown
+        // conditions. Only the explicit diagnostic if-branch is excluded.
+        var diagnosticBranches: [Bool] = []
+        var lines: [String] = []
+        for line in source.components(separatedBy: "\n") {
+            let directive = line.trimmingCharacters(in: .whitespaces)
+            if directive.hasPrefix("#if ") {
+                diagnosticBranches.append(directive == "#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS")
+            } else if directive == "#else" || directive.hasPrefix("#elseif ") {
+                guard !diagnosticBranches.isEmpty else { return source }
+                diagnosticBranches[diagnosticBranches.count - 1] = false
+            } else if directive == "#endif" {
+                guard !diagnosticBranches.isEmpty else { return source }
+                diagnosticBranches.removeLast()
+            } else if !diagnosticBranches.contains(true) {
+                lines.append(line)
+            }
+        }
+        return diagnosticBranches.isEmpty ? lines.joined(separator: "\n") : source
+    }
+
+    func testReleaseSourceContractOnlyExcludesDiagnosticIfBranches() {
+        let diagnostic = "#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS\nthermalState\n#endif"
+        XCTAssertFalse(sourceWithoutPerformanceDiagnostics(diagnostic).contains("thermalState"))
+        for source in [
+            "thermalState",
+            "#if os(iOS)\nthermalState\n#endif",
+            "#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS\nlogOnly\n#else\nthermalState\n#endif",
+            "#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS\nlogOnly\n#elseif os(iOS)\nthermalState\n#endif",
+            "#if os(iOS)\n#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS\nlogOnly\n#endif\nthermalState\n#endif",
+            "#if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS\nthermalState"
+        ] {
+            XCTAssertTrue(sourceWithoutPerformanceDiagnostics(source).contains("thermalState"))
+        }
     }
 
     func testPlayerChannelInfoOverlayIsNonInteractiveAndReplacesOldTitleOverlay() throws {

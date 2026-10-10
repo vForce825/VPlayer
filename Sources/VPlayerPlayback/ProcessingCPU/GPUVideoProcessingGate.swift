@@ -4,6 +4,7 @@
 
 #if os(iOS)
 import Foundation
+import os
 
 /// The app closes admission synchronously at impending inactivity/PiP entry.
 /// Every admitted submission must commit and waitUntilScheduled before its
@@ -11,6 +12,7 @@ import Foundation
 final class GPUVideoProcessingGate: @unchecked Sendable {
     static let shared = GPUVideoProcessingGate()
     private let lock = NSLock()
+    private static let logger = Logger(subsystem: "org.vplayer.playback", category: "iOSVideoProcessing")
     private var foreground = false
     private var pictureInPicture = false
     private var fence = GPUVideoHandoffFence()
@@ -19,11 +21,19 @@ final class GPUVideoProcessingGate: @unchecked Sendable {
     func setForeground(_ value: Bool) { update(foreground: value, pictureInPicture: nil) }
     func setPictureInPicture(_ value: Bool) { update(foreground: nil, pictureInPicture: value) }
     private func update(foreground: Bool?, pictureInPicture: Bool?) {
-        lock.withLock {
+        let change = lock.withLock { () -> (foreground: Bool, pip: Bool, metal: Bool)? in
+            let oldForeground = self.foreground
+            let oldPiP = self.pictureInPicture
             let previouslyAccepted = acceptsGPU
             if let foreground { self.foreground = foreground }
             if let pictureInPicture { self.pictureInPicture = pictureInPicture }
             if acceptsGPU && !previouslyAccepted { fence = GPUVideoHandoffFence(inheriting: fence.outstandingTickets) }
+            guard oldForeground != self.foreground || oldPiP != self.pictureInPicture else { return nil }
+            return (self.foreground, self.pictureInPicture, acceptsGPU)
+        }
+        if let change {
+            // State transitions only; no media identifiers or per-frame log traffic.
+            Self.logger.info("IOS_VIDEO_ACTIVITY foreground=\(change.foreground, privacy: .public) pip=\(change.pip, privacy: .public) metal=\(change.metal, privacy: .public)")
         }
     }
     /// nil means GPU work was admitted; otherwise CPU must join this exact
