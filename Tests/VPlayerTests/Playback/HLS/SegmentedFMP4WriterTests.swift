@@ -2078,24 +2078,12 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         for mode in Task17VideoCapacityHarness.Mode.allCases {
             let harness = try await Task17VideoCapacityHarness.make(mode: mode, seed: 81_310 + mode.rawValue)
             defer { harness.close() }
-            let trace = Task17CapacityTrace()
-            harness.trace = trace
-            harness.clock.deadlineScheduleObserver = { deadline in
-                trace.record(deadline.map { "waiter.timer.registered deadline=\($0)" } ?? "timer.cleared")
-            }
-            defer { print("CAPACITY_ORDER mode=\(mode) " + trace.snapshot) }
             let before = harness.writer.usage
-            let append = Task {
-                trace.record("append.task.begin")
-                defer { trace.record("append.task.end") }
-                try await harness.appendPending()
-            }
+            let append = Task { try await harness.appendPending() }
             await harness.awaitCapacityWait()
             XCTAssertNil(harness.predecessor.value)
-            trace.record("cancel.request")
             append.cancel()
             await assertWriterThrowsError(try await append.value) { XCTAssertTrue($0 is CancellationError) }
-            trace.record("cancel.completed")
             _ = harness.writer.cancel()
             XCTAssertFalse(harness.wakeup.isWaitingForTesting)
             XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
@@ -2103,60 +2091,12 @@ final class SegmentedFMP4WriterTests: XCTestCase {
             XCTAssertEqual(harness.writer.usage.liveInputBytes, before.liveInputBytes)
             XCTAssertEqual(harness.writer.usage.inputAllocationCount, before.inputAllocationCount)
             XCTAssertEqual(harness.native.appendCount, 0)
-            trace.record("aliases.first.release")
             harness.aliases.releaseAll()
             XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
-            trace.record("aliases.final.release")
             harness.lastAliases.releaseAll()
-            trace.record("occupancy.final=\(harness.writer.usage.liveInputCount)")
             XCTAssertEqual(harness.writer.usage.liveInputCount, 0)
             XCTAssertEqual(harness.writer.usage.liveInputBytes, 0)
             XCTAssertEqual(harness.writer.usage.inputAllocationCount, harness.writer.usage.inputReleaseCount)
-        }
-    }
-
-    func testVideoCapacitySeparatePredicateReadsCanStraddleRegistration() async throws {
-        for mode in Task17VideoCapacityHarness.Mode.allCases {
-            let harness = try await Task17VideoCapacityHarness.make(mode: mode, seed: 81_315 + mode.rawValue)
-            defer { harness.close() }
-            let gate = Task17CapacityAdmissionGate()
-            let registered = expectation(description: "Original five-second capacity timer registered")
-            harness.clock.deadlineScheduleObserver = { deadline in
-                if let deadline {
-                    XCTAssertEqual(deadline, 5_000_000_000)
-                    registered.fulfill()
-                }
-            }
-            let before = harness.writer.usage
-            let append = Task {
-                await gate.wait()
-                try await harness.appendPending()
-            }
-            // Keep append suspended throughout the original two-second observation.
-            // This forces the failed-observation signature without failing the
-            // control test or changing the production five-second deadline.
-            let observationStart = DispatchTime.now().uptimeNanoseconds
-            let observationLimit = Date().addingTimeInterval(2)
-            while !harness.wakeup.isWaitingForTesting && Date() < observationLimit { await Task.yield() }
-            let firstPredicate = harness.wakeup.isWaitingForTesting
-            let observationElapsed = DispatchTime.now().uptimeNanoseconds - observationStart
-            XCTAssertFalse(firstPredicate)
-            XCTAssertTrue(Date() >= observationLimit)
-            await gate.open()
-            await fulfillment(of: [registered], timeout: 2)
-            let secondPredicate = harness.clock.hasScheduledDeadlineTimer
-            XCTAssertTrue(secondPredicate)
-            XCTAssertTrue(harness.wakeup.isWaitingForTesting)
-            XCTAssertEqual(harness.writer.usage.liveInputCount, before.liveInputCount)
-            append.cancel()
-            await assertWriterThrowsError(try await append.value) { XCTAssertTrue($0 is CancellationError) }
-            XCTAssertFalse(harness.wakeup.isWaitingForTesting)
-            XCTAssertFalse(harness.clock.hasScheduledDeadlineTimer)
-            harness.aliases.releaseAll()
-            XCTAssertEqual(harness.writer.usage.liveInputCount, 2)
-            harness.lastAliases.releaseAll()
-            XCTAssertEqual(harness.writer.usage.liveInputCount, 0)
-            print("CAPACITY_CONTROL mode=\(mode) waiterBefore=\(firstPredicate) timerAfter=\(secondPredicate) observationNs=\(observationElapsed) deadline=5000000000")
         }
     }
 
@@ -9742,7 +9682,6 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
     let attempt: HLSVideoRemuxWriterAttempt?
     let encodedOutput: HLSVideoEncodedOutput?
     let payload: Data
-    var trace: Task17CapacityTrace?
 
     private init(boundary: SegmentBoundaryCoordinator, writer: SegmentedFMP4Writer,
                  successorFactory: Task17FakeSystemWriterFactory,
@@ -9850,7 +9789,6 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
     }
 
     func appendPending() async throws {
-        trace?.record("append.admission.request")
         if let attempt {
             try await writer.appendRemuxVideoAwaitingPredecessorCapacity(attempt, boundary: boundary, wakeup: wakeup)
         } else {
@@ -9874,16 +9812,10 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
     }
 
     func awaitCapacityWait() async {
-        let start = Date()
-        let limit = start.addingTimeInterval(2)
-        trace?.record("observation.begin budget=2s revision=\(wakeup.currentRevision)")
+        let limit = Date().addingTimeInterval(2)
         while !wakeup.isWaitingForTesting && Date() < limit { await Task.yield() }
-        let waiting = wakeup.isWaitingForTesting
-        trace?.record("predicate.waiter=\(waiting) expired=\(Date() >= limit) wallNs=\(Int64(Date().timeIntervalSince(start) * 1_000_000_000)) revision=\(wakeup.currentRevision)")
-        XCTAssertTrue(waiting)
-        let scheduled = clock.hasScheduledDeadlineTimer
-        trace?.record("predicate.timer=\(scheduled)")
-        XCTAssertTrue(scheduled)
+        XCTAssertTrue(wakeup.isWaitingForTesting)
+        XCTAssertTrue(clock.hasScheduledDeadlineTimer)
     }
 
     func close() {
@@ -12338,31 +12270,4 @@ private func assertWriterEqual<T: Equatable>(
 ) async throws {
     let actual = try await expression()
     XCTAssertEqual(actual, expected, message(), file: file, line: line)
-}
-
-private final class Task17CapacityTrace: @unchecked Sendable {
-    private let lock = NSLock()
-    private let start = DispatchTime.now().uptimeNanoseconds
-    private var events: [String] = []
-    func record(_ event: String) {
-        lock.withLock {
-            guard events.count < 64 else { return }
-            events.append("\(DispatchTime.now().uptimeNanoseconds - start)ns:\(event)")
-        }
-    }
-    var snapshot: String { lock.withLock { events.joined(separator: " | ") } }
-}
-
-private actor Task17CapacityAdmissionGate {
-    private var opened = false
-    private var continuation: CheckedContinuation<Void, Never>?
-    func wait() async {
-        if opened { return }
-        await withCheckedContinuation { continuation = $0 }
-    }
-    func open() {
-        opened = true
-        continuation?.resume()
-        continuation = nil
-    }
 }
