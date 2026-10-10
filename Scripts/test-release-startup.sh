@@ -72,19 +72,32 @@ PY
 )" || fail '未找到唯一的已启动 tvOS 模拟器'
 simulator_udid="${simulator_selection%%$'\n'*}"
 simulator_data_path="${simulator_selection#*$'\n'}"
-printf '模拟器 UDID：%s；构建配置：%s；增量构建目录：%s\n' "$simulator_udid" "$configuration" "$derived_data"
+printf '模拟器 UDID：%s；构建配置：%s；构建目录：%s\n' "$simulator_udid" "$configuration" "$derived_data"
 # 清除调用环境的模拟器子进程开关，保证普通启动没有继承注入或验收设置。
 for variable in ${!SIMCTL_CHILD_@}; do unset "$variable"; done
-# 构建输出同时进入 CI 日志与本地证据；超时终止前也能看到最后的编译进展。
-# 保留 pipefail，避免 tee 成功掩盖构建失败。
-# 使用前置 Release UI 测试的无覆盖率 scheme，保持相同的生产目标与 Release 设置；
-# 只编译选定模拟器的架构，避免 Swift 覆盖率触发整包重编译。
-xcodebuild build -project "$repository_root/VPlayer.xcodeproj" -scheme VPlayerReleaseStartupTests \
-    -configuration "$configuration" -sdk appletvsimulator \
-    -destination "platform=tvOS Simulator,id=$simulator_udid" \
-    -derivedDataPath "$derived_data" ONLY_ACTIVE_ARCH=YES \
-    CLANG_ENABLE_CODE_COVERAGE=NO \
-    CODE_SIGNING_ALLOWED=NO 2>&1 | tee "$evidence/build.log" || fail '模拟器构建失败'
+# CI 先全新构建并验证，再以 test-without-building 运行 UI 测试；冷启动只复用
+# 同一日志/源码树/二进制收据，禁止用增量空日志代替真实编译证据。
+if [[ -n "${VPLAYER_STARTUP_BUILD_LOG:-}" ]]; then
+    [[ -n "${VPLAYER_STARTUP_DERIVED_DATA:-}" ]] || fail '复用构建日志必须显式指定构建目录'
+    build_log="$VPLAYER_STARTUP_BUILD_LOG"
+    [[ -s "$build_log.release-guard.json" ]] || fail '缺少已验证 Release 构建收据'
+else
+    [[ ! -e "$derived_data" ]] || fail '必须使用全新构建目录或已验证的完整构建日志'
+    # 先记录源码起点，再启动编译器；仅写一份有大小上限的日志，并持续显示进展。
+    build_log="$evidence/build.log"
+    python3 "$repository_root/Scripts/Support/capture-release-build.py" --tee --log "$build_log" -- \
+        xcodebuild build -project "$repository_root/VPlayer.xcodeproj" -scheme VPlayerReleaseStartupTests \
+        -configuration "$configuration" -sdk appletvsimulator \
+        -destination "platform=tvOS Simulator,id=$simulator_udid" \
+        -derivedDataPath "$derived_data" ONLY_ACTIVE_ARCH=YES \
+        CODE_SIGNING_ALLOWED=NO || fail '模拟器构建失败'
+
+fi
+python3 "$repository_root/Scripts/verify-release-artifacts.py" verify --sdk appletvsimulator \
+    --derived-data "$derived_data" --build-log "$build_log" --scope app \
+    --ffmpeg "$repository_root/Vendor/FFmpeg/Artifacts/FFmpeg.xcframework/tvos-arm64_x86_64-simulator/libFFmpeg.a" \
+    || fail 'Release 产物验证失败'
+
 app="$derived_data/Build/Products/$configuration-appletvsimulator/VPlayer.app"
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
 sdk="$(xcrun --sdk appletvsimulator --show-sdk-path)"

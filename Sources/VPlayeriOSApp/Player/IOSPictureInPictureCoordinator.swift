@@ -17,13 +17,75 @@ struct PiPCallbackReference<Object: AnyObject>: @unchecked Sendable {
     var identity: ObjectIdentifier { ObjectIdentifier(object) }
 }
 
+/// Composition keeps lifecycle tests independent of native PiP capability.
+/// The callback object must have stable identity and be strongly retained.
+@MainActor
+protocol PiPControllerHandle: AnyObject {
+    var callbackObject: AnyObject { get }
+    var nativeController: AVPictureInPictureController? { get }
+    var contentSource: AVPictureInPictureController.ContentSource? { get }
+    var isPictureInPictureActive: Bool { get }
+    func observePossibility(_ change: @escaping @Sendable (Bool) -> Void)
+    func cancelObservation()
+    func startPictureInPicture()
+    func stopPictureInPicture()
+    func invalidatePlaybackState()
+    func detach()
+}
+
+@MainActor
+private final class NativePiPControllerHandle: PiPControllerHandle {
+    private let controller: AVPictureInPictureController
+    private var observation: NSKeyValueObservation?
+    var callbackObject: AnyObject { controller }
+    var nativeController: AVPictureInPictureController? { controller }
+    var contentSource: AVPictureInPictureController.ContentSource? { controller.contentSource }
+    var isPictureInPictureActive: Bool { controller.isPictureInPictureActive }
+
+    static func make(source: AVPictureInPictureController.ContentSource,
+                     delegate: any AVPictureInPictureControllerDelegate) -> (any PiPControllerHandle)? {
+        // AVKit documents that unsupported construction returns nil despite the
+        // nonfailable Swift signature. A policy/test override cannot bypass this.
+        guard AVPictureInPictureController.isPictureInPictureSupported() else { return nil }
+        return NativePiPControllerHandle(source: source, delegate: delegate)
+    }
+    private init(source: AVPictureInPictureController.ContentSource,
+                 delegate: any AVPictureInPictureControllerDelegate) {
+        controller = AVPictureInPictureController(contentSource: source)
+        controller.delegate = delegate
+        controller.requiresLinearPlayback = true
+        controller.canStartPictureInPictureAutomaticallyFromInline = true
+    }
+    func observePossibility(_ change: @escaping @Sendable (Bool) -> Void) {
+        cancelObservation()
+        observation = controller.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { _, value in
+            change(value.newValue ?? false)
+        }
+    }
+    func cancelObservation() {
+        observation?.invalidate()
+        observation = nil
+    }
+    func startPictureInPicture() { controller.startPictureInPicture() }
+    func stopPictureInPicture() { controller.stopPictureInPicture() }
+    func invalidatePlaybackState() {
+        guard contentSource?.sampleBufferDisplayLayer != nil else { return }
+        controller.invalidatePlaybackState()
+    }
+    func detach() {
+        cancelObservation()
+        controller.delegate = nil
+        controller.contentSource = nil
+    }
+}
+
 final class PiPPlaybackSnapshot: @unchecked Sendable {
     private let lock = NSLock()
     private var paused = true
     private var available = false
     private var identity: ObjectIdentifier?
     private var restoreIdentity: ObjectIdentifier?
-    private var pendingTransport: (PiPCallbackReference<AVPictureInPictureController>, Bool)?
+    private var pendingTransport: (PiPCallbackReference<AnyObject>, Bool)?
     private var transportDeliveryQueued = false
     func update(paused: Bool, available: Bool, identity: ObjectIdentifier?) {
         lock.withLock {
@@ -31,16 +93,16 @@ final class PiPPlaybackSnapshot: @unchecked Sendable {
             self.paused = paused; self.available = available; self.identity = identity
         }
     }
-    func queueTransport(_ controller: AVPictureInPictureController, paused: Bool) -> Bool {
+    func queueTransport(_ reference: PiPCallbackReference<AnyObject>, paused: Bool) -> Bool {
         lock.withLock {
-            guard identity == ObjectIdentifier(controller) else { return false }
-            pendingTransport = (PiPCallbackReference(controller), paused)
+            guard identity == reference.identity else { return false }
+            pendingTransport = (reference, paused)
             let shouldQueue = !transportDeliveryQueued
             transportDeliveryQueued = true
             return shouldQueue
         }
     }
-    func takeTransport() -> (PiPCallbackReference<AVPictureInPictureController>, Bool)? {
+    func takeTransport() -> (PiPCallbackReference<AnyObject>, Bool)? {
         lock.withLock {
             defer { pendingTransport = nil; transportDeliveryQueued = false }
             return pendingTransport
@@ -57,7 +119,7 @@ final class PiPPlaybackSnapshot: @unchecked Sendable {
             return true
         }
     }
-    func read(for controller: AVPictureInPictureController) -> (paused: Bool, available: Bool) {
+    func read(for controller: AnyObject) -> (paused: Bool, available: Bool) {
         lock.withLock {
             guard identity == ObjectIdentifier(controller) else { return (true, false) }
             return (paused, available)
@@ -80,6 +142,8 @@ private final class PiPRestoreReply: @unchecked Sendable {
 final class IOSPictureInPictureCoordinator: NSObject,
     AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
     typealias RestoreRequest = @MainActor (@escaping @MainActor (Bool) -> Void) -> Void
+    typealias ControllerFactory = @MainActor (AVPictureInPictureController.ContentSource,
+        any AVPictureInPictureControllerDelegate) -> (any PiPControllerHandle)?
     private(set) var isPossible = false
     private(set) var isActive = false
     private(set) var message: String?
@@ -87,9 +151,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored var onStopped: (@MainActor () -> Void)?
     @ObservationIgnored var onRestore: RestoreRequest?
     @ObservationIgnored private weak var target: (any NowPlayingPlaybackTarget)?
-    @ObservationIgnored private var controller: AVPictureInPictureController?
-    @ObservationIgnored private var retiring: AVPictureInPictureController?
-    @ObservationIgnored private var observation: NSKeyValueObservation?
+    @ObservationIgnored private var controller: (any PiPControllerHandle)?
+    @ObservationIgnored private var retiring: (any PiPControllerHandle)?
     @ObservationIgnored private var pending: (PresentationIdentity, AVPictureInPictureController.ContentSource)?
     @ObservationIgnored private var presentationIdentity: PresentationIdentity?
     @ObservationIgnored private var transportTask: Task<Void, Never>?
@@ -100,13 +163,25 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored private var state: PlaybackState = .idle
     @ObservationIgnored private var paused = true
     nonisolated private let snapshot = PiPPlaybackSnapshot()
+    @ObservationIgnored private let supportsPictureInPicture: @MainActor () -> Bool
+    @ObservationIgnored private let setPictureInPicture: @MainActor (Bool) -> Void
+    @ObservationIgnored private let makeController: ControllerFactory
 
     #if DEBUG
     /// Read-only native state for hosted integration tests, not a transport authority.
-    var nativeControllerForTesting: AVPictureInPictureController? { controller }
+    var nativeControllerForTesting: AVPictureInPictureController? { controller?.nativeController }
     #endif
 
-    init(target: any NowPlayingPlaybackTarget) { self.target = target; super.init() }
+    init(target: any NowPlayingPlaybackTarget,
+         supportsPictureInPicture: @escaping @MainActor () -> Bool = { AVPictureInPictureController.isPictureInPictureSupported() },
+         setPictureInPicture: @escaping @MainActor (Bool) -> Void = PlaybackVideoProcessingActivity.setPictureInPicture,
+         makeController: @escaping ControllerFactory = { NativePiPControllerHandle.make(source: $0, delegate: $1) }) {
+        self.target = target
+        self.supportsPictureInPicture = supportsPictureInPicture
+        self.setPictureInPicture = setPictureInPicture
+        self.makeController = makeController
+        super.init()
+    }
 
     func install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer, identity: PresentationIdentity) {
         install(.init(sampleBufferDisplayLayer: sampleBufferDisplayLayer, playbackDelegate: self), identity: identity)
@@ -138,7 +213,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
     }
     private func install(_ source: AVPictureInPictureController.ContentSource, identity: PresentationIdentity) {
         guard !closed, presentationIdentity != identity else { return }
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+        guard supportsPictureInPicture() else {
             message = "当前设备不支持画中画。后台音频仍由系统播放策略管理。"
             return
         }
@@ -156,7 +231,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         guard let current = controller else { return }
         pendingTransport = nil
         transportTask?.cancel()
-        observation = nil
+        current.cancelObservation()
         controller = nil
         presentationIdentity = nil
         isPossible = false
@@ -168,32 +243,41 @@ final class IOSPictureInPictureCoordinator: NSObject,
             retiring = current
             current.stopPictureInPicture()
         } else {
-            current.delegate = nil
-            current.contentSource = nil
+            current.detach()
+            // Native state can become inactive before its queued didStop actor
+            // hop. Retiring the identity makes that callback stale, so retire
+            // its processing policy here as well. Do not stop the replacement session.
             starting = false
+            isActive = false
+            restoring = false
+            setPictureInPicture(false)
         }
     }
     private func installPendingIfPossible() {
         guard !closed, retiring == nil, let pending else { return }
         self.pending = nil
-        let current = AVPictureInPictureController(contentSource: pending.1)
+        guard let current = makeController(pending.1, self) else {
+            presentationIdentity = nil
+            starting = false; isActive = false; isPossible = false; restoring = false
+            updateSnapshot()
+            setPictureInPicture(false)
+            message = "当前设备无法创建画中画，播放会继续。"
+            return
+        }
         controller = current
         presentationIdentity = pending.0
-        current.delegate = self
-        current.requiresLinearPlayback = true
-        current.canStartPictureInPictureAutomaticallyFromInline = true
-        let reference = PiPCallbackReference(current)
-        observation = current.observe(\.isPictureInPicturePossible, options: [.initial, .new]) { [weak self] _, change in
-            let possible = change.newValue ?? false
-            Task { @MainActor [weak self] in
+        let reference = PiPCallbackReference(current.callbackObject)
+        current.observePossibility { [weak self] possible in
+            DispatchQueue.main.async { [weak self] in
                 guard let self, self.currentID == reference.identity else { return }
                 self.isPossible = possible
             }
         }
         updateSnapshot()
-        current.invalidatePlaybackState()
+        invalidatePlaybackStateIfNeeded()
     }
-    private var currentID: ObjectIdentifier? { controller.map(ObjectIdentifier.init) }
+    private var currentID: ObjectIdentifier? { controller.map { ObjectIdentifier($0.callbackObject) } }
+    private var retiringID: ObjectIdentifier? { retiring.map { ObjectIdentifier($0.callbackObject) } }
     func start() {
         guard !closed, !starting, let controller, isPossible else {
             message = "画中画尚未就绪，请在画面开始播放后重试。"
@@ -204,7 +288,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
         snapshot.clearRestoreIntent()
         starting = true
         // Close GPU admission before asking AVKit to start its transition.
-        PlaybackVideoProcessingActivity.setPictureInPicture(true)
+        setPictureInPicture(true)
         controller.startPictureInPicture()
     }
     func stopForRestoration() {
@@ -215,7 +299,11 @@ final class IOSPictureInPictureCoordinator: NSObject,
     func update(state: PlaybackState, paused: Bool) {
         self.state = state; self.paused = paused
         updateSnapshot()
-        controller?.invalidatePlaybackState()
+        invalidatePlaybackStateIfNeeded()
+    }
+    private func invalidatePlaybackStateIfNeeded() {
+        guard let controller, controller.contentSource?.sampleBufferDisplayLayer != nil else { return }
+        controller.invalidatePlaybackState()
     }
     private func updateSnapshot() {
         let available: Bool
@@ -230,57 +318,56 @@ final class IOSPictureInPictureCoordinator: NSObject,
         closed = true
         pendingTransport = nil
         transportTask?.cancel()
-        observation = nil
         pending = nil
         for item in [controller, retiring].compactMap({ $0 }) {
-            item.delegate = nil
+            item.cancelObservation()
             item.stopPictureInPicture()
-            item.contentSource = nil
+            item.detach()
         }
         controller = nil; retiring = nil; presentationIdentity = nil
         isActive = false; isPossible = false; starting = false
         updateSnapshot()
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
     }
     private func didStart(_ identity: ObjectIdentifier) {
         guard !closed else { return }
-        if retiring.map(ObjectIdentifier.init) == identity {
+        if retiringID == identity {
             retiring?.stopPictureInPicture()
             return
         }
         guard currentID == identity else { return }
         starting = false; isActive = true
-        PlaybackVideoProcessingActivity.setPictureInPicture(true)
+        setPictureInPicture(true)
         onStarted?()
     }
     private func didStop(_ identity: ObjectIdentifier) {
         guard !closed else { return }
-        if retiring.map(ObjectIdentifier.init) == identity {
-            retiring?.delegate = nil
-            retiring?.contentSource = nil
+        if retiringID == identity {
+            retiring?.cancelObservation()
+            retiring?.detach()
             retiring = nil
             starting = false; isActive = false
-            PlaybackVideoProcessingActivity.setPictureInPicture(false)
+            setPictureInPicture(false)
             installPendingIfPossible()
             return
         }
         guard currentID == identity else { return }
         starting = false; isActive = false
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
         let restored = snapshot.consumeRestoreIntent(identity)
         if !restoring && !restored { onStopped?() }
         restoring = false
     }
     private func failed(_ identity: ObjectIdentifier) {
         guard !closed else { return }
-        if retiring.map(ObjectIdentifier.init) == identity {
+        if retiringID == identity {
             didStop(identity)
             return
         }
         guard currentID == identity else { return }
         starting = false; isActive = false; restoring = false
         snapshot.clearRestoreIntent()
-        PlaybackVideoProcessingActivity.setPictureInPicture(false)
+        setPictureInPicture(false)
         message = "暂时无法进入画中画，播放会继续。请返回全屏后重试。"
     }
     private func restore(_ identity: ObjectIdentifier, reply: PiPRestoreReply) {
@@ -293,20 +380,32 @@ final class IOSPictureInPictureCoordinator: NSObject,
     }
 
     nonisolated func pictureInPictureControllerDidStartPictureInPicture(_ controller: AVPictureInPictureController) {
+        receiveDidStart(controller)
+    }
+    nonisolated func receiveDidStart(_ controller: AnyObject) {
         let reference = PiPCallbackReference(controller)
         DispatchQueue.main.async { [weak self] in self?.didStart(reference.identity) }
     }
     nonisolated func pictureInPictureControllerDidStopPictureInPicture(_ controller: AVPictureInPictureController) {
+        receiveDidStop(controller)
+    }
+    nonisolated func receiveDidStop(_ controller: AnyObject) {
         let reference = PiPCallbackReference(controller)
         DispatchQueue.main.async { [weak self] in self?.didStop(reference.identity) }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: any Error) {
+        receiveFailure(controller)
+    }
+    nonisolated func receiveFailure(_ controller: AnyObject) {
         let reference = PiPCallbackReference(controller)
         DispatchQueue.main.async { [weak self] in self?.failed(reference.identity) }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController,
         restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void) {
+        receiveRestore(controller, completionHandler: completionHandler)
+    }
+    nonisolated func receiveRestore(_ controller: AnyObject, completionHandler: @escaping (Bool) -> Void) {
         let reference = PiPCallbackReference(controller)
         let reply = PiPRestoreReply(completionHandler)
         snapshot.requestRestore(reference.identity)
@@ -316,13 +415,23 @@ final class IOSPictureInPictureCoordinator: NSObject,
         }
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, setPlaying playing: Bool) {
-        guard snapshot.queueTransport(controller, paused: !playing) else { return }
+        receiveTransport(controller, playing: playing)
+    }
+    nonisolated func receiveTransport(_ controller: AnyObject, playing: Bool) {
+        let reference = PiPCallbackReference(controller)
+        guard snapshot.queueTransport(reference, paused: !playing) else { return }
         DispatchQueue.main.async { [weak self] in self?.drainSampleTransport() }
     }
     nonisolated func pictureInPictureControllerTimeRangeForPlayback(_ controller: AVPictureInPictureController) -> CMTimeRange {
+        playbackTimeRange(for: controller)
+    }
+    nonisolated func playbackTimeRange(for controller: AnyObject) -> CMTimeRange {
         snapshot.read(for: controller).available ? CMTimeRange(start: .zero, duration: .positiveInfinity) : .invalid
     }
     nonisolated func pictureInPictureControllerIsPlaybackPaused(_ controller: AVPictureInPictureController) -> Bool {
+        isPlaybackPaused(for: controller)
+    }
+    nonisolated func isPlaybackPaused(for controller: AnyObject) -> Bool {
         snapshot.read(for: controller).paused
     }
     nonisolated func pictureInPictureController(_ controller: AVPictureInPictureController, didTransitionToRenderSize newRenderSize: CMVideoDimensions) {}

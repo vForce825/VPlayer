@@ -923,7 +923,7 @@ final class HLSVideoBranch: @unchecked Sendable {
         { surfaceAdmission, eventSink in
             let relay = RoutingVideoDecoderChildRelay()
             let vt: VideoToolboxDecoder
-            if let metrics, let signposts {
+            if let metrics {
                 vt = VideoToolboxDecoder(
                     executor: executor, tuning: tuning,
                     diagnostics: (metrics: metrics, signposts: signposts),

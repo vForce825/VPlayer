@@ -21,6 +21,11 @@ REPORTER = ROOT / 'Scripts/report-ios-test-status.py'
 NATIVE = 'VPlayeriOSTests/IOSNativePictureInPictureTests/testRealSampleBufferPiPStartsRestoresAndClosesTheRetainedSession'
 NATIVE_URL = 'test://com.apple.xcode/VPlayer/' + NATIVE + '()'
 BENCHMARK = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUYADIFBenchmarkReportsNativeHostMeasurementsWithoutDeviceQualification'
+RELEASE_GOLDEN = 'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testCPUAdapterMatchesEveryPinnedNV12AndP010FieldExactly'
+PREFLIGHT = (
+    'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/testRetirementBeforeQueuedNativeStopCannotLeaveForegroundOnCPU',
+    'VPlayeriOSUITests/IOSLibraryFlowTests/testPlaylistDeleteCancelsWithoutRemovalAndRequiresExplicitConfirmation',
+)
 
 
 def schema():
@@ -204,9 +209,10 @@ class IOSSelectedStatusTests(unittest.TestCase):
         m = self.module()
         self.assertIsInstance(m.DEFAULT_TESTS, tuple)
         self.assertNotIn(BENCHMARK, m.DEFAULT_TESTS)
-        self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK,))
+        self.assertEqual(m.BENCHMARK_TESTS, (BENCHMARK, RELEASE_GOLDEN,
+            'VPlayeriOSBenchmarks/YADIFGoldenPixelTests/testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease'))
         self.assertTrue(any('/IOSPlaybackSessionTests/' in x for x in m.DEFAULT_TESTS))
-        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 3)
+        self.assertEqual(sum('/IOSLibraryFlowTests/' in x for x in m.DEFAULT_TESTS), 11)
         self.assertEqual(len(m.DEFAULT_TESTS), len(set(m.DEFAULT_TESTS)))
 
     def test_manifest_includes_all_budget_fixture_and_fill_regressions(self):
@@ -228,8 +234,81 @@ class IOSSelectedStatusTests(unittest.TestCase):
             'testPausedWorkspaceChargeSurvivesUntilTheFinalWorkspaceAliasIsReleased',
         ):
             expected.add('VPlayeriOSTests/LoopbackHTTPServerTests/' + method)
-        self.assertEqual(len(m.DEFAULT_TESTS), 45)
+        self.assertEqual(len(m.DEFAULT_TESTS), 86)
         self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+
+    def test_manifest_includes_native_factory_and_observation_regressions(self):
+        m = self.module()
+        expected = {
+            'VPlayeriOSTests/IOSPictureInPictureCoordinatorTests/' + method for method in (
+                'testActiveAndStartingRetirementWaitForStopBeforeCreatingSuccessor',
+                'testFactoryFailureClearsPresentationAndProcessingActivity',
+                'testNativeFactoryCannotBypassActualRuntimeCapability',
+                'testPlaybackInvalidationOnlyTargetsSampleBufferContent',
+            )
+        }
+        expected.update('VPlayeriOSTests/HLSAVPlayerBackendTests/' + method for method in (
+            'testHandoffMediaObservationWaitsThroughProbeAndClearForCurrentOutput',
+            'testHandoffMediaObservationRejectsMissingOutputFailureAndChangedIdentity',
+            'testProductionHLSRouteHandoffClearsMediaAndRejectsOldCallbacksAfterSampleBuffer',
+        ))
+        expected.add('VPlayeriOSUITests/IOSLibraryFlowTests/testDeletionCancellationGeometryUsesOnlyObservedExteriorSpace')
+        self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+
+    def test_manifest_includes_controls_visibility_policy_and_native_ui_regressions(self):
+        m = self.module()
+        expected = {
+            'VPlayeriOSTests/IOSPlayerControlsVisibilityTests/' + method for method in (
+                'testCurrentIdleTimeoutHidesControlsAndLeavesNoTimer',
+                'testBackgroundTapHidesAndRestoresControls',
+                'testControlInteractionRefreshesTimeoutWithoutTogglingVisibility',
+                'testPinningRevealsControlsAndRejectsTimeoutAcrossResume',
+                'testRepeatedPlaybackUpdateDoesNotPostponeTimeout',
+                'testDisappearanceInvalidatesTimeoutBeforeReappearance',
+                'testOnlyUnobstructedActivePlaybackAllowsAutoHide',
+            )
+        }
+        expected.update('VPlayeriOSUITests/IOSLibraryFlowTests/' + method for method in (
+            'testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession',
+            'testPlaybackControlTapsAndSettingsDoNotToggleBackgroundOrStopSession',
+            'testHiddenPlaybackControlsCanBeRevealedAfterRotation',
+            'testForegroundReturnRevealsControlsAndStartsFreshIdleTimeout',
+            'testPlaybackFailureKeepsControlsAndExitVisible',
+        ))
+        self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+
+    def test_manifest_includes_inactive_signpost_regressions(self):
+        m = self.module()
+        expected = {'VPlayeriOSTests/PlaybackMetricsTests/' + method for method in (
+            'testInactiveSignpostsDoNotCreateIntervalsOrAsyncLifetimes',
+            'testSignpostFactoryOnlyEnablesDiagnosticBuilds',
+            'testSignpostLifetimeFinishesExactlyOnceAcrossConcurrentCallbacks',
+        )}
+        self.assertTrue(expected.issubset(m.DEFAULT_TESTS))
+        self.assertIn('VPlayeriOSTests/AdaptiveYADIFHandoffTests/testCPUProcessingTimingCallbackFollowsBuildConfiguration', m.DEFAULT_TESTS)
+
+    def test_release_scheme_selectors_match_the_required_report(self):
+        m = self.module()
+        spec = (ROOT / 'project.yml').read_text()
+        scheme = spec.split('\n  VPlayeriOSBenchmarks:\n')[-1]
+        selected = {line.strip()[2:] for line in scheme.splitlines()
+                    if line.strip().startswith('- YADIFGoldenPixelTests/')}
+        self.assertEqual(selected, {identifier.split('/', 1)[1] for identifier in m.BENCHMARK_TESTS})
+
+    def test_manifest_includes_release_launch_hook_exclusion(self):
+        m = self.module()
+        self.assertIn('VPlayeriOSTests/VPlayerAppStartupTests/testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds', m.DEFAULT_TESTS)
+
+    def test_manifest_includes_worker_service_evidence(self):
+        m = self.module()
+        workers = (
+            'testWorkerSummarySeparatesCPUServiceFromHeterogeneousWallTimesAndRequestedQoS',
+            'testMissingWorkerCPUClockAndMissingSlotStayUnverifiedInsteadOfZeroService',
+            'testWorkerWindowCountersExtremaAndContextResetAtOneSecondBoundary',
+            'testWorkerWindowMarksMixedSurfaceContextsAndDoesNotInventMissingTelemetry',
+            'testNativeThreadCPUClockProvidesValidNonnegativeElapsedService',
+        )
+        self.assertTrue({f'VPlayeriOSTests/AdaptiveYADIFDiagnosticsTests/{method}' for method in workers}.issubset(m.DEFAULT_TESTS))
 
     def test_manifest_includes_native_eof_boundary_regressions(self):
         m = self.module()
@@ -251,14 +330,39 @@ class IOSSelectedStatusTests(unittest.TestCase):
     def test_full_default_manifest_fits_output_and_summary_without_omitting_cases(self):
         m = self.module()
         rows = m.analyze(schema(), {'testNodes': [case(test) for test in m.DEFAULT_TESTS]})
-        self.assertEqual(len(rows), 45)
+        self.assertEqual(len(rows), 86)
         self.assertTrue(all(row['status'] == 'Passed' for row in rows))
         lines = m.report_lines(rows, 'functional_unit_and_ui')
         summary = m.job_summary(lines)
-        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 45)
+        self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in lines), 86)
         self.assertNotIn('TRUNCATED', '\n'.join(lines) + summary)
         self.assertLessEqual(len(('\n'.join(lines) + '\n').encode()), m.MAX_OUTPUT)
         self.assertLessEqual(len(summary.encode()), m.MAX_OUTPUT)
+
+    def test_preflight_manifest_is_exact_and_remains_required_in_full_suite(self):
+        m = self.module()
+        self.assertEqual(getattr(m, 'PREFLIGHT_TESTS', None), PREFLIGHT)
+        self.assertTrue(set(PREFLIGHT).issubset(m.DEFAULT_TESTS))
+        self.assertEqual(len(m.DEFAULT_TESTS), 86)
+
+    def test_preflight_requires_both_passed_and_never_accepts_skipped_or_missing_tests(self):
+        m = self.module()
+        self.assertTrue(hasattr(m, 'PREFLIGHT_TESTS'), 'A separate preflight manifest is required')
+        for result, missing in [('Passed', False), ('Failed', False), ('Skipped', False),
+                                ('Expected Failure', False), ('Passed', True)]:
+            with self.subTest(result=result, missing=missing), tempfile.TemporaryDirectory() as temp:
+                bundle = Path(temp) / 'preflight.xcresult'; bundle.mkdir()
+                tree = [case(PREFLIGHT[0])]
+                if not missing:
+                    tree.append(case(PREFLIGHT[1], result=result))
+                replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': tree})]
+                output = io.StringIO()
+                with patch.object(m, 'run_bounded', side_effect=replies), \
+                        patch.object(m, 'enrich_skip_reasons'), contextlib.redirect_stdout(output):
+                    status = m.main([str(bundle), '--preflight'])
+                self.assertEqual(status, int(result != 'Passed' or missing))
+                self.assertIn('IOS_SELECTED_TEST_SCOPE=regression_preflight', output.getvalue())
+                self.assertEqual(sum(line.startswith('IOS_SELECTED_TEST ') for line in output.getvalue().splitlines()), 2)
 
     def test_allowlist_methods_exist_under_exact_source_classes(self):
         import re
@@ -294,7 +398,7 @@ class IOSSelectedStatusTests(unittest.TestCase):
 
     def test_runtime_discovers_schema_and_reads_only_tests_json(self):
         m = self.module()
-        replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': [case(BENCHMARK)]})]
+        replies = ['--schema --path', json.dumps(schema()), json.dumps({'testNodes': [case(identifier) for identifier in m.BENCHMARK_TESTS]})]
         with tempfile.TemporaryDirectory() as temp:
             bundle = Path(temp) / 'bench.xcresult'; bundle.mkdir()
             with patch.object(m, 'run_bounded', side_effect=replies) as run, contextlib.redirect_stdout(io.StringIO()):

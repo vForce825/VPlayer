@@ -23,21 +23,103 @@ static int raw_code(const uint8_t *plane, size_t stride, int x, int y,
     memcpy(&value, address, sizeof(value));
     return (int)value;
 }
-static int code(const uint8_t *plane, size_t stride, int x, int y,
-                int component, int components, int depth) {
-    int value = raw_code(plane, stride, x, y, component, components, depth);
-    return depth == 10 ? value >> 6 : value;
+
+// A row is addressed in component samples. UV neighbors remain two samples
+// apart; memcpy keeps P010 access valid even when a row address is unaligned.
+static inline int sample_code(const uint8_t *plane, size_t stride,
+                              int i, int y, int depth) {
+    const uint8_t *address = plane + (size_t)y * stride +
+        (size_t)i * (depth == 10 ? 2u : 1u);
+    if (depth == 8) return *address;
+    uint16_t value;
+    memcpy(&value, address, sizeof(value));
+    return value >> 6;
 }
-static void store_code(uint8_t *plane, size_t stride, int x, int y,
-                       int component, int components, int depth, int value) {
+static inline void sample_store(uint8_t *plane, size_t stride,
+                                int i, int y, int depth, int value) {
     uint8_t *address = plane + (size_t)y * stride +
-        ((size_t)x * (size_t)components + (size_t)component) * (depth == 10 ? 2u : 1u);
+        (size_t)i * (depth == 10 ? 2u : 1u);
     if (depth == 8) { *address = (uint8_t)value; return; }
     uint16_t word = (uint16_t)((unsigned)value << 6);
     memcpy(address, &word, sizeof(word));
 }
 
-int VPYADIFProcessPlaneRows(const uint8_t *previous, size_t previousStride,
+// Keep one set of equations while specializing depth, component spacing and
+// border handling at the call sites below. No restrict aliasing is introduced.
+static inline __attribute__((always_inline)) int vp_synthesize(
+    const uint8_t *previous, size_t previousStride,
+    const uint8_t *current, size_t currentStride,
+    const uint8_t *next, size_t nextStride,
+    const uint8_t *before, size_t beforeStride,
+    const uint8_t *after, size_t afterStride,
+    int i, int y, int aboveY, int belowY, int height,
+    int components, int bitDepth, int spatialOnly, int interior) {
+    int above[7], below[7];
+    if (interior) {
+        for (int k=-3;k<=3;++k) {
+            above[k+3]=sample_code(current,currentStride,i+k*components,aboveY,bitDepth);
+            below[k+3]=sample_code(current,currentStride,i+k*components,belowY,bitDepth);
+        }
+    } else {
+        above[3]=sample_code(current,currentStride,i,aboveY,bitDepth);
+        below[3]=sample_code(current,currentStride,i,belowY,bitDepth);
+    }
+    int prediction=(above[3]+below[3])>>1;
+    if (interior) {
+        // Preserve the scalar search: far may improve only if near improved;
+        // ties retain the prior prediction, with negative directions first.
+        int score=vp_abs(above[2]-below[2])+vp_abs(above[3]-below[3])+vp_abs(above[4]-below[4])-1;
+        {
+            int nearScore=vp_abs(above[1]-below[3])+vp_abs(above[2]-below[4])+vp_abs(above[3]-below[5]);
+            int nearPrediction=(above[2]+below[4])>>1;
+            int farScore=vp_abs(above[0]-below[4])+vp_abs(above[1]-below[5])+vp_abs(above[2]-below[6]);
+            int farPrediction=(above[1]+below[5])>>1;
+            int takeNear=nearScore<score;
+            int takeFar=takeNear && farScore<nearScore;
+            prediction=takeNear ? nearPrediction : prediction;
+            score=takeNear ? nearScore : score;
+            prediction=takeFar ? farPrediction : prediction;
+            score=takeFar ? farScore : score;
+        }
+        {
+            int nearScore=vp_abs(above[3]-below[1])+vp_abs(above[4]-below[2])+vp_abs(above[5]-below[3]);
+            int nearPrediction=(above[4]+below[2])>>1;
+            int farScore=vp_abs(above[4]-below[0])+vp_abs(above[5]-below[1])+vp_abs(above[6]-below[2]);
+            int farPrediction=(above[5]+below[1])>>1;
+            int takeNear=nearScore<score;
+            int takeFar=takeNear && farScore<nearScore;
+            prediction=takeNear ? nearPrediction : prediction;
+            score=takeNear ? nearScore : score;
+            prediction=takeFar ? farPrediction : prediction;
+            score=takeFar ? farScore : score;
+        }
+
+    }
+    if (!spatialOnly) {
+        int temporalBefore=sample_code(before,beforeStride,i,y,bitDepth);
+        int temporalAfter=sample_code(after,afterStride,i,y,bitDepth);
+        int center=(temporalBefore+temporalAfter)>>1;
+        int previousDifference=(vp_abs(sample_code(previous,previousStride,i,aboveY,bitDepth)-above[3])+
+            vp_abs(sample_code(previous,previousStride,i,belowY,bitDepth)-below[3]))>>1;
+        int nextDifference=(vp_abs(sample_code(next,nextStride,i,aboveY,bitDepth)-above[3])+
+            vp_abs(sample_code(next,nextStride,i,belowY,bitDepth)-below[3]))>>1;
+        int bound=vp_max(vp_abs(temporalBefore-temporalAfter)>>1,vp_max(previousDifference,nextDifference));
+        if (y!=1 && y+2!=height) {
+            int farAboveY=y+2*(aboveY-y),farBelowY=y+2*(belowY-y);
+            int farAbove=(sample_code(before,beforeStride,i,farAboveY,bitDepth)+
+                sample_code(after,afterStride,i,farAboveY,bitDepth))>>1;
+            int farBelow=(sample_code(before,beforeStride,i,farBelowY,bitDepth)+
+                sample_code(after,afterStride,i,farBelowY,bitDepth))>>1;
+            int upper=vp_max(center-below[3],vp_max(center-above[3],vp_min(farAbove-above[3],farBelow-below[3])));
+            int lower=vp_min(center-below[3],vp_min(center-above[3],vp_max(farAbove-above[3],farBelow-below[3])));
+            bound=vp_max(bound,vp_max(lower,-upper));
+        }
+        prediction=vp_clamp(prediction,center-bound,center+bound);
+    }
+    return prediction;
+}
+static inline __attribute__((always_inline)) int vp_yadif_specialized(
+                       const uint8_t *previous, size_t previousStride,
                        const uint8_t *current, size_t currentStride,
                        const uint8_t *next, size_t nextStride,
                        uint8_t *output, size_t outputStride,
@@ -61,60 +143,69 @@ int VPYADIFProcessPlaneRows(const uint8_t *previous, size_t previousStride,
                    (size_t)width*(size_t)components);
             continue;
         }
+        if ((y & 1) == copiedParity) {
+            for (int i=0;i<width*components;++i)
+                sample_store(output,outputStride,i,y,bitDepth,
+                    sample_code(current,currentStride,i,y,bitDepth));
+            continue;
+        }
         int aboveY = y == 0 ? 1 : y-1;
         int belowY = y+1 == height ? height-2 : y+1;
-        for (int x=0; x<width; ++x) for (int component=0; component<components; ++component) {
-            if ((y & 1) == copiedParity) {
-                store_code(output,outputStride,x,y,component,components,bitDepth,
-                    code(current,currentStride,x,y,component,components,bitDepth));
-                continue;
-            }
-            int above[7], below[7];
-            for (int k=-3; k<=3; ++k) {
-                int sx=vp_clamp(x+k,0,width-1);
-                above[k+3]=code(current,currentStride,sx,aboveY,component,components,bitDepth);
-                below[k+3]=code(current,currentStride,sx,belowY,component,components,bitDepth);
-            }
-            int prediction=(above[3]+below[3])>>1;
-            if (x>=3 && x+3<width) {
-                int score=vp_abs(above[2]-below[2])+vp_abs(above[3]-below[3])+vp_abs(above[4]-below[4])-1;
-                for (int sign=-1; sign<=1; sign+=2) {
-                    for (int distance=1; distance<=2; ++distance) {
-                        int direction=sign*distance;
-                        int candidate=vp_abs(above[2+direction]-below[2-direction])+
-                            vp_abs(above[3+direction]-below[3-direction])+
-                            vp_abs(above[4+direction]-below[4-direction]);
-                        if (candidate >= score) break;
-                        score=candidate;
-                        prediction=(above[3+direction]+below[3-direction])>>1;
-                    }
-                }
-            }
-            if (!spatialOnly) {
-                int temporalBefore=code(before,beforeStride,x,y,component,components,bitDepth);
-                int temporalAfter=code(after,afterStride,x,y,component,components,bitDepth);
-                int center=(temporalBefore+temporalAfter)>>1;
-                int previousDifference=(vp_abs(code(previous,previousStride,x,aboveY,component,components,bitDepth)-above[3])+
-                    vp_abs(code(previous,previousStride,x,belowY,component,components,bitDepth)-below[3]))>>1;
-                int nextDifference=(vp_abs(code(next,nextStride,x,aboveY,component,components,bitDepth)-above[3])+
-                    vp_abs(code(next,nextStride,x,belowY,component,components,bitDepth)-below[3]))>>1;
-                int bound=vp_max(vp_abs(temporalBefore-temporalAfter)>>1,vp_max(previousDifference,nextDifference));
-                if (y!=1 && y+2!=height) {
-                    int farAboveY=y+2*(aboveY-y),farBelowY=y+2*(belowY-y);
-                    int farAbove=(code(before,beforeStride,x,farAboveY,component,components,bitDepth)+
-                        code(after,afterStride,x,farAboveY,component,components,bitDepth))>>1;
-                    int farBelow=(code(before,beforeStride,x,farBelowY,component,components,bitDepth)+
-                        code(after,afterStride,x,farBelowY,component,components,bitDepth))>>1;
-                    int upper=vp_max(center-below[3],vp_max(center-above[3],vp_min(farAbove-above[3],farBelow-below[3])));
-                    int lower=vp_min(center-below[3],vp_min(center-above[3],vp_max(farAbove-above[3],farBelow-below[3])));
-                    bound=vp_max(bound,vp_max(lower,-upper));
-                }
-                prediction=vp_clamp(prediction,center-bound,center+bound);
-            }
-            store_code(output,outputStride,x,y,component,components,bitDepth,prediction);
+        // Only the three-pixel borders need the nondirectional average. The
+        // interior's seven taps are all in range, so no clamp is necessary.
+        int edge=width<6 ? width : 3;
+        for(int i=0;i<edge*components;++i) {
+            int prediction=vp_synthesize(
+                previous,previousStride,current,currentStride,next,nextStride,
+                before,beforeStride,after,afterStride,i,y,aboveY,belowY,height,
+                components,bitDepth,spatialOnly,0);
+            sample_store(output,outputStride,i,y,bitDepth,prediction);
         }
+        for(int i=edge*components;i<(width-3)*components;++i) {
+            int prediction=vp_synthesize(
+                previous,previousStride,current,currentStride,next,nextStride,
+                before,beforeStride,after,afterStride,i,y,aboveY,belowY,height,
+                components,bitDepth,spatialOnly,1);
+            sample_store(output,outputStride,i,y,bitDepth,prediction);
+        }
+        for(int i=(width<6 ? width : width-3)*components;i<width*components;++i) {
+            int prediction=vp_synthesize(
+                previous,previousStride,current,currentStride,next,nextStride,
+                before,beforeStride,after,afterStride,i,y,aboveY,belowY,height,
+                components,bitDepth,spatialOnly,0);
+            sample_store(output,outputStride,i,y,bitDepth,prediction);
+        }
+
     }
     return 0;
+}
+int VPYADIFProcessPlaneRows(const uint8_t *previous, size_t previousStride,
+                       const uint8_t *current, size_t currentStride,
+                       const uint8_t *next, size_t nextStride,
+                       uint8_t *output, size_t outputStride,
+                       int width, int height, int components, int bitDepth,
+                       int outputIndex, int topFieldFirst, int spatialOnly, int firstRow, int rowCount) {
+    if (bitDepth==8 && components==1) {
+        return vp_yadif_specialized(previous,previousStride,current,currentStride,
+            next,nextStride,output,outputStride,width,height,1,8,outputIndex,
+            topFieldFirst,spatialOnly,firstRow,rowCount);
+    }
+    if (bitDepth==8 && components==2) {
+        return vp_yadif_specialized(previous,previousStride,current,currentStride,
+            next,nextStride,output,outputStride,width,height,2,8,outputIndex,
+            topFieldFirst,spatialOnly,firstRow,rowCount);
+    }
+    if (bitDepth==10 && components==1) {
+        return vp_yadif_specialized(previous,previousStride,current,currentStride,
+            next,nextStride,output,outputStride,width,height,1,10,outputIndex,
+            topFieldFirst,spatialOnly,firstRow,rowCount);
+    }
+    if (bitDepth==10 && components==2) {
+        return vp_yadif_specialized(previous,previousStride,current,currentStride,
+            next,nextStride,output,outputStride,width,height,2,10,outputIndex,
+            topFieldFirst,spatialOnly,firstRow,rowCount);
+    }
+    return -1;
 }
 
 int VPYADIFProcessPlane(const uint8_t *previous, size_t previousStride,

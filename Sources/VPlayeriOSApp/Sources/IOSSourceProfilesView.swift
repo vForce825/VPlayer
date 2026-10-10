@@ -39,10 +39,23 @@ struct IOSSourceProfilesView: View {
                         refreshRow(profile, resource: .playlist, title: "频道列表", status: profile.m3uStatus)
                         refreshRow(profile, resource: .epg, title: "节目单（EPG）", status: profile.epgStatus)
                         HStack {
-                            Button("编辑") { editedProfile = profile }
+                            Button { editedProfile = profile } label: {
+                                Text("编辑")
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
                             Spacer()
-                            Button("删除", role: .destructive) { pendingDeletion = profile }
+                            Button(role: .destructive) { pendingDeletion = profile } label: {
+                                Text("删除")
+                                    .frame(minWidth: 44, minHeight: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityIdentifier("source.delete.\(profile.id.uuidString)")
                         }
+                        // Automatic buttons in a List share the row's tap action.
+                        // Keep these two controls independent, including their hit regions.
+                        .buttonStyle(.borderless)
                     }
                 }
             }

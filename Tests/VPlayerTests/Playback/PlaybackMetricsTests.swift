@@ -716,6 +716,45 @@ final class PlaybackMetricsTests: XCTestCase {
         XCTAssertEqual(recorder.count, 2)
     }
 
+    func testInactiveSignpostsDoNotCreateIntervalsOrAsyncLifetimes() {
+        let signposts = PlaybackSignposts(
+            channelIdentifier: PlaybackDiagnosticsChannelID(rawValue: "inactive-signposts"),
+            signposter: .disabled
+        )
+        let spans: [PlaybackSignpostSpan] = [
+            .videoToolboxDecode, .scanProbe, .yadifCommandBuffer, .renderDraw,
+            .modeSwitch, .reanchor, .hlsSegmentWrite, .hlsPlaylistPublish,
+            .hlsWatchdogCheck, .hlsRecoveryTransaction
+        ]
+
+        for span in spans {
+            XCTAssertNil(signposts.begin(span, correlation: 42))
+            XCTAssertNil(signposts.beginLifetime(span, correlation: 42))
+        }
+    }
+
+    func testSignpostFactoryOnlyEnablesDiagnosticBuilds() {
+        let signposts = PlaybackSignposts.makeForCurrentBuild(
+            channelIdentifier: PlaybackDiagnosticsChannelID(rawValue: "build-signposts")
+        )
+        #if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        XCTAssertNotNil(signposts)
+        #else
+        XCTAssertNil(signposts)
+        #endif
+    }
+
+    func testSignpostLifetimeFinishesExactlyOnceAcrossConcurrentCallbacks() {
+        let recorder = SignpostFinishRecorder()
+        let lifetime = PlaybackSignpostLifetime { recorder.record() }
+
+        DispatchQueue.concurrentPerform(iterations: 64) { _ in
+            lifetime.finish()
+        }
+
+        XCTAssertEqual(recorder.count, 1)
+    }
+
     func testSignpostCorrelationIsHashedAndBounded() {
         let identifier = PlaybackDiagnosticsChannelID(rawValue: "channel")
         let correlation = PlaybackDiagnosticsCorrelationID(

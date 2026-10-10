@@ -6,6 +6,9 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import XCTest
+#if os(iOS)
+import UIKit
+#endif
 @testable import VPlayerPlayback
 
 @MainActor
@@ -801,12 +804,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] {
             let message = NativeSmokeFailureReport.message(phase: "full-eof-completion", managed: managed,
                 reason: "deadline", context: "replacement-recovery " + oversized,
-                detail: "original-output=1 " + oversized, trace: oversized + "latest-inspection")
+                detail: "original-output=1 " + oversized, trace: oversized + "latest-inspection",
+                runtime: "appState=active " + oversized)
             let reported = String(("failed - " + message).prefix(4_096))
             XCTAssertEqual(reported, "failed - " + message, "CI must retain the entire bounded failure record")
             XCTAssertTrue(reported.contains("phase=full-eof-completion route=\(managed ? "managed" : "native")"))
             XCTAssertTrue(reported.contains("context={replacement-recovery"))
             XCTAssertTrue(reported.contains("detail={original-output=1"))
+            XCTAssertTrue(reported.contains("runtime={appState=active"))
             XCTAssertTrue(reported.hasSuffix("latest-inspection}"))
         }
     }
@@ -1302,7 +1307,8 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                     "output=\(value.activation?.outputLifecycleEpoch.outputNonce ?? 0) activation=\(value.activation?.activationNonce ?? 0)"
             } else { context = "none" }
             XCTFail(NativeSmokeFailureReport.message(phase: String(describing: phase), managed: managed,
-                reason: reason, context: context, detail: detail(), trace: factory.trace.summary), file: file, line: line)
+                reason: reason, context: context, detail: detail(), trace: factory.trace.summary,
+                runtime: nativeSmokeRuntimeSummary()), file: file, line: line)
         }
         while !predicate(), ContinuousClock.now < deadline {
             if case let .failed(failure) = registry.playbackStateSnapshot() {
@@ -1367,10 +1373,21 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
 }
 
 private enum NativeSmokeFailureReport {
-    static func message(phase: String, managed: Bool, reason: String, context: String, detail: String, trace: String) -> String {
+    static func message(phase: String, managed: Bool, reason: String, context: String, detail: String, trace: String, runtime: String = "not-observed") -> String {
         "NATIVE_HLS_SMOKE_FAILURE phase=\(phase.prefix(48)) route=\(managed ? "managed" : "native") reason=\(reason.prefix(128)) " +
-            "context={\(context.prefix(512))} detail={\(detail.prefix(1_024))} trace={\(trace.suffix(1_536))}"
+            "context={\(context.prefix(512))} detail={\(detail.prefix(1_024))} runtime={\(runtime.prefix(128))} trace={\(trace.suffix(1_536))}"
     }
+}
+
+@MainActor private func nativeSmokeRuntimeSummary() -> String {
+    // Read only after the original failure. No activation, UI mutation, route names or UIDs.
+    #if os(iOS)
+    let ui = "appState=\(UIApplication.shared.applicationState.rawValue) protected=\(UIApplication.shared.isProtectedDataAvailable) idleDisabled=\(UIApplication.shared.isIdleTimerDisabled)"
+    #else
+    let ui = "appState=not-ios"
+    #endif
+    let session = AVAudioSession.sharedInstance()
+    return "\(ui) outputs=\(session.currentRoute.outputs.count) channels=\(session.outputNumberOfChannels) rate=\(session.sampleRate)"
 }
 
 private enum NativeEndpointControl: String, CaseIterable {

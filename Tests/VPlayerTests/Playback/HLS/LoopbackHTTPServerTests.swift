@@ -4,6 +4,7 @@
 
 import AVFoundation
 import CryptoKit
+import CoreMedia
 import Darwin
 import Foundation
 import Network
@@ -167,6 +168,35 @@ final class LoopbackHTTPServerTests: XCTestCase {
             }
         }
     }
+
+#if DEBUG
+    func testCompressedShutdownWaitsForTheOriginalLastNativeInputAlias() async throws {
+        let held = Task21HeldCompressedInputAlias()
+        let track = try await Task21CompressedLifecycleTrack(codec: .ac3,
+            outputLifecycleEpoch: AudioServiceLeaseTestHarness.makeLifecycle(outputNonce: 73_121),
+            nativeInputObserver: held.retainFirst)
+        defer { held.release() }
+        XCTAssertTrue(held.isHoldingAlias, "The real native append must submit the held backing")
+        let retirement = Task {
+            held.recordShutdownStart()
+            await track.shutdown()
+            held.recordShutdownReturn()
+        }
+        defer { held.release(); retirement.cancel() }
+        let startDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !held.shutdownStarted, ContinuousClock.now < startDeadline { await Task.yield() }
+        XCTAssertTrue(held.shutdownStarted)
+        let tailDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while !held.shutdownReturned, ContinuousClock.now < tailDeadline { await Task.yield() }
+        XCTAssertFalse(held.shutdownReturned,
+                       "Joined cancellation must not masquerade as the last native backing release")
+        XCTAssertTrue(held.isHoldingAlias)
+        held.release()
+        await retirement.value
+        XCTAssertTrue(held.shutdownReturned)
+    }
+
+#endif
 
     func testCompressedFinalProjectionUsesCommittedCommonTailWithoutAACAuthority() async throws {
         for codec in [HLSAudioCodec.ac3, .eac3] {
@@ -5667,13 +5697,15 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
     private let accessUnitSource: AccessUnitSource
     private let collector = Task21CompressedLifecycleCollector()
     private let boundary: SegmentBoundaryCoordinator
-    private let writer: SegmentedFMP4Writer
+    private var writer: SegmentedFMP4Writer?
+    private let inputOwnership = HLSWriterAcceptanceProbe()
     private let timeline: SegmentTimelineValidator
     private var media: [SealedMediaObject]
     private var nextSequence: UInt64 = 0
 
     init(codec: HLSAudioCodec,
-         outputLifecycleEpoch: OutputLifecycleEpoch) async throws {
+         outputLifecycleEpoch: OutputLifecycleEpoch,
+         nativeInputObserver: (@Sendable (CMBlockBuffer) -> Void)? = nil) async throws {
         self.codec = codec
         let binding = FMP4WriterBinding(
             outputLifecycleEpoch: outputLifecycleEpoch,
@@ -5730,7 +5762,13 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
             boundarySession: boundary.session,
             compressedFormatConfiguration: first.formatConfiguration,
             relay: relay,
-            systemFactory: AVAssetSegmentedFMP4SystemWriterFactory())
+            systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(),
+            acceptanceProbe: inputOwnership)
+#if DEBUG
+        if let nativeInputObserver {
+            try createdWriter.observeNativeInputAliasesForTesting(nativeInputObserver)
+        }
+#endif
         let resolvedInitialization: SealedMediaObject
         let resolvedMedia: [SealedMediaObject]
         let resolvedProof: EpochFormatProof
@@ -5817,12 +5855,22 @@ private final class Task21CompressedLifecycleTrack: @unchecked Sendable {
     }
 
     func shutdown() async {
-        _ = await writer.cancelAwaitingCompletion()
-        XCTAssertEqual(writer.usage.retainedTerminalOwnershipCount, 0,
+        await cancelAndReleaseWriter()
+        // Cancellation joins submitted transactions, not the final native block
+        // aliases. Release this fixture's real writer owner, then observe only
+        // the original FreeBlock-backed accounting. The existing XCTest budget
+        // supervises this physical tail; no credit or timeout is manufactured.
+        while inputOwnership.snapshot.liveInputCount != 0 { await Task.yield() }
+        XCTAssertEqual(inputOwnership.snapshot.liveInputCount, 0,
                        "native cancellation terminal must release every submitted AU owner")
     }
 
-    deinit { _ = writer.cancel() }
+    private func cancelAndReleaseWriter() async {
+        defer { writer = nil }
+        _ = await writer?.cancelAwaitingCompletion()
+    }
+
+    deinit { _ = writer?.cancel() }
 
     func next() throws -> Task19Packet {
         guard !media.isEmpty else {
@@ -7098,4 +7146,33 @@ private func waitUntil(timeout: TimeInterval = 2,
         RunLoop.current.run(until: Date().addingTimeInterval(0.005))
     } while Date() < deadline
     return condition()
+}
+
+/// One real submitted CMBlockBuffer alias, released only at the test's controlled boundary.
+/// It owns neither a writer nor a sample/submission container and returns no synthetic credit.
+private final class Task21HeldCompressedInputAlias: @unchecked Sendable {
+    private let lock = NSLock()
+    private var backing: CMBlockBuffer?
+    private var captured = false
+    private var started = false
+    private var returned = false
+    var isHoldingAlias: Bool { lock.withLock { backing != nil } }
+    var shutdownStarted: Bool { lock.withLock { started } }
+    var shutdownReturned: Bool { lock.withLock { returned } }
+    func retainFirst(_ block: CMBlockBuffer) {
+        lock.withLock {
+            guard !captured else { return }
+            captured = true
+            backing = block
+        }
+    }
+    func recordShutdownStart() { lock.withLock { started = true } }
+    func recordShutdownReturn() { lock.withLock { returned = true } }
+    func release() {
+        let old = lock.withLock { () -> CMBlockBuffer? in
+            defer { backing = nil }
+            return backing
+        }
+        withExtendedLifetime(old) {}
+    }
 }

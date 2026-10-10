@@ -527,17 +527,36 @@ final class YADIFGoldenPixelTests: XCTestCase {
                 var actual = Data()
                 for center in 1...3 {
                     let outputs = try pool.allocatePair(matching: inputs[center])
+                    var timingCallbacks = 0
                     try CPUVideoProcessing.yadif(job: YADIFJob(
                         previous: normalized(inputs[center - 1], id: UInt64(center)),
                         current: normalized(inputs[center], id: UInt64(center + 1)),
                         next: normalized(inputs[center + 1], id: UInt64(center + 2)),
-                        order: resolved(order), spatialOnly: false), outputs: outputs)
+                        order: resolved(order), spatialOnly: false), outputs: outputs) { _ in
+                            timingCallbacks += 1
+                        }
+                    #if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+                    XCTAssertEqual(timingCallbacks, 1, "Diagnostic builds observe each CPU pair")
+                    #else
+                    XCTAssertEqual(timingCallbacks, 0, "Shipping Release must compile out CPU timing callbacks")
+                    #endif
                     actual.append(try packedBytes(outputs.first))
                     actual.append(try packedBytes(outputs.second))
                 }
                 XCTAssertEqual(actual, expected, "\(name) \(stem) CPU adapter")
             }
         }
+    }
+
+    func testPlaybackDiagnosticPolicyExcludesSignpostsFromShippingRelease() {
+        let signposts = PlaybackSignposts.makeForCurrentBuild(
+            channelIdentifier: PlaybackDiagnosticsChannelID(rawValue: "release-diagnostic-policy")
+        )
+        #if DEBUG || VPLAYER_PERFORMANCE_DIAGNOSTICS
+        XCTAssertNotNil(signposts)
+        #else
+        XCTAssertNil(signposts)
+        #endif
     }
     #endif
 

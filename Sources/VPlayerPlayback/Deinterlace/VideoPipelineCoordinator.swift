@@ -1222,10 +1222,9 @@ final class VideoPipelineCoordinator: @unchecked Sendable {
             nextProbeSubmissionID &+= 1
             let submissionID = nextProbeSubmissionID
             activeProbeSubmissionID = submissionID
-            let token = signposts?.begin(.scanProbe, correlation: frame.accessUnitID)
-            activeProbeSignpostLifetime = PlaybackSignpostLifetime(
-                signposts: signposts,
-                token: token
+            activeProbeSignpostLifetime = signposts?.beginLifetime(
+                .scanProbe,
+                correlation: frame.accessUnitID
             )
             let accepted = probe.submit(
                 current: frame.pixelBuffer,

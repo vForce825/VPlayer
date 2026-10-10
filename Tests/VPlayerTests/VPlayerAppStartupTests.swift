@@ -522,8 +522,12 @@ final class VPlayerAppStartupTests: XCTestCase {
     func testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds() {
         #if DEBUG
         let expectedSeededMode: AppLaunchMode = .seededFixture
+        let expectedReset = true
+        let expectedPlaybackFixture: String? = "failed-diagnostic"
         #else
         let expectedSeededMode: AppLaunchMode = .live
+        let expectedReset = false
+        let expectedPlaybackFixture: String? = nil
         #endif
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: ["VPlayer", "-ui-fixture", "seeded"]).mode,
@@ -547,20 +551,32 @@ final class VPlayerAppStartupTests: XCTestCase {
             ]).mode,
             .live
         )
-        XCTAssertTrue(
+        XCTAssertEqual(
             AppLaunchConfiguration(arguments: ["VPlayer", "-uiTestResetPlaybackSettings"])
-                .resetsPlaybackSettings
+                .resetsPlaybackSettings,
+            expectedReset
         )
         XCTAssertEqual(
             AppLaunchConfiguration(arguments: [
                 "VPlayer", "-ui-fixture", "seeded",
                 "-ui-playback-fixture", "failed-diagnostic",
             ]).playbackFixture,
-            "failed-diagnostic"
+            expectedPlaybackFixture
         )
         XCTAssertNil(AppLaunchConfiguration(arguments: [
             "VPlayer", "-ui-playback-fixture",
         ]).playbackFixture)
+        XCTAssertNil(AppLaunchConfiguration(arguments: [
+            "VPlayer", "-ui-playback-fixture", "failed-diagnostic",
+            "-ui-playback-fixture", "another-fixture",
+        ]).playbackFixture)
+        let combined = AppLaunchConfiguration(arguments: [
+            "VPlayer", "-ui-fixture", "seeded", "-acceptance-playback",
+            "-uiTestResetPlaybackSettings", "-ui-playback-fixture", "failed-diagnostic",
+        ])
+        XCTAssertEqual(combined.mode, .live)
+        XCTAssertEqual(combined.resetsPlaybackSettings, expectedReset)
+        XCTAssertEqual(combined.playbackFixture, expectedPlaybackFixture)
     }
 
     private static let onePixelPNG = Data(base64Encoded:

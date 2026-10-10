@@ -226,14 +226,21 @@ final class SourceAACPublicationFixture: @unchecked Sendable {
     }
 
     static func make(finishSource: Bool = true, loopbackSession: LoopbackSessionToken? = nil,
-                     binding suppliedBinding: FMP4WriterBinding? = nil) async throws -> SourceAACPublicationFixture {
+                     binding suppliedBinding: FMP4WriterBinding? = nil, diagnostics: SourceAACFixtureDiagnostics? = nil) async throws -> SourceAACPublicationFixture {
+        let observer: any AACCalibrationObserver
+        if let diagnostics { observer = diagnostics }
+        else { observer = AACDefaultCalibrationObserver() }
+        diagnostics?.record("calibration-begin")
         let request = try AACRenditionRequest(layout: .init(labels: [.l, .r]),
             capabilityVersion: "source-aac-publication-native-v1")
-        let calibration = try await AACPrimingCalibrator().calibrate(plan: .build([request]))
+        let calibration = try await AACPrimingCalibrator(observer: observer).calibrate(plan: .build([request]))
+        diagnostics?.record("calibration-return")
         let encoder = try XCTUnwrap(calibration.encoders.first)
+        diagnostics?.record("input-encode-begin")
         let encoded = try encoder.encodeEpoch((0..<(8_192 * 2)).map {
             sin(Float($0) * 0.025) * 0.2
         })
+        diagnostics?.record("input-encode-return")
         let buffer = try XCTUnwrap(encoded.buffers.first(where: {
             CMSampleBufferGetNumSamples($0) == 1
         }))
@@ -243,6 +250,7 @@ final class SourceAACPublicationFixture: @unchecked Sendable {
         XCTAssertEqual(payload.withUnsafeMutableBytes {
             CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: length, destination: $0.baseAddress!)
         }, noErr)
+        diagnostics?.record("input-copy-complete")
         let copies = HLSAudioCopyOwnership(maximumCompressedBytes: 1_048_576,
             maximumPCMBytes: 1_024, capacity: 512)
         let timeline = HLSTimelineCoordinator(hlsAudioCopyOwnership: copies)
@@ -276,16 +284,21 @@ final class SourceAACPublicationFixture: @unchecked Sendable {
             systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(), sourceAACConfiguration: configuration)
         try writer.start(at: first.timing.presentationTimeStamp.cmTime)
         do {
+            diagnostics?.record("source-append-begin")
             try await writer.appendSourceAACAwaitingReadiness(.init(timed: first,
                 configuration: configuration, binding: binding), boundary: boundary)
             for index in 1..<290 {
+                if index == 145 { diagnostics?.record("source-append-145-complete") }
                 try await writer.appendSourceAACAwaitingReadiness(.init(timed: unit(index),
                     configuration: configuration, binding: binding), boundary: boundary)
             }
+            diagnostics?.record("source-append-290-complete")
+            diagnostics?.record("source-finish-begin")
             if finishSource {
                 _ = try timeline.consume(.endOfStream)
                 _ = try await writer.finishSourceAAC()
             } else { _ = try await writer.finish() }
+            diagnostics?.record("source-finish-return")
             let objects = sink.takeAll()
             let initialization = try XCTUnwrap(objects.first(where: { $0.kind == .initialization }))
             let proof = try FinalFMP4Validator(binding: binding, mediaType: .audio).validateInitialization(initialization)
@@ -311,10 +324,14 @@ final class SourceAACPublicationFixture: @unchecked Sendable {
             if finishSource {
                 _ = try publisher.publish(ticket: publisher.ticket, now: 1_000_000_000, naturalEnd: true)
             }
+            diagnostics?.record("source-publication-complete")
             return try .init(timeline: timeline, writer: writer, store: store, publisher: publisher,
                 declaration: declaration, packets: packets, initialization: initialization,
                 proof: proof, relay: relay, session: session)
-        } catch { _ = await writer.cancelAwaitingCompletion(); timeline.retireCompressedGeneration(); throw error }
+        } catch {
+            diagnostics?.record("source-error-before-cleanup", error: error)
+            _ = await writer.cancelAwaitingCompletion(); timeline.retireCompressedGeneration(); throw error
+        }
     }
 
     func close() {
@@ -330,5 +347,93 @@ private final class SourceAACPublicationCollector: @unchecked Sendable {
     func collect(_ object: SealedMediaObject) { lock.withLock { objects.append(object) } }
     func takeAll() -> [SealedMediaObject] {
         lock.withLock { let values = objects; objects.removeAll(); return values }
+    }
+}
+
+/// Test-only scalar observations. No native object, URL, error text or authority escapes.
+final class SourceAACFixtureDiagnostics: AACCalibrationObserver, @unchecked Sendable {
+    private let started = ContinuousClock.now
+    private let attempt: Int
+    private let lock = NSLock()
+    private struct Event: Equatable {
+        let stage: String
+        let index: Int
+        let elapsed: Int64
+        let category: String
+        let code: Int
+    }
+    private var records: [Event] = []
+    private var firstError: Event?
+    private var lastError: Event?
+    private var truncated = false
+    private var errorFlushes = 0
+    private var terminalFlushes = 0
+    private var initializationWriters = Set<ObjectIdentifier>()
+    init(attempt: Int) { self.attempt = attempt }
+    func record(_ stage: String, index: Int = 0, error: (any Error)? = nil) {
+        let duration = started.duration(to: .now).components
+        let elapsed = max(0, min(3_600_000, duration.seconds * 1_000 + duration.attoseconds / 1_000_000_000_000_000))
+        var category = "none"
+        var code = 0
+        if let error {
+            let native = error as NSError
+            code = max(-2_147_483_648, min(2_147_483_647, native.code))
+            if error is CancellationError { category = "cancelled" }
+            else if let failure = error as? AACRenditionFailure {
+                switch failure {
+                case .framework(let status), .frameworkProperty(let status, _): category = "aac-framework"; code = Int(status)
+                default: category = "other"
+                }
+            } else if native.domain == AVFoundationErrorDomain { category = "avfoundation" }
+            else if native.domain == NSOSStatusErrorDomain { category = "osstatus" }
+            else { category = "other" }
+        }
+        let event = Event(stage: stage, index: index, elapsed: elapsed, category: category, code: code)
+        let snapshot = lock.withLock { () -> ([Event], Bool)? in
+            if records.count == 64 { records.removeFirst(); truncated = true }
+            records.append(event)
+            if error != nil {
+                if firstError == nil { firstError = event }
+                lastError = event
+            }
+            // Keep observations off SDK callback stdout. Flush on error before
+            // the caller's cleanup, or after real retirement, with fixed limits.
+            if error != nil, errorFlushes < 4 { errorFlushes += 1 }
+            else if stage == "retire-return", terminalFlushes < 2 { terminalFlushes += 1 }
+            else { return nil }
+            var values = records
+            if let firstError, !values.contains(firstError) { values.insert(firstError, at: 0) }
+            if let lastError, !values.contains(lastError) { values.append(lastError) }
+            return (values, truncated)
+        }
+        if let (values, truncated) = snapshot {
+            for value in values {
+                print("SOURCE_AAC_FIXTURE_STAGE attempt=\(attempt) stage=\(value.stage) index=\(value.index) elapsed-ms=\(value.elapsed) category=\(value.category) code=\(value.code)")
+            }
+            if truncated {
+                print("SOURCE_AAC_FIXTURE_STAGE attempt=\(attempt) stage=diagnostic-truncated index=0 elapsed-ms=\(elapsed) category=none code=0")
+            }
+        }
+    }
+    func cookie(_ value: Data, at stage: AACCookieStage) -> Data {
+        if case .finalizedPass(let pass) = stage { record("calibration-pass-\(pass)-encoded") }
+        return value
+    }
+    func completedPass(_ pass: Int, lane: AACOwnedCallLane) { record("calibration-pass-\(pass)-complete") }
+    func loopbackPhase(_ phase: AACLoopbackPhase, lane: AACOwnedCallLane) {
+        switch phase {
+        case .loadedTracks: record("calibration-tracks-loaded")
+        case .createReader: record("calibration-reader-create")
+        }
+    }
+    func willDispose() { record("calibration-dispose") }
+    func writerSegment(initialization: Bool, writerIdentity: ObjectIdentifier) {
+        guard initialization else { return }
+        let ordinal = lock.withLock { () -> Int? in
+            guard initializationWriters.count < 2,
+                  initializationWriters.insert(writerIdentity).inserted else { return nil }
+            return initializationWriters.count
+        }
+        if let ordinal { record("calibration-native-init", index: ordinal) }
     }
 }

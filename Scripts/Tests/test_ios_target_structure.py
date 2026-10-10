@@ -104,7 +104,8 @@ class IOSTargetStructureTests(unittest.TestCase):
         self.assertIn('TEST_HOST: ""',benchmark)
         workflow=(ROOT/'.github/workflows/ios-ci.yml').read_text()
         self.assertIn('-scheme VPlayeriOSBenchmarks',workflow)
-        self.assertIn('-enableCodeCoverage NO',workflow)
+        self.assertNotIn('-enableCodeCoverage',workflow)
+        self.assertIn('verify-release-artifacts.py verify --sdk iphonesimulator',workflow)
     def test_tv_target_identity_remains_unchanged(self):
         app=self.target('VPlayer')
         self.assertIn('platform: tvOS',app)

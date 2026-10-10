@@ -387,7 +387,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
     convenience init(
         executor: PlaybackSerialExecutor,
         tuning: PlaybackTuning,
-        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts),
+        diagnostics: (metrics: PlaybackMetrics, signposts: PlaybackSignposts?),
         submissionPolicy: VideoDecodeSubmissionPolicy = .realtimeDropping,
         surfaceAdmission: (any DecodedVideoSurfaceAdmitting)? = nil,
         eventSink: @escaping @Sendable (VideoDecoderEvent) -> Void
@@ -857,10 +857,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         // Temporal processing only ever meant the decoder's own deinterlace,
         // which this pipeline does on the GPU instead.
         decodeFlags.remove(._EnableTemporalProcessing)
-        let signpostLifetime = PlaybackSignpostLifetime(
-            signposts: signposts,
-            token: signposts?.begin(.videoToolboxDecode, correlation: accessUnit.id)
-        )
+        let signpostLifetime = signposts?.beginLifetime(.videoToolboxDecode, correlation: accessUnit.id)
         let metrics = metrics
         let submissionStartedAt = ProcessInfo.processInfo.systemUptime
         let status = api.decode(
@@ -883,7 +880,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
                 )
             )
             metrics?.recordDecoderCallback()
-            signpostLifetime.finish()
+            signpostLifetime?.finish()
             // VideoToolbox 的 imageBuffer 属于 callback。先在 callback lane
             // 收费，才允许把它 capture 到 owner executor。
             let surfaceTail: DecodedVideoFrameRetentionTail?
@@ -915,7 +912,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         guard status == noErr else {
             submissionLease.releaseOnce()
             completionRegistry.remove(completion, sessionID: sessionID)
-            signpostLifetime.finish()
+            signpostLifetime?.finish()
             let classified = Self.classify(status)
             if !classified.isRecoverable {
                 Self.logger.error(

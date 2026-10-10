@@ -79,7 +79,71 @@ class IOSStartupRunnerTests(unittest.TestCase):
         source=(ROOT/'Scripts/Support/ios-startup-runner.py').read_text()
         self.assertIn("modes.add_argument('--build-only',action='store_true')",source)
         self.assertIn("'generic/platform=iOS Simulator'",source)
-        self.assertLess(source.index('if args.build_only:'),source.index("if device['state']!='Booted':"))
+        self.assertLess(source.index('if args.build_only or args.build_shipping:'),source.index("if device['state']!='Booted':"))
+    def test_shipping_simulator_build_uses_existing_bounded_owned_process_supervision(self):
+        module=self.module()
+        device='00000000-0000-0000-0000-000000000001'
+        inventory={'devices':{'com.apple.CoreSimulator.SimRuntime.iOS-27-0':[
+            {'udid':device,'isAvailable':True,'name':'iPhone 17','state':'Shutdown'}]}}
+        calls=[]
+        def build(label,command,timeout,directory,diagnostics,capture_log=None):
+            self.assertIsNotNone(capture_log)
+            calls.append((label,command,timeout))
+            return 7,b'build failed'
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'argv',[
+                'runner','--build-shipping','--simulator',device,'--derived-data',directory,
+                '--build-log',directory+'/verified.log']),patch.object(module.subprocess,'check_output',
+                return_value=json.dumps(inventory)),patch.object(module,'run_command',side_effect=build),contextlib.redirect_stdout(io.StringIO()):
+            try: code=module.main()
+            except SystemExit as error: code=error.code
+            self.assertEqual(code,7)
+        self.assertEqual(len(calls),1)
+        label,command,timeout=calls[0]
+        self.assertEqual(label,'build')
+        self.assertEqual(command[:2],['xcodebuild','build'])
+        self.assertEqual(command[command.index('-scheme')+1],'VPlayeriOSRelease')
+        self.assertEqual(command[command.index('-destination')+1],'generic/platform=iOS Simulator')
+        self.assertEqual(timeout,480)
+        self.assertFalse(any('COVERAGE' in argument or argument=='-enableCodeCoverage' for argument in command))
+
+    def test_build_capture_preserves_full_stream_without_unbounded_supervisor_copy(self):
+        module=self.module()
+        complete=b'CompileC original first command\n'+b'x'*65536+b'\nlast command\n'
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory); log=directory/'verified.log'
+            command=[sys.executable,'-c',"import os; os.write(1,"+repr(complete)+")"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code,_=module.run_command('build',command,5,directory,lambda deadline:None,capture_log=log)
+            self.assertEqual(code,0)
+            self.assertEqual(log.read_bytes(),complete)
+            self.assertTrue(Path(str(log)+'.capture.json').exists())
+            self.assertNotIn(b'original first command',(directory/'build.supervisor.log').read_bytes())
+
+    def test_build_capture_preserves_native_failure_and_timeout_cleanup(self):
+        module=self.module()
+        for exit_code in [0,7]:
+            with self.subTest(exit_code=exit_code),tempfile.TemporaryDirectory() as directory:
+                directory=Path(directory); log=directory/'verified.log'
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code,_=module.run_command('build',[sys.executable,'-c',
+                        f"print('native compiler output'); raise SystemExit({exit_code})"],
+                        5,directory,lambda deadline:None,capture_log=log)
+                self.assertEqual(code,exit_code)
+                self.assertIn(b'native compiler output',log.read_bytes())
+        with tempfile.TemporaryDirectory() as directory:
+            directory=Path(directory); log=directory/'verified.log'; pidfile=directory/'native.pid'
+            command=[sys.executable,'-c',
+                f"import os,time; open({str(pidfile)!r},'w').write(str(os.getpid())); print('in-flight compiler',flush=True); time.sleep(60)"]
+            with contextlib.redirect_stdout(io.StringIO()):
+                code,data=module.run_command('build',command,1,directory,lambda deadline:None,capture_log=log)
+            self.assertEqual(code,124)
+            self.assertIn(b'in-flight compiler',data)
+            pid=int(pidfile.read_text())
+            proc=Path('/proc')/str(pid)/'stat'
+            if proc.exists():self.assertEqual(proc.read_text().split()[2],'Z')
+            else:
+                with self.assertRaises(ProcessLookupError):os.kill(pid,0)
+
     def test_compiler_sampling_matches_exact_derived_data_not_process_name(self):
         module=self.module()
         rows="10 1 10 0.1 01:00 10 /usr/bin/xcodebuild\n11 2 2 99 01:00 100 /x/swift-frontend -o /tmp/build/obj.o\n12 2 2 99 01:00 100 /x/swift-frontend -o /tmp/build-other/obj.o"
@@ -179,6 +243,27 @@ class IOSStartupRunnerTests(unittest.TestCase):
         self.assertIn('IOS_STARTUP_CLEANUP_UNVERIFIED=TimeoutExpired',out.getvalue())
         self.assertIn('IOS_STARTUP_PHASE_END=bootstatus exit=124 timed_out=True',out.getvalue())
         self.assertNotIn('subprocess.TimeoutExpired:',out.getvalue())
+
+    def test_wrapped_build_samples_direct_native_child_before_swift_with_existing_deadline(self):
+        module=self.module();commands=[]
+        rows=('123 1 123 0.1 00:01 100 /usr/bin/python3\n'
+              '124 123 123 0.1 00:01 100 /Xcode/usr/bin/xcodebuild\n'
+              '125 999 123 0.1 00:01 100 /Other/xcodebuild\n'
+              '126 123 999 0.1 00:01 100 /Unowned/xcodebuild\n'
+              '127 124 123 50.0 00:01 100 /Xcode/swift-frontend -o /tmp/build/a.o\n')
+        def invoke(command,**kwargs):
+            commands.append((command,kwargs.get('timeout')))
+            return SimpleNamespace(stdout=rows if command[0]=='/bin/ps' else '',stderr='',returncode=0)
+        process=SimpleNamespace(pid=123,args=[sys.executable,str(
+            ROOT/'Scripts/Support/capture-release-build.py'),'--log','/tmp/build.log'])
+        with tempfile.TemporaryDirectory() as directory,patch.object(module.sys,'platform','darwin'),patch.object(
+                module,'observe_owned_identity',return_value=True),patch.object(module.subprocess,'run',side_effect=invoke),contextlib.redirect_stdout(io.StringIO()):
+            module.sample_owned_processes(process,Path(directory),
+                ['xcodebuild','build','-derivedDataPath','/tmp/build'],deadline=time.monotonic()+25)
+        self.assertEqual(commands[0][0][:3],['/bin/ps','-g','123'])
+        samples=[command for command,_ in commands if command[0]=='sample']
+        self.assertEqual([command[1] for command in samples],['124','127'])
+        self.assertTrue(all(timeout<=8 for command,timeout in commands if command[0]=='sample'))
 
     def test_bootstatus_observes_exact_owned_pid_before_sample_without_inventory(self):
         module=self.module();commands=[]
