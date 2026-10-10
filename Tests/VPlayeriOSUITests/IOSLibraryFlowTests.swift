@@ -139,6 +139,21 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertTrue(found, found ? "" : failureDetails(in: app, stage: stage),
             file: file, line: line)
     }
+    private func requireTransientControl(_ element: XCUIElement, in app: XCUIApplication,
+                                         stage: String, timeout: TimeInterval,
+                                         file: StaticString = #filePath, line: UInt = #line) {
+        // Observe the same predicate before XCTest's delayed first polling tick.
+        // Both observations share the original budget; the real idle timer stays active.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        if element.exists && element.isHittable && ContinuousClock.now <= deadline { return }
+        let remaining = ContinuousClock.now.duration(to: deadline).components
+        let seconds = Double(remaining.seconds) + Double(remaining.attoseconds) / 1e18
+        guard seconds > 0 else {
+            XCTFail("IOS_UI_STAGE=\(stage) original readiness budget exhausted", file: file, line: line)
+            return
+        }
+        require(element, in: app, stage: stage, timeout: seconds, hittable: true, file: file, line: line)
+    }
     private func launch(playbackFixture: String? = nil) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
@@ -148,14 +163,23 @@ final class IOSLibraryFlowTests: XCTestCase {
         app.launch()
         return app
     }
+    private func pauseBeforeControlInspection(in app: XCUIApplication, stage: String) {
+        let pause = app.buttons["player-play-pause"]
+        // Use the existing five-second presentation budget for the transport
+        // itself, before spending AX queries on its siblings. The real touch
+        // supplies reachability; the existing three-second hittability check
+        // runs afterward, once paused controls cannot auto-hide.
+        if !pause.exists {
+            require(pause, in: app, stage: stage + "-transport-presented", timeout: 5)
+        }
+        if pause.label == "暂停" {
+            pause.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
+    }
     private func assertPlayerControls(in app: XCUIApplication, stage: String,
                                       file: StaticString = #filePath, line: UInt = #line) {
-        // Detailed accessibility queries can exceed the real idle timeout.
-        // Pause through the actual button before inspecting its sibling controls.
         let pause = app.buttons["player-play-pause"]
-        if !pause.exists { tapPlayerBackground(in: app) }
-        require(pause, in: app, stage: stage + "-pause-for-inspection", timeout: 3, hittable: true)
-        if pause.label == "暂停" { pause.tap() }
+        require(pause, in: app, stage: stage + "-paused-controls", timeout: 3, hittable: true)
         XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3), file: file, line: line)
         let screens = identified("player-full-screen", in: app.descendants(matching: .any))
         XCTAssertEqual(screens.count, 1, failureDetails(in: app, stage: stage + "-screen-identity"),
@@ -189,7 +213,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(channel, in: app, stage: "initial-channel", timeout: 15)
         for cycle in 1...3 {
             channel.tap()
-            require(app.buttons["player-back"], in: app, stage: "touch-cycle-\(cycle)-player-back", timeout: 5)
+            pauseBeforeControlInspection(in: app, stage: "touch-cycle-\(cycle)")
             assertPlayerControls(in: app, stage: "touch-cycle-\(cycle)")
             app.buttons["player-back"].tap()
             require(channel, in: app, stage: "touch-cycle-\(cycle)-channel-after-close", timeout: 5, hittable: true)
@@ -342,12 +366,12 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [background], timeout: 5), .completed,
             "VPlayer must actually enter background, state=\(app.state.rawValue)")
         app.activate()
-        require(back, in: app, stage: "foreground-controls-revealed", timeout: 2, hittable: true)
+        requireTransientControl(back, in: app, stage: "foreground-controls-revealed", timeout: 2)
         XCTAssertEqual(playerSessionIdentity(in: app), identity)
         XCTAssertTrue(back.waitForNonExistence(timeout: 6), "Foreground playback starts a fresh idle timeout")
         assertPlayerSession(identity, in: app)
         tapPlayerBackground(in: app)
-        require(back, in: app, stage: "foreground-controls-exit", timeout: 2, hittable: true)
+        requireTransientControl(back, in: app, stage: "foreground-controls-exit", timeout: 2)
         back.tap()
     }
     func testPlaybackFailureKeepsControlsAndExitVisible() {
@@ -476,7 +500,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         defer { app.terminate() }
         require(app.buttons["channel.http"], in: app, stage: "rotation-initial-channel", timeout: 15)
         app.buttons["channel.http"].tap()
-        require(app.buttons["player-back"], in: app, stage: "rotation-initial-player-back", timeout: 5)
+        pauseBeforeControlInspection(in: app, stage: "rotation-initial")
         assertPlayerControls(in: app, stage: "rotation-initial")
         defer { XCUIDevice.shared.orientation = .portrait }
         XCUIDevice.shared.orientation = .landscapeLeft
