@@ -13,7 +13,7 @@ Scripts/build-metal-libraries.sh --platform macos
 Scripts/bootstrap.sh --generate
 ```
 
-在 Xcode 中选择 `VPlayerMacOS` scheme 和 `My Mac`。调试时可使用本地临时签名；正式分发需配置开发团队、签名和对应的发布渠道。完整验证命令为：
+在 Xcode 中选择 `VPlayerMacOS` scheme 和 `My Mac`：运行与测试使用 Debug，归档与性能分析使用 Release。直接运行发布配置请选择 `VPlayerMacOSRelease`，其运行、性能分析、静态分析与归档均使用 Release，运行时不附加调试器或 GPU 验证。两者生成同一个 VPlayer 应用，不另建应用副本。调试时可使用本地临时签名；正式分发需配置开发团队、签名和对应的发布渠道。完整验证命令为：
 
 ```sh
 Scripts/test-macos.sh
@@ -22,7 +22,7 @@ Scripts/test-macos.sh
 生成本地 Release 归档可使用：
 
 ```sh
-xcodebuild archive -project VPlayer.xcodeproj -scheme VPlayerMacOS \
+xcodebuild archive -project VPlayer.xcodeproj -scheme VPlayerMacOSRelease \
   -configuration Release -destination 'generic/platform=macOS' \
   -archivePath build/VPlayerMacOS.xcarchive \
   CODE_SIGN_IDENTITY="Apple Development" DEVELOPMENT_TEAM="你的团队ID"
@@ -35,6 +35,14 @@ CI 可用 `CODE_SIGN_IDENTITY=-` 仅检查归档构建与资源完整性；临�
 测试另需 `ffmpeg` 命令行工具（`brew install ffmpeg`），用于将已入库的 16 秒夹具无损重封装为 60 秒连续时间戳媒体；临时产物只保存在 `build/macos-test-fixtures`。它是测试依赖，应用仍使用仓库独立构建并审计的 FFmpeg 库。
 
 源码和开发产物必须保存在非 iCloud 同步目录。构建缓存、测试夹具和临时输出使用仓库已忽略的 `build/`；需要长期保留的日志、截图、测试结果与最终发布归档存放在 `~/Library/Application Support/VPlayer/DevelopmentArchive/`。不要使用开启 iCloud 同步的“文稿”“桌面”保存工作区或验收输出，具体规范见 `AGENTS.md`。
+
+### HDR 验证与兼容处理
+
+2026-10-11 使用本机配置的东方卫视 4K 验证了 macOS 与 iPhone 18 Pro（iOS 27 模拟器）。实际信号为 3840×2160、50 fps、HEVC Main 10、视频范围、BT.2020 / HLG；基础 SPS 使用 BT.2020 兼容曲线，SEI 声明 HLG。
+
+Mac 的原有解码和显示标签正确。iOS 模拟器的 VideoToolbox 输出保留了原始 HLG 像素，但将传递函数标成 BT.709；修正后按每个输入帧的已确认 HDR 信息恢复该标签，仅限仍为 10-bit BT.2020 的匹配输出。已正确标识 HDR、线性、8-bit 或色彩矩阵不匹配的输出不改写。旧颜色空间与 gamma 附件随错误曲线一起清除，防止覆盖修正后的标签。修正不调整像素、亮度或饱和度。
+
+同一素材的 25 帧在 Mac、iOS 模拟器与系统参考解码之间像素哈希一致。iOS 的 105 项相关测试通过，包含真实素材原生播放宿主、显示样本、HLG/PQ 标签恢复和乱序回调下的 SDR 隔离；Mac 的 8 项平台回归通过，实际窗口与浮窗可播放 4K 画面；通过 `Scripts/test.sh` 运行的 tvOS 93 项共享解码回归也通过。两端的视频层均实测为允许 HDR、由系统自动映射。模拟器不能验证 iPhone 屏幕实际的峰值亮度与色彩观感，也不能据此断言真机解码器存在同样的标签问题。私人源、录制片段与临时验收代码均不进入 Git。
 
 验证包括共享解析、真实资料库事务、按 URL 合并刷新、Mac 平台与浮层行为、真实 HLS/TS 播放、Metal 去隔行、暂停恢复与资源释放，以及桌面界面交互。测试会启动仅绑定 `127.0.0.1:18765` 的本地媒体服务器，并在退出时清理。连续 TS 按直播速率发送，HLS 按分段突发发送。
 

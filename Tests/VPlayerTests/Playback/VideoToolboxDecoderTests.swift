@@ -1183,6 +1183,91 @@ final class VideoToolboxDecoderTests: XCTestCase {
         XCTAssertEqual(harness.events.failures.first?.disposition, .fatal)
     }
 
+    func testDecodedHDRTransferFallbackIsRestoredBeforeBuildingDisplaySamples() throws {
+        for transfer in [kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+                         kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ] {
+            for fallback in [nil, kCVImageBufferTransferFunction_ITU_R_709_2,
+                             kCVImageBufferTransferFunction_ITU_R_2020] as [CFString?] {
+                let harness = makeHarness()
+                let format = try makeHDRFormat(transfer: transfer)
+                try configure(harness, format: format, generation: 12)
+                try decode(harness, id: 404, generation: 12, format: format)
+                let pixel = try makePixelBuffer(format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+                setAttachment(pixel, key: kCVImageBufferColorPrimariesKey, value: kCVImageBufferColorPrimaries_ITU_R_2020)
+                setAttachment(pixel, key: kCVImageBufferYCbCrMatrixKey, value: kCVImageBufferYCbCrMatrix_ITU_R_2020)
+                if let fallback { setAttachment(pixel, key: kCVImageBufferTransferFunctionKey, value: fallback) }
+                setAttachment(pixel, key: kCVImageBufferGammaLevelKey, value: NSNumber(value: 2.2))
+                setAttachment(pixel, key: kCVImageBufferCGColorSpaceKey, value: try XCTUnwrap(CGColorSpace(name: CGColorSpace.itur_709)))
+                harness.api.deliver(index: 0, output: output(imageBuffer: pixel))
+                drain(harness.executor)
+
+                let frame = try XCTUnwrap(harness.events.frames.first)
+                XCTAssertTrue(frame.pixelBuffer === pixel)
+                XCTAssertEqual(frame.formatMetadata.bitDepth, 10)
+                XCTAssertEqual(frame.formatMetadata.transfer,
+                    transfer == kCVImageBufferTransferFunction_ITU_R_2100_HLG ? .hlg : .pq)
+                XCTAssertNil(CVBufferCopyAttachment(pixel, kCVImageBufferGammaLevelKey, nil))
+                XCTAssertNil(CVBufferCopyAttachment(pixel, kCVImageBufferCGColorSpaceKey, nil))
+                let sample = try VideoImageSampleBufferBuilder().make(frame: VideoPresentationFrame(
+                    pixelBuffer: pixel, presentationTimeStamp: frame.presentationTimeStamp,
+                    duration: frame.duration, generation: frame.generation, sequenceNumber: 1,
+                    sourceAccessUnitID: frame.accessUnitID, formatMetadata: frame.formatMetadata))
+                XCTAssertEqual(CMFormatDescriptionGetExtension(try XCTUnwrap(CMSampleBufferGetFormatDescription(sample)),
+                    extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String, transfer as String)
+            }
+        }
+    }
+
+    func testHDRMetadataDoesNotRelabelSDRConvertedOrAlreadyHDRFrames() throws {
+        XCTAssertNil(VideoHDRMetadata(format: nil))
+        XCTAssertNil(VideoHDRMetadata(format: try makeFormat(codec: kCMVideoCodecType_HEVC)))
+        XCTAssertNil(VideoHDRMetadata(format: try makeHDRFormat(transfer: kCVImageBufferTransferFunction_ITU_R_709_2)))
+        let metadata = try XCTUnwrap(VideoHDRMetadata(format: makeHDRFormat(transfer: kCVImageBufferTransferFunction_ITU_R_2100_HLG)))
+        for (pixelFormat, matrix, transfer) in [
+            (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVImageBufferTransferFunction_ITU_R_709_2),
+            (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2),
+            (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ),
+            (kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVImageBufferYCbCrMatrix_ITU_R_2020, kCVImageBufferTransferFunction_Linear),
+        ] {
+            let pixel = try makePixelBuffer(format: pixelFormat)
+            setAttachment(pixel, key: kCVImageBufferColorPrimariesKey, value: kCVImageBufferColorPrimaries_ITU_R_2020)
+            setAttachment(pixel, key: kCVImageBufferYCbCrMatrixKey, value: matrix)
+            setAttachment(pixel, key: kCVImageBufferTransferFunctionKey, value: transfer)
+            metadata.restoreTransferIfNeeded(on: pixel)
+            XCTAssertEqual(CVBufferCopyAttachment(pixel, kCVImageBufferTransferFunctionKey, nil) as? String, transfer as String)
+        }
+    }
+
+    func testHDRTransferEvidenceFollowsItsAccessUnitAcrossReorderedCallbacks() throws {
+        let harness = makeHarness()
+        let hdr = try makeHDRFormat(transfer: kCVImageBufferTransferFunction_ITU_R_2100_HLG)
+        let sdr = try makeHDRFormat(transfer: kCVImageBufferTransferFunction_ITU_R_709_2)
+        try configure(harness, format: hdr, generation: 12)
+        try decode(harness, id: 1, generation: 12, format: hdr)
+        try decode(harness, id: 2, generation: 12, format: sdr)
+        for index in [1, 0] {
+            let pixel = try makePixelBuffer(format: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            setAttachment(pixel, key: kCVImageBufferColorPrimariesKey, value: kCVImageBufferColorPrimaries_ITU_R_2020)
+            setAttachment(pixel, key: kCVImageBufferYCbCrMatrixKey, value: kCVImageBufferYCbCrMatrix_ITU_R_2020)
+            setAttachment(pixel, key: kCVImageBufferTransferFunctionKey, value: kCVImageBufferTransferFunction_ITU_R_709_2)
+            harness.api.deliver(index: index, output: output(imageBuffer: pixel))
+        }
+        drain(harness.executor)
+        XCTAssertEqual(harness.events.frames.map(\.accessUnitID), [2, 1])
+        XCTAssertEqual(harness.events.frames.map(\.formatMetadata.transfer), [.bt709, .hlg])
+    }
+
+    private func makeHDRFormat(transfer: CFString) throws -> CMVideoFormatDescription {
+        var format: CMVideoFormatDescription?
+        XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_HEVC, width: 64, height: 32, extensions: [
+                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+                kCMFormatDescriptionExtension_TransferFunction: transfer,
+            ] as CFDictionary, formatDescriptionOut: &format), noErr)
+        return try XCTUnwrap(format)
+    }
+
     func testP010HLGBT2020CleanApertureChromaAndHDRAreExactDeepCopies() throws {
         let harness = makeHarness()
         try configure(harness, generation: 12)
@@ -1372,6 +1457,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         _ harness: DecoderHarness,
         id: UInt64,
         generation: UInt64,
+        format sourceFormat: CMVideoFormatDescription? = nil,
         parserMetadata: VideoParserMetadata = VideoParserMetadata(
             fieldOrder: .progressive,
             pictureStructure: .frame,
@@ -1383,7 +1469,7 @@ final class VideoToolboxDecoderTests: XCTestCase {
         flags: VTDecodeFrameFlags = ._EnableAsynchronousDecompression,
         drainSubmissionQueue: Bool = true
     ) throws {
-        let format = try makeFormat(codec: kCMVideoCodecType_H264)
+        let format = try sourceFormat ?? makeFormat(codec: kCMVideoCodecType_H264)
         let sampleBuffer = try SampleBufferBuilder.makeVideo(
             data: Data([0]),
             formatDescription: format,

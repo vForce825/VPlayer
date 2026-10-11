@@ -680,6 +680,29 @@ schemes:
       config: Debug
     archive:
       config: Release
+  VPlayerMacOSRelease:
+    build:
+      targets:
+        VPlayerCoreMacOS: [run, profile, analyze, archive]
+        VPlayerPlaybackMacOS: [run, profile, analyze, archive]
+        VPlayerMacOS: [run, profile, analyze, archive]
+    test:
+      config: Release
+      gatherCoverageData: false
+    run:
+      config: Release
+      executable: VPlayerMacOS
+      debugEnabled: false
+      enableGPUFrameCaptureMode: disabled
+      enableGPUValidationMode: false
+      disableMainThreadChecker: true
+      disableThreadPerformanceChecker: true
+    profile:
+      config: Release
+    analyze:
+      config: Release
+    archive:
+      config: Release
   VPlayer:
     build:
       targets:

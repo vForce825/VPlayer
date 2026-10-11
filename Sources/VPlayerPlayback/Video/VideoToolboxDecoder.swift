@@ -322,6 +322,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let accessUnitID: UInt64
         let identity: VideoDecoderEventIdentity
         let parserMetadata: VideoParserMetadata
+        let hdrMetadata: VideoHDRMetadata?
     }
 
     /// Pixel formats this pipeline can actually turn into a Metal texture.
@@ -829,7 +830,8 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         let token = DecodeToken(
             accessUnitID: accessUnit.id,
             identity: identity,
-            parserMetadata: accessUnit.parserMetadata
+            parserMetadata: accessUnit.parserMetadata,
+            hdrMetadata: VideoHDRMetadata(format: CMSampleBufferGetFormatDescription(accessUnit.sampleBuffer))
         )
         let sessionID = active.id
         let surfaceScope = active.surfaceScope
@@ -1053,6 +1055,7 @@ public final class VideoToolboxDecoder: VideoDecoding, @unchecked Sendable {
         }
 
         do {
+            token.hdrMetadata?.restoreTransferIfNeeded(on: pixelBuffer)
             let formatMetadata = try VideoFormatMetadataReader.read(
                 from: pixelBuffer,
                 compatibilityCheck: compatibilityCheck
