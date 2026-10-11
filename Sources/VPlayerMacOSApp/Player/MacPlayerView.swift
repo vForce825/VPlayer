@@ -59,16 +59,13 @@ struct MacPlayerView: View {
             }
             .contentShape(Rectangle())
             .focusable().focusEffectDisabled().focused($playerFocused)
-            .onContinuousHover { phase in if case .active = phase { reveal() } }
+            .onContinuousHover { phase in
+                if case .active = phase { overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused) }
+            }
             .onKeyPress(.space) { session.model.togglePause(); reveal(); return .handled }
             .onKeyPress("i") { overlay.toggleInformation(paused: session.model.isPaused); return .handled }
             .onKeyPress("e") { showsProgrammes = true; return .handled }
             .onKeyPress("l") { overlay.toggleSidebar(paused: session.model.isPaused); return .handled }
-            .onKeyPress(.escape) {
-                if state.isTheaterMode { state.toggleFullScreen() }
-                else { reveal() }
-                return .handled
-            }
             .animation(.easeInOut(duration: 0.2), value: overlay.controlsVisible)
             .animation(.easeInOut(duration: 0.2), value: overlay.informationVisible)
         }
@@ -127,7 +124,10 @@ struct MacPlayerView: View {
                         .accessibilityLabel(session.model.isPaused ? "播放" : "暂停")
                         .accessibilityIdentifier("player.play-pause")
                     Button { Task { await state.stopPlayback() } } label: {
-                        Label("停止", systemImage: "stop.fill").frame(height: 30)
+                        Label("停止", systemImage: "stop.fill")
+                            .labelStyle(.titleAndIcon)
+                            .padding(.horizontal, 6).frame(height: 34)
+                            .contentShape(Rectangle())
                     }.help("停止播放，返回频道列表（⌘.）")
                         .accessibilityLabel("停止播放").accessibilityIdentifier("player.stop")
                     Button("节目单", systemImage: "list.bullet.rectangle") { showsProgrammes = true }
@@ -157,7 +157,13 @@ struct MacPlayerView: View {
                         .accessibilityIdentifier("player.fullscreen")
                 }.buttonStyle(.plain)
             }.padding(.horizontal, 24).padding(.bottom, 20).padding(.top, 24)
-            .onHover { hovering in overlay.holdsControlsOpen = hovering || showsProgrammes || showsSettings; reveal() }
+            .onHover { hovering in
+                overlay.holdsControlsOpen = hovering || showsProgrammes || showsSettings
+                if hovering, overlay.controlsVisible {
+                    overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
+                }
+                else { overlay.scheduleAutoHide(paused: session.model.isPaused) }
+            }
         }
     }
     private var bufferingLabel: String {

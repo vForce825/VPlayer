@@ -10,6 +10,14 @@ final class MacLibraryUITests: XCTestCase {
         app.launchArguments = ["-ui-fixture", "seeded", "-ui-playback-fixture", "media-information", "-uiTestResetPlaybackSettings"]
         app.launch()
         XCTAssertTrue(app.textFields["channels.search"].waitForExistence(timeout: 10))
+        // macOS 可能恢复上次测试的全屏窗口，先用系统菜单的实际状态统一测试起点。
+        let fullscreen = app.menuItems["toggleFullScreen:"]
+        if fullscreen.label == "Exit Full Screen" || fullscreen.label.hasPrefix("退出全屏") {
+            app.typeKey("f", modifierFlags: [.control, .command])
+            XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "label != %@ AND NOT label BEGINSWITH %@", "Exit Full Screen", "退出全屏"),
+                object: fullscreen)], timeout: 5), .completed)
+        }
         return app
     }
     func testSearchSourceManagementAndEditorValidation() {
@@ -88,5 +96,69 @@ final class MacLibraryUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(search.waitForExistence(timeout: 10))
         XCTAssertEqual(search.frame.width, adjustedWidth, accuracy: 2)
+    }
+    func testEscapeHidesPausedControlsAndFocusedSidebarWithoutLeavingFullscreen() {
+        let app = launch()
+        app.staticTexts["测试频道"].firstMatch.doubleClick()
+        XCTAssertTrue(app.windows["VPlayer - 测试频道"].waitForExistence(timeout: 5))
+        let pause = app.buttons["player.play-pause"]
+        XCTAssertTrue(pause.waitForExistence(timeout: 5))
+        pause.click()
+        XCTAssertEqual(pause.label, "播放")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(pause.waitForNonExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["player.information.hide"].exists)
+
+        let surface = app.descendants(matching: .any)["player.interaction-surface"].firstMatch
+        surface.hover()
+        XCTAssertTrue(pause.waitForExistence(timeout: 3))
+        app.buttons["player.channels"].click()
+        let search = app.textFields["channels.search"]
+        XCTAssertTrue(search.waitForExistence(timeout: 3))
+        search.click()
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(search.waitForNonExistence(timeout: 3))
+        XCTAssertFalse(pause.exists)
+        XCTAssertFalse(app.buttons["player.information.hide"].exists)
+
+        surface.hover()
+        app.buttons["player.information.hide"].click()
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(pause.waitForNonExistence(timeout: 3))
+        surface.hover()
+        XCTAssertTrue(pause.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["player.information.hide"].exists)
+
+        surface.doubleClick()
+        let fullscreen = app.buttons["player.fullscreen"]
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "退出全屏"), object: fullscreen)], timeout: 5), .completed)
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(pause.waitForNonExistence(timeout: 3))
+        surface.coordinate(withNormalizedOffset: CGVector(dx: 0.6, dy: 0.4)).hover()
+        XCTAssertTrue(fullscreen.waitForExistence(timeout: 3))
+        XCTAssertEqual(fullscreen.label, "退出全屏")
+        surface.doubleClick()
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", "全屏"), object: fullscreen)], timeout: 5), .completed)
+        app.buttons["player.programmes"].click()
+        XCTAssertTrue(app.sheets.firstMatch.waitForExistence(timeout: 3))
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(app.sheets.firstMatch.waitForNonExistence(timeout: 3))
+        XCTAssertTrue(pause.exists)
+        app.typeKey(".", modifierFlags: [.command])
+    }
+    func testStopButtonTextAndTrailingPaddingBothStopPlaybackAndResetWindowTitle() {
+        let app = launch()
+        for (name, horizontalPosition) in [("测试频道", 0.72), ("另一组频道", 0.98)] {
+            app.staticTexts[name].firstMatch.doubleClick()
+            XCTAssertTrue(app.windows["VPlayer - \(name)"].waitForExistence(timeout: 5))
+            let stop = app.buttons["player.stop"]
+            XCTAssertTrue(stop.waitForExistence(timeout: 5))
+            stop.coordinate(withNormalizedOffset: CGVector(dx: horizontalPosition, dy: 0.5)).click()
+            XCTAssertTrue(app.textFields["channels.search"].waitForExistence(timeout: 3))
+            XCTAssertFalse(stop.exists)
+            XCTAssertTrue(app.windows["VPlayer"].exists)
+        }
     }
 }

@@ -25,7 +25,7 @@ struct MacRootView: View {
             } else { ProgressView("正在打开本地资料库…").frame(maxWidth: .infinity, maxHeight: .infinity) }
         }
         .toolbar {
-            if state.session == nil, !state.isTheaterMode {
+            if state.session == nil {
                 ToolbarItemGroup {
                     Button("添加播放列表", systemImage: "plus") { state.showsAddSource = true }
                         .help("添加播放列表（⌘N）").accessibilityIdentifier("sources.add")
@@ -35,8 +35,13 @@ struct MacRootView: View {
                 }
             }
         }
-        .toolbarVisibility(state.session == nil ? .automatic : .hidden, for: .windowToolbar)
-        .background(MacLibraryWindowReader { state.registerLibraryWindow($0) })
+        .navigationTitle(state.session.map { "VPlayer - \($0.presentation.request.title)" } ?? "VPlayer")
+        .toolbarVisibility(.visible, for: .windowToolbar)
+        .background(MacLibraryWindowReader(update: { state.registerLibraryWindow($0) }, hidePlaybackControls: {
+            guard let session = state.session else { return false }
+            session.overlay.hide(pointerLocation: NSEvent.mouseLocation)
+            return true
+        }))
         .onAppear { state.openLibraryWindow = { openWindow(id: "library") } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
             if notification.object as? NSWindow === state.libraryWindow { state.isTheaterMode = true }
@@ -74,18 +79,22 @@ struct MacRootView: View {
                 .onHover { hovering in
                     guard let session = state.session else { return }
                     session.overlay.holdsSidebarOpen = hovering
-                    session.overlay.interact(paused: session.model.isPaused)
+                    if hovering, session.overlay.sidebarVisible {
+                        session.overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
+                    } else { session.overlay.scheduleAutoHide(paused: session.model.isPaused) }
                 }
                 .onContinuousHover { phase in
-                    if case .active = phase, let session = state.session {
-                        session.overlay.interact(paused: session.model.isPaused)
+                    if case .active = phase, let session = state.session, session.overlay.sidebarVisible {
+                        session.overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
                     }
                 }
                 .transition(.move(edge: .leading).combined(with: .opacity))
             } else if let session = state.session {
                 Color.clear.frame(width: 12).contentShape(Rectangle())
                     .onHover { hovering in
-                        if hovering { session.overlay.interact(paused: session.model.isPaused, revealSidebar: true) }
+                        if hovering {
+                            session.overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused, revealSidebar: true)
+                        }
                     }
                     .accessibilityHidden(true)
             }
@@ -254,17 +263,41 @@ private struct MacChannelRow: View {
 
 private struct MacLibraryWindowReader: NSViewRepresentable {
     let update: @MainActor (NSWindow?) -> Void
+    let hidePlaybackControls: @MainActor () -> Bool
     func makeNSView(context: Context) -> WindowView {
         let view = WindowView()
         view.update = update
+        view.hidePlaybackControls = hidePlaybackControls
         return view
     }
-    func updateNSView(_ view: WindowView, context: Context) { view.update = update }
+    func updateNSView(_ view: WindowView, context: Context) {
+        view.update = update
+        view.hidePlaybackControls = hidePlaybackControls
+    }
+    static func dismantleNSView(_ view: WindowView, coordinator: ()) { view.stopMonitoring() }
     final class WindowView: NSView {
         var update: (@MainActor (NSWindow?) -> Void)?
+        var hidePlaybackControls: (@MainActor () -> Bool)?
+        private var keyMonitor: Any?
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            stopMonitoring()
             update?(window)
+            guard window != nil else { return }
+            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let handled = MainActor.assumeIsolated {
+                    guard event.keyCode == 53,
+                          event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+                          let window = self?.window, event.window === window,
+                          window.attachedSheet == nil else { return false }
+                    return self?.hidePlaybackControls?() == true
+                }
+                return handled ? nil : event
+            }
+        }
+        func stopMonitoring() {
+            if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+            keyMonitor = nil
         }
     }
 }

@@ -141,7 +141,10 @@ final class MacApplicationState {
         }
     }
     func registerLibraryWindow(_ window: NSWindow?) {
-        if let window { libraryWindow = window }
+        if let window {
+            libraryWindow = window
+            isTheaterMode = window.styleMask.contains(.fullScreen)
+        }
     }
     func libraryWindowWillClose(_ window: NSWindow) {
         guard window === libraryWindow, session?.pictureInPicture.isActive != true else { return }
