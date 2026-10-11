@@ -36,6 +36,24 @@ CI 可用 `CODE_SIGN_IDENTITY=-` 仅检查归档构建与资源完整性；临�
 
 源码和开发产物必须保存在非 iCloud 同步目录。构建缓存、测试夹具和临时输出使用仓库已忽略的 `build/`；需要长期保留的日志、截图、测试结果与最终发布归档存放在 `~/Library/Application Support/VPlayer/DevelopmentArchive/`。不要使用开启 iCloud 同步的“文稿”“桌面”保存工作区或验收输出，具体规范见 `AGENTS.md`。
 
+### 加密出口申报
+
+2026-10-11 核对应用源码、三端共享的 FFmpeg 配置和本机 Mac 发布包后，当前版本按“仅使用豁免加密”自我评估，三端的 `ITSAppUsesNonExemptEncryption` 均设为布尔值 `false`。这个值包含“使用了加密，但用途符合豁免”的情况，不表示应用完全没有加密，也不是监管机构出具的分类决定。
+
+| 实现 | 当前用途及边界 |
+| --- | --- |
+| URLSession、FFmpeg Secure Transport | 获取播放列表、节目单与媒体的 HTTPS 连接；FFmpeg 使用 Apple 系统 TLS，未启用 OpenSSL、GnuTLS、libssh、libsrt。 |
+| FFmpeg AES、CommonCrypto AES-128 | 支持受保护媒体的解密和播放前检查。应用的 FFmpeg 入口仅接受 HTTP/HTTPS，子资源 I/O 拒绝写入；没有提供通用文件加密或加密导出功能。库中仍包含 AES 加密符号，不能据此声称库本身只有解密能力。 |
+| CryptoKit、CommonCrypto 的 SHA-256 / HMAC-SHA256 | 稳定标识、媒体完整性校验和播放资源访问认证；不用于加密用户文件或消息。 |
+
+依据：[Apple 的申报字段说明](https://developer.apple.com/documentation/bundleresources/information-property-list/itsappusesnonexemptencryption)允许仅使用豁免加密（包括第三方库）的应用声明 `false`；[BIS 的用途分类说明](https://media.bis.gov/learn-support/encryption-controls/cryptography-for-data-confidentiality)将娱乐、商业广播的加密/解密，以及认证、完整性校验排除在 5A002.a 的数据保密加密用途之外。本项目的判断基于这些实际用途，并非仅凭“播放器”名称、开源许可或未使用 OpenSSL。此记录不替代完整的出口分类或其他地区的要求。
+
+法国分发需要独立核对。[法国第 2007-663 号法令附件一](https://www.legifrance.gouv.fr/loda/article_lc/LEGIARTI000006428332)列有受限广播/电视接收及音视频播放设备的豁免，但不能仅将设备条款直接视作本 App 已获豁免确认。若 App Store Connect 对法国分发仍要求文稿，应向 Apple 或 ANSSI 提供上述用途说明确认适用性；不能通过虚报发行地区或修改此字段代替所需材料。本次未提交申报、取得法国批复或修改商店发行范围。
+
+新增通用加密、加密存储、VPN/私密通信、密钥管理产品能力，或改变第三方加密组件及其用途时，需要重新评估。修改源文件后须重新构建并上传才会影响后续构建的申报；已有构建仍在 App Store Connect 中处理。
+
+本次通过仓库 `Scripts/test.sh` 执行 6 项现有用例，覆盖 AES 媒体保护解析、实际初始化段解密、密钥更新后返回字节的绑定，以及 Swift/C 播放入口的非 HTTP 协议拒绝；零失败、无跳过。三端 plist 格式与布尔值校验、Mac Debug/Release 实际 plist 路径及无生成键覆盖检查、项目生成一致性和许可检查均通过。
+
 ### HDR 验证与兼容处理
 
 2026-10-11 使用本机配置的东方卫视 4K 验证了 macOS 与 iPhone 18 Pro（iOS 27 模拟器）。实际信号为 3840×2160、50 fps、HEVC Main 10、视频范围、BT.2020 / HLG；基础 SPS 使用 BT.2020 兼容曲线，SEI 声明 HLG。
