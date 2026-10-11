@@ -67,6 +67,7 @@ extension PlaybackCoreError {
         switch self {
         case .videoDecoderFailure(.softwareDecoder): .retrySameRequest
         case .videoDecoderFailure: .chooseAnotherChannel
+        case .videoDecode(CompressedVideoAssembler.recoveryExhaustedErrorCode): .retrySameRequest
         case .ffmpegFailure(let kind, _, _):
             kind == .unsupportedVideo || kind == .unsupportedAudio ? .chooseAnotherChannel : .retrySameRequest
         case .unexpected(let stage, _):

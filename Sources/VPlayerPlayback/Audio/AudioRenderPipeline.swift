@@ -181,6 +181,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     private enum RemovalContinuation: Sendable {
         case configure
         case compressedRetry
+        case pcmRetry
         case fallback
         case audioSessionReset
         case stop
@@ -280,6 +281,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
     private var stopped = true
     private var stopDeadlineRevision: UInt64 = 0
     private var fallbackUsed = false
+    /// 同一配置/媒体代次只自动重建一次 PCM 输出，避免持续错误形成重建循环。
+    private var pcmRendererRetryUsed = false
     private var progressMonitor: AudioRendererRecoveryProgressMonitor
     private var automaticFlushProgressOrigin =
         AudioAutomaticFlushProgressOriginTracker()
@@ -637,7 +640,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             case .fallback:
                 updateSnapshot(route: route, ready: false)
                 return
-            case .compressedRetry, .audioSessionReset:
+            case .compressedRetry, .pcmRetry, .audioSessionReset:
                 break
             }
             pendingRemoval.continuation = .audioSessionReset
@@ -665,6 +668,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         epoch = newEpoch
         self.generation = generation
         terminal = false
+        pcmRendererRetryUsed = false
         pendingReevaluation = false
         invalidateNoOutputRouteDeadline()
         recoveryCoordinator.invalidate()
@@ -694,7 +698,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             switch pendingRemoval.continuation {
             case .configure, .stop:
                 routeMonitor.stop()
-            case .compressedRetry, .fallback, .audioSessionReset:
+            case .compressedRetry, .pcmRetry, .fallback, .audioSessionReset:
                 startRouteMonitor(epoch: newEpoch, generation: generation)
             }
             updateReadiness()
@@ -858,6 +862,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         configured = true
         stopped = false
         fallbackUsed = false
+        pcmRendererRetryUsed = false
         replacing = renderer != nil
         terminal = false
         needsAnchor = false
@@ -1053,6 +1058,19 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
 
     private func handleRendererFailure(reason: String, diagnostic: ErrorDiagnosticSnapshot?) {
         if replacing { return }
+        if route == .ffmpegPCM, let renderer, renderer.mediaKind == .linearPCM {
+            guard !pcmRendererRetryUsed else {
+                emitTerminal(.unexpected(stage: "audio.renderer.recovery", diagnostic:
+                    diagnostic ?? ErrorDiagnosticSnapshot(typeName: "音频输出", message: reason)))
+                return
+            }
+            pcmRendererRetryUsed = true
+            recoveryCoordinator.invalidate()
+            invalidateProgressMonitor()
+            pendingReevaluation = false
+            beginRemoval(of: renderer, continuation: .pcmRetry)
+            return
+        }
         let terminalError: PlaybackCoreError = diagnostic.map {
             .unexpected(stage: "audio.renderer", diagnostic: $0)
         } ?? .audioRendererFailed(reason)
@@ -1530,7 +1548,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         replacing = true
         sharedTimelineOpened = false
         switch continuation {
-        case .compressedRetry, .audioSessionReset:
+        case .compressedRetry, .pcmRetry, .audioSessionReset:
             needsAnchor = true
         case .configure, .fallback, .stop:
             needsAnchor = false
@@ -1586,7 +1604,7 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               renderer?.identity == rendererID,
               replacing, !terminal else { return }
         switch transition.continuation {
-        case .configure, .compressedRetry, .fallback, .audioSessionReset:
+        case .configure, .compressedRetry, .pcmRetry, .fallback, .audioSessionReset:
             guard configured, !stopped else { return }
         case .stop:
             guard stopped, !configured else { return }
@@ -1613,6 +1631,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             }
         case .compressedRetry:
             completeCompressedRetryAfterRemoval()
+        case .pcmRetry:
+            completePCMRendererRebuildAfterRemoval(stage: "audio.renderer.recovery")
         case .fallback:
             completeFallbackAfterRemoval()
         case .audioSessionReset:
@@ -1702,15 +1722,26 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             scheduleNoOutputRouteDeadlineForCurrentRendererIfNeeded()
             driveRenderer()
         case .ffmpegPCM:
-            decoder?.destroy()
-            decoder = nil
-            pendingPCM.removeAll(keepingCapacity: true)
-            for index in replay.indices { replay[index].decoded = false }
-            do {
-                try activatePCMRenderer()
-            } catch {
-                classifyAndEmitDecode(error, stage: "audio.renderer.reset-pcm")
-            }
+            completePCMRendererRebuildAfterRemoval(stage: "audio.renderer.reset-pcm")
+        }
+    }
+
+    private func completePCMRendererRebuildAfterRemoval(stage: String) {
+        guard configured, !stopped, replacing, !terminal else { return }
+        decoder?.destroy()
+        decoder = nil
+        pcmOutputFormat = nil
+        pendingPCM.removeAll(keepingCapacity: true)
+        for index in replay.indices { replay[index].decoded = false }
+        do {
+            try activatePCMRenderer()
+        } catch {
+            classifyAndEmitDecode(error, stage: stage)
+            return
+        }
+        if pendingReevaluation {
+            pendingReevaluation = false
+            ingestRecovery(.routeChanged)
         }
     }
 
@@ -1848,7 +1879,9 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               let renderer,
               renderer.mediaKind == .compressed,
               rendererAttached, !replacing, !terminal else { return }
-        while submission == nil, !submissionBackpressured,
+        // enqueue 的同步失败可启动异步移除；每轮都重新核对当前物理输出。
+        while submission == nil, !submissionBackpressured, !replacing, !terminal,
+              rendererAttached, self.renderer?.identity == renderer.identity,
               let index = replay.firstIndex(where: { !$0.sentCompressed }) {
             // A suspended enqueue must not cause later expired recovery packets
             // to be submitted using the playhead sampled before that suspension.
@@ -1913,7 +1946,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               let renderer,
               renderer.mediaKind == .linearPCM,
               rendererAttached, !replacing, !terminal else { return }
-        while submission == nil, !submissionBackpressured {
+        while submission == nil, !submissionBackpressured, !replacing, !terminal,
+              rendererAttached, self.renderer?.identity == renderer.identity {
             if let sample = pendingPCM.first {
                 submit(sample, compressed: nil, retentionID: nil,
                     resetsDecoder: false, to: renderer)
@@ -2011,7 +2045,16 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
             if !renderer.isReadyForMoreMediaData { recordRendererBackpressure(on: renderer) }
             if !drivingRenderer { driveRenderer() }
         } catch {
-            classifyAndEmitDecode(error, stage: "audio.renderer.enqueue")
+            if let core = error as? PlaybackCoreError {
+                if case .audioRendererFailed(let reason) = core {
+                    handleRendererFailure(reason: reason, diagnostic: nil)
+                } else {
+                    classifyAndEmitDecode(core, stage: "audio.renderer.enqueue")
+                }
+            } else {
+                let diagnostic = ErrorDiagnosticSnapshot(error)
+                handleRendererFailure(reason: diagnostic.summary, diagnostic: diagnostic)
+            }
         }
     }
 

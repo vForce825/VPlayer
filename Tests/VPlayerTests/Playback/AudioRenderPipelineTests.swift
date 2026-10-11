@@ -7,6 +7,7 @@ import AudioToolbox
 import CoreMedia
 import Foundation
 import XCTest
+import VPlayerCore
 @testable import VPlayerPlayback
 
 final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
@@ -298,6 +299,13 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
         XCTAssertEqual(pcm.mediaKind, .linearPCM)
         pcm.emit(nativeEvent)
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        harness.synchronizer.completeRemoval(index: 2, didRemove: true)
+        drain(harness.executor)
+        let pcmRetry = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertEqual(pcmRetry.mediaKind, .linearPCM)
+        pcmRetry.emit(nativeEvent)
         drain(harness.executor)
 
         let error = try XCTUnwrap(harness.failures.snapshot.first?.error)
@@ -1123,7 +1131,7 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    func testPCMRendererFailureRemainsTerminalAndNeverSwitchesBackToCompressed() throws {
+    func testRepeatedPCMRendererFailureIsTerminalAndNeverSwitchesBackToCompressed() throws {
         let harness = try makeHarness()
         let first = try XCTUnwrap(harness.renderers.snapshot.first)
         try perform(on: harness.executor) {
@@ -1146,13 +1154,23 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         repeatedPCMHandler(.failed("pcm:repeated"))
         drain(harness.executor)
 
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        XCTAssertEqual(harness.synchronizer.removalCount, 3)
+        harness.synchronizer.completeRemoval(index: 2, didRemove: true)
+        drain(harness.executor)
+        let pcmRetry = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcmRetry.emit(.failed("pcm:terminal"))
+        drain(harness.executor)
+        repeatedPCMHandler(.failed("pcm:stale"))
+        drain(harness.executor)
         XCTAssertEqual(harness.failures.snapshot.map(\.error), [
-            .audioRendererFailed("pcm:terminal"),
+            .unexpected(stage: "audio.renderer.recovery", diagnostic:
+                ErrorDiagnosticSnapshot(typeName: "音频输出", message: "pcm:terminal")),
         ])
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [
-            .compressed, .compressed, .linearPCM,
+            .compressed, .compressed, .linearPCM, .linearPCM,
         ])
-        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        XCTAssertEqual(harness.synchronizer.removalCount, 3)
     }
 
     func testAwaitedStopCompletesExactlyOnceAfterRemovalSuccessFailureAndRepeatedCalls() async throws {
@@ -2743,8 +2761,16 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             pcm.emit(.failed("PCMDomain:-9"))
             compressed.emit(.failed("stale"))
             drain(harness.executor)
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+            let pcmRemoval = harness.synchronizer.removalCount - 1
+            harness.synchronizer.completeRemoval(index: pcmRemoval, didRemove: true)
+            drain(harness.executor)
+            let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+            replacement.emit(.failed("PCMDomain:-9"))
+            drain(harness.executor)
             XCTAssertEqual(harness.failures.snapshot.map(\.error), [
-                .audioRendererFailed("PCMDomain:-9"),
+                .unexpected(stage: "audio.renderer.recovery",
+                    diagnostic: ErrorDiagnosticSnapshot(typeName: "音频输出", message: "PCMDomain:-9")),
             ])
         }
     }
@@ -5354,6 +5380,232 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.renderers.snapshot.map(\.mediaKind), [.compressed, .compressed])
         XCTAssertNotEqual(replacement.identity, original.identity)
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPCMRendererFailureDuringBluetoothSwitchRebuildsReplaysAndReanchors() throws {
+        let harness = try makePCMRecoveryHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        let oldDecoder = try XCTUnwrap(harness.decoderFactory.snapshot.first)
+        original.configureReadiness(ready: true)
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(id: 1, pts: CMTime(value: 1, timescale: 1)))
+        }
+        XCTAssertEqual(original.snapshot.enqueuedPTS.count, 1)
+        harness.routeMonitor.emit(AudioOutputRouteSnapshot(category: .bluetooth,
+            reason: .newDeviceAvailable, revision: 1))
+        drain(harness.executor)
+        original.emit(.failedWithDiagnostic(reason: "AVFoundationErrorDomain:-11847", diagnostic:
+            ErrorDiagnosticSnapshot(NSError(domain: "AVFoundationErrorDomain", code: -11_847))))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertFalse(harness.pipeline.isReadyForPlayback)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        XCTAssertNotEqual(replacement.identity, original.identity)
+        XCTAssertEqual(oldDecoder.destroyCountSnapshot, 1)
+        XCTAssertEqual(harness.decoderFactory.snapshot.count, 2)
+        replacement.configureReadiness(ready: true, sufficient: true)
+        replacement.fireReady()
+        drain(harness.executor)
+        XCTAssertEqual(replacement.snapshot.enqueuedPTS.map(CMTimeGetSeconds), [1])
+        XCTAssertTrue(harness.pipeline.isReadyForPlayback)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        XCTAssertEqual(harness.pipeline.route, .ffmpegPCM)
+    }
+
+    func testPCMRecoveryPublishesReadinessWithoutMovingTheSharedClock() throws {
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.audio.pcm-recovery-clock")
+        let synchronizer = FakeAudioSynchronizer()
+        let renderers = FakeAudioRendererFactory()
+        let readiness = LockedAudioReadinessChanges(executor: executor)
+        let failures = LockedAudioFailures(executor: executor)
+        let support = FakeAudioFormatSupportChecker()
+        support.compressedSupported = false
+        let pipeline = AudioRenderPipeline(synchronizer: synchronizer, executor: executor,
+            failureSink: { error, generation in failures.append(error, generation: generation) },
+            rendererFactory: renderers,
+            decoderFactory: FakePCMAudioDecoderFactory { sample in
+                [try self.makePCMBuffer(pts: sample.presentationTimeStamp)]
+            }, routeMonitor: FakeAudioRouteMonitor(), decodeCapabilityChecker: support,
+            pcmOutputValidator: support, clockMode: .externallyManaged,
+            readinessSink: { change, generation in readiness.append(change, generation: generation) })
+        synchronizer.setRate(1, time: CMTime(value: 7, timescale: 1))
+        try perform(on: executor) {
+            try pipeline.configure(self.makeRenderConfiguration(codec: .aac,
+                extradata: Data([0x11, 0x90]), fingerprint: self.fingerprint(1)),
+                generation: MediaGeneration(rawValue: 1))
+            pipeline.activateContinuityIsland(AudioContinuityIslandID(rawValue: 1), generation: MediaGeneration(rawValue: 1))
+            pipeline.setSharedTimelineOpened(true)
+        }
+        let original = try XCTUnwrap(renderers.snapshot.first)
+        original.configureReadiness(ready: true, sufficient: true)
+        try perform(on: executor) {
+            try pipeline.enqueue(self.makeSample(id: 1, pts: CMTime(value: 7, timescale: 1)))
+        }
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        let originalRates = synchronizer.rateSnapshot.map(\.0)
+        original.emit(.failed("bluetooth-switch"))
+        drain(executor)
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .rendererReplacementStarted])
+        synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(executor)
+        XCTAssertFalse(pipeline.isReadyForPlayback)
+        let replacement = try XCTUnwrap(renderers.snapshot.last)
+        replacement.configureReadiness(ready: true, sufficient: true)
+        replacement.fireReady()
+        drain(executor)
+        XCTAssertEqual(replacement.snapshot.enqueuedPTS.map(CMTimeGetSeconds), [7])
+        XCTAssertTrue(pipeline.isReadyForPlayback)
+        XCTAssertEqual(readiness.snapshot.map(\.change), [.available, .rendererReplacementStarted, .available])
+        XCTAssertEqual(synchronizer.rateSnapshot.map(\.0), originalRates,
+            "音频只发布重锚信号，公共音视频时钟仍由上层控制")
+        XCTAssertTrue(failures.snapshot.isEmpty)
+    }
+
+    func testPCMRendererFailureBeforeRouteNotificationIsBoundedAndKeepsSystemDiagnostic() throws {
+        let harness = try makePCMRecoveryHarness()
+        let original = try XCTUnwrap(harness.renderers.snapshot.first)
+        let diagnostic = ErrorDiagnosticSnapshot(NSError(domain: "AVFoundationErrorDomain", code: -11_847))
+        original.emit(.failedWithDiagnostic(reason: "AVFoundationErrorDomain:-11847", diagnostic: diagnostic))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.emit(.failedWithDiagnostic(reason: "AVFoundationErrorDomain:-11847", diagnostic: diagnostic))
+        drain(harness.executor)
+        replacement.emit(.failed("duplicate"))
+        original.emit(.failed("stale"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [
+            .unexpected(stage: "audio.renderer.recovery", diagnostic: diagnostic),
+        ])
+    }
+
+    func testPCMEnqueueFailureUsesTheSameBoundedRecovery() throws {
+        let harness = try makePCMRecoveryHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        renderer.holdEnqueueCompletions = true
+        try perform(on: harness.executor) { try harness.pipeline.enqueue(try self.makeSample(id: 1)) }
+        XCTAssertEqual(renderer.heldEnqueueCount, 1)
+        renderer.failEnqueue(NSError(domain: "AVFoundationErrorDomain", code: -11_847))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testSynchronousEnqueueFailureDoesNotSubmitAgainToRetiringRenderer() throws {
+        for pcm in [false, true] {
+            let harness = try pcm ? makePCMRecoveryHarness() : makeHarness()
+            let original = try XCTUnwrap(harness.renderers.snapshot.first)
+            original.configureReadiness(ready: true)
+            original.configureNextEnqueueError(NSError(domain: "AVFoundationErrorDomain", code: -11_847))
+            try perform(on: harness.executor) { try harness.pipeline.enqueue(try self.makeSample(id: 1)) }
+            drain(harness.executor)
+            XCTAssertEqual(harness.synchronizer.removalCount, 1)
+            XCTAssertTrue(original.snapshot.enqueuedPTS.isEmpty, "同步失败后不可继续向退休 renderer 提交")
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+            guard harness.synchronizer.removalCount == 1 else { continue }
+            harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+            drain(harness.executor)
+            let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+            XCTAssertNotEqual(replacement.identity, original.identity)
+            replacement.configureReadiness(ready: true, sufficient: true)
+            replacement.fireReady()
+            drain(harness.executor)
+            XCTAssertEqual(replacement.snapshot.enqueuedPTS.count, 1, "旧 submission 不可阻塞新 renderer 的重放")
+            XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        }
+    }
+
+    func testStopDuringPCMRecoveryCannotAttachAReplacement() throws {
+        let harness = try makePCMRecoveryHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.emit(.failed("route-change"))
+        drain(harness.executor)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+        try perform(on: harness.executor) { harness.pipeline.stop() }
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.count, 1)
+        XCTAssertEqual(harness.decoderFactory.snapshot.first?.destroyCountSnapshot, 1)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testFlushDuringPCMRecoveryUsesNewGenerationAndRearmsItsRetryBudget() throws {
+        let harness = try makePCMRecoveryHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: true)
+        try perform(on: harness.executor) { try harness.pipeline.enqueue(try self.makeSample(id: 1)) }
+        renderer.emit(.failed("route-change"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        guard harness.synchronizer.removalCount == 1 else { return }
+        let generation = MediaGeneration(rawValue: 2)
+        try perform(on: harness.executor) {
+            harness.pipeline.flush(to: generation)
+            harness.pipeline.activateContinuityIsland(AudioContinuityIslandID(rawValue: 1), generation: generation)
+            try harness.pipeline.enqueue(try self.makeSample(id: 2, pts: CMTime(value: 2, timescale: 1), generation: generation))
+        }
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        let replacement = try XCTUnwrap(harness.renderers.snapshot.last)
+        replacement.configureReadiness(ready: true)
+        replacement.fireReady()
+        drain(harness.executor)
+        XCTAssertEqual(replacement.snapshot.enqueuedPTS.map(CMTimeGetSeconds), [2])
+        replacement.emit(.failed("next-generation-route-change"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 2)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    func testPCMRecoveryRemovalFailureIsTerminalExactlyOnce() throws {
+        let harness = try makePCMRecoveryHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.emit(.failed("route-change"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        guard harness.synchronizer.removalCount == 1 else { return }
+        harness.synchronizer.completeRemoval(index: 0, didRemove: false)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: false)
+        drain(harness.executor)
+        XCTAssertEqual(harness.failures.snapshot.map(\.error), [.audioRendererFailed(AudioRenderPipeline.removalFailedError)])
+        XCTAssertEqual(harness.renderers.snapshot.count, 1)
+    }
+
+    func testAudioSessionResetDuringPCMRecoveryMergesIntoOneReplacement() throws {
+        let harness = try makePCMRecoveryHarness()
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.emit(.failed("route-change"))
+        drain(harness.executor)
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        guard harness.synchronizer.removalCount == 1 else { return }
+        try perform(on: harness.executor) { harness.pipeline.recoverFromAudioSessionReset() }
+        XCTAssertEqual(harness.synchronizer.removalCount, 1)
+        harness.synchronizer.completeRemoval(index: 0, didRemove: true)
+        drain(harness.executor)
+        XCTAssertEqual(harness.renderers.snapshot.count, 2)
+        XCTAssertEqual(harness.decoderFactory.snapshot.count, 2)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
+    private func makePCMRecoveryHarness() throws -> AudioHarness {
+        let harness = try makeHarness(configure: false)
+        harness.support.compressedSupported = false
+        try perform(on: harness.executor) {
+            try harness.pipeline.configure(
+                self.makeRenderConfiguration(codec: .aac, extradata: Data([0x11, 0x90]), fingerprint: self.fingerprint(1)),
+                generation: MediaGeneration(rawValue: 1))
+            harness.pipeline.activateContinuityIsland(AudioContinuityIslandID(rawValue: 1), generation: MediaGeneration(rawValue: 1))
+        }
+        return harness
     }
 
     func testAudioSessionResetDestroysAndRecreatesPCMDecoderAndRenderer() throws {

@@ -1853,11 +1853,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 diagnosticCode: "video.decoder-transition.timeout"
             )
         case let .videoDecode(status):
-            PlaybackFailure(
-                code: "video.decode",
-                userMessage: "视频解码失败（系统返回码 \(status)），请尝试其他频道。",
-                diagnosticCode: "video.decode.status.\(status)"
-            )
+            videoDataFailure(status: status)
         case .videoDecoderFailure(let cause):
             videoDecoderFailure(for: cause)
         case let .videoSampleBuffer(reason):
@@ -1975,6 +1971,28 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             diagnosticCode: "ffmpeg.\(kind.rawValue).\(stage.rawValue).\(status)")
     }
 
+    private static func videoDataFailure(status: OSStatus) -> PlaybackFailure {
+        switch status {
+        case AnnexBScanner.invalidDataErrorCode:
+            PlaybackFailure(code: "video.decode",
+                userMessage: "视频数据格式异常，无法解析码流，请尝试其他频道。",
+                diagnosticCode: "video.annex-b.invalid-data")
+        case CompressedVideoAssembler.recoveryExhaustedErrorCode:
+            PlaybackFailure(code: "video.decode",
+                userMessage: "视频数据持续异常或未收到有效关键帧，自动恢复失败，请重试。",
+                diagnosticCode: "video.annex-b.recovery-exhausted")
+        case SampleBufferBuilder.invalidDataErrorCode, LiveFFmpegParserHandle.malformedFrameErrorCode,
+             CompressedVideoAssembler.invalidInputErrorCode, CompressedVideoAssembler.idExhaustedErrorCode:
+            PlaybackFailure(code: "video.decode",
+                userMessage: "视频数据处理失败（内部错误码 \(status)），请尝试其他频道。",
+                diagnosticCode: "video.processing.internal.\(status)")
+        default:
+            PlaybackFailure(code: "video.decode",
+                userMessage: "视频解码失败（系统返回码 \(status)），请尝试其他频道。",
+                diagnosticCode: "video.decode.status.\(status)")
+        }
+    }
+
     private static func failureStageName(_ stage: String) -> String {
         switch stage {
         case "backend.factory": "播放器创建"
@@ -1987,6 +2005,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         case "startup.acquisition": "音频会话接管"
         case "startup.successor": "播放器输出切换"
         case "audio.renderer": "音频输出"
+        case "audio.renderer.recovery": "音频输出恢复"
+        case "audio.renderer.enqueue": "音频帧提交"
         case "video.renderer": "视频输出"
         case "video.sample-buffer": "视频帧处理"
         case "demux.start": "频道读取任务启动"

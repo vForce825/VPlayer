@@ -140,6 +140,33 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertFalse(failure.diagnosticCode?.contains(secret) == true)
     }
 
+    func testInternalVideoDataErrorsAreNotPresentedAsSystemDecoderFailures() {
+        let failure = PlaybackController.failure(for: .videoDecode(-1_448_143_361))
+        XCTAssertTrue(failure.userMessage.contains("视频数据"), failure.userMessage)
+        XCTAssertFalse(failure.userMessage.contains("系统返回码"))
+        XCTAssertEqual(failure.diagnosticCode, "video.annex-b.invalid-data")
+        let exhausted = PlaybackController.failure(for: .videoDecode(-1_448_143_366))
+        XCTAssertTrue(exhausted.userMessage.contains("恢复"), exhausted.userMessage)
+        XCTAssertEqual(exhausted.diagnosticCode, "video.annex-b.recovery-exhausted")
+        XCTAssertEqual(exhausted.retryDisposition, .retrySameRequest)
+    }
+
+    func testOtherInternalVideoProcessingCodesAreNotPresentedAsSystemStatus() {
+        for code: Int32 in [-1_448_143_362, -1_448_143_363, -1_448_143_364, -1_448_143_365] {
+            let failure = PlaybackController.failure(for: .videoDecode(code))
+            XCTAssertFalse(failure.userMessage.contains("系统返回码"), failure.userMessage)
+            XCTAssertTrue(failure.userMessage.contains("内部错误码"), failure.userMessage)
+        }
+    }
+
+    func testAudioRecoveryFailureNamesTheOutputAndKeepsOriginalSystemError() {
+        let diagnostic = ErrorDiagnosticSnapshot(NSError(domain: "AVFoundationErrorDomain", code: -11_847))
+        let failure = PlaybackController.failure(for: .unexpected(stage: "audio.renderer.recovery", diagnostic: diagnostic))
+        XCTAssertTrue(failure.userMessage.contains("音频输出恢复失败"), failure.userMessage)
+        XCTAssertTrue(failure.userMessage.contains("AVFoundationErrorDomain(-11847)"), failure.userMessage)
+        XCTAssertEqual(failure.retryDisposition, .retrySameRequest)
+    }
+
     func testVideoDecoderTransitionTimeoutHasStableRetryableChineseFailure() {
         let failure = PlaybackController.failure(for: .videoDecoderTransitionTimeout)
 

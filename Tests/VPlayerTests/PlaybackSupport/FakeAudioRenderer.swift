@@ -31,6 +31,7 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
     private var maximumEnqueuesPerReadyCallback = Int.max
     private var enqueuesSinceReadyCallback = 0
     private var enqueueResults: [AudioRendererEnqueueResult] = []
+    private var nextEnqueueError: (any Error)?
     private var readyHandler: (@Sendable () -> Void)?
     private var eventHandler: (@Sendable (AudioRendererEvent) -> Void)?
     private var operations: [String] = []
@@ -80,6 +81,10 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         withLock { enqueueResults = results }
     }
 
+    func configureNextEnqueueError(_ error: any Error) {
+        withLock { nextEnqueueError = error }
+    }
+
     var holdEnqueueCompletions = false
     private var heldEnqueues: [@Sendable (Result<AudioRendererEnqueueResult, any Error>) -> Void] = []
     var heldEnqueueCount: Int { withLock { heldEnqueues.count } }
@@ -103,6 +108,11 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
         completion?(.success(result))
     }
 
+    func failEnqueue(_ error: any Error) {
+        let completion = withLock { heldEnqueues.isEmpty ? nil : heldEnqueues.removeFirst() }
+        completion?(.failure(error))
+    }
+
     func cancelPendingEnqueue() {}
     private(set) var finishedEnqueuingCount = 0
     func finishedEnqueuing() { withLock { finishedEnqueuingCount += 1 } }
@@ -117,6 +127,10 @@ final class FakeAudioRenderer: AudioRenderer, @unchecked Sendable {
             let expectedPCM = mediaKind == .linearPCM
             guard (formatID == kAudioFormatLinearPCM) == expectedPCM else {
                 throw PlaybackCoreError.audioRendererFailed("fake.mixed-media")
+            }
+            if let error = nextEnqueueError {
+                nextEnqueueError = nil
+                throw error
             }
             let scriptedResult = enqueueResults.isEmpty ? nil : enqueueResults.removeFirst()
             guard scriptedResult != .backpressured,

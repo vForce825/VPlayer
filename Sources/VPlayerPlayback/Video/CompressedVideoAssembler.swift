@@ -8,6 +8,9 @@ import Foundation
 final class CompressedVideoAssembler {
     static let invalidInputErrorCode: Int32 = -1_448_143_364
     static let idExhaustedErrorCode: Int32 = -1_448_143_365
+    static let recoveryExhaustedErrorCode: Int32 = -1_448_143_366
+    private static let maximumMalformedFrames = 8
+    private static let maximumRecoveryDiscardedFrames = 250
 
     private let generationProvider: () -> MediaGeneration
     private let eventSink: (VideoAssemblerEvent) -> Void
@@ -29,6 +32,8 @@ final class CompressedVideoAssembler {
     private var formatPreferredTransfer: DemuxColorTransfer?
     private var previousSequenceEnded = false
     private var initialConfigurationTransfer: DemuxColorTransfer?
+    private var malformedFrameCount = 0
+    private var recoveryDiscardedFrameCount = 0
 
     init(
         trackSet: DemuxTrackSet,
@@ -87,6 +92,9 @@ final class CompressedVideoAssembler {
     func drain() throws {
         try ensureParserIsCurrent()
         try parser?.drain()
+        guard recoveryDiscardedFrameCount == 0 else {
+            throw PlaybackCoreError.videoDecode(Self.recoveryExhaustedErrorCode)
+        }
     }
 
     private func makeParser(
@@ -114,6 +122,8 @@ final class CompressedVideoAssembler {
         parser = nil
         parserOperationID = operationID
         lastEmittedDTS = nil
+        malformedFrameCount = 0
+        recoveryDiscardedFrameCount = 0
         parser = try makeParser(for: descriptor, operationID: operationID)
         if hlsCopyOwnership != nil ? hlsParameterSetOwner == nil : parameterSets.isEmpty {
             try prepareExtradata(descriptor.extradata)
@@ -123,23 +133,53 @@ final class CompressedVideoAssembler {
     private func receive(_ frame: FFmpegParsedFrame) throws {
         if let hlsCopyOwnership {
             try frame.withBorrowedBytes { bytes in
-            let envelope = try AnnexBScanner.measureLengthPrefixedOutput(bytes, codec: descriptor.codec)
+                let envelope: (lengthPrefixedBytes: Int, parameterSetBytes: Int, parameterSetCount: Int)
+                do {
+                    envelope = try AnnexBScanner.measureLengthPrefixedOutput(bytes, codec: descriptor.codec)
+                } catch {
+                    try discardMalformedFrame(error)
+                    return
+                }
                 let temporaryLease = try hlsCopyOwnership.acquireScanTemporary(
                     bytes: try scanWorkspaceBytes(envelope)
                 )
-            defer { temporaryLease.release() }
-                let scan = try AnnexBScanner.scan(
-                    bytes,
-                    codec: descriptor.codec,
-                    outputCapacity: envelope.lengthPrefixedBytes,
-                    parameterSetCapacity: envelope.parameterSetCount
-                )
+                defer { temporaryLease.release() }
+                let scan: AnnexBScanResult
+                do {
+                    scan = try AnnexBScanner.scan(
+                        bytes, codec: descriptor.codec,
+                        outputCapacity: envelope.lengthPrefixedBytes,
+                        parameterSetCapacity: envelope.parameterSetCount
+                    )
+                } catch {
+                    try discardMalformedFrame(error)
+                    return
+                }
                 try receiveScanned(frame, scan: scan)
             }
             return
         }
-        let scan = try frame.withBorrowedBytes { try AnnexBScanner.scan($0, codec: descriptor.codec) }
+        let scan: AnnexBScanResult
+        do {
+            scan = try frame.withBorrowedBytes { try AnnexBScanner.scan($0, codec: descriptor.codec) }
+        } catch {
+            try discardMalformedFrame(error)
+            return
+        }
         try receiveScanned(frame, scan: scan)
+    }
+
+    /// 只恢复运行中扫描器拒绝的数据；格式构建、所有权和内存准入错误仍原样传播。
+    private func discardMalformedFrame(_ error: any Error) throws {
+        guard error as? PlaybackCoreError == .videoDecode(AnnexBScanner.invalidDataErrorCode) else {
+            throw error
+        }
+        malformedFrameCount += 1
+        recoveryDiscardedFrameCount += 1
+        guard malformedFrameCount <= Self.maximumMalformedFrames,
+              recoveryDiscardedFrameCount <= Self.maximumRecoveryDiscardedFrames else {
+            throw PlaybackCoreError.videoDecode(Self.recoveryExhaustedErrorCode)
+        }
     }
 
     /// HLS 的 scan 结果在 format/fingerprint/CM block copy 全部结束前仍然活着。
@@ -157,6 +197,29 @@ final class CompressedVideoAssembler {
             force: preferredTransfer != formatPreferredTransfer)
         formatState.commitVideoPreferredTransfer(preferredTransfer)
         formatState.commitVideoSequenceEnded(scan.endsCodedVideoSequence)
+        defer {
+            previousSequenceEnded = scan.endsCodedVideoSequence
+            if scan.endsCodedVideoSequence { preferredTransfer = nil }
+        }
+        let recoveringRandomAccess = recoveryDiscardedFrameCount > 0
+        if recoveringRandomAccess {
+            // IDR 清空旧参考图；CRA 后的 RASL 仍可能引用损坏前的图像，继续等待 IDR。
+            // 容器 key 标记不能替代实际码流语法。
+            let syntaxRandomAccess: Bool
+            switch scan.randomAccessKind {
+            case .h264IDR, .hevcIDR: syntaxRandomAccess = true
+            case .none, .containerKey, .hevcCRA: syntaxRandomAccess = false
+            }
+            guard syntaxRandomAccess, formatDescription != nil else {
+                recoveryDiscardedFrameCount += 1
+                guard recoveryDiscardedFrameCount <= Self.maximumRecoveryDiscardedFrames else {
+                    throw PlaybackCoreError.videoDecode(Self.recoveryExhaustedErrorCode)
+                }
+                return
+            }
+            malformedFrameCount = 0
+            recoveryDiscardedFrameCount = 0
+        }
         guard let formatDescription else {
             return
         }
@@ -216,7 +279,7 @@ final class CompressedVideoAssembler {
            CMTimeCompare(presentationTimeStamp, decodeTimeStamp) < 0 {
             presentationTimeStamp = decodeTimeStamp
         }
-        let isRandomAccess = frame.keyFrame == true
+        let isRandomAccess = recoveringRandomAccess || frame.keyFrame == true
         let sampleBuffer: CMSampleBuffer
         if let hlsCopyOwnership {
             sampleBuffer = try SampleBufferBuilder.makeHLSOwnedVideo(
@@ -251,10 +314,6 @@ final class CompressedVideoAssembler {
             sourceBacking: sourceBacking,
             sourceByteRange: sourceBacking.wholeRange
         )))
-        previousSequenceEnded = scan.endsCodedVideoSequence
-        if scan.endsCodedVideoSequence {
-            preferredTransfer = nil
-        }
     }
 
     /// H.264/HEVC parser 未必能从 access unit 语法恢复 duration；此时使用 demux 已冻结的

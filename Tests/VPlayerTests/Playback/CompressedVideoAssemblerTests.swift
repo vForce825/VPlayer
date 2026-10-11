@@ -767,6 +767,180 @@ final class CompressedVideoAssemblerTests: XCTestCase {
         try assertSharedAVFingerprintsRemainComplete(resetVideoFirst: false)
     }
 
+    func testMalformedRuntimeVideoWaitsForSyntaxRandomAccessAndContinuesForLegacyAndHLS() throws {
+        for codec in [VideoCodec.h264, .hevc] {
+            for owned in [false, true] {
+                let key = codec == .h264 ? AssemblerTestFixtures.h264AccessUnit()
+                    : AssemblerTestFixtures.hevcAccessUnit()
+                let dependent = codec == .h264 ? Data([0, 0, 1, 0x41, 0x80])
+                    : Data([0, 0, 1, 0x02, 0x01, 0x80])
+                let frames = [key, Data([0, 0, 1]), dependent, key, dependent]
+                let factory = ScriptedFFmpegParserFactory { handle, index, _, _, _, _ in
+                    try handle.emit(AssemblerTestFixtures.parsedVideoFrame(
+                        bytes: frames[index], pts: Int64(index) * 3_600, dts: Int64(index) * 3_600,
+                        duration: CMTime(value: 1, timescale: 25),
+                        // 坏帧后的依赖帧被容器误标为 key；恢复关键帧反而没有 key 标记。
+                        keyFrame: index == 2 || index == 0))
+                }
+                let tracks = try AssemblerTestFixtures.videoTracks(codec: codec)
+                var units: [CompressedVideoAccessUnit] = []
+                let assembler = try CompressedVideoAssembler(trackSet: tracks,
+                    generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                        if case .accessUnit(let unit) = $0 { units.append(unit) }
+                    }, parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks),
+                    hlsCopyOwnership: owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 4_096,
+                        applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil)
+                for _ in frames { XCTAssertNoThrow(try assembler.push(AssemblerTestFixtures.videoPacket(codec: codec))) }
+                XCTAssertEqual(units.map(\.id), [1, 2, 3])
+                XCTAssertEqual(units.map { CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp($0.sampleBuffer)) }, [0, 0.12, 0.16])
+                XCTAssertTrue(try XCTUnwrap(units.dropFirst().first).isRandomAccess)
+                XCTAssertEqual(factory.handles.count, 1, "扫描坏帧无需重建健康解析器")
+            }
+        }
+    }
+
+    func testHEVCRecoveryWaitsPastCRAAndLeadingPicturesForIDR() throws {
+        for owned in [false, true] {
+            let tracks = try AssemblerTestFixtures.videoTracks(codec: .hevc)
+            let factory = ScriptedFFmpegParserFactory()
+            var units: [CompressedVideoAccessUnit] = []
+            let assembler = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                    if case .accessUnit(let unit) = $0 { units.append(unit) }
+                }, parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks),
+                hlsCopyOwnership: owned ? HLSVideoCopyOwnership(maximumPayloadBytes: 65_536,
+                    applicationLedger: HLSDeliveryApplicationChargeLedger()) : nil)
+            let handle = try XCTUnwrap(factory.handles.first)
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1])))
+            // CRA、RASL_N、RASL_R、TRAIL_R 都不能证明旧参考图已被清空。
+            for type: UInt8 in [21, 8, 9, 1] {
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes:
+                    AssemblerTestFixtures.hevcAccessUnit(nal: Data([type << 1, 1, 0x80])), keyFrame: true))
+            }
+            XCTAssertTrue(units.isEmpty)
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes:
+                AssemblerTestFixtures.hevcAccessUnit(), keyFrame: false))
+            XCTAssertEqual(units.count, 1)
+            XCTAssertTrue(try XCTUnwrap(units.first).isRandomAccess)
+            withExtendedLifetime(assembler) {}
+        }
+    }
+
+    func testMalformedVideoRecoveryIsBoundedAndRearmedByAValidKeyFrame() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let factory = ScriptedFFmpegParserFactory()
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: { _ in },
+            parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks))
+        let handle = try XCTUnwrap(factory.handles.first)
+        let bad = AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1]))
+        for _ in 0..<8 { XCTAssertNoThrow(try handle.emit(bad)) }
+        XCTAssertNoThrow(try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: AssemblerTestFixtures.h264AccessUnit())))
+        for _ in 0..<8 { XCTAssertNoThrow(try handle.emit(bad)) }
+        XCTAssertThrowsError(try handle.emit(bad)) { error in
+            XCTAssertEqual(error as? PlaybackCoreError, .videoDecode(-1_448_143_366))
+        }
+        withExtendedLifetime(assembler) {}
+    }
+
+    func testMalformedVideoCannotWaitForeverForAKeyFrame() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let factory = ScriptedFFmpegParserFactory()
+        var units: [CompressedVideoAccessUnit] = []
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                if case .accessUnit(let unit) = $0 { units.append(unit) }
+            }, parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks))
+        let handle = try XCTUnwrap(factory.handles.first)
+        XCTAssertNoThrow(try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1]))))
+        let dependent = AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1, 0x41, 0x80]))
+        for _ in 0..<249 { XCTAssertNoThrow(try handle.emit(dependent)) }
+        XCTAssertThrowsError(try handle.emit(dependent)) { error in
+            XCTAssertEqual(error as? PlaybackCoreError, .videoDecode(-1_448_143_366))
+        }
+        XCTAssertTrue(units.isEmpty)
+        withExtendedLifetime(assembler) {}
+    }
+
+    func testVideoRecoveryStateDoesNotCrossAnAssemblyRebind() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks(extradata:
+            AssemblerTestFixtures.annexBParameterSets([AssemblerTestFixtures.h264SPS, AssemblerTestFixtures.h264PPS]))
+        let binding = AssemblyEpochBinding(epochID: AssemblyEpochID(
+            timelineEpoch: TimelineEpochID(rawValue: 1), instanceToken: 1))
+        let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+            try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1, 0x41, 0x80]), keyFrame: false))
+        }
+        var units: [CompressedVideoAccessUnit] = []
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                if case .accessUnit(let unit) = $0 { units.append(unit) }
+            }, parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks), binding: binding)
+        let old = try XCTUnwrap(factory.handles.first)
+        XCTAssertNoThrow(try old.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1]))))
+        _ = binding.rebind()
+        try assembler.push(AssemblerTestFixtures.videoPacket())
+        XCTAssertEqual(units.count, 1)
+        XCTAssertEqual(old.destroyCount, 1)
+    }
+
+    func testVideoRecoveryRetainsParameterSetsWhileWaitingForRandomAccess() throws {
+        let replacementPPS = Data([0x68, 0xEE, 0x06, 0xE2])
+        let tracks = try AssemblerTestFixtures.videoTracks(extradata:
+            AssemblerTestFixtures.annexBParameterSets([AssemblerTestFixtures.h264SPS, AssemblerTestFixtures.h264PPS]))
+        let state = AssemblyFormatState(trackSet: tracks)
+        let factory = ScriptedFFmpegParserFactory()
+        var units: [CompressedVideoAccessUnit] = []
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: {
+                if case .accessUnit(let unit) = $0 { units.append(unit) }
+            }, parserFactory: factory, formatState: state)
+        let handle = try XCTUnwrap(factory.handles.first)
+        XCTAssertNoThrow(try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1]))))
+        try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: AssemblerTestFixtures.annexBParameterSets([replacementPPS])))
+        XCTAssertTrue(units.isEmpty, "等待关键帧时只更新有效格式参数")
+        XCTAssertEqual(state.snapshot().videoParameterSets, [AssemblerTestFixtures.h264SPS, replacementPPS])
+        try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1, 0x65, 0x80])))
+        XCTAssertEqual(units.count, 1)
+        withExtendedLifetime(assembler) {}
+    }
+
+    func testUnrecoveredVideoAtEOFReportsRecoveryFailureInsteadOfSilentlyFinishing() throws {
+        let tracks = try AssemblerTestFixtures.videoTracks()
+        let factory = ScriptedFFmpegParserFactory()
+        let assembler = try CompressedVideoAssembler(trackSet: tracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: { _ in },
+            parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks))
+        XCTAssertNoThrow(try XCTUnwrap(factory.handles.first).emit(
+            AssemblerTestFixtures.parsedVideoFrame(bytes: Data([0, 0, 1]))))
+        XCTAssertThrowsError(try assembler.drain()) { error in
+            XCTAssertEqual(error as? PlaybackCoreError, .videoDecode(-1_448_143_366))
+        }
+    }
+
+    func testVideoRecoveryDoesNotHideInvalidInitialExtradataOrHLSOwnershipFailures() throws {
+        let badTracks = try AssemblerTestFixtures.videoTracks(extradata: Data([0, 0, 1]))
+        XCTAssertThrowsError(try CompressedVideoAssembler(trackSet: badTracks,
+            generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: { _ in },
+            parserFactory: ScriptedFFmpegParserFactory(), formatState: AssemblyFormatState(trackSet: badTracks))) { error in
+            XCTAssertEqual(error as? PlaybackCoreError, .videoDecode(AnnexBScanner.invalidDataErrorCode))
+        }
+        let ledger = HLSDeliveryApplicationChargeLedger()
+        do {
+            let tracks = try AssemblerTestFixtures.videoTracks()
+            let factory = ScriptedFFmpegParserFactory { handle, _, _, _, _, _ in
+                try handle.emit(AssemblerTestFixtures.parsedVideoFrame(bytes: AssemblerTestFixtures.h264AccessUnit()))
+            }
+            let assembler = try CompressedVideoAssembler(trackSet: tracks,
+                generationProvider: { MediaGeneration(rawValue: 1) }, eventSink: { _ in },
+                parserFactory: factory, formatState: AssemblyFormatState(trackSet: tracks),
+                hlsCopyOwnership: HLSVideoCopyOwnership(maximumPayloadBytes: 1, applicationLedger: ledger))
+            XCTAssertThrowsError(try assembler.push(AssemblerTestFixtures.videoPacket())) { error in
+                XCTAssertEqual(error as? PlaybackCoreError, .videoDecode(SampleBufferBuilder.invalidDataErrorCode))
+            }
+        }
+        XCTAssertEqual(ledger.chargedBytes, 0)
+    }
+
     func testScannerHandlesH264HEVCZerosAndRejectsMalformedAndOversizedUnits() throws {
         let h264 = Data([0, 0, 0, 0, 1, 0x67, 0x42, 0, 0, 1, 0x68, 0xCE, 0, 0])
         let h264Result = try AnnexBScanner.scan(h264, codec: .h264)
