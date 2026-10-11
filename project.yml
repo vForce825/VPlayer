@@ -4,6 +4,7 @@ options:
   deploymentTarget:
     tvOS: "27.0"
     iOS: "27.0"
+    macOS: "27.0"
   createIntermediateGroups: true
   groupSortPosition: top
   developmentLanguage: zh-Hans
@@ -62,6 +63,7 @@ targets:
         excludes:
           - VPlayerPlayback-ios.metallib
           - VPlayerPlayback-iphonesimulator.metallib
+          - VPlayerPlayback-macos.metallib
     dependencies:
       - target: VPlayerCore
       - framework: Vendor/FFmpeg/Artifacts/FFmpeg.xcframework
@@ -97,6 +99,7 @@ targets:
       - path: Sources/VPlayerApp
         excludes:
           - Resources/Info.plist
+          - Player/PictureInPictureCoordinator.swift
     dependencies:
       - target: VPlayerCore
       - target: VPlayerPlayback
@@ -229,6 +232,7 @@ targets:
         excludes:
           - VPlayerPlayback-tvos.metallib
           - VPlayerPlayback-tvsimulator.metallib
+          - VPlayerPlayback-macos.metallib
     dependencies:
       - target: VPlayerCoreiOS
       - framework: Vendor/FFmpeg/Artifacts-iOS/FFmpeg.xcframework
@@ -281,6 +285,7 @@ targets:
       - path: Sources/VPlayerApp/Player/PlaybackMediaInformationPresentation.swift
       - path: Sources/VPlayerApp/Player/PlaybackNowPlayingCoordinator.swift
       - path: Sources/VPlayerApp/Player/PlaybackPresentationHost.swift
+      - path: Sources/VPlayerApp/Player/PictureInPictureCoordinator.swift
       - path: Sources/VPlayerApp/Player/PlayerChannelPresentation.swift
       - path: Sources/VPlayerApp/Player/PlayerPresentationPolicies.swift
       - path: Sources/VPlayerApp/Player/UITestPlaybackEngine.swift
@@ -388,7 +393,293 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests.ios
         GENERATE_INFOPLIST_FILE: true
         TEST_TARGET_NAME: VPlayeriOS
+  VPlayerCoreMacOS:
+    productName: VPlayerCore
+    type: framework
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayerCore
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_NAME: VPlayerCore
+        PRODUCT_MODULE_NAME: VPlayerCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core.macos
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: true
+        DEFINES_MODULE: true
+  VPlayerPlaybackMacOS:
+    productName: VPlayerPlayback
+    type: framework
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayerPlayback
+        excludes:
+          - include
+          - Resources
+          - Deinterlace/YADIF/YADIF.metal
+          - Scan/ScanProbe.metal
+      - path: Sources/VPlayerPlayback/include
+        headerVisibility: public
+      - path: Sources/VPlayerPlayback/Resources/VPlayerPlayback-macos.metallib
+        buildPhase: resources
+      - path: Sources/VPlayerPlayback/Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCoreMacOS
+      - framework: Vendor/FFmpeg/Artifacts-macOS/FFmpeg.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CryptoKit.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
+      - sdk: AppKit.framework
+      - sdk: Network.framework
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_NAME: VPlayerPlayback
+        PRODUCT_MODULE_NAME: VPlayerPlayback
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback.macos
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: true
+        DEFINES_MODULE: true
+        CLANG_C_LANGUAGE_STANDARD: c11
+        GCC_TREAT_WARNINGS_AS_ERRORS: true
+        OTHER_LDFLAGS: "$(inherited) -lz"
+  VPlayerMacOS:
+    productName: VPlayer
+    type: application
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: THIRD_PARTY_NOTICES
+        buildPhase: resources
+      - path: LICENSE
+        buildPhase: resources
+      - path: LICENSE.APPSTORE-EXCEPTION
+        buildPhase: resources
+      - path: Sources/VPlayerMacOSApp
+        excludes:
+          - Resources/Info.plist
+          - Resources/VPlayer.entitlements
+      - path: Sources/VPlayerApp/AppDependencies.swift
+      - path: Sources/VPlayerApp/AppLaunchConfiguration.swift
+      - path: Sources/VPlayerApp/AppModel.swift
+      - path: Sources/VPlayerApp/ChannelLogoDataLoader.swift
+      - path: Sources/VPlayerApp/ChannelLogoDiskCache.swift
+      - path: Sources/VPlayerApp/ChannelLogoImageDecoder.swift
+      - path: Sources/VPlayerApp/LibraryChangeSignal.swift
+      - path: Sources/VPlayerApp/Lifecycle
+      - path: Sources/VPlayerApp/Player/AcceptancePlaybackStatePresentation.swift
+      - path: Sources/VPlayerApp/Player/FullScreenPlayerViewModel.swift
+      - path: Sources/VPlayerApp/Player/PlaybackMediaInformationPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlaybackNowPlayingCoordinator.swift
+      - path: Sources/VPlayerApp/Player/PictureInPictureCoordinator.swift
+      - path: Sources/VPlayerApp/Player/PlayerChannelPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlayerPresentationPolicies.swift
+      - path: Sources/VPlayerApp/Player/UITestPlaybackEngine.swift
+      - path: Sources/VPlayerApp/Settings/ChannelBrowsingSettingsStore.swift
+      - path: Sources/VPlayerApp/Settings/PlaybackSettingsView.swift
+      - path: Sources/VPlayerApp/Views/ChannelEPGMappingView.swift
+      - path: Sources/VPlayerApp/Views/ChannelLogoView.swift
+      - path: Sources/VPlayerApp/Views/ChannelProgrammePresentation.swift
+      - path: Sources/VPlayerApp/Views/ChannelSections.swift
+      - path: Sources/VPlayerApp/Views/EPGCoverageNotice.swift
+      - path: Sources/VPlayerApp/Views/SourceProfilePresentation.swift
+      - path: Sources/VPlayerApp/Views/SourceProfileValidationMessage.swift
+      - path: Sources/VPlayerApp/Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCoreMacOS
+      - target: VPlayerPlaybackMacOS
+      - sdk: NowPlaying.framework
+      - sdk: CryptoKit.framework
+      - sdk: AVKit.framework
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_NAME: VPlayer
+        PRODUCT_MODULE_NAME: VPlayer
+        PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
+        MARKETING_VERSION: "2.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Sources/VPlayerMacOSApp/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Sources/VPlayerMacOSApp/Resources/VPlayer.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: true
+        ENABLE_APP_SANDBOX: true
+        ENABLE_INCOMING_NETWORK_CONNECTIONS: true
+        ENABLE_OUTGOING_NETWORK_CONNECTIONS: true
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+  VPlayerMacOSTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayerMacOSTests
+      - path: Tests/VPlayerTests/DomainTests.swift
+      - path: Tests/VPlayerTests/M3UParserTests.swift
+      - path: Tests/VPlayerTests/XMLTVParserTests.swift
+      - path: Tests/VPlayerTests/EPGMatcherTests.swift
+      - path: Tests/VPlayerTests/RefreshSchedulePlannerTests.swift
+      - path: Tests/VPlayerTests/RefreshCoordinatorTests.swift
+      - path: Tests/VPlayerTests/SwiftDataLibraryStoreTests.swift
+      - path: Tests/VPlayerTests/RefreshLifecycleTests.swift
+      - path: Tests/VPlayerTests/Support/RepositorySpy.swift
+      - path: Tests/VPlayerTests/ChannelSectionsTests.swift
+      - path: Tests/VPlayerTests/Playback/MediaCodecTests.swift
+      - path: Tests/VPlayerTests/Playback/MediaTimestampTests.swift
+      - path: Tests/VPlayerTests/Playback/BoundedMediaQueueTests.swift
+      - path: Tests/VPlayerTests/PlaybackSupport/PlaybackFakeMedia.swift
+      - path: Tests/VPlayerTests/Playback/MediaGenerationTests.swift
+      - path: Tests/VPlayerTests/Playback/HLS/HTTPRangeTests.swift
+      - path: Tests/VPlayerTests/PlaybackSettingsStoreTests.swift
+      - path: Tests/VPlayerTests/Support/FixtureLoader.swift
+      - path: Tests/Fixtures/playlists
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/epg
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerMacOS
+      - target: VPlayerCoreMacOS
+      - target: VPlayerPlaybackMacOS
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests.macos
+        GENERATE_INFOPLIST_FILE: true
+  VPlayerMacOSUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Tests/VPlayerMacOSUITests
+    dependencies:
+      - target: VPlayerMacOS
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.uitests.macos
+        GENERATE_INFOPLIST_FILE: true
+        TEST_TARGET_NAME: VPlayerMacOS
+  VPlayerMacOSHeadlessTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "27.0"
+    sources:
+      - path: Sources/VPlayerMacOSApp
+        excludes:
+          - VPlayerMacOSApp.swift
+          - Resources
+      - path: Sources/VPlayerApp/AppDependencies.swift
+      - path: Sources/VPlayerApp/AppLaunchConfiguration.swift
+      - path: Sources/VPlayerApp/AppModel.swift
+      - path: Sources/VPlayerApp/ChannelLogoDataLoader.swift
+      - path: Sources/VPlayerApp/ChannelLogoDiskCache.swift
+      - path: Sources/VPlayerApp/ChannelLogoImageDecoder.swift
+      - path: Sources/VPlayerApp/LibraryChangeSignal.swift
+      - path: Sources/VPlayerApp/Lifecycle
+      - path: Sources/VPlayerApp/Player/AcceptancePlaybackStatePresentation.swift
+      - path: Sources/VPlayerApp/Player/FullScreenPlayerViewModel.swift
+      - path: Sources/VPlayerApp/Player/PlaybackMediaInformationPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlaybackNowPlayingCoordinator.swift
+      - path: Sources/VPlayerApp/Player/PictureInPictureCoordinator.swift
+      - path: Sources/VPlayerApp/Player/PlayerChannelPresentation.swift
+      - path: Sources/VPlayerApp/Player/PlayerPresentationPolicies.swift
+      - path: Sources/VPlayerApp/Player/UITestPlaybackEngine.swift
+      - path: Sources/VPlayerApp/Settings/ChannelBrowsingSettingsStore.swift
+      - path: Sources/VPlayerApp/Settings/PlaybackSettingsView.swift
+      - path: Sources/VPlayerApp/Views/ChannelEPGMappingView.swift
+      - path: Sources/VPlayerApp/Views/ChannelLogoView.swift
+      - path: Sources/VPlayerApp/Views/ChannelProgrammePresentation.swift
+      - path: Sources/VPlayerApp/Views/ChannelSections.swift
+      - path: Sources/VPlayerApp/Views/EPGCoverageNotice.swift
+      - path: Sources/VPlayerApp/Views/SourceProfilePresentation.swift
+      - path: Sources/VPlayerApp/Views/SourceProfileValidationMessage.swift
+      - path: Sources/VPlayerApp/Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
+      - path: Tests/VPlayerMacOSTests
+      - path: Tests/VPlayerTests/DomainTests.swift
+      - path: Tests/VPlayerTests/M3UParserTests.swift
+      - path: Tests/VPlayerTests/XMLTVParserTests.swift
+      - path: Tests/VPlayerTests/EPGMatcherTests.swift
+      - path: Tests/VPlayerTests/RefreshSchedulePlannerTests.swift
+      - path: Tests/VPlayerTests/RefreshCoordinatorTests.swift
+      - path: Tests/VPlayerTests/SwiftDataLibraryStoreTests.swift
+      - path: Tests/VPlayerTests/RefreshLifecycleTests.swift
+      - path: Tests/VPlayerTests/Support/RepositorySpy.swift
+      - path: Tests/VPlayerTests/ChannelSectionsTests.swift
+      - path: Tests/VPlayerTests/Playback/MediaCodecTests.swift
+      - path: Tests/VPlayerTests/Playback/MediaTimestampTests.swift
+      - path: Tests/VPlayerTests/Playback/BoundedMediaQueueTests.swift
+      - path: Tests/VPlayerTests/PlaybackSupport/PlaybackFakeMedia.swift
+      - path: Tests/VPlayerTests/Playback/MediaGenerationTests.swift
+      - path: Tests/VPlayerTests/Playback/HLS/HTTPRangeTests.swift
+      - path: Tests/VPlayerTests/PlaybackSettingsStoreTests.swift
+      - path: Tests/VPlayerTests/Support/FixtureLoader.swift
+      - path: Tests/Fixtures/playlists
+        type: folder
+        buildPhase: resources
+      - path: Tests/Fixtures/epg
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: VPlayerCoreMacOS
+      - target: VPlayerPlaybackMacOS
+      - sdk: NowPlaying.framework
+      - sdk: CryptoKit.framework
+      - sdk: AVKit.framework
+    settings:
+      base:
+        ARCHS: arm64
+        PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.tests.macos.headless
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_FILE: ""
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) VPLAYER_MACOS_HEADLESS_TESTS"
 schemes:
+  VPlayerMacOSHeadless:
+    build:
+      targets:
+        VPlayerMacOSHeadlessTests: [test]
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: VPlayerMacOSHeadlessTests
+          parallelizable: false
+  VPlayerMacOS:
+    build:
+      targets:
+        VPlayerMacOS: all
+        VPlayerMacOSTests: [test]
+        VPlayerMacOSUITests: [test]
+    test:
+      gatherCoverageData: false
+      targets:
+        - name: VPlayerMacOSTests
+          parallelizable: false
+        - name: VPlayerMacOSUITests
+          parallelizable: false
+    run:
+      config: Debug
+    archive:
+      config: Release
   VPlayer:
     build:
       targets:

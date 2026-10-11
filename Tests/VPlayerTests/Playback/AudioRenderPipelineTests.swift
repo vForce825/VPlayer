@@ -1989,6 +1989,32 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(harness.failures.snapshot.isEmpty)
     }
 
+    func testInputBackpressureClearsAfterRendererAcceptsPendingReplay() throws {
+        let limits = try CompressedAudioRetentionLimits(maximumCount: 10, maximumOwnedBytes: 100,
+            latestTailHorizon: CMTime(value: 4, timescale: 1))
+        let harness = try makeHarness(replayRetentionLimits: limits, replayHardCount: 10)
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+        try perform(on: harness.executor) {
+            XCTAssertFalse(harness.pipeline.isInputBackpressured)
+            for id in 1...3 {
+                try harness.pipeline.enqueue(try self.makeSample(id: UInt64(id),
+                    pts: CMTime(value: Int64(id - 1), timescale: 1),
+                    duration: CMTime(value: 1, timescale: 1), payloadBytes: 2))
+            }
+            XCTAssertTrue(harness.pipeline.isInputBackpressured)
+        }
+        renderer.configureReadiness(ready: true, sufficient: true)
+        renderer.fireReady()
+        drain(harness.executor)
+        try perform(on: harness.executor) {
+            XCTAssertFalse(harness.pipeline.isInputBackpressured)
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [1, 2, 3])
+        }
+        XCTAssertEqual(renderer.snapshot.enqueuedPTS.count, 3)
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testReplayBudgetNeverDropsBackpressuredUnsentHead() throws {
         let limits = try CompressedAudioRetentionLimits(
             maximumCount: 10,

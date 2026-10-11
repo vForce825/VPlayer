@@ -34,6 +34,11 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
 
     static var routeAllocationReservation: RouteAllocationReservation {
         func object(_ type: AnyClass) -> Int { malloc_good_size(class_getInstanceSize(type)) }
+        #if os(macOS)
+        let observerBytes = MacAudioDeviceObserver.allocationReservationBytes
+        #else
+        let observerBytes = 64 + 32 + 48 + 16
+        #endif
         return .init(
             serviceObject: object(PlaybackAudioRouteService.self),
             serviceLock: object(NSLock.self),
@@ -45,7 +50,7 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
             resampleSyncBridge: PlaybackExternalSyncProducerReservation.FixedLedgerCharge
                 .routeResampleSyncBridge.bytes,
             // 原生 token 及包含弱引用、绑定 UUID 的回调；不保存逐通知任务或媒体数据。
-            notificationObserver: 64 + 32 + 48 + 16,
+            notificationObserver: observerBytes,
             weakTargetAllocationCharges: 32)
     }
     private let registry: ControlTaskRegistry
@@ -57,6 +62,9 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
     private var sessionRegistration: PlaybackAudioSessionRegistration?
     private let notificationCenter: NotificationCenter
     private var routeObserver: NSObjectProtocol?
+    #if os(macOS)
+    private var macDeviceObserver: MacAudioDeviceObserver?
+    #endif
     private var bindingID: UUID?
     private var routeSamplingPending = false
     private let timer: any PlaybackDeadlineTimer
@@ -96,12 +104,18 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
                     bindingID = id
                 }
                 // 先发布绑定再安装监听，安装过程中同步到达的通知也必须使旧输出失效。
+                #if os(macOS)
+                macDeviceObserver = MacAudioDeviceObserver { [weak self] in
+                    _ = self?.publishRouteIngress(topologyChangeHint: true, expectedBindingID: id)
+                }
+                #else
                 routeObserver = notificationCenter.addObserver(forName: AVAudioSession.routeChangeNotification,
                     object: nil, queue: nil) { [weak self] notification in
                         guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
                               let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
                         self?.receiveRouteNotification(reason, bindingID: id)
                     }
+                #endif
             }
             if let sampler = initialSampler {
                 _ = owner.sample(sampler, receiver: self)
@@ -120,6 +134,10 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
             }
             if let routeObserver { notificationCenter.removeObserver(routeObserver) }
             routeObserver = nil
+            #if os(macOS)
+            macDeviceObserver?.stop()
+            macDeviceObserver = nil
+            #endif
         }
     }
     
@@ -166,10 +184,13 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         registry.executor.sync { drainRouteSampling() }
     }
 
+    #if !os(macOS)
     private func receiveRouteNotification(_ reason: AVAudioSession.RouteChangeReason, bindingID: UUID) {
         _ = publishRouteIngress(topologyChangeHint: reason == .routeConfigurationChange || reason == .categoryChange,
             expectedBindingID: bindingID)
     }
+
+    #endif
 
     private func publishRouteIngress(topologyChangeHint: Bool, expectedBindingID: UUID? = nil) -> Bool {
         lock.withLock {

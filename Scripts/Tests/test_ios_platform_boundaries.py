@@ -21,8 +21,10 @@ class IOSPlatformBoundaryTests(unittest.TestCase):
 
     def test_metal_selects_platform_before_simulator_variant(self):
         source = (ROOT/'Sources/VPlayerPlayback/Media/PlaybackMetalLibrary.swift').read_text()
-        self.assertIn('#if os(iOS)', source)
-        for resource in ['ios', 'iphonesimulator', 'tvos', 'tvsimulator']:
+        self.assertIn('#if os(macOS)', source)
+        self.assertIn('#elseif os(iOS)', source)
+        self.assertLess(source.index('#elseif os(iOS)'), source.index('#if targetEnvironment(simulator)'))
+        for resource in ['macos', 'ios', 'iphonesimulator', 'tvos', 'tvsimulator']:
             self.assertIn('VPlayerPlayback-'+resource+'"', source)
 
     def test_phone_native_envelope_is_explicit_and_does_not_replace_tv_models(self):

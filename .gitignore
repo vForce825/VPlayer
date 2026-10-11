@@ -15,3 +15,5 @@ xcuserdata/
 /Vendor/FFmpeg/Artifacts-iOS/
 build/
 *.log
+
+/Vendor/FFmpeg/Artifacts-macOS/

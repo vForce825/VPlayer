@@ -31,7 +31,19 @@ ffmpeg_select_platform() {
       ffmpeg_device_platform_id=2
       ffmpeg_simulator_platform_id=7
       ;;
-    *) echo 'FFmpeg platform must be tvos or ios' >&2; return 64 ;;
+    macos)
+      ffmpeg_platform=macos
+      ffmpeg_required_symbols=system-symbol-allowlist-macos.txt
+      ffmpeg_display_name=macOS
+      ffmpeg_artifact_directory=Artifacts-macOS
+      ffmpeg_work_suffix=/macos
+      ffmpeg_device_sdk=macosx
+      ffmpeg_simulator_sdk=''
+      ffmpeg_simulator_architectures=''
+      ffmpeg_device_platform_id=1
+      ffmpeg_simulator_platform_id=0
+      ;;
+    *) echo 'FFmpeg platform must be tvos, ios or macos' >&2; return 64 ;;
   esac
 }
 

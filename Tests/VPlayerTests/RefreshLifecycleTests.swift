@@ -3,7 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import XCTest
+#if !VPLAYER_MACOS_HEADLESS_TESTS
 @testable import VPlayer
+#endif
 @testable import VPlayerCore
 
 @MainActor
@@ -941,6 +943,57 @@ final class RefreshLifecycleTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("Expected profile load \(count)")
+    }
+
+    func testForegroundCycleDeduplicatesSharedURLsBeforeSequentialCalls() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var first = makeProfile(now: now)
+        first.epgRefreshInterval = .hourly
+        let second = SourceProfile(id: UUID(), name: "共享源", m3uURL: first.m3uURL, epgURL: first.epgURL,
+            m3uRefreshInterval: .hourly, epgRefreshInterval: .hourly,
+            m3uStatus: .init(), epgStatus: .init(), createdAt: now, updatedAt: now)
+        let profiles = [first, second]
+        let work = BackgroundWorkProbe()
+        let loop = ForegroundLoopProbe()
+        let driver = ForegroundRefreshDriver(loadProfiles: { profiles },
+            refresh: { _, resources, trigger in
+                await work.recordRefresh(resources: resources, trigger: trigger)
+                return resources.map { RefreshOutcome(resource: $0, succeeded: false, message: "下载失败") }
+            }, now: { now }, sleep: {
+                await loop.recordSleepStarted()
+                try await Task.sleep(for: .seconds(3_600))
+            }, reportStatus: { _ in })
+        driver.initialLibraryLoadDidComplete()
+        driver.activate()
+        await loop.waitForSleepCount(1)
+        driver.deactivate()
+        let count = await work.refreshCount
+        let resources = await work.resources
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(resources, [.playlist, .epg])
+    }
+
+    func testBackgroundCycleDeduplicatesSharedURLsEvenWhenDownloadFails() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let first = makeProfile(now: now)
+        let second = SourceProfile(id: UUID(), name: "共享源", m3uURL: first.m3uURL, epgURL: first.epgURL,
+            m3uRefreshInterval: .hourly, epgRefreshInterval: .manual,
+            m3uStatus: .init(), epgStatus: .init(), createdAt: now, updatedAt: now)
+        let profiles = [first, second]
+        let scheduler = BackgroundSchedulerSpy()
+        let work = BackgroundWorkProbe()
+        let registrar = BackgroundRefreshRegistrar(scheduler: scheduler, loadProfiles: { profiles },
+            refresh: { _, resources, trigger in
+                await work.recordRefresh(resources: resources, trigger: trigger)
+                return resources.map { RefreshOutcome(resource: $0, succeeded: false, message: "下载失败") }
+            }, now: { now }, reportStatus: { _ in })
+        registrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await eventually { task.completions.count == 1 }
+        let count = await work.refreshCount
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(task.completions, [false])
     }
 
     private func makeProfile(now: Date) -> SourceProfile {

@@ -3,7 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 public enum VPlayerCore {
-    #if os(iOS)
+    #if os(macOS)
+    public static let deploymentTarget = "macOS 27.0"
+    #elseif os(iOS)
     public static let deploymentTarget = "iOS 27.0"
     #else
     public static let deploymentTarget = "tvOS 27.0"

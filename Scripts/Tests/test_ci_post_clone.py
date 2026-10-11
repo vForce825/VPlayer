@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-ARTIFACT_DIRECTORIES = {"ios": "Artifacts-iOS", "tvos": "Artifacts"}
+ARTIFACT_DIRECTORIES = {"ios": "Artifacts-iOS", "tvos": "Artifacts", "macos": "Artifacts-macOS"}
 
 
 class PostCloneTests(unittest.TestCase):
@@ -53,11 +53,11 @@ class PostCloneTests(unittest.TestCase):
                         sys.exit(status)
                     platform = "tvos"
                     if args:
-                        if len(args) != 2 or args[0] != "--platform" or args[1] not in ("ios", "tvos"):
+                        if len(args) != 2 or args[0] != "--platform" or args[1] not in ("ios", "tvos", "macos"):
                             sys.exit(64)
                         platform = args[1]
                     platform = os.environ.get("BUILD_OUTPUT_PLATFORM", platform)
-                    directory = {"ios": "Artifacts-iOS", "tvos": "Artifacts"}[platform]
+                    directory = {"ios": "Artifacts-iOS", "tvos": "Artifacts", "macos": "Artifacts-macOS"}[platform]
                     artifact = root / "Vendor/FFmpeg" / directory / "FFmpeg.xcframework"
                     artifact.mkdir(parents=True, exist_ok=True)
                     if os.environ.get("BUILD_OMIT_INFO") != "1":
@@ -90,7 +90,7 @@ class PostCloneTests(unittest.TestCase):
             return result, calls, artifacts, root
 
     def test_builds_selected_platform_when_only_other_platform_is_cached(self):
-        for product, selected, other in [("iOS", "ios", "tvos"), ("tvOS", "tvos", "ios")]:
+        for product, selected, other in [("iOS", "ios", "tvos"), ("tvOS", "tvos", "ios"), ("macOS", "macos", "ios")]:
             for cached in [(), (other,)]:
                 with self.subTest(product=product, cached=cached):
                     result, calls, artifacts, root = self.run_hook(product, cached=cached, CI_XCODE_CLOUD="TRUE")
@@ -101,9 +101,9 @@ class PostCloneTests(unittest.TestCase):
                     self.assertIn(selected, artifacts)
 
     def test_audits_only_selected_platform_when_both_artifacts_exist(self):
-        for product, selected in [("iOS", "ios"), ("tvOS", "tvos")]:
+        for product, selected in [("iOS", "ios"), ("tvOS", "tvos"), ("macOS", "macos")]:
             with self.subTest(product=product):
-                result, calls, _, root = self.run_hook(product, cached=("ios", "tvos"), CI_XCODE_CLOUD="TRUE")
+                result, calls, _, root = self.run_hook(product, cached=("ios", "tvos", "macos"), CI_XCODE_CLOUD="TRUE")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 artifact = root / "Vendor/FFmpeg" / ARTIFACT_DIRECTORIES[selected] / "FFmpeg.xcframework"
                 self.assertEqual([(call["command"], call["args"]) for call in calls],
@@ -111,7 +111,7 @@ class PostCloneTests(unittest.TestCase):
                 self.assertEqual(calls[0]["cwd"], str(root))
 
     def test_unsupported_platform_fails_before_install_or_artifact_commands(self):
-        for platform in ["macOS", "watchOS", "visionOS", "ios", "tvos", "unknown"]:
+        for platform in ["macos", "watchOS", "visionOS", "ios", "tvos", "unknown"]:
             with self.subTest(platform=platform):
                 result, calls, artifacts, _ = self.run_hook(platform, jq=False)
                 self.assertNotEqual(result.returncode, 0)

@@ -25,7 +25,7 @@ public protocol DisplayReadinessControlling: AnyObject {
     func reanchorAfterDisplayModeSwitch() -> Bool
 }
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 @MainActor
 final class IOSDisplayModeController: PlaybackDisplayModeControlling {
     func enterFullScreen(formatDescription: CMFormatDescription, outputFrameRate: Float) {}

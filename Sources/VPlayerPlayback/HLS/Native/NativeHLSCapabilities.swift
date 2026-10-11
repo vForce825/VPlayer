@@ -10,9 +10,12 @@ import VideoToolbox
 enum NativeHLSPlatform: Sendable, Equatable {
     case appleTV
     case iPhone
+    case mac
 
     static var current: Self {
-        #if os(iOS)
+        #if os(macOS)
+        .mac
+        #elseif os(iOS)
         .iPhone
         #else
         .appleTV
@@ -59,6 +62,7 @@ enum NativeHLSCapabilities {
         // below remains mandatory and does not promise measured performance.
         let knownPhone = evidence.platform == .iPhone &&
             evidence.model.range(of: "^iPhone[0-9]+,[0-9]+$", options: .regularExpression) != nil
+        let knownMac = evidence.platform == .mac
         let modernHDR = ["AppleTV11,1", "AppleTV14,1"].contains(evidence.model)
         // Since tvOS 17 the public API interprets codecs in the MIME container's
         // namespace. A playlist is not a media-data container: qualifying the
@@ -69,14 +73,14 @@ enum NativeHLSCapabilities {
             nativeHLSMediaPlayable($0, evidence: evidence)
         }
         var videoFormats: [HLSVideoCapability] = []
-        var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K || knownPhone
+        var everyVideoPlayable = facts.media.allSatisfy { $0.video == nil } || known4K || knownPhone || knownMac
         // Apple HLS authoring 1.3/1.6 and Apple TV 4K technical specifications:
         // https://developer.apple.com/documentation/http-live-streaming/hls-authoring-specification-for-apple-devices
         // https://support.apple.com/en-us/111922
         // https://support.apple.com/en-us/111839
         // Unknown hardware stays outside this device envelope. Exact per-source
         // MIME queries remain necessary even for an allowlisted model.
-        if known4K || knownPhone {
+        if known4K || knownPhone || knownMac {
             for video in facts.media.compactMap(\.video) {
                 guard let codec = video.codec, let mimeCodec = codecString(video),
                       (codec == .h264 ? evidence.hardwareH264 : evidence.hardwareHEVC),

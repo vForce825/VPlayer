@@ -485,6 +485,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 #endif
     private var deferredPackets: [DemuxPacket] = []
     private var pendingPacketAdmission: PendingPacketAdmission?
+    private var readAheadAdmissionToken: UUID?
     private var pendingTrackVideo = CompressedVideoReservoir(
         limits: PlaybackPipeline.pendingTrackVideoRetentionLimits
     )
@@ -1051,8 +1052,31 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             }
             return
         }
+        // 首次建立时间线前仍需读取到视频关键帧；开始播放后的积压由音频队列背压约束。
+        if case let .packet(packet) = event, hasOpenedReadinessForCurrentMedia, audio.isInputBackpressured {
+            pendingPacketAdmission = PendingPacketAdmission(packet: packet, acknowledgement: acknowledgement)
+            let token = UUID()
+            readAheadAdmissionToken = token
+            scheduleReadAheadAdmissionIsolated(token: token)
+            return
+        }
         handleDemuxIsolated(event)
         acknowledgement.signal()
+    }
+
+    private func scheduleReadAheadAdmissionIsolated(token: UUID) {
+        executor.submit(after: .milliseconds(20)) { [weak self] in
+            guard let self, readAheadAdmissionToken == token,
+                  let admission = pendingPacketAdmission, !terminal, !paused else { return }
+            if hasOpenedReadinessForCurrentMedia, audio.isInputBackpressured {
+                scheduleReadAheadAdmissionIsolated(token: token)
+                return
+            }
+            readAheadAdmissionToken = nil
+            pendingPacketAdmission = nil
+            handleDemuxIsolated(.packet(admission.packet))
+            admission.acknowledgement.signal()
+        }
     }
 
     private func handleDemuxIsolated(_ event: DemuxEvent) {
@@ -2651,6 +2675,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         guard started, !terminal, paused != shouldPause else { return }
         self.readinessCycle = readinessCycle
         paused = shouldPause
+        readAheadAdmissionToken = nil
         if shouldPause {
             audioSupplyHold = nil
             invalidateVideoDecodeStallWatchdogIsolated()
@@ -3284,6 +3309,17 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             let end = CMTimeAdd($0.presentationTimeStamp, $0.duration)
             return !end.isNumeric || CMTimeCompare(end, commonPTS) > 0
         }
+        let seedVideo: [VideoPresentationFrame]
+        #if os(macOS)
+        if clock is RenderSynchronizerClock {
+            // 可见的 Mac renderer 在暂停时只接受有限预滚；不能等整个缓冲窗
+            // 写完才启动时钟，否则剩余未来帧与零速率时钟相互等待。
+            seedVideo = Array(candidateVideo.prefix(videoCoordinator.requiredVideoFrameCount))
+        } else { seedVideo = candidateVideo }
+        #else
+        seedVideo = candidateVideo
+        #endif
+        let deferredVideo = Array(candidateVideo.dropFirst(seedVideo.count))
         guard hasSufficientMediaForAnchor(
             commonPTS: commonPTS,
             audioIsland: audioCandidate,
@@ -3323,6 +3359,14 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 routeRevision: expectedRouteRevision
             )
             anchorPreparationTransaction = preparation
+            #if os(macOS)
+            if clock is RenderSynchronizerClock {
+                // Mac 的原生 Receiver 会等待过远的未来帧。先以零速率移到待提交
+                // 的恢复位置，才能接受种子帧；就绪及正速率授权仍等待真实提交回执。
+                clock.anchor(mediaTime: commonPTS,
+                    atHostTime: CMClockGetTime(CMClockGetHostTimeClock()), rate: 0)
+            }
+            #endif
             do {
                 try audio.prepareAnchor(at: commonPTS, in: audioCandidate.id)
             } catch let error as PlaybackCoreError {
@@ -3345,18 +3389,21 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
                 generation: expectedGeneration,
                 reason: resetReason,
                 removeDisplayedImage: true,
-                seedFrames: candidateVideo
+                seedFrames: seedVideo
             )) { [weak self] result in
                 guard let self else { return }
                 executor.submit { [self] in
                     completeAnchorPreparationIsolated(
                         preparation,
                         audioCandidate: audioCandidate,
-                        candidateVideo: candidateVideo,
+                        candidateVideo: seedVideo,
                         result: result
                     )
                 }
             }
+            // 其余恢复帧先进入重置屏障后的普通队列，再接收新解码帧，保持
+            // 时间顺序。就绪仍只依据种子帧的真实回执，后续帧随时钟启动排空。
+            for frame in deferredVideo { renderer.enqueue(frame) }
             // Readiness must stay closed until the physical renderer flush has
             // completed and every seed sample has crossed the backend boundary.
             return false
@@ -3843,6 +3890,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 
     private func releasePendingAdmissionIsolated() {
         assertIsolated()
+        readAheadAdmissionToken = nil
         pendingPacketAdmission?.acknowledgement.signal()
         pendingPacketAdmission = nil
     }

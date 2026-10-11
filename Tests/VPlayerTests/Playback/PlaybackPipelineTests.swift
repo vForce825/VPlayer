@@ -7034,6 +7034,36 @@ final class PlaybackPipelineTests: XCTestCase {
         )
     }
 
+    func testAudioBackpressureWaitsForRendererAndStopReleasesBlockedDemux() async throws {
+        for releaseByStopping in [false, true] {
+            let harness = makeHarness()
+            addTeardownBlock { await harness.pipeline.stop() }
+            let generation = try await configure(harness)
+            try await openInitialSharedTimeline(harness, generation: generation)
+            harness.audio.setInputBackpressured(true)
+            let started = LockedFlag()
+            let finished = LockedFlag()
+            let emitter = Task.detached {
+                started.set()
+                harness.demux.emit(.packet(DemuxPacket(
+                    streamIndex: 100, codec: .video(.h264), data: Data([0]),
+                    presentationTimeStamp: CMTime(value: 8, timescale: 1),
+                    decodeTimeStamp: .invalid, duration: CMTime(value: 1, timescale: 25),
+                    isKey: false, isCorrupt: false
+                )))
+                finished.set()
+            }
+            try await eventually { started.value }
+            try await Task.sleep(for: .milliseconds(100))
+            XCTAssertFalse(finished.value, "音频背压期间应暂停读取，保留尚未播放的音频")
+            if releaseByStopping { await harness.pipeline.stop() }
+            else { harness.audio.setInputBackpressured(false) }
+            try await eventually { finished.value }
+            await emitter.value
+            await harness.pipeline.stop()
+        }
+    }
+
     func testPauseKeepsBoundedPacketsAndBackpressuresUntilResume() async throws {
         let harness = makeHarness()
         _ = try await configure(harness)

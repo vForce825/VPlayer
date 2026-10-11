@@ -5,7 +5,13 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+#if os(macOS)
+import AppKit
+public typealias PlaybackWindow = NSWindow
+#else
 import UIKit
+public typealias PlaybackWindow = UIWindow
+#endif
 
 public enum PlaybackPresentationRoute: UInt8, Sendable, Equatable {
     case progressive
@@ -70,10 +76,10 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
     }
 
     typealias DisplayModeFactory = @MainActor @Sendable (
-        UIWindow, any DisplayLinkControlling, any DisplayReadinessControlling
+        PlaybackWindow, any DisplayLinkControlling, any DisplayReadinessControlling
     ) -> any PlaybackDisplayModeControlling
     #if os(tvOS)
-    typealias DisplayManagerFactory = @MainActor @Sendable (UIWindow) -> any DisplayCriteriaManaging
+    typealias DisplayManagerFactory = @MainActor @Sendable (PlaybackWindow) -> any DisplayCriteriaManaging
     #endif
 
     private let switchStarted: @Sendable () -> Void
@@ -83,7 +89,7 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
     @MainActor private var cachedView: SampleBufferVideoView?
     @MainActor private let presentationControl = SystemPresentationControlAdapter()
     @MainActor private var criteriaController: (any PlaybackDisplayModeControlling)?
-    @MainActor private weak var attachedWindow: UIWindow?
+    @MainActor private weak var attachedWindow: PlaybackWindow?
     @MainActor private var pendingCriteria: CriteriaRequest?
     @MainActor private var terminal = false
 
@@ -139,7 +145,7 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
     }
 
     @MainActor
-    public func attach(to window: UIWindow) {
+    public func attach(to window: PlaybackWindow) {
         guard !terminal else { return }
         _ = makeVideoView()
         guard attachedWindow !== window || criteriaController == nil else { return }

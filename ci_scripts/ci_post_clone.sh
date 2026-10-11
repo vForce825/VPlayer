@@ -21,6 +21,7 @@ fi
 case "$product_platform" in
   iOS) platform=ios; artifact_directory=Artifacts-iOS ;;
   tvOS) platform=tvos; artifact_directory=Artifacts ;;
+  macOS) platform=macos; artifact_directory=Artifacts-macOS ;;
   *)
     echo "Xcode Cloud preparation failed: unsupported CI_PRODUCT_PLATFORM: $product_platform" >&2
     exit 64

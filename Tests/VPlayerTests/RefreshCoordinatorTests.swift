@@ -822,6 +822,297 @@ final class RefreshCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.playlistInstallCount, 0)
     }
 
+    func testManualRefreshWritesSharedPlaylistAndEPGToEveryMatchingProfile() async throws {
+        let otherID = UUID()
+        let unrelatedID = UUID()
+        var other = makeProfile(id: otherID)
+        other.m3uRefreshInterval = .manual
+        other.epgRefreshInterval = .manual
+        let unrelated = makeProfile(id: unrelatedID,
+            m3uURL: URL(string: "https://different.test/list.m3u")!,
+            epgURL: URL(string: "https://different.test/guide.xml")!)
+        let repository = RepositorySpy(profiles: [makeProfile(), other, unrelated])
+        let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享频道"), .epg: validEPG()])
+        let terminal = ProfileRefreshNotifications()
+        let started = ProfileRefreshNotifications()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(repository: repository, downloader: downloader, now: { fixedNow },
+            onPersistedOutcome: { id, outcome in await terminal.record(id, outcome.resource) },
+            onRefreshStarted: { id, resource in await started.record(id, resource) })
+
+        let outcomes = await coordinator.refresh(profileID: profileID, resources: [.playlist, .epg], trigger: .manual)
+
+        XCTAssertTrue(outcomes.allSatisfy(\.succeeded))
+        for resource in RefreshResource.allCases {
+            let count = await downloader.invocationCount(for: resource)
+            XCTAssertEqual(count, 1)
+        }
+        let snapshot = await repository.snapshot()
+        for id in [profileID, otherID] {
+            let updated = try XCTUnwrap(snapshot.profiles.first { $0.id == id })
+            XCTAssertEqual(updated.m3uStatus.lastSuccessAt, now)
+            XCTAssertEqual(updated.epgStatus.lastSuccessAt, now)
+            XCTAssertEqual(updated.m3uStatus.attemptID, outcomes[0].attemptID)
+            XCTAssertEqual(updated.epgStatus.attemptID, outcomes[1].attemptID)
+            XCTAssertEqual(snapshot.channels[id]?.map(\.sourceProfileID), [id])
+            XCTAssertEqual(snapshot.epgChannels[id]?.map(\.id), ["news"])
+        }
+        XCTAssertNotEqual(snapshot.channels[profileID]?.first?.id, snapshot.channels[otherID]?.first?.id)
+        XCTAssertNil(snapshot.channels[unrelatedID])
+        XCTAssertNil(snapshot.epgChannels[unrelatedID])
+        XCTAssertEqual(snapshot.profiles.first { $0.id == unrelatedID }, unrelated)
+        let terminalIDs = await terminal.profileIDs
+        let startedIDs = await started.profileIDs
+        XCTAssertEqual(terminalIDs, Set([profileID, otherID]))
+        XCTAssertEqual(startedIDs, Set([otherID]))
+        await assertTemporaryDownloadsWereDeleted(downloader)
+    }
+
+    func testConcurrentDifferentProfilesShareURLFlightsForBothResources() async {
+        let otherID = UUID()
+        let repository = RepositorySpy(profiles: [makeProfile(), makeProfile(id: otherID)])
+        let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享"), .epg: validEPG()],
+            delay: .milliseconds(100))
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let firstID = profileID
+        async let first = coordinator.refresh(profileID: firstID, resources: [.playlist, .epg], trigger: .manual)
+        async let second = coordinator.refresh(profileID: otherID, resources: [.playlist, .epg], trigger: .foreground)
+        let results = await (first, second)
+        XCTAssertEqual(results.0, results.1)
+        XCTAssertTrue(results.0.allSatisfy(\.succeeded))
+        for resource in RefreshResource.allCases {
+            let count = await downloader.invocationCount(for: resource)
+            XCTAssertEqual(count, 1)
+        }
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.playlistInstallCount, 2)
+        XCTAssertEqual(snapshot.epgInstallCount, 2)
+    }
+
+    func testSharedFailurePreservesBothSnapshotsAndWritesBothStatuses() async {
+        let otherID = UUID()
+        let epg = [EPGChannel(id: "old", displayNames: ["旧节目"], iconURL: nil)]
+        let repository = RepositorySpy(profiles: [makeProfile(), makeProfile(id: otherID)],
+            epgChannels: [profileID: epg, otherID: epg])
+        let downloader = FakeRemoteDownloader(data: [.epg: Data("<tv><channel".utf8)])
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let result = await coordinator.refresh(profileID: profileID, resources: [.epg], trigger: .manual)
+        let snapshot = await repository.snapshot()
+        XCTAssertFalse(result[0].succeeded)
+        for profile in snapshot.profiles {
+            XCTAssertEqual(profile.epgStatus.state, .failed)
+            XCTAssertEqual(profile.epgStatus.errorSummary, result[0].message)
+            XCTAssertEqual(snapshot.epgChannels[profile.id], epg)
+        }
+        let count = await downloader.invocationCount(for: .epg)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testRetargetedParticipantDoesNotPreventOtherURLParticipantsFromCommitting() async {
+        for resource in RefreshResource.allCases {
+            let otherID = UUID()
+            let original = makeProfile()
+            let other = makeProfile(id: otherID)
+            let repository = RepositorySpy(profiles: [original, other])
+            let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享"), .epg: validEPG()],
+                isSuspended: true)
+            let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+            let task = Task { await coordinator.refresh(profileID: profileID, resources: [resource], trigger: .manual) }
+            await waitUntil { await downloader.invocationCount(for: resource) == 1 }
+            let changed = resource == .playlist
+                ? makeProfile(m3uURL: URL(string: "https://changed.test/list.m3u")!)
+                : makeProfile(epgURL: URL(string: "https://changed.test/guide.xml")!)
+            let currentOther = await repository.snapshot().profiles.first { $0.id == otherID }!
+            await repository.replaceProfiles([changed, currentOther], activeProfileID: profileID)
+            await downloader.resume(resource)
+            let result = await task.value
+            let snapshot = await repository.snapshot()
+            XCTAssertFalse(result[0].succeeded)
+            XCTAssertEqual(snapshot.profiles.first { $0.id == profileID }, changed)
+            let status = resource == .playlist ? snapshot.profiles[1].m3uStatus : snapshot.profiles[1].epgStatus
+            XCTAssertEqual(status.state, .succeeded)
+            XCTAssertEqual(status.lastSuccessAt, now)
+        }
+    }
+
+    func testProfileAddedDuringDownloadReceivesSharedResult() async {
+        let repository = RepositorySpy(profiles: [makeProfile()])
+        let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享")], isSuspended: true)
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let task = Task { await coordinator.refresh(profileID: profileID, resources: [.playlist], trigger: .manual) }
+        await waitUntil { await downloader.invocationCount(for: .playlist) == 1 }
+        let current = await repository.snapshot().profiles
+        let newID = UUID()
+        await repository.replaceProfiles(current + [makeProfile(id: newID)], activeProfileID: profileID)
+        await downloader.resume(.playlist)
+        let result = await task.value
+        XCTAssertTrue(result[0].succeeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.channels[newID]?.map(\.sourceProfileID), [newID])
+        XCTAssertEqual(snapshot.profiles.last?.m3uStatus.lastSuccessAt, now)
+    }
+
+    func testCancellingOneProfileWaiterPreservesSharedDownloadForAnotherProfile() async throws {
+        let otherID = UUID()
+        let repository = RepositorySpy(profiles: [makeProfile(), makeProfile(id: otherID)])
+        let downloader = FakeRemoteDownloader(data: [.epg: validEPG()], isSuspended: true)
+        let registrations = ProfileRefreshNotifications()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(repository: repository, downloader: downloader, now: { fixedNow },
+            waiterRegistrationObserver: { registration in
+                Task { await registrations.record(registration.profileID, registration.resource) }
+            })
+        let first = Task { await coordinator.refresh(profileID: profileID, resources: [.epg], trigger: .manual) }
+        await waitUntil { await downloader.invocationCount(for: .epg) == 1 }
+        let second = Task { await coordinator.refresh(profileID: otherID, resources: [.epg], trigger: .background) }
+        await waitUntil { await registrations.profileIDs.count == 2 }
+        first.cancel()
+        let cancelled = await first.value
+        XCTAssertEqual(cancelled[0].message, "刷新已取消。")
+        let cancellationCount = await downloader.cancellationCount(for: .epg)
+        XCTAssertEqual(cancellationCount, 0)
+        await downloader.resume(.epg)
+        let completed = await second.value
+        XCTAssertTrue(completed[0].succeeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertTrue(snapshot.profiles.allSatisfy { $0.epgStatus.state == .succeeded })
+        let count = await downloader.invocationCount(for: .epg)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testSharedRefreshPersistsIndependentSwiftDataSnapshotsAndProgrammes() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let store = SwiftDataLibraryStore(modelContainer: container)
+        let input = try SourceProfileInput(name: "共享源", m3uURLString: "https://source.test/list.m3u",
+            epgURLString: "https://source.test/guide.xml", m3uRefreshInterval: .daily, epgRefreshInterval: .daily).validated()
+        let first = try await store.createProfile(input, now: now)
+        let second = try await store.createProfile(input, now: now)
+        let epg = Data("""
+            <tv><channel id="news"><display-name>新闻</display-name></channel>
+            <programme channel="news" start="20000101000000 +0000" stop="20000101010000 +0000">
+            <title>共享节目</title></programme></tv>
+            """.utf8)
+        let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享频道"), .epg: epg])
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(repository: store, downloader: downloader, now: { fixedNow })
+        let outcomes = await coordinator.refresh(profileID: first.id, resources: [.playlist, .epg], trigger: .manual)
+        XCTAssertTrue(outcomes.allSatisfy(\.succeeded))
+        let reader = SwiftDataLibraryStore(modelContainer: container)
+        var channelIDs: [String] = []
+        for id in [first.id, second.id] {
+            let channels = try await reader.channels(profileID: id)
+            XCTAssertEqual(channels.map(\.sourceProfileID), [id])
+            channelIDs.append(try XCTUnwrap(channels.first?.id))
+            let programmes = try await reader.programmes(profileID: id, xmltvChannelID: "news",
+                overlapping: Date(timeIntervalSince1970: 946_684_800)..<Date(timeIntervalSince1970: 946_688_400))
+            XCTAssertEqual(programmes.map(\.title), ["共享节目"])
+        }
+        XCTAssertNotEqual(channelIDs[0], channelIDs[1])
+        let profiles = try await reader.profiles()
+        XCTAssertTrue(profiles.allSatisfy { $0.m3uStatus.state == .succeeded && $0.epgStatus.state == .succeeded })
+        for resource in RefreshResource.allCases {
+            let count = await downloader.invocationCount(for: resource)
+            XCTAssertEqual(count, 1)
+        }
+        try await store.setManualMapping(profileID: first.id, channelID: channelIDs[0], xmltvChannelID: "news")
+        _ = await coordinator.refresh(profileID: second.id, resources: [.epg], trigger: .manual)
+        let retained = try await reader.manualMapping(profileID: first.id, channelID: channelIDs[0])
+        XCTAssertEqual(retained?.xmltvChannelID, "news")
+        let count = await downloader.invocationCount(for: .epg)
+        XCTAssertEqual(count, 2, "一次完成后的显式手动刷新应发起新请求")
+    }
+
+    func testSharedEPGRefreshUpdatesDifferentPlaylistsWithoutRefreshingTheirM3U() async {
+        let otherID = UUID()
+        let first = makeProfile()
+        let other = makeProfile(id: otherID, m3uURL: URL(string: "https://other.test/list.m3u")!)
+        let original = [channel(name: "保留频道")]
+        let repository = RepositorySpy(profiles: [first, other], channels: [profileID: original])
+        let downloader = FakeRemoteDownloader(data: [.epg: validEPG()])
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let result = await coordinator.refresh(profileID: profileID, resources: [.epg], trigger: .manual)
+        XCTAssertTrue(result[0].succeeded)
+        let snapshot = await repository.snapshot()
+        XCTAssertEqual(snapshot.channels[profileID], original)
+        XCTAssertEqual(snapshot.profiles[0].m3uStatus, first.m3uStatus)
+        XCTAssertEqual(snapshot.profiles[1].m3uStatus, other.m3uStatus)
+        XCTAssertTrue(snapshot.profiles.allSatisfy { $0.epgStatus.lastSuccessAt == now })
+        let count = await downloader.invocationCount(for: .epg)
+        let playlistCount = await downloader.invocationCount(for: .playlist)
+        XCTAssertEqual(count, 1)
+        XCTAssertEqual(playlistCount, 0)
+    }
+
+    func testOneSharedProfileCommitFailureDoesNotPreventOtherSwiftDataCommit() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let store = SwiftDataLibraryStore(modelContainer: container)
+        let input = try SourceProfileInput(name: "共享源", m3uURLString: "https://source.test/list.m3u",
+            epgURLString: "https://source.test/guide.xml", m3uRefreshInterval: .daily, epgRefreshInterval: .daily).validated()
+        let first = try await store.createProfile(input, now: now)
+        _ = try await store.createProfile(input, now: now.addingTimeInterval(1))
+        let fault = SinglePlaylistCommitFault()
+        let writer = SwiftDataLibraryStore(modelContainer: container, saveFault: { try fault.inject($0) })
+        let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "共享频道")])
+        let coordinator = RefreshCoordinator(repository: writer, downloader: downloader)
+        _ = await coordinator.refresh(profileID: first.id, resources: [.playlist], trigger: .manual)
+        let reader = SwiftDataLibraryStore(modelContainer: container)
+        let profiles = try await reader.profiles()
+        XCTAssertEqual(profiles.filter { $0.m3uStatus.state == .succeeded }.count, 1)
+        XCTAssertEqual(profiles.filter { $0.m3uStatus.state == .failed }.count, 1)
+        for profile in profiles {
+            let channels = try await reader.channels(profileID: profile.id)
+            XCTAssertEqual(channels.count, profile.m3uStatus.state == .succeeded ? 1 : 0)
+        }
+        let count = await downloader.invocationCount(for: .playlist)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testProfileJoiningDuringWritebackSharesDownloadAndReceivesItsOwnOutcome() async {
+        let repository = RepositorySpy(profiles: [makeProfile(), makeProfile(id: UUID())])
+        let downloader = FakeRemoteDownloader(data: [.epg: validEPG()])
+        let gate = SharedWritebackGate()
+        let registrations = ProfileRefreshNotifications()
+        let fixedNow = now
+        let coordinator = RefreshCoordinator(repository: repository, downloader: downloader, now: { fixedNow },
+            onPersistedOutcome: { _, _ in await gate.pauseFirstCompletion() },
+            waiterRegistrationObserver: { registration in
+                Task { await registrations.record(registration.profileID, registration.resource) }
+            })
+        let first = Task { await coordinator.refresh(profileID: profileID, resources: [.epg], trigger: .manual) }
+        await waitUntil { await gate.isBlocked }
+        let current = await repository.snapshot().profiles
+        let newID = UUID()
+        await repository.replaceProfiles(current + [makeProfile(id: newID)], activeProfileID: profileID)
+        let joined = Task { await coordinator.refresh(profileID: newID, resources: [.epg], trigger: .manual) }
+        await waitUntil { await registrations.profileIDs.contains(newID) }
+        await gate.release()
+        let result = await first.value
+        let joinedResult = await joined.value
+        XCTAssertTrue(result[0].succeeded)
+        XCTAssertEqual(joinedResult, result)
+        let snapshot = await repository.snapshot()
+        XCTAssertTrue(snapshot.profiles.allSatisfy { $0.epgStatus.lastSuccessAt == now })
+        XCTAssertEqual(snapshot.epgInstallCount, 3)
+        let count = await downloader.invocationCount(for: .epg)
+        XCTAssertEqual(count, 1)
+    }
+
+    func testDifferentAuthenticatedURLsRemainSeparateFlights() async {
+        let otherID = UUID()
+        let firstURL = URL(string: "https://guide.test/epg.xml?token=one")!
+        let secondURL = URL(string: "https://guide.test/epg.xml?token=two")!
+        let repository = RepositorySpy(profiles: [makeProfile(epgURL: firstURL), makeProfile(id: otherID, epgURL: secondURL)])
+        let downloader = FakeRemoteDownloader(data: [.epg: validEPG()], delay: .milliseconds(100))
+        let coordinator = makeCoordinator(repository: repository, downloader: downloader)
+        let firstID = profileID
+        async let first = coordinator.refresh(profileID: firstID, resources: [.epg], trigger: .manual)
+        async let second = coordinator.refresh(profileID: otherID, resources: [.epg], trigger: .manual)
+        let results = await (first, second)
+        XCTAssertTrue((results.0 + results.1).allSatisfy(\.succeeded))
+        let count = await downloader.invocationCount(for: .epg)
+        XCTAssertEqual(count, 2)
+    }
+
     private func makeCoordinator(
         repository: RepositorySpy,
         downloader: FakeRemoteDownloader
@@ -835,11 +1126,12 @@ final class RefreshCoordinatorTests: XCTestCase {
     }
 
     private func makeProfile(
+        id: UUID? = nil,
         m3uURL: URL = URL(string: "https://example.test/list.m3u")!,
         epgURL: URL = URL(string: "https://example.test/guide.xml")!
     ) -> SourceProfile {
         SourceProfile(
-            id: profileID,
+            id: id ?? profileID,
             name: "Home",
             m3uURL: m3uURL,
             epgURL: epgURL,
@@ -1091,4 +1383,33 @@ private extension RepositorySpy.Event {
             resource
         }
     }
+}
+
+private actor ProfileRefreshNotifications {
+    private(set) var profileIDs: Set<UUID> = []
+    func record(_ profileID: UUID, _ resource: RefreshResource) { profileIDs.insert(profileID) }
+}
+
+private final class SinglePlaylistCommitFault: @unchecked Sendable {
+    private let lock = NSLock()
+    private var armed = true
+    func inject(_ phase: LibraryStoreSavePhase) throws {
+        try lock.withLock {
+            guard phase == .playlistPointer, armed else { return }
+            armed = false
+            throw NSError(domain: "SharedProfileCommit", code: 1)
+        }
+    }
+}
+
+private actor SharedWritebackGate {
+    private var hasBlocked = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    var isBlocked: Bool { continuation != nil }
+    func pauseFirstCompletion() async {
+        guard !hasBlocked else { return }
+        hasBlocked = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+    func release() { continuation?.resume(); continuation = nil }
 }

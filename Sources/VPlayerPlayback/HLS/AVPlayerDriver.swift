@@ -727,7 +727,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             if !transferred { creationLock.withLock { releaseAdmissionLocked(admission) } }
         }
         guard player?.currentItem == nil else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         let nativePlayer = player ?? IOSControlledAVPlayer()
         #else
         let nativePlayer = player ?? AVPlayer()
@@ -745,7 +745,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     }
     let player: AVPlayer
     private func performPlayerTransportMutation(_ operation: () -> Void) {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         if let controlled = player as? IOSControlledAVPlayer {
             controlled.performDriverMutation(operation)
             return
@@ -833,7 +833,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         // After play, the driver keeps prepaid rollback until the original
         // physical disconnect. Callback aliases retain their exact pool too.
         if ownsCurrentCallbackCreditPool(pool), !systemAudioTransitionInFlight,
-           player.disconnectedFromSystemAudio, player.rate == 0, player.timeControlStatus == .paused {
+           nativeAudioDisconnected, player.rate == 0, player.timeControlStatus == .paused {
             _ = releaseUnusedSDKRollbackCreditIfDisconnected(pool)
             pausedResumeCallbackPool = nil
         }
@@ -884,7 +884,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     /// direct state check, not a stop receipt or authorization to resume playback.
     func releaseUnusedSDKRollbackCreditIfDisconnected(_ pool: AVPlayerSDKCallbackCreditPool) -> Bool {
         guard ownsCurrentCallbackCreditPool(pool),
-              !systemAudioTransitionInFlight, player.disconnectedFromSystemAudio,
+              !systemAudioTransitionInFlight, nativeAudioDisconnected,
               player.rate == 0, player.timeControlStatus == .paused else { return false }
         return pool.resolveUnusedRollbackAfterDriverReadback()
     }
@@ -894,8 +894,16 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         eventHub.retainInstallationResourceContext(reservation)
     }
 
+    private var nativeAudioDisconnected: Bool {
+        #if os(macOS)
+        false
+        #else
+        player.disconnectedFromSystemAudio
+        #endif
+    }
+
     var disconnectedFromSystemAudio: Bool {
-        !systemAudioTransitionInFlight && player.disconnectedFromSystemAudio
+        !systemAudioTransitionInFlight && nativeAudioDisconnected
     }
 
     /// Cancellation cannot complete this physical transition early. The signed
@@ -905,13 +913,18 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         guard currentItemIdentity == identity, let item, player.currentItem === item else {
             throw .staleIdentity
         }
+        #if os(macOS)
+        // Mac SDK 不支持 system-audio 断开凭证；拒绝要求断开的路径，不能伪造成功。
+        guard !disconnected else { throw .systemAudioConnectionNotConfirmed }
+        return
+        #else
         guard !systemAudioTransitionInFlight else { throw .operationInFlight }
         // A settled matching state needs no new SDK transition or callback
         // lease. Do not use the public disconnected projection for this check:
         // it is also false while a physical transition is still in flight.
         // Callers retain cancellation/authority checks around this operation;
         // cleanup must still be able to settle audio after cancellation.
-        guard player.disconnectedFromSystemAudio != disconnected else {
+        guard nativeAudioDisconnected != disconnected else {
             if disconnected { finishPausedResumeCallbacks(item: identity) }
             return
         }
@@ -939,13 +952,14 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         }
         guard currentItemIdentity == identity, self.item === item,
               player.currentItem === item else { throw .staleIdentity }
-        guard player.disconnectedFromSystemAudio == disconnected else {
+        guard nativeAudioDisconnected == disconnected else {
             throw .systemAudioConnectionNotConfirmed
         }
         if disconnected {
             systemAudioTransitionInFlight = false
             finishPausedResumeCallbacks(item: identity)
         }
+        #endif
     }
 
     var rate: Float { player.rate }
@@ -1305,7 +1319,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     func play(invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
               item identity: AVPlayerItemInstanceIdentity) async throws {
         guard currentItemIdentity == identity, !systemAudioTransitionInFlight,
-              !player.disconnectedFromSystemAudio,
+              !nativeAudioDisconnected,
               let snapshot = invocation.currentSnapshot,
               snapshot.interval.outputLifecycle == identity.outputLifecycleEpoch,
               snapshot.interval.itemGeneration == identity.itemGeneration else {

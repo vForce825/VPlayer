@@ -5,7 +5,11 @@
 import CryptoKit
 import Foundation
 import OSLog
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 import VPlayerCore
 import VPlayerPlayback
 
@@ -13,14 +17,14 @@ import VPlayerPlayback
 final class ChannelLogoCache {
     static let shared = ChannelLogoCache()
 
-    private let memoryCache = NSCache<NSURL, UIImage>()
+    private let memoryCache = NSCache<NSURL, ChannelLogoImage>()
     private let dataLoader: any ChannelLogoDataLoading
     private let imageDecoder: any ChannelLogoImageDecoding
     private let diskCache: ChannelLogoDiskCache?
     private let maximumResponseBytes: Int
     private struct LogoRequest {
         let identifier: UUID
-        var waiters: [UUID: CheckedContinuation<UIImage?, Never>]
+        var waiters: [UUID: CheckedContinuation<ChannelLogoImage?, Never>]
         let task: Task<Void, Never>
     }
 
@@ -58,13 +62,13 @@ final class ChannelLogoCache {
         }
     }
 
-    func image(for url: URL) async -> UIImage? {
+    func image(for url: URL) async -> ChannelLogoImage? {
         guard !Task.isCancelled else { return nil }
         if let image = memoryCache.object(forKey: url as NSURL) {
             return image
         }
         let waiter = UUID()
-        let image: UIImage? = await withTaskCancellationHandler {
+        let image: ChannelLogoImage? = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard !Task.isCancelled else {
                     continuation.resume(returning: nil)
@@ -118,7 +122,7 @@ final class ChannelLogoCache {
         }
     }
 
-    func memoryCachedImage(for url: URL) -> UIImage? {
+    func memoryCachedImage(for url: URL) -> ChannelLogoImage? {
         memoryCache.object(forKey: url as NSURL)
     }
 

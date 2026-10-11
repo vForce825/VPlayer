@@ -3,6 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFoundation
+#if os(macOS)
+import AppKit
+#endif
 import Foundation
 import VPlayerCore
 
@@ -127,8 +130,15 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     public init() {
         let allocator = PlaybackIdentityAllocator()
         let registry = ControlTaskRegistry(allocator: allocator)
+        #if os(macOS)
+        let sdk = MacPlaybackAudioSessionSDK()
+        let workspaceMonitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress,
+            notificationCenter: NSWorkspace.shared.notificationCenter)
+        let owner = try! PlaybackAudioSessionOwner(registry: registry, sdk: sdk, monitor: workspaceMonitor)
+        #else
         let sdk = SystemPlaybackAudioSessionSDK(session: AVAudioSession.sharedInstance())
         let owner = try! PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
+        #endif
         let routeService = PlaybackAudioRouteService(registry: registry, owner: owner)
         let monitor = owner.monitor
         let pipelineFactory = SystemPlaybackPipelineFactory(routeMonitor: AudioOutputRouteMonitor(service: routeService))

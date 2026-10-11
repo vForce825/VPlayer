@@ -85,12 +85,10 @@ final class ForegroundRefreshDriver {
                     }
                     let profiles = try await loadProfiles()
                     try Task.checkCancellation()
-                    for profile in profiles {
+                    for planned in planner.dueRefreshes(for: profiles, now: now()) {
                         try Task.checkCancellation()
                         guard self?.prefersReducedResourceUsage != true else { break }
-                        let resources = planner.dueResources(for: profile, now: now())
-                        guard !resources.isEmpty else { continue }
-                        _ = await refresh(profile.id, resources, .foreground)
+                        _ = await refresh(planned.profileID, planned.resources, .foreground)
                     }
                 } catch is CancellationError {
                     return

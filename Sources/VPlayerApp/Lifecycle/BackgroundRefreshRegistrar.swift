@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+#if !os(macOS)
 @preconcurrency import BackgroundTasks
+#endif
 import Foundation
 import VPlayerCore
 
@@ -142,12 +144,10 @@ final class BackgroundRefreshRegistrar {
                 }
 
                 let refreshDate = now()
-                for profile in profiles {
+                for planned in planner.dueRefreshes(for: profiles, now: refreshDate) {
                     try Task.checkCancellation()
                     if self.prefersReducedResourceUsage { break }
-                    let resources = planner.dueResources(for: profile, now: refreshDate)
-                    guard !resources.isEmpty else { continue }
-                    let outcomes = await refresh(profile.id, resources, .background)
+                    let outcomes = await refresh(planned.profileID, planned.resources, .background)
                     succeeded = succeeded && outcomes.allSatisfy(\.succeeded)
                 }
                 return succeeded
@@ -240,6 +240,14 @@ private final class BackgroundRefreshExecution {
     }
 }
 
+#if os(macOS)
+@MainActor
+private final class SystemBackgroundRefreshScheduler: BackgroundRefreshScheduling {
+    func register(identifier: String, handler: @escaping @MainActor @Sendable (any BackgroundRefreshTask) -> Void) -> Bool { false }
+    func cancel(identifier: String) {}
+    func submit(identifier: String, earliestBeginDate: Date) async throws {}
+}
+#else
 @MainActor
 private final class SystemBackgroundRefreshScheduler: BackgroundRefreshScheduling {
     private let handoff = SystemBackgroundRefreshTaskHandoff()
@@ -271,6 +279,8 @@ private final class SystemBackgroundRefreshScheduler: BackgroundRefreshSchedulin
         try await BGTaskScheduler.shared.submitTaskRequest(request)
     }
 }
+
+#endif
 
 protocol SystemBackgroundRefreshSystemTask: AnyObject, Sendable {
     func installSystemExpirationHandler(_ handler: @escaping @Sendable () -> Void)
@@ -316,6 +326,7 @@ final class SystemBackgroundRefreshTaskHandoff: Sendable {
     }
 }
 
+#if !os(macOS)
 private final class BGAppRefreshTaskSystemTask: SystemBackgroundRefreshSystemTask, @unchecked Sendable {
     private let task: BGAppRefreshTask
 
@@ -337,6 +348,8 @@ private final class BGAppRefreshTaskSystemTask: SystemBackgroundRefreshSystemTas
         task.setTaskCompleted(success: success)
     }
 }
+
+#endif
 
 final class SystemBackgroundRefreshTaskBridge: BackgroundRefreshTask, @unchecked Sendable {
     typealias MainActorAction = @MainActor @Sendable () -> Void

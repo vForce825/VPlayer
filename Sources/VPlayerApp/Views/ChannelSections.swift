@@ -82,7 +82,7 @@ enum ChannelSectionBuilder {
         }
     }
 
-    private static func resolvedGroupTitle(for channel: Channel) -> String {
+    static func resolvedGroupTitle(for channel: Channel) -> String {
         let trimmed = channel.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty else { return ungroupedTitle }
         return trimmed

@@ -187,7 +187,8 @@ assert_no_workspace_server() {
 assert_no_web_output() {
   local found
   found="$(find "$root" \
-    \( -path "$root/.git" -o -path "$root/Vendor/FFmpeg/Work" -o -path "$root/Vendor/FFmpeg/Artifacts" \) -prune -o \
+    \( -path "$root/.git" -o -path "$root/Vendor/FFmpeg/Work" -o -path "$root/Vendor/FFmpeg/Artifacts" -o \
+       -path "$root/Vendor/FFmpeg/Artifacts-iOS" -o -path "$root/Vendor/FFmpeg/Artifacts-macOS" \) -prune -o \
     \( -type f \( -iname '*.html' -o -iname '*.htm' \) -o \
        -type d \( -iname web -o -iname www -o -iname htdocs \) \) \
     -print -quit)"

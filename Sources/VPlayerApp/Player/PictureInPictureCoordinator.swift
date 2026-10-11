@@ -6,7 +6,11 @@ import AVFoundation
 import AVKit
 import Foundation
 import Observation
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 import VPlayerPlayback
 
 /// Pins the native controller through a MainActor hop. A bare ObjectIdentifier
@@ -54,7 +58,9 @@ private final class NativePiPControllerHandle: PiPControllerHandle {
         controller = AVPictureInPictureController(contentSource: source)
         controller.delegate = delegate
         controller.requiresLinearPlayback = true
+        #if os(iOS)
         controller.canStartPictureInPictureAutomaticallyFromInline = true
+        #endif
     }
     func observePossibility(_ change: @escaping @Sendable (Bool) -> Void) {
         cancelObservation()
@@ -139,7 +145,7 @@ private final class PiPRestoreReply: @unchecked Sendable {
 
 @MainActor
 @Observable
-final class IOSPictureInPictureCoordinator: NSObject,
+final class PictureInPictureCoordinator: NSObject,
     AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
     typealias RestoreRequest = @MainActor (@escaping @MainActor (Bool) -> Void) -> Void
     typealias ControllerFactory = @MainActor (AVPictureInPictureController.ContentSource,
@@ -175,7 +181,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
 
     init(target: any NowPlayingPlaybackTarget,
          supportsPictureInPicture: @escaping @MainActor () -> Bool = { AVPictureInPictureController.isPictureInPictureSupported() },
-         setPictureInPicture: @escaping @MainActor (Bool) -> Void = PlaybackVideoProcessingActivity.setPictureInPicture,
+         setPictureInPicture: @escaping @MainActor (Bool) -> Void = setPlatformPictureInPicture,
          makeController: @escaping ControllerFactory = { NativePiPControllerHandle.make(source: $0, delegate: $1) }) {
         self.target = target
         self.supportsPictureInPicture = supportsPictureInPicture
@@ -479,3 +485,12 @@ final class IOSPictureInPictureCoordinator: NSObject,
         skipByInterval skipInterval: CMTime, completion completionHandler: @escaping () -> Void) { completionHandler() }
     nonisolated func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ controller: AVPictureInPictureController) -> Bool { false }
 }
+
+#if os(macOS)
+@MainActor
+private func setPlatformPictureInPicture(_ active: Bool) {}
+#else
+typealias IOSPictureInPictureCoordinator = PictureInPictureCoordinator
+@MainActor
+private func setPlatformPictureInPicture(_ active: Bool) { PlaybackVideoProcessingActivity.setPictureInPicture(active) }
+#endif

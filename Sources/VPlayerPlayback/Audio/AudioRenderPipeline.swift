@@ -1874,6 +1874,20 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         }
     }
 
+    var isInputBackpressured: Bool {
+        assert(executor.isIsolated)
+        let pending = replay.filter { !isCompletedReplayHistory($0) }
+        guard let first = pending.first, let last = replay.last,
+              let start = replayInterval(of: first), let end = replayInterval(of: last) else { return false }
+        // 按仍需提交的实际队列施加背压。暂停恢复或替换 renderer 会把历史重新排队，
+        // 单看播放时钟的提前量会漏掉这些较早的帧；保留一半余量容纳当前解复用包。
+        let pendingBytes = pending.reduce(0) { $0 + $1.ownedPayloadBytes }
+        return pending.count >= max(1, replayRetentionLimits.maximumCount / 2)
+            || pendingBytes >= max(1, replayRetentionLimits.maximumOwnedBytes / 2)
+            || CMTimeCompare(CMTimeSubtract(end.end, start.start),
+                CMTimeMultiplyByFloat64(replayRetentionLimits.latestTailHorizon, multiplier: 0.5)) >= 0
+    }
+
     private func enqueueCompressedUntilBackpressured() throws {
         guard route == .systemCompressed,
               let renderer,

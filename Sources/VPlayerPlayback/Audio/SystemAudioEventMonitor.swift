@@ -3,6 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AVFAudio
+#if os(macOS)
+import AppKit
+#endif
 import Foundation
 import Synchronization
 
@@ -212,7 +215,15 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
         lock.withLock { _ in
             guard interruptionObserver == nil, observerGeneration < .max else { return }
             observerGeneration += 1
+            #if !os(macOS)
             let generation = observerGeneration
+            #endif
+            #if os(macOS)
+            interruptionObserver = notificationCenter.addObserver(forName: NSWorkspace.willSleepNotification,
+                object: nil, queue: nil) { [weak self] _ in self?.emit(.interruptionBegan) }
+            resetObserver = notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                object: nil, queue: nil) { [weak self] _ in self?.emit(.interruptionEnded(shouldResume: true)) }
+            #else
             activeObserver = notificationCenter.addObserver(for: AVAudioSession.DidBecomeActiveMessage.self) { [weak self] _ in
                 self?.emitLifecycle(.becameActive, observationGeneration: generation)
             }
@@ -250,6 +261,7 @@ public final class SystemAudioEventMonitor: @unchecked Sendable {
                     self.emit(.mediaServicesWereReset)
                 }
             }
+            #endif
         }
     }
     

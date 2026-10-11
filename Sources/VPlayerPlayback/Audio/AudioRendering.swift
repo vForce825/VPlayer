@@ -235,6 +235,8 @@ public enum AudioRenderReadinessChange: Sendable, Equatable {
 
 public protocol AudioRenderPipelineProtocol: AnyObject {
     var isReadyForPlayback: Bool { get }
+    /// 仅在播放执行队列读取；未提交音频接近保留上限时，暂停上游解复用输入。
+    var isInputBackpressured: Bool { get }
     var isOutputRouteReadyForSharedAnchor: Bool { get }
     var route: AudioRoute { get }
     var currentRouteSnapshot: AudioOutputRouteSnapshot? { get }
@@ -286,6 +288,7 @@ protocol AudioRendererCoverageObserving: AnyObject {
 }
 
 public extension AudioRenderPipelineProtocol {
+    var isInputBackpressured: Bool { false }
     func finishInputForNaturalEOF() {}
     var isDrainedForNaturalEOF: Bool { true }
     var naturalEOFAcceptedEndPTS: CMTime? { nil }

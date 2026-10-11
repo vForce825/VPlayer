@@ -319,17 +319,17 @@ final class AudioSessionBlockingCallLane: Sendable, Equatable {
             }
             // 每个已处理位置只初始化一次；摘要只有四个UInt64，无需保留或销毁对象引用。
             digests.baseAddress!.advanced(by: index).initialize(to: digest)
-            if endpoint.portType.isEqual(to: AVAudioSession.Port.airPlay.rawValue) {
+            if endpoint.portType.isEqual(to: PlaybackAudioPortNames.airPlay) {
                 ports.insert(.airPlay)
-            } else if endpoint.portType.isEqual(to: AVAudioSession.Port.HDMI.rawValue) {
+            } else if endpoint.portType.isEqual(to: PlaybackAudioPortNames.HDMI) {
                 ports.insert(.hdmi)
-            } else if endpoint.portType.isEqual(to: AVAudioSession.Port.bluetoothA2DP.rawValue)
-                || endpoint.portType.isEqual(to: AVAudioSession.Port.bluetoothLE.rawValue)
-                || endpoint.portType.isEqual(to: AVAudioSession.Port.bluetoothHFP.rawValue)
+            } else if endpoint.portType.isEqual(to: PlaybackAudioPortNames.bluetoothA2DP)
+                || endpoint.portType.isEqual(to: PlaybackAudioPortNames.bluetoothLE)
+                || endpoint.portType.isEqual(to: PlaybackAudioPortNames.bluetoothHFP)
             {
                 ports.insert(.bluetooth)
-            } else if endpoint.portType.isEqual(to: AVAudioSession.Port.builtInSpeaker.rawValue)
-                || endpoint.portType.isEqual(to: AVAudioSession.Port.builtInMic.rawValue)
+            } else if endpoint.portType.isEqual(to: PlaybackAudioPortNames.builtInSpeaker)
+                || endpoint.portType.isEqual(to: PlaybackAudioPortNames.builtInMic)
             {
                 ports.insert(.builtIn)
             } else {

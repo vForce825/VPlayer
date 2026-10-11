@@ -2720,6 +2720,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
     }
 
     func testStoreWithoutMirrorDefaultsNeverTouchesTheMirror() async throws {
+        let standardMirrorBefore = UserDefaults.standard.data(forKey: SourceProfileMirror.storageKey)
         let defaults = try mirrorDefaults()
         let (_, unmirrored) = try makeStore()
         _ = try await unmirrored.createProfile(input(name: "Fixture"), now: date(10))
@@ -2727,8 +2728,9 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let restoredCount = try await unmirrored.synchronizeProfileMirror()
         XCTAssertEqual(restoredCount, 0)
         XCTAssertNil(defaults.data(forKey: SourceProfileMirror.storageKey))
-        XCTAssertNil(
-            UserDefaults.standard.data(forKey: SourceProfileMirror.storageKey)
+        XCTAssertEqual(
+            UserDefaults.standard.data(forKey: SourceProfileMirror.storageKey),
+            standardMirrorBefore
         )
     }
 

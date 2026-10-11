@@ -18,7 +18,7 @@ source="$work/source"
 source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
 platform=tvos
 if [[ $# -ne 0 ]]; then
-  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/build-ffmpeg.sh [--platform tvos|ios]' >&2; exit 64; }
+  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/build-ffmpeg.sh [--platform tvos|ios|macos]' >&2; exit 64; }
   platform="$2"
 fi
 ffmpeg_select_platform "$platform"
@@ -363,9 +363,19 @@ if [[ "$platform" == "tvos" ]]; then
   build_slice device appletvos arm64 "arm64-apple-tvos${sdk_version_floor}"
   build_slice sim-arm64 appletvsimulator arm64 "arm64-apple-tvos${sdk_version_floor}-simulator"
   build_slice sim-x86_64 appletvsimulator x86_64 "x86_64-apple-tvos${sdk_version_floor}-simulator"
-else
+elif [[ "$platform" == "ios" ]]; then
   build_slice device iphoneos arm64 "arm64-apple-ios${sdk_version_floor}"
   build_slice sim-arm64 iphonesimulator arm64 "arm64-apple-ios${sdk_version_floor}-simulator"
+else
+  build_slice device macosx arm64 "arm64-apple-macos${sdk_version_floor}"
+fi
+
+if [[ "$platform" == "macos" ]]; then
+  xcodebuild -create-xcframework \
+    -library "$build_work/install-device/lib/libFFmpeg.a" -headers "$build_work/install-device/include" \
+    -output "$candidate"
+  "$root/Scripts/promote-ffmpeg-artifact.sh" --platform "$platform"
+  exit 0
 fi
 
 sim="$build_work/install-simulator"

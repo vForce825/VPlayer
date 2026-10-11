@@ -1,0 +1,44 @@
+name: macOS 27 应用验证
+
+"on":
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-app-${{ github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  native-mac:
+    name: 原生播放、单元测试与发布归档
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      CI_PRODUCT_PLATFORM: macOS
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: 准备构建依赖
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
+          brew install mint jq ffmpeg
+          xcodebuild -downloadComponent MetalToolchain
+          ./ci_scripts/ci_post_clone.sh
+          ./Scripts/verify-licenses.sh
+      - name: 验证共享模型及真实 Mac 播放
+        # 无窗口测试直接运行测试包；桌面 UI 和原生画中画另需图形登录会话。
+        run: ./Scripts/test-macos.sh --headless
+      - name: 验证发布归档
+        run: |
+          xcodebuild archive -project VPlayer.xcodeproj -scheme VPlayerMacOS \
+            -configuration Release -destination 'generic/platform=macOS' \
+            -archivePath "$RUNNER_TEMP/VPlayerMacOS.xcarchive" CODE_SIGN_IDENTITY=-

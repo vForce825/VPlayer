@@ -9,7 +9,7 @@ work="$root/Vendor/FFmpeg/Work"
 source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
 platform=tvos
 if [[ $# -ne 0 ]]; then
-  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/promote-ffmpeg-artifact.sh [--platform tvos|ios]' >&2; exit 64; }
+  [[ $# -eq 2 && "$1" == "--platform" ]] || { echo 'Usage: Scripts/promote-ffmpeg-artifact.sh [--platform tvos|ios|macos]' >&2; exit 64; }
   platform="$2"
 fi
 ffmpeg_select_platform "$platform"
@@ -115,7 +115,7 @@ fingerprint_before="$(tree_fingerprint "$candidate")"
 if [[ "$platform" == "tvos" ]]; then
   "$root/Scripts/audit-ffmpeg.sh" "$candidate"
 else
-  "$root/Scripts/audit-ffmpeg.sh" --platform ios "$candidate"
+  "$root/Scripts/audit-ffmpeg.sh" --platform "$platform" "$candidate"
 fi
 lock_is_current || fail "the current build lock changed during audit"
 [[ -d "$candidate" && ! -L "$candidate" ]] || fail "candidate identity changed during audit"

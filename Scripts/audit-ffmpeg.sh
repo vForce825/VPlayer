@@ -44,14 +44,14 @@ fi
 source "$root/Scripts/Support/ffmpeg-platform-profile.sh"
 selected_platform=tvos
 if [[ "${1:-}" == "--platform" ]]; then
-  [[ $# -eq 3 ]] || fail "usage: $0 [--platform tvos|ios] <FFmpeg.xcframework>"
+  [[ $# -eq 3 ]] || fail "usage: $0 [--platform tvos|ios|macos] <FFmpeg.xcframework>"
   selected_platform="$2"
   shift 2
 fi
 ffmpeg_select_platform "$selected_platform"
 required_system_symbols="$vendor/$ffmpeg_required_symbols"
 build_work="$work$ffmpeg_work_suffix"
-[[ $# -eq 1 ]] || fail "usage: $0 [--platform tvos|ios] <FFmpeg.xcframework>"
+[[ $# -eq 1 ]] || fail "usage: $0 [--platform tvos|ios|macos] <FFmpeg.xcframework>"
 xcframework="$1"
 [[ -d "$xcframework" ]] || fail "XCFramework not found: $xcframework"
 [[ -f "$xcframework/Info.plist" ]] || fail "Info.plist is missing"
@@ -88,7 +88,7 @@ trap cleanup EXIT
 
 /usr/bin/plutil -convert json -o "$tmp/info.json" "$xcframework/Info.plist"
 jq -e --arg platform "$selected_platform" --arg architectures "$ffmpeg_simulator_architectures" '
-  (.AvailableLibraries | length) == 2 and
+  (.AvailableLibraries | length) == (if $platform == "macos" then 1 else 2 end) and
   ([.AvailableLibraries[] | {
       platform: .SupportedPlatform,
       variant: (.SupportedPlatformVariant // ""),
@@ -99,7 +99,7 @@ jq -e --arg platform "$selected_platform" --arg architectures "$ffmpeg_simulator
   ([
     {platform:$platform, variant:"", architectures:["arm64"], library:"libFFmpeg.a", headers:"Headers"},
     {platform:$platform, variant:"simulator", architectures:($architectures | split(",")), library:"libFFmpeg.a", headers:"Headers"}
-  ] | sort_by(.platform, .variant))
+  ] | if $platform == "macos" then map(select(.variant == "")) else . end | sort_by(.platform, .variant))
 ' "$tmp/info.json" >/dev/null || fail "unexpected XCFramework platform or architecture inventory"
 
 flags_json="$(jq -Rsc 'split("\n") | map(select(length > 0))' < "$vendor/configure.flags")"
@@ -344,8 +344,10 @@ done < <(jq -r '.AvailableLibraries[] | [.LibraryIdentifier, .SupportedPlatform,
 sort "$tmp/seen-slices.txt" > "$tmp/seen-slices-sorted.txt"
 if [[ "$selected_platform" == "tvos" ]]; then
   printf 'device\nsim-arm64\nsim-x86_64\n' > "$tmp/expected-slices.txt"
-else
+elif [[ "$selected_platform" == "ios" ]]; then
   printf 'device\nsim-arm64\n' > "$tmp/expected-slices.txt"
+else
+  printf 'device\n' > "$tmp/expected-slices.txt"
 fi
 diff -u "$tmp/expected-slices.txt" "$tmp/seen-slices-sorted.txt" >/dev/null || \
   fail "architecture build records differ from selected profile"

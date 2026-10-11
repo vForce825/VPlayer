@@ -16,10 +16,10 @@ while [[ $# -gt 0 ]]; do
     --platform)
       [[ $# -ge 2 ]] || { echo 'Missing platform' >&2; exit 64; }
       platform="$2"; shift 2 ;;
-    *) echo 'Usage: Scripts/build-metal-libraries.sh [--platform tvos|ios] [--output-directory PATH]' >&2; exit 64 ;;
+    *) echo 'Usage: Scripts/build-metal-libraries.sh [--platform tvos|ios|macos] [--output-directory PATH]' >&2; exit 64 ;;
   esac
 done
-case "$platform" in tvos|ios) ;; *) echo 'Metal platform must be tvos or ios' >&2; exit 64 ;; esac
+case "$platform" in tvos|ios|macos) ;; *) echo 'Metal platform must be tvos, ios or macos' >&2; exit 64 ;; esac
 
 temporary="$(mktemp -d)"
 cleanup() {
@@ -63,10 +63,13 @@ if [[ "$platform" == "tvos" ]]; then
   compile_library appletvos air64-apple-tvos27.0 VPlayerPlayback-tvos.metallib
   compile_library appletvsimulator air64-apple-tvos27.0-simulator VPlayerPlayback-tvsimulator.metallib
   libraries=(VPlayerPlayback-tvos.metallib VPlayerPlayback-tvsimulator.metallib)
-else
+elif [[ "$platform" == "ios" ]]; then
   compile_library iphoneos air64-apple-ios27.0 VPlayerPlayback-ios.metallib
   compile_library iphonesimulator air64-apple-ios27.0-simulator VPlayerPlayback-iphonesimulator.metallib
   libraries=(VPlayerPlayback-ios.metallib VPlayerPlayback-iphonesimulator.metallib)
+else
+  compile_library macosx air64-apple-macos27.0 VPlayerPlayback-macos.metallib
+  libraries=(VPlayerPlayback-macos.metallib)
 fi
 mkdir -p "$output_directory"
 for library in "${libraries[@]}"; do

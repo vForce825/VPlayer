@@ -7,8 +7,12 @@ import AVKit
 
 public final class AVPlayerPresentationContext: @unchecked Sendable {
     public let player: AVPlayer
+    #if os(macOS)
+    @MainActor private weak var mountedController: AVPlayerView?
+    #else
     @MainActor private weak var mountedController: AVPlayerViewController?
-    #if os(iOS)
+    #endif
+    #if os(iOS) || os(macOS)
     @MainActor private weak var mountedLayer: AVPlayerLayer?
     #endif
 
@@ -16,9 +20,20 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
         self.player = player
     }
 
+    #if os(macOS)
+    @MainActor
+    public func attach(to controller: AVPlayerView) {
+        (player as? IOSControlledAVPlayer)?.setTransportIntentHandler(nil)
+        mountedLayer?.player = nil
+        mountedLayer = nil
+        if mountedController !== controller { mountedController?.player = nil; mountedController = controller }
+        controller.controlsStyle = .none
+        controller.player = player
+    }
+    #else
     @MainActor
     public func attach(to controller: AVPlayerViewController) {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         (player as? IOSControlledAVPlayer)?.setTransportIntentHandler(nil)
         mountedLayer?.player = nil
         mountedLayer = nil
@@ -31,7 +46,9 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
         controller.player = player
     }
 
-    #if os(iOS)
+    #endif
+
+    #if os(iOS) || os(macOS)
     @MainActor
     public func setPictureInPictureTransportHandler(
         _ handler: (@MainActor @Sendable (Bool) -> Void)?,
@@ -64,6 +81,14 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
     }
     #endif
 
+    #if os(macOS)
+    @MainActor
+    public func detach(from expectedController: AVPlayerView) {
+        guard mountedController === expectedController else { return }
+        expectedController.player = nil
+        mountedController = nil
+    }
+    #else
     @MainActor
     public func detach(from expectedController: AVPlayerViewController) {
         guard mountedController === expectedController else { return }
@@ -71,9 +96,11 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
         mountedController = nil
     }
 
+    #endif
+
     @MainActor
     public func detach() {
-        #if os(iOS)
+        #if os(iOS) || os(macOS)
         (player as? IOSControlledAVPlayer)?.setTransportIntentHandler(nil)
         mountedLayer?.player = nil
         mountedLayer = nil
@@ -83,7 +110,7 @@ public final class AVPlayerPresentationContext: @unchecked Sendable {
     }
 }
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 /// AVKit's player-layer PiP controls use AVPlayer transport entry points, not
 /// AVPictureInPictureSampleBufferPlaybackDelegate. Keep those calls as intents
 /// until the existing registry grants the driver its exact mutation authority.

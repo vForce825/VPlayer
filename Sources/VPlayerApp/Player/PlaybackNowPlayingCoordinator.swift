@@ -6,7 +6,11 @@ import Foundation
 import NowPlaying
 import Observation
 import OSLog
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 import VPlayerPlayback
 
 @MainActor

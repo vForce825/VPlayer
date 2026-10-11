@@ -60,7 +60,7 @@ cleanup_generated_check() {
     unlink "$temporary/VPlayer.xcodeproj/project.xcworkspace/contents.xcworkspacedata"
   test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme" || \
     unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/VPlayer.xcscheme"
-  for scheme in VPlayerReleaseBoundaryTests VPlayerReleaseStartupTests VPlayerHLSAcceptance VPlayeriOS VPlayeriOSReleaseStartup; do
+  for scheme in VPlayerReleaseBoundaryTests VPlayerReleaseStartupTests VPlayerHLSAcceptance VPlayeriOS VPlayeriOSReleaseStartup VPlayerMacOS VPlayerMacOSHeadless; do
     test ! -e "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme" || \
       unlink "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes/$scheme.xcscheme"
   done
@@ -70,6 +70,9 @@ cleanup_generated_check() {
   rmdir "$temporary/VPlayer.xcodeproj/xcshareddata/xcschemes" 2>/dev/null || true
   rmdir "$temporary/VPlayer.xcodeproj/xcshareddata" 2>/dev/null || true
   rmdir "$temporary/VPlayer.xcodeproj" 2>/dev/null || true
+  for notice in LICENSE LICENSE.APPSTORE-EXCEPTION THIRD_PARTY_NOTICES; do
+    test ! -L "$temporary/$notice" || unlink "$temporary/$notice"
+  done
   test ! -L "$temporary/Sources" || unlink "$temporary/Sources"
   test ! -L "$temporary/Tests" || unlink "$temporary/Tests"
   test ! -L "$temporary/Vendor" || unlink "$temporary/Vendor"
@@ -78,6 +81,9 @@ cleanup_generated_check() {
 trap cleanup_generated_check EXIT
 
 ln -s "$repo/VPlayerHLSAcceptance.xctestplan" "$temporary/VPlayerHLSAcceptance.xctestplan"
+for notice in LICENSE LICENSE.APPSTORE-EXCEPTION THIRD_PARTY_NOTICES; do
+  ln -s "$repo/$notice" "$temporary/$notice"
+done
 ln -s "$repo/Sources" "$temporary/Sources"
 ln -s "$repo/Tests" "$temporary/Tests"
 ln -s "$repo/Vendor" "$temporary/Vendor"

@@ -18,6 +18,7 @@ protocol PlaybackAudioSessionSDK: AnyObject, Sendable {
 }
 
 /// 仅显式注入系统实例；Task9才建立唯一App runtime，本类型不调用sharedInstance。
+#if !os(macOS)
 final class SystemPlaybackAudioSessionSDK: PlaybackAudioSessionSDK, @unchecked Sendable {
     private let session: AVAudioSession
     init(session: AVAudioSession) { self.session = session }
@@ -111,6 +112,8 @@ final class SystemAudioSessionRouteSnapshot: AudioSessionRouteSnapshot, @uncheck
         return object.perform(selector)?.takeUnretainedValue()
     }
 }
+
+#endif
 
 enum AudioSessionCallStart: Sendable, Equatable { case started, parked, rejected }
 

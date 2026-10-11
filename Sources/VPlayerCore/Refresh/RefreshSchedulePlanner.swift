@@ -5,6 +5,11 @@
 import Foundation
 
 public struct RefreshSchedulePlanner: Sendable {
+    public struct PlannedRefresh: Equatable, Sendable {
+        public let profileID: UUID
+        public let resources: Set<RefreshResource>
+    }
+
     private static let minimumBackgroundDelay: TimeInterval = 15 * 60
 
     public init() {}
@@ -14,6 +19,20 @@ public struct RefreshSchedulePlanner: Sendable {
             let schedule = schedule(for: resource, in: profile)
             return schedule.interval.isDue(lastSuccessAt: schedule.lastSuccessAt, now: now)
         })
+    }
+
+    /// 同一轮调度按资源 URL 去重；协调器负责写回所有关联配置。
+    public func dueRefreshes(for profiles: [SourceProfile], now: Date) -> [PlannedRefresh] {
+        var scheduled: [RefreshResource: Set<SourceURLIdentity>] = [:]
+        return profiles.compactMap { profile in
+            let resources = Set(dueResources(for: profile, now: now).filter { resource in
+                scheduled[resource, default: []].insert(
+                    SourceURLIdentity(url: profile.sourceURL(for: resource))
+                ).inserted
+            })
+            guard !resources.isEmpty else { return nil }
+            return PlannedRefresh(profileID: profile.id, resources: resources)
+        }
     }
 
     public func nextBackgroundDate(for profiles: [SourceProfile], now: Date) -> Date? {

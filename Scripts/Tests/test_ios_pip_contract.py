@@ -7,7 +7,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[2]
 class IOSPiPContractTests(unittest.TestCase):
     def test_pip_uses_real_sample_and_player_layers_with_public_apis(self):
-        path=ROOT/'Sources/VPlayeriOSApp/Player/IOSPictureInPictureCoordinator.swift'
+        path=ROOT/'Sources/VPlayerApp/Player/PictureInPictureCoordinator.swift'
         self.assertTrue(path.exists(),'PiP coordinator is missing')
         text=path.read_text()
         for contract in ['sampleBufferDisplayLayer:', 'playerLayer:', 'requiresLinearPlayback', 'canStartPictureInPictureAutomaticallyFromInline', 'restoreUserInterfaceForPictureInPictureStopWithCompletionHandler']:

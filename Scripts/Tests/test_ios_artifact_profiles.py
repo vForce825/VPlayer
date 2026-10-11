@@ -31,6 +31,11 @@ printf '%s\\n' "$ffmpeg_platform" "$ffmpeg_artifact_directory" "$ffmpeg_work_suf
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ['ios', 'Artifacts-iOS', '/ios', 'iphoneos', 'iphonesimulator', 'arm64', '2', '7'])
 
+    def test_macos_profile_uses_native_arm64_sdk_and_independent_output(self):
+        result = self.run_profile("macos")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["macos", "Artifacts-macOS", "/macos", "macosx", "", "", "1", "0"])
+
     def test_only_tv_fat_simulator_archive_requires_thinning(self):
         self.assertTrue(PROFILE.is_file())
         for platform, variant, expected in [('tvos', 'simulator', 0), ('tvos', '', 1), ('ios', 'simulator', 1), ('ios', '', 1)]:
@@ -38,7 +43,7 @@ printf '%s\\n' "$ffmpeg_platform" "$ffmpeg_artifact_directory" "$ffmpeg_work_suf
             self.assertEqual(result.returncode, expected, (platform, variant, result.stderr))
 
     def test_untrusted_profile_cannot_select_a_path(self):
-        for value in ['', 'macos', '../Artifacts', 'ios/../../Work', 'IOS', 'ios; echo injected']:
+        for value in ['', 'visionos', '../Artifacts', 'ios/../../Work', 'IOS', 'ios; echo injected']:
             with self.subTest(value=value):
                 result = self.run_profile(value)
                 self.assertNotEqual(result.returncode, 0)
@@ -61,12 +66,12 @@ printf '%s\\n' "$ffmpeg_platform" "$ffmpeg_artifact_directory" "$ffmpeg_work_suf
             shutil.copy(ROOT / 'Scripts/build-ffmpeg.sh', root / 'Scripts')
             (root / 'Vendor/FFmpeg/Work/.build-lock').mkdir(parents=True)
             sentinels = []
-            for name in ['Artifacts', 'Artifacts-iOS']:
+            for name in ['Artifacts', 'Artifacts-iOS', 'Artifacts-macOS']:
                 marker = root / 'Vendor/FFmpeg' / name / 'existing'
                 marker.parent.mkdir()
                 marker.write_text(name)
                 sentinels.append(marker)
-            for platform in ['tvos', 'ios']:
+            for platform in ['tvos', 'ios', 'macos']:
                 result = subprocess.run(['bash', str(root / 'Scripts/build-ffmpeg.sh'), '--platform', platform], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('FFmpeg build lock already exists', result.stderr)

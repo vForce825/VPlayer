@@ -4,10 +4,22 @@
 
 import Foundation
 import ImageIO
+#if os(macOS)
+import AppKit
+typealias ChannelLogoImage = NSImage
+extension NSImage {
+    func pngData() -> Data? {
+        guard let tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiffRepresentation) else { return nil }
+        return bitmap.representation(using: .png, properties: [:])
+    }
+}
+#else
 import UIKit
+typealias ChannelLogoImage = UIImage
+#endif
 
 struct DecodedChannelLogo: @unchecked Sendable {
-    let image: UIImage
+    let image: ChannelLogoImage
     let cost: Int
 }
 
@@ -67,8 +79,13 @@ struct ChannelLogoImageDecoder: ChannelLogoImageDecoding {
         let (cost, overflow) = thumbnail.bytesPerRow.multipliedReportingOverflow(
             by: thumbnail.height
         )
+        #if os(macOS)
+        let image = NSImage(cgImage: thumbnail, size: NSSize(width: thumbnail.width, height: thumbnail.height))
+        #else
+        let image = UIImage(cgImage: thumbnail, scale: 1, orientation: .up)
+        #endif
         return DecodedChannelLogo(
-            image: UIImage(cgImage: thumbnail, scale: 1, orientation: .up),
+            image: image,
             cost: overflow ? Int.max : cost
         )
     }

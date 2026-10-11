@@ -43,26 +43,25 @@ public actor RefreshCoordinator {
     typealias WaiterRegistrationObserver = @Sendable (WaiterRegistration) -> Void
 
     private struct RefreshKey: Hashable, Sendable {
-        let profileID: UUID
         let resource: RefreshResource
         let source: SourceURLIdentity
     }
 
+    private struct Waiter {
+        let profileID: UUID
+        let continuation: CheckedContinuation<RefreshOutcome, Never>
+    }
+
     private struct InFlight {
         let id: UUID
-        let task: Task<RefreshOutcome, Never>
-        var waiters: [UUID: CheckedContinuation<RefreshOutcome, Never>]
+        let task: Task<Void, Never>
+        var waiters: [UUID: Waiter]
         var drainWaiters: [UUID: CheckedContinuation<Bool, Never>]
         var isDraining: Bool
     }
 
     private enum CoordinatorError: Error, Sendable {
         case unsupportedRemoteURL
-    }
-
-    private struct PerformedRefresh: Sendable {
-        let outcome: RefreshOutcome
-        let didPersistTerminalStatus: Bool
     }
 
     private let repository: any LibraryRepository & RefreshSnapshotCommitting
@@ -140,9 +139,11 @@ public actor RefreshCoordinator {
         }
 
         let sourceURL: URL
+        let profiles: [SourceProfile]
         do {
             try Task.checkCancellation()
-            guard let profile = try await repository.profiles().first(where: {
+            profiles = try await repository.profiles()
+            guard let profile = profiles.first(where: {
                 $0.id == profileID
             }) else {
                 throw LibraryRepositoryError.profileNotFound
@@ -159,7 +160,7 @@ public actor RefreshCoordinator {
             )
         }
         let source = SourceURLIdentity(url: sourceURL)
-        let key = RefreshKey(profileID: profileID, resource: resource, source: source)
+        let key = RefreshKey(resource: resource, source: source)
         if let existing = inFlight[key], existing.isDraining {
             let shouldRetry = await waitForDrain(key: key, flightID: existing.id)
             guard shouldRetry else {
@@ -184,22 +185,20 @@ public actor RefreshCoordinator {
             let id = UUID()
             let context = RefreshSourceContext(source: source, attemptID: id)
             let task = Task {
-                let performed = await Self.performRefresh(
+                let outcomes = await Self.performRefresh(
                     repository: repository,
                     downloader: downloader,
-                    profileID: profileID,
+                    profiles: profiles,
+                    initiatingProfileID: profileID,
                     resource: resource,
                     sourceURL: sourceURL,
                     context: context,
                     timestamp: timestamp,
                     trigger: trigger,
-                    onRefreshStarted: onRefreshStarted
+                    onRefreshStarted: onRefreshStarted,
+                    onPersistedOutcome: onPersistedOutcome
                 )
-                if performed.didPersistTerminalStatus, let onPersistedOutcome {
-                    await onPersistedOutcome(profileID, performed.outcome)
-                }
-                self.completeFlight(key: key, id: id, outcome: performed.outcome)
-                return performed.outcome
+                self.completeFlight(key: key, id: id, outcomes: outcomes)
             }
             inFlight[key] = InFlight(
                 id: id,
@@ -233,7 +232,7 @@ public actor RefreshCoordinator {
                     ))
                     return
                 }
-                flight.waiters[waiterID] = continuation
+                flight.waiters[waiterID] = Waiter(profileID: profileID, continuation: continuation)
                 inFlight[key] = flight
                 waiterRegistrationObserver?(WaiterRegistration(
                     profileID: profileID,
@@ -268,7 +267,7 @@ public actor RefreshCoordinator {
             flight.task.cancel()
         }
         inFlight[key] = flight
-        waiter.resume(returning: Self.cancellationOutcome(
+        waiter.continuation.resume(returning: Self.cancellationOutcome(
             resource: resource,
             attemptID: flightID
         ))
@@ -320,12 +319,17 @@ public actor RefreshCoordinator {
     private func completeFlight(
         key: RefreshKey,
         id: UUID,
-        outcome: RefreshOutcome
+        outcomes: [UUID: RefreshOutcome]
     ) {
         guard let flight = inFlight[key], flight.id == id else { return }
         inFlight[key] = nil
         for waiter in flight.waiters.values {
-            waiter.resume(returning: outcome)
+            waiter.continuation.resume(returning: outcomes[waiter.profileID] ?? Self.failureOutcome(
+                error: LibraryRepositoryError.sourceConfigurationChanged,
+                resource: key.resource,
+                sourceURL: nil,
+                attemptID: id
+            ))
         }
         for waiter in flight.drainWaiters.values {
             waiter.resume(returning: true)
@@ -336,150 +340,155 @@ public actor RefreshCoordinator {
         repository: any LibraryRepository & RefreshSnapshotCommitting
             & ConditionalRefreshStatusWriting,
         downloader: any RemoteResourceDownloading,
-        profileID: UUID,
+        profiles: [SourceProfile],
+        initiatingProfileID: UUID,
         resource: RefreshResource,
         sourceURL: URL,
         context: RefreshSourceContext,
         timestamp: Date,
         trigger: RefreshTrigger,
-        onRefreshStarted: RefreshStartedHandler?
-    ) async -> PerformedRefresh {
+        onRefreshStarted: RefreshStartedHandler?,
+        onPersistedOutcome: PersistedOutcomeHandler?
+    ) async -> [UUID: RefreshOutcome] {
+        var begun: [UUID] = []
+        var outcomes: [UUID: RefreshOutcome] = [:]
         do {
-            try Task.checkCancellation()
-            let began = try await repository.beginRefresh(
-                profileID: profileID,
-                resource: resource,
-                context: context,
-                at: timestamp
-            )
-            guard began else {
-                return PerformedRefresh(
-                    outcome: RefreshOutcome(
-                        resource: resource,
-                        succeeded: false,
-                        message: sanitizedSummary(
-                            error: LibraryRepositoryError.sourceConfigurationChanged,
-                            resource: resource,
-                            url: nil
-                        ),
-                        attemptID: context.attemptID
-                    ),
-                    didPersistTerminalStatus: false
-                )
+            // 同一 URL 的资料共用下载；快照、频道身份和事务仍归各自的源配置。
+            for profile in profiles where SourceURLIdentity(url: profile.sourceURL(for: resource)) == context.source {
+                try Task.checkCancellation()
+                do {
+                    guard try await repository.beginRefresh(
+                        profileID: profile.id, resource: resource, context: context, at: timestamp
+                    ) else { throw LibraryRepositoryError.sourceConfigurationChanged }
+                    begun.append(profile.id)
+                    // 手动调用者已即时更新界面；其他关联配置也需要收到开始通知。
+                    if profile.id != initiatingProfileID || trigger != .manual {
+                        await onRefreshStarted?(profile.id, resource)
+                    }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    outcomes[profile.id] = failureOutcome(
+                        error: error, resource: resource, sourceURL: sourceURL, attemptID: context.attemptID
+                    )
+                }
             }
-            if case .manual = trigger {
-                // Manual refreshes already update AppModel synchronously.
-            } else if let onRefreshStarted {
-                await onRefreshStarted(profileID, resource)
-            }
+            guard !begun.isEmpty else { return outcomes }
             try Task.checkCancellation()
             guard isRemoteHTTPURL(sourceURL) else { throw CoordinatorError.unsupportedRemoteURL }
-
-            let downloaded = try await downloader.download(RemoteResourceRequest(
-                url: sourceURL,
-                resource: resource
-            ))
+            let downloaded = try await downloader.download(RemoteResourceRequest(url: sourceURL, resource: resource))
             defer { try? FileManager.default.removeItem(at: downloaded.temporaryFileURL) }
             try Task.checkCancellation()
 
+            let parsedChannels: [Channel]?
             switch resource {
             case .playlist:
-                guard isRemoteHTTPURL(downloaded.responseURL) else {
-                    throw CoordinatorError.unsupportedRemoteURL
-                }
-                let data = try Data(contentsOf: downloaded.temporaryFileURL)
-                let channels = try M3UParser().parse(
-                    data: data,
+                guard isRemoteHTTPURL(downloaded.responseURL) else { throw CoordinatorError.unsupportedRemoteURL }
+                parsedChannels = try M3UParser().parse(
+                    data: Data(contentsOf: downloaded.temporaryFileURL),
                     sourceURL: downloaded.responseURL,
-                    profileID: profileID
-                )
-                try Task.checkCancellation()
-                try await repository.commitPlaylistRefresh(
-                    profileID: profileID,
-                    channels: channels,
-                    fetchedAt: timestamp,
-                    context: context
+                    profileID: initiatingProfileID
                 )
             case .epg:
-                try Task.checkCancellation()
-                _ = try await repository.commitEPGRefresh(
-                    profileID: profileID,
-                    fileURL: downloaded.temporaryFileURL,
-                    fetchedAt: timestamp,
-                    context: context
-                )
+                parsedChannels = nil
             }
-            return PerformedRefresh(
-                outcome: RefreshOutcome(
-                    resource: resource,
-                    succeeded: true,
-                    message: nil,
-                    attemptID: context.attemptID
-                ),
-                didPersistTerminalStatus: true
-            )
-        } catch is CancellationError {
-            let summary = "刷新已取消。"
-            let persisted = await recordFailure(
-                repository: repository,
-                profileID: profileID,
-                resource: resource,
-                summary: summary,
-                at: timestamp,
-                context: context
-            )
-            return PerformedRefresh(
-                outcome: RefreshOutcome(
-                    resource: resource,
-                    succeeded: false,
-                    message: summary,
-                    attemptID: context.attemptID
-                ),
-                didPersistTerminalStatus: persisted
-            )
-        } catch RemoteDownloadError.cancelled {
-            let summary = "刷新已取消。"
-            let persisted = await recordFailure(
-                repository: repository,
-                profileID: profileID,
-                resource: resource,
-                summary: summary,
-                at: timestamp,
-                context: context
-            )
-            return PerformedRefresh(
-                outcome: RefreshOutcome(
-                    resource: resource,
-                    succeeded: false,
-                    message: summary,
-                    attemptID: context.attemptID
-                ),
-                didPersistTerminalStatus: persisted
-            )
+
+            var pending = begun
+            while !pending.isEmpty {
+                for profileID in pending {
+                    try Task.checkCancellation()
+                    do {
+                        switch resource {
+                        case .playlist:
+                            let channels = (parsedChannels ?? []).map { channel in
+                                Channel(
+                                    sourceProfileID: profileID, displayName: channel.displayName,
+                                    streamURL: channel.streamURL, tvgID: channel.tvgID, tvgName: channel.tvgName,
+                                    logoURL: channel.logoURL, groupTitle: channel.groupTitle,
+                                    attributes: channel.attributes, order: channel.order
+                                )
+                            }
+                            try await repository.commitPlaylistRefresh(
+                                profileID: profileID, channels: channels, fetchedAt: timestamp, context: context
+                            )
+                        case .epg:
+                            _ = try await repository.commitEPGRefresh(
+                                profileID: profileID, fileURL: downloaded.temporaryFileURL,
+                                fetchedAt: timestamp, context: context
+                            )
+                        }
+                        let outcome = RefreshOutcome(
+                            resource: resource, succeeded: true, message: nil, attemptID: context.attemptID
+                        )
+                        outcomes[profileID] = outcome
+                        await onPersistedOutcome?(profileID, outcome)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        let outcome = failureOutcome(
+                            error: error, resource: resource, sourceURL: sourceURL, attemptID: context.attemptID
+                        )
+                        outcomes[profileID] = outcome
+                        if await recordFailure(repository: repository, profileID: profileID, resource: resource,
+                            summary: outcome.message ?? "刷新失败。", at: timestamp, context: context) {
+                            await onPersistedOutcome?(profileID, outcome)
+                        }
+                    }
+                }
+                pending = []
+                // 下载或写回期间新增的同 URL 配置也获得结果。提交时仍校验 URL 和
+                // attemptID，旧响应不能覆盖已更改的配置。
+                let currentProfiles = try await repository.profiles()
+                let knownIDs = Set(begun).union(outcomes.keys)
+                for profile in currentProfiles where !knownIDs.contains(profile.id)
+                    && SourceURLIdentity(url: profile.sourceURL(for: resource)) == context.source {
+                    try Task.checkCancellation()
+                    do {
+                        guard try await repository.beginRefresh(
+                            profileID: profile.id, resource: resource, context: context, at: timestamp
+                        ) else { throw LibraryRepositoryError.sourceConfigurationChanged }
+                        begun.append(profile.id)
+                        pending.append(profile.id)
+                        await onRefreshStarted?(profile.id, resource)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        outcomes[profile.id] = failureOutcome(
+                            error: error, resource: resource, sourceURL: sourceURL, attemptID: context.attemptID
+                        )
+                    }
+                }
+            }
         } catch {
-            let summary = sanitizedSummary(
-                error: error,
-                resource: resource,
-                url: sourceURL
+            let outcome = failureOutcome(
+                error: error, resource: resource, sourceURL: sourceURL, attemptID: context.attemptID
             )
-            let persisted = await recordFailure(
-                repository: repository,
-                profileID: profileID,
-                resource: resource,
-                summary: summary,
-                at: timestamp,
-                context: context
-            )
-            return PerformedRefresh(
-                outcome: RefreshOutcome(
-                    resource: resource,
-                    succeeded: false,
-                    message: summary,
-                    attemptID: context.attemptID
-                ),
-                didPersistTerminalStatus: persisted
-            )
+            // 已提交的配置保留其成功状态；其余配置共享下载/解析失败或取消结果。
+            for profileID in begun where outcomes[profileID] == nil {
+                outcomes[profileID] = outcome
+                if await recordFailure(repository: repository, profileID: profileID, resource: resource,
+                    summary: outcome.message ?? "刷新失败。", at: timestamp, context: context) {
+                    await onPersistedOutcome?(profileID, outcome)
+                }
+            }
+            if outcomes[initiatingProfileID] == nil { outcomes[initiatingProfileID] = outcome }
         }
+        return outcomes
+    }
+
+    private nonisolated static func failureOutcome(
+        error: any Error,
+        resource: RefreshResource,
+        sourceURL: URL?,
+        attemptID: UUID
+    ) -> RefreshOutcome {
+        if error is CancellationError || (error as? RemoteDownloadError) == .cancelled {
+            return cancellationOutcome(resource: resource, attemptID: attemptID)
+        }
+        return RefreshOutcome(
+            resource: resource, succeeded: false,
+            message: sanitizedSummary(error: error, resource: resource, url: sourceURL), attemptID: attemptID
+        )
     }
 
     private nonisolated static func recordFailure(

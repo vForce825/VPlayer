@@ -213,7 +213,12 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         switch state {
         case .playing, .paused:
             break
-        case .idle, .preparing, .buffering, .recovering, .stopped, .failed:
+        #if os(macOS)
+        case .buffering, .recovering: break
+        #else
+        case .buffering, .recovering: return
+        #endif
+        case .idle, .preparing, .stopped, .failed:
             return
         }
         enqueuePause(!desiredPaused)
@@ -223,7 +228,12 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         guard started, !stopped else { return }
         switch state {
         case .playing, .paused: break
-        case .idle, .preparing, .buffering, .recovering, .stopped, .failed: return
+        #if os(macOS)
+        case .buffering, .recovering: break
+        #else
+        case .buffering, .recovering: return
+        #endif
+        case .idle, .preparing, .stopped, .failed: return
         }
         // A drained worker can still be waiting for the state stream to
         // acknowledge its last command. Preserve that intent over stale state.

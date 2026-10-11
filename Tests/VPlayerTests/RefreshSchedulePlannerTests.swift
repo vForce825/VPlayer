@@ -106,6 +106,31 @@ final class RefreshSchedulePlannerTests: XCTestCase {
         XCTAssertNil(RefreshSchedulePlanner().nextBackgroundDate(for: [profile], now: now))
     }
 
+    func testDueBatchDeduplicatesEachResourceURLAndRetainsOtherURLs() {
+        let first = profile(m3uInterval: .hourly, epgInterval: .hourly, m3uLastSuccess: nil, epgLastSuccess: nil)
+        var shared = first
+        shared = SourceProfile(id: UUID(), name: "共享源", m3uURL: first.m3uURL, epgURL: first.epgURL,
+            m3uRefreshInterval: .hourly, epgRefreshInterval: .hourly,
+            m3uStatus: .init(), epgStatus: .init(), createdAt: now, updatedAt: now)
+        var separatePlaylist = shared
+        separatePlaylist = SourceProfile(id: UUID(), name: "独立列表", m3uURL: URL(string: "https://other.test/list.m3u")!,
+            epgURL: first.epgURL, m3uRefreshInterval: .hourly, epgRefreshInterval: .hourly,
+            m3uStatus: .init(), epgStatus: .init(), createdAt: now, updatedAt: now)
+        let batch = RefreshSchedulePlanner().dueRefreshes(for: [first, shared, separatePlaylist], now: now)
+        XCTAssertEqual(batch.map(\.profileID), [first.id, separatePlaylist.id])
+        XCTAssertEqual(batch.map(\.resources), [[.playlist, .epg], [.playlist]])
+    }
+
+    func testNotDueOrManualProfileDoesNotSuppressAnotherProfilesDueSharedURL() {
+        let manual = profile(m3uInterval: .manual, epgInterval: .manual, m3uLastSuccess: nil, epgLastSuccess: nil)
+        let due = SourceProfile(id: UUID(), name: "需刷新", m3uURL: manual.m3uURL, epgURL: manual.epgURL,
+            m3uRefreshInterval: .hourly, epgRefreshInterval: .hourly,
+            m3uStatus: .init(), epgStatus: .init(), createdAt: now, updatedAt: now)
+        let batch = RefreshSchedulePlanner().dueRefreshes(for: [manual, due], now: now)
+        XCTAssertEqual(batch.map(\.profileID), [due.id])
+        XCTAssertEqual(batch.first?.resources, [.playlist, .epg])
+    }
+
     private func profile(
         m3uInterval: RefreshInterval,
         epgInterval: RefreshInterval,

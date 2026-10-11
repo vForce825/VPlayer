@@ -3,7 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import XCTest
+#if !VPLAYER_MACOS_HEADLESS_TESTS
 @testable import VPlayer
+#endif
 @testable import VPlayerCore
 
 final class ChannelSectionsTests: XCTestCase {

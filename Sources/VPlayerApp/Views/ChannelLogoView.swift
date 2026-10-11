@@ -3,7 +3,11 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import SwiftUI
+#if os(macOS)
+import AppKit
+#else
 import UIKit
+#endif
 
 struct ChannelLogoView: View {
     @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
@@ -30,18 +34,18 @@ struct CachedChannelLogo: View {
     let prefersReducedResourceUsage: Bool
     let imagePadding: CGFloat
     let placeholderVerticalPadding: CGFloat
-    var memoryCachedImage: @MainActor @Sendable (URL) -> UIImage? = {
+    var memoryCachedImage: @MainActor @Sendable (URL) -> ChannelLogoImage? = {
         ChannelLogoCache.shared.memoryCachedImage(for: $0)
     }
-    var loadImage: @MainActor @Sendable (URL) async -> UIImage? = {
+    var loadImage: @MainActor @Sendable (URL) async -> ChannelLogoImage? = {
         await ChannelLogoCache.shared.image(for: $0)
     }
-    @State private var image: UIImage?
+    @State private var image: ChannelLogoImage?
 
     var body: some View {
         Group {
             if let image = image ?? memoryCachedImage(url) {
-                Image(uiImage: image)
+                logoImage(image)
                     .resizable()
                     .scaledToFit()
                     .padding(imagePadding)
@@ -72,4 +76,13 @@ private struct ChannelLogoPlaceholder: View {
             .padding(.vertical, verticalPadding)
             .foregroundStyle(.secondary)
     }
+}
+
+@MainActor
+private func logoImage(_ image: ChannelLogoImage) -> Image {
+    #if os(macOS)
+    Image(nsImage: image)
+    #else
+    Image(uiImage: image)
+    #endif
 }
