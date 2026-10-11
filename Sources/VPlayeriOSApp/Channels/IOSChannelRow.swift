@@ -24,7 +24,6 @@ struct IOSChannelRow: View {
                     if let progress = programme.progress { ProgressView(value: progress) }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                Image(systemName: "play.circle").foregroundStyle(.tint)
             }
             .padding(.vertical, 5)
             .contentShape(Rectangle())

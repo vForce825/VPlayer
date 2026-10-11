@@ -221,6 +221,102 @@ final class IOSLibraryFlowTests: XCTestCase {
                 failureDetails(in: app, stage: "touch-cycle-\(cycle)-player-dismissed"))
         }
     }
+    func testChannelInformationShowsMetadataAndEPGWithoutStartingPlayback() {
+        let app = launch()
+        defer { app.terminate() }
+        let information = app.buttons["channel.info.channel.http"]
+        require(information, in: app, stage: "channel-information-button", timeout: 15, hittable: true)
+        information.tap()
+        require(app.navigationBars["频道信息"], in: app, stage: "channel-information-sheet", timeout: 5)
+        // LabeledContent 会把字段名和值合并为一个辅助功能标签。
+        XCTAssertTrue(app.staticTexts["channel.info.name"].label.contains("测试频道"))
+        XCTAssertTrue(app.staticTexts["channel.info.stream-url"].label.contains(
+            "https://relay.fixture.invalid/rtp/239.1.1.1:5000"))
+        app.buttons["channel.info.copy"].tap()
+        XCTAssertTrue(app.buttons["channel.info.copy"].label.contains("已复制"))
+        let informationScreenshot = XCTAttachment(screenshot: app.screenshot())
+        informationScreenshot.name = "频道基础信息"
+        informationScreenshot.lifetime = .keepAlways
+        add(informationScreenshot)
+        app.swipeUp()
+        require(app.staticTexts["正在播出"], in: app, stage: "channel-information-current-programme", timeout: 3)
+        require(app.staticTexts["接下来"], in: app, stage: "channel-information-next-programme", timeout: 3)
+        let programmeScreenshot = XCTAttachment(screenshot: app.screenshot())
+        programmeScreenshot.name = "频道节目单"
+        programmeScreenshot.lifetime = .keepAlways
+        add(programmeScreenshot)
+        XCTAssertFalse(app.buttons["player-back"].exists, "查看频道信息不能启动播放")
+        app.buttons["channel.info.done"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "channel-information-dismissed", timeout: 5,
+                hittable: true)
+        app.buttons["channel.http"].tap()
+        pauseBeforeControlInspection(in: app, stage: "channel-information-playback")
+        assertPlayerControls(in: app, stage: "channel-information-playback")
+        app.buttons["player-back"].tap()
+    }
+    func testUnmatchedChannelInformationCanOpenEPGMapping() {
+        let app = launch()
+        defer { app.terminate() }
+        let information = app.buttons["channel.info.channel.udp"]
+        require(information, in: app, stage: "unmatched-information-button", timeout: 15, hittable: true)
+        information.tap()
+        require(app.navigationBars["频道信息"], in: app, stage: "unmatched-information-sheet", timeout: 5)
+        app.swipeUp()
+        require(app.staticTexts["尚未匹配 EPG 频道"], in: app, stage: "unmatched-information-status", timeout: 3)
+        app.buttons["channel.info.mapping"].tap()
+        require(app.buttons["mapping.save"], in: app, stage: "information-epg-mapping", timeout: 5)
+        app.buttons["取消"].tap()
+        require(app.buttons["channel.info.done"], in: app, stage: "information-mapping-cancelled", timeout: 3)
+        app.buttons["channel.info.done"].tap()
+        XCTAssertFalse(app.alerts.firstMatch.exists, "查看组播频道信息不能触发播放协议错误")
+        XCTAssertFalse(app.buttons["player-back"].exists)
+    }
+    func testChannelBrowserDisplaysRenamedActivePlaylist() {
+        let app = launch()
+        defer { app.terminate() }
+        let profile = app.staticTexts["channel.active-playlist"]
+        require(profile, in: app, stage: "channel-active-playlist", timeout: 15)
+        XCTAssertEqual(profile.label, "测试播放列表")
+        app.tabBars.buttons["播放列表"].tap()
+        app.buttons["编辑"].tap()
+        let name = app.textFields["source.editor.name"]
+        require(name, in: app, stage: "channel-playlist-rename", timeout: 5, hittable: true)
+        name.tap()
+        name.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: "测试播放列表".count)
+                      + "新的播放列表")
+        app.buttons["source.editor.save"].tap()
+        require(app.buttons["编辑"], in: app, stage: "channel-playlist-renamed", timeout: 5)
+        app.tabBars.buttons["频道"].tap()
+        require(profile, in: app, stage: "channel-playlist-name-updated", timeout: 5)
+        XCTAssertEqual(profile.label, "新的播放列表")
+    }
+    func testGroupMenuJumpsToDistantSectionsAndStaysReachable() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-fixture", "seeded", "-ui-card-focus-diagnostics",
+                               "-uiTestResetPlaybackSettings"]
+        app.launch()
+        defer { app.terminate() }
+        let first = app.buttons["channel.focus-probe.000"]
+        let lastGroup = app.buttons["channel.focus-probe.060"]
+        let groups = app.buttons["channel.groups"]
+        require(first, in: app, stage: "group-jump-initial", timeout: 15, hittable: true)
+        require(app.navigationBars["频道"], in: app, stage: "group-jump-navigation-title", timeout: 3)
+        let browserScreenshot = XCTAttachment(screenshot: app.screenshot())
+        browserScreenshot.name = "频道列表与分组入口"
+        browserScreenshot.lifetime = .keepAlways
+        add(browserScreenshot)
+        XCTAssertFalse(lastGroup.isHittable)
+        groups.tap()
+        app.buttons["channel.group.诊断分组 4"].tap()
+        require(lastGroup, in: app, stage: "group-jump-distant", timeout: 5, hittable: true)
+        XCTAssertFalse(first.isHittable)
+        require(groups, in: app, stage: "group-jump-menu-still-reachable", timeout: 3, hittable: true)
+        groups.tap()
+        app.buttons["channel.group.诊断分组 1"].tap()
+        require(first, in: app, stage: "group-jump-return", timeout: 5, hittable: true)
+        XCTAssertFalse(app.buttons["player-back"].exists)
+    }
     private func tapPlayerBackground(in app: XCUIApplication) {
         let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
         if !screen.exists {

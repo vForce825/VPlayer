@@ -38,7 +38,7 @@ struct IOSFullScreenPlayerView: View {
                 VStack {
                     HStack {
                         Button { close() } label: {
-                            Image(systemName: "chevron.down").frame(width: 44, height: 44)
+                            Image(systemName: "chevron.left").frame(width: 44, height: 44)
                         }
                         .accessibilityLabel("关闭播放").accessibilityIdentifier("player-back")
                         Text(session.presentation.request.title).font(.headline).lineLimit(1)

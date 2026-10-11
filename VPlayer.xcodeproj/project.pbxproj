@@ -19,6 +19,7 @@
 		0296B8DACFFB11BD484C12E7 /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B16CFEEA73472380FF70D554 /* VPlayerPlayback.framework */; };
 		02A12F1D42C6988A086B2BE5 /* OutputCleanupCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5902DFB90B0B9D0700E5B82 /* OutputCleanupCoordinatorTests.swift */; };
 		02B8D95A9C4B5D00D4804C03 /* AVKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5498201DF1E4B105E63C7D22 /* AVKit.framework */; };
+		0367EE5BBA9AAC8AC2E6178B /* IOSChannelInformationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1FB09D066AFF39461A415C9D /* IOSChannelInformationView.swift */; };
 		03A33825C47BC2A9E6ABA5D2 /* YADIFProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 88BF6A356D15DC7B669B2F90 /* YADIFProcessor.swift */; };
 		03C2431CE143F84391408374 /* VPlayerPlayback.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 566BFCB698B5219F51B747B6 /* VPlayerPlayback.framework */; };
 		03C83B0456E9AFFF8D2E9E84 /* HLSApplicationLifetimeCharge.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AEAEC3D7CEF3A3E0EFCFDD8 /* HLSApplicationLifetimeCharge.swift */; };
@@ -1403,6 +1404,7 @@
 		1E9F526E75D1691C1C4F2931 /* AVFoundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AVFoundation.framework; path = System/Library/Frameworks/AVFoundation.framework; sourceTree = SDKROOT; };
 		1EE05E546CEFD030C89E573F /* VTVideoEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VTVideoEncoder.swift; sourceTree = "<group>"; };
 		1F7E8149EA0D346F53B55328 /* PlayerChannelPresentation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerChannelPresentation.swift; sourceTree = "<group>"; };
+		1FB09D066AFF39461A415C9D /* IOSChannelInformationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSChannelInformationView.swift; sourceTree = "<group>"; };
 		200B5CF20EF25197640989C4 /* VideoToolboxDecoderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoToolboxDecoderTests.swift; sourceTree = "<group>"; };
 		2030AE6C6FA9E597891A75D2 /* PlaybackPresentationContext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackPresentationContext.swift; sourceTree = "<group>"; };
 		20A0D95ECEB4373E41B3199F /* PlaybackOperationDeadline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackOperationDeadline.swift; sourceTree = "<group>"; };
@@ -2482,6 +2484,7 @@
 			isa = PBXGroup;
 			children = (
 				7B49E416FB22298055BB28EC /* IOSChannelBrowserView.swift */,
+				1FB09D066AFF39461A415C9D /* IOSChannelInformationView.swift */,
 				0C738F3F97F7F33D289CFC96 /* IOSChannelRow.swift */,
 			);
 			path = Channels;
@@ -3919,6 +3922,7 @@
 				05A9B6D0F64F04F2154E82AC /* ForegroundRefreshDriver.swift in Sources */,
 				3025C554229BE0222DD0DC4C /* FullScreenPlayerViewModel.swift in Sources */,
 				423127DE9D179418453D3BDE /* IOSChannelBrowserView.swift in Sources */,
+				0367EE5BBA9AAC8AC2E6178B /* IOSChannelInformationView.swift in Sources */,
 				CC1F64EFC245EB2474D1CF78 /* IOSChannelRow.swift in Sources */,
 				349FE996DDE03C3B6F8822A4 /* IOSFullScreenPlayerView.swift in Sources */,
 				CFE7F1FA8EC7C3A9138507E8 /* IOSPictureInPictureCoordinator.swift in Sources */,
