@@ -14,6 +14,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
         case recordAttempt
         case recordFailure
         case read
+        case editorWrite
     }
 
     enum Event: Equatable, Sendable {
@@ -165,6 +166,12 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
 
     func setReadFailure(_ enabled: Bool) {
         failsReads = enabled
+    }
+
+    private var failsEditorWrites = false
+
+    func setEditorWriteFailure(_ enabled: Bool) {
+        failsEditorWrites = enabled
     }
 
     func setRefreshPersistenceFaults(
@@ -338,6 +345,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
     }
 
     func createProfile(_ input: ValidatedSourceProfileInput, now: Date) async throws -> SourceProfile {
+        if failsEditorWrites { throw InjectedError.editorWrite }
         if shouldGateNextCreate {
             shouldGateNextCreate = false
             blockedCreateContinuation?.resume()
@@ -367,6 +375,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
     }
 
     func updateProfile(id: UUID, input: ValidatedSourceProfileInput, now: Date) throws {
+        if failsEditorWrites { throw InjectedError.editorWrite }
         let index = try profileIndex(id)
         storedProfiles[index].name = input.name
         storedProfiles[index].m3uURL = input.m3uURL
@@ -531,6 +540,7 @@ actor RepositorySpy: LibraryRepository, RefreshSnapshotCommitting,
         xmltvChannelID: String?
     ) async throws -> Bool {
         await waitAtMappingWriteGateIfNeeded()
+        if failsEditorWrites { throw InjectedError.editorWrite }
         _ = try profileIndex(profileID)
         guard storedActiveProfileID == profileID,
               storedChannels[profileID, default: []].contains(where: {

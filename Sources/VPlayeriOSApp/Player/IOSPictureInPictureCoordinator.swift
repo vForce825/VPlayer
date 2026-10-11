@@ -159,6 +159,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
     @ObservationIgnored private var pendingTransport: (PresentationIdentity, Bool)?
     @ObservationIgnored private var starting = false
     @ObservationIgnored private var restoring = false
+    @ObservationIgnored private var resumingAfterReplacement = false
     @ObservationIgnored private var closed = false
     @ObservationIgnored private var state: PlaybackState = .idle
     @ObservationIgnored private var paused = true
@@ -229,6 +230,18 @@ final class IOSPictureInPictureCoordinator: NSObject,
     }
     private func retireCurrent() {
         guard let current = controller else { return }
+        // 保留原生窗口的播放意图；已经收到停止的旧窗口不能被重新拉起。
+        let requestedRestore = snapshot.consumeRestoreIntent(ObjectIdentifier(current.callbackObject))
+        if requestedRestore, !restoring {
+            // 身份退休会让排队中的 AVKit 恢复回调失效，先兑现已记录的用户意图。
+            restoring = true
+            onRestore? { _ in }
+        }
+        if restoring || requestedRestore {
+            resumingAfterReplacement = false
+        } else if current.isPictureInPictureActive || starting {
+            resumingAfterReplacement = true
+        }
         pendingTransport = nil
         transportTask?.cancel()
         current.cancelObservation()
@@ -262,6 +275,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
             updateSnapshot()
             setPictureInPicture(false)
             message = "当前设备无法创建画中画，播放会继续。"
+            restoreAfterFailedReplacement()
             return
         }
         controller = current
@@ -271,6 +285,9 @@ final class IOSPictureInPictureCoordinator: NSObject,
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.currentID == reference.identity else { return }
                 self.isPossible = possible
+                if possible, self.resumingAfterReplacement, !self.starting, !self.isActive {
+                    self.start()
+                }
             }
         }
         updateSnapshot()
@@ -292,6 +309,8 @@ final class IOSPictureInPictureCoordinator: NSObject,
         controller.startPictureInPicture()
     }
     func stopForRestoration() {
+        // 用户可能在旧窗口停止、新窗口尚未安装的间隙返回全屏。
+        resumingAfterReplacement = false
         guard let controller, isActive || starting || controller.isPictureInPictureActive else { return }
         restoring = true
         controller.stopPictureInPicture()
@@ -316,6 +335,7 @@ final class IOSPictureInPictureCoordinator: NSObject,
     func close() {
         guard !closed else { return }
         closed = true
+        resumingAfterReplacement = false
         pendingTransport = nil
         transportTask?.cancel()
         pending = nil
@@ -336,7 +356,12 @@ final class IOSPictureInPictureCoordinator: NSObject,
             return
         }
         guard currentID == identity else { return }
-        starting = false; isActive = true
+        if restoring && starting {
+            controller?.stopPictureInPicture()
+            return
+        }
+        resumingAfterReplacement = false
+        starting = false; isActive = true; restoring = false
         setPictureInPicture(true)
         onStarted?()
     }
@@ -346,12 +371,13 @@ final class IOSPictureInPictureCoordinator: NSObject,
             retiring?.cancelObservation()
             retiring?.detach()
             retiring = nil
-            starting = false; isActive = false
+            starting = false; isActive = false; restoring = false
             setPictureInPicture(false)
             installPendingIfPossible()
             return
         }
         guard currentID == identity else { return }
+        resumingAfterReplacement = false
         starting = false; isActive = false
         setPictureInPicture(false)
         let restored = snapshot.consumeRestoreIntent(identity)
@@ -369,12 +395,26 @@ final class IOSPictureInPictureCoordinator: NSObject,
         snapshot.clearRestoreIntent()
         setPictureInPicture(false)
         message = "暂时无法进入画中画，播放会继续。请返回全屏后重试。"
+        restoreAfterFailedReplacement()
+    }
+    private func restoreAfterFailedReplacement() {
+        guard resumingAfterReplacement else { return }
+        resumingAfterReplacement = false
+        restoring = true
+        onRestore? { _ in }
     }
     private func restore(_ identity: ObjectIdentifier, reply: PiPRestoreReply) {
-        guard !closed, currentID == identity, let onRestore else { reply.call(false); return }
+        guard !closed, currentID == identity || retiringID == identity,
+              let onRestore else { reply.call(false); return }
+        resumingAfterReplacement = false
         restoring = true
         onRestore { [weak self] success in
-            guard let self, !self.closed, self.currentID == identity else { reply.call(false); return }
+            guard let self, !self.closed,
+                  self.currentID == identity || self.retiringID == identity
+                    || (!self.isActive && !self.starting) else {
+                reply.call(false)
+                return
+            }
             reply.call(success)
         }
     }

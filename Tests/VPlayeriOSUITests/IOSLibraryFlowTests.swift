@@ -285,7 +285,16 @@ final class IOSLibraryFlowTests: XCTestCase {
         name.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: "测试播放列表".count)
                       + "新的播放列表")
         app.buttons["source.editor.save"].tap()
-        require(app.buttons["编辑"], in: app, stage: "channel-playlist-renamed", timeout: 5)
+        // 弹层后方的“编辑”仍可能存在于辅助功能树，必须等待编辑器真正退出。
+        let dismissed = name.waitForNonExistence(timeout: 10)
+        let error = app.staticTexts["source.editor.error"]
+        if !dismissed {
+            let screenshot = XCTAttachment(screenshot: app.screenshot())
+            screenshot.lifetime = .keepAlways
+            add(screenshot)
+        }
+        XCTAssertTrue(dismissed, "保存后编辑器未退出：\(error.exists ? error.label : app.debugDescription)")
+        require(app.buttons["编辑"], in: app, stage: "channel-playlist-renamed", timeout: 5, hittable: true)
         app.tabBars.buttons["频道"].tap()
         require(profile, in: app, stage: "channel-playlist-name-updated", timeout: 5)
         XCTAssertEqual(profile.label, "新的播放列表")

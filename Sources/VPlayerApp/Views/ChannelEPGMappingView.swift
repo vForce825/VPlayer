@@ -13,6 +13,7 @@ struct ChannelEPGMappingView: View {
     @State private var selection: String?
     @State private var searchText = ""
     @State private var isSaving = false
+    @State private var errorMessage: String?
 
     init(model: AppModel, channel: Channel) {
         self.model = model
@@ -26,6 +27,11 @@ struct ChannelEPGMappingView: View {
     var body: some View {
         NavigationStack {
             List {
+                if let errorMessage {
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("mapping.error")
+                }
                 if model.manualEPGChannelID(for: channel) != nil {
                     Button {
                         selection = nil
@@ -123,16 +129,20 @@ struct ChannelEPGMappingView: View {
     }
 
     private func save() {
+        errorMessage = nil
         isSaving = true
         Task {
+            var failure: String?
             let succeeded = await model.saveMapping(
                 channel: channel,
                 xmltvChannelID: selection
-            )
+            ) { failure = $0 }
             guard !Task.isCancelled else { return }
             isSaving = false
             if succeeded {
                 dismiss()
+            } else {
+                errorMessage = failure ?? "未能完成保存，请重试。"
             }
         }
     }

@@ -10,6 +10,9 @@ import VPlayerPlayback
 @MainActor
 @Observable
 final class AppModel {
+    /// 表单可以接管本次操作的错误，避免根视图弹窗被编辑弹层遮挡。
+    typealias OperationErrorHandler = @MainActor (String) -> Void
+
     typealias Refresh = @Sendable (
         UUID,
         Set<RefreshResource>,
@@ -79,6 +82,7 @@ final class AppModel {
     private var manualMappingByChannelID: [String: String] = [:]
     @ObservationIgnored private var programmeWindowDate: Date?
     private var reloadID: UUID?
+    @ObservationIgnored private var appliedReloadID: UUID?
     private var activeTransition: ActiveTransition?
     private var pendingCreation: PendingCreation?
     private var activeCreationAttemptIDs: Set<UUID> = []
@@ -184,12 +188,19 @@ final class AppModel {
     }
 
     @discardableResult
-    func reload() async -> Bool {
+    func reload(onError: OperationErrorHandler? = nil) async -> Bool {
         while true {
             guard await waitForActiveMutationLaneIdle() else { return false }
             guard activeMutationLease == nil, queuedActiveMutations.isEmpty else { continue }
-            return await reloadOutcome() == .applied
+            return await reloadOutcome(onError: onError) == .applied
         }
+    }
+
+    /// 写入通知可能抢先发起更新的重读；以最终成功应用的快照判断是否完成。
+    private func reloadEditorSnapshot(onError: OperationErrorHandler?) async -> Bool {
+        if await reload(onError: onError) { return true }
+        await waitForWinningReloadCompletion()
+        return !Task.isCancelled && appliedReloadID != nil && appliedReloadID == reloadID
     }
 
     /// 由前台视图任务持有，退出前台时取消；只重读本地 EPG，不触发订阅下载。
@@ -244,7 +255,7 @@ final class AppModel {
         }
     }
 
-    private func reloadOutcome() async -> ReloadOutcome {
+    private func reloadOutcome(onError: OperationErrorHandler? = nil) async -> ReloadOutcome {
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
@@ -365,7 +376,7 @@ final class AppModel {
         } catch {
             guard reloadID == currentReloadID else { return .superseded }
             lastReloadFailure = ErrorDiagnosticSnapshot(error)
-            presentOperationError(error, operation: "读取资料库失败")
+            presentOperationError(error, operation: "读取资料库失败", onError: onError)
             finishLoading(reloadID: currentReloadID)
             return .failedWhileCurrent
         }
@@ -577,7 +588,7 @@ final class AppModel {
     }
 
     @discardableResult
-    func create(input: SourceProfileInput, attemptID: UUID) async -> Bool {
+    func create(input: SourceProfileInput, attemptID: UUID, onError: OperationErrorHandler? = nil) async -> Bool {
         activeCreationAttemptIDs.insert(attemptID)
         defer {
             activeCreationAttemptIDs.remove(attemptID)
@@ -603,18 +614,18 @@ final class AppModel {
             }
             guard !cancelledCreationAttemptIDs.contains(attemptID) else {
                 reconcileCreatedProfile(createdProfile)
-                _ = await reload()
+                _ = await reload(onError: onError)
                 return false
             }
             pendingCreation = PendingCreation(attemptID: attemptID, profile: createdProfile)
             reconcileCreatedProfile(createdProfile)
-            guard await reload() else {
+            guard await reloadEditorSnapshot(onError: onError) else {
                 guard !cancelledCreationAttemptIDs.contains(attemptID) else {
                     pendingCreation = nil
                     return false
                 }
                 reconcileCreatedProfile(createdProfile)
-                presentReloadFailure("播放列表已保存，但界面未能重新读取。请重试；再次保存不会重复创建。")
+                presentReloadFailure("播放列表已保存，但界面未能重新读取。请重试；再次保存不会重复创建。", onError: onError)
                 return false
             }
             guard !cancelledCreationAttemptIDs.contains(attemptID) else {
@@ -623,7 +634,7 @@ final class AppModel {
             }
             guard profiles.contains(where: { $0.id == createdProfile.id }) else {
                 pendingCreation = nil
-                presentOperationMessage("播放列表已保存，但已无法在资料库中找到。请重新添加。")
+                presentOperationMessage("播放列表已保存，但已无法在资料库中找到。请重新添加。", onError: onError)
                 return false
             }
             if pendingCreation?.attemptID == attemptID {
@@ -635,7 +646,7 @@ final class AppModel {
             )
             return true
         } catch {
-            presentOperationError(error, operation: "创建播放列表失败")
+            presentOperationError(error, operation: "创建播放列表失败", onError: onError)
             return false
         }
     }
@@ -650,7 +661,7 @@ final class AppModel {
     }
 
     @discardableResult
-    func update(profileID: UUID, input: SourceProfileInput) async -> Bool {
+    func update(profileID: UUID, input: SourceProfileInput, onError: OperationErrorHandler? = nil) async -> Bool {
         do {
             let validatedInput = try input.validated()
             let updatedAt = now()
@@ -665,15 +676,24 @@ final class AppModel {
                 profileID: profileID,
                 resources: retargetedResources
             )
-            let reloadApplied = await reload()
+            let reloadApplied = await reloadEditorSnapshot(onError: onError)
             startAutomaticRefresh(profileID: profileID, resources: retargetedResources)
             guard reloadApplied else {
-                presentReloadFailure("更改已保存，但界面未能重新读取。请稍后重试。")
+                presentReloadFailure("更改已保存，但界面未能重新读取。请稍后重试。", onError: onError)
+                return false
+            }
+            guard let current = profiles.first(where: { $0.id == profileID }),
+                  current.name == validatedInput.name,
+                  current.m3uURL == validatedInput.m3uURL,
+                  current.epgURL == validatedInput.epgURL,
+                  current.m3uRefreshInterval == validatedInput.m3uRefreshInterval,
+                  current.epgRefreshInterval == validatedInput.epgRefreshInterval else {
+                presentOperationMessage("播放列表已被其他操作更改，请检查最新内容。", onError: onError)
                 return false
             }
             return true
         } catch {
-            presentOperationError(error, operation: "修改播放列表失败")
+            presentOperationError(error, operation: "修改播放列表失败", onError: onError)
             return false
         }
     }
@@ -1048,9 +1068,9 @@ final class AppModel {
     }
 
     @discardableResult
-    func saveMapping(channel: Channel, xmltvChannelID: String?) async -> Bool {
+    func saveMapping(channel: Channel, xmltvChannelID: String?, onError: OperationErrorHandler? = nil) async -> Bool {
         guard isCurrentMappingTarget(channel) else {
-            await rejectStaleMappingTarget()
+            await rejectStaleMappingTarget(onError: onError)
             return false
         }
         do {
@@ -1060,18 +1080,23 @@ final class AppModel {
                 xmltvChannelID: xmltvChannelID
             )
             guard persisted else {
-                await rejectStaleMappingTarget()
+                await rejectStaleMappingTarget(onError: onError)
                 return false
             }
-            guard await reload() else {
-                presentReloadFailure("映射已保存，但界面未能重新读取。请稍后重试。")
+            guard await reloadEditorSnapshot(onError: onError) else {
+                presentReloadFailure("映射已保存，但界面未能重新读取。请稍后重试。", onError: onError)
+                return false
+            }
+            guard isCurrentMappingTarget(channel),
+                  manualMappingByChannelID[channel.id] == xmltvChannelID else {
+                presentOperationMessage("频道或映射已被其他操作更改，请重新检查。", onError: onError)
                 return false
             }
             return true
         } catch {
             let original = ErrorDiagnosticSnapshot(error)
-            _ = await reload()
-            presentOperationError(original, operation: "保存 EPG 映射失败")
+            _ = await reload(onError: onError)
+            presentOperationError(original, operation: "保存 EPG 映射失败", onError: onError)
             return false
         }
     }
@@ -1138,6 +1163,7 @@ final class AppModel {
             terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
         )
         hasAppliedLibrarySnapshot = true
+        appliedReloadID = currentReloadID
         finishLoading(reloadID: currentReloadID)
         return .applied
     }
@@ -1176,6 +1202,7 @@ final class AppModel {
         self.programmesByChannelID = programmes
         self.programmeWindowDate = programmeWindowDate
         hasAppliedLibrarySnapshot = true
+        appliedReloadID = currentReloadID
         finishLoading(reloadID: currentReloadID)
         return .applied
     }
@@ -1214,6 +1241,7 @@ final class AppModel {
         self.programmesByChannelID = programmes
         self.programmeWindowDate = programmeWindowDate
         hasAppliedLibrarySnapshot = true
+        appliedReloadID = currentReloadID
         if let request = presentedPlaybackRequest,
            activeProfile?.id != request.sourceProfileID
             || playbackChannelIdentities[request.channelID] != PlaybackChannelIdentity(
@@ -1287,17 +1315,19 @@ final class AppModel {
         }
     }
 
-    private func presentOperationError(_ error: any Error, operation: String) {
+    private func presentOperationError(
+        _ error: any Error, operation: String, onError: OperationErrorHandler? = nil
+    ) {
         if let validation = SourceProfileValidationMessage.text(for: error) {
-            presentOperationMessage(validation)
+            presentOperationMessage(validation, onError: onError)
         } else {
-            presentOperationMessage("\(operation)：\(ErrorDiagnosticSnapshot(error).summary)")
+            presentOperationMessage("\(operation)：\(ErrorDiagnosticSnapshot(error).summary)", onError: onError)
         }
     }
 
-    private func presentReloadFailure(_ message: String) {
+    private func presentReloadFailure(_ message: String, onError: OperationErrorHandler? = nil) {
         let detail = lastReloadFailure.map { "\n\($0.summary)" } ?? ""
-        presentOperationMessage(message + detail)
+        presentOperationMessage(message + detail, onError: onError)
     }
 
     private func beginActiveTransition(to profile: SourceProfile?) -> ActiveTransition {
@@ -1733,7 +1763,11 @@ final class AppModel {
         }
     }
 
-    private func presentOperationMessage(_ message: String) {
+    private func presentOperationMessage(_ message: String, onError: OperationErrorHandler? = nil) {
+        if let onError {
+            onError(message)
+            return
+        }
         alertKind = .operation
         alertMessage = message
     }
@@ -1751,9 +1785,9 @@ final class AppModel {
             })
     }
 
-    private func rejectStaleMappingTarget() async {
-        _ = await reload()
-        presentOperationMessage("频道列表已更改，请重新选择频道后再保存映射。")
+    private func rejectStaleMappingTarget(onError: OperationErrorHandler? = nil) async {
+        _ = await reload(onError: onError)
+        presentOperationMessage("频道列表已更改，请重新选择频道后再保存映射。", onError: onError)
     }
 }
 

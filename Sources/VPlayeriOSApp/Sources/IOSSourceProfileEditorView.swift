@@ -88,12 +88,17 @@ struct IOSSourceProfileEditorView: View {
         catch { errorMessage = SourceProfileValidationMessage.text(for: error) ?? "请检查输入内容。"; return }
         errorMessage = nil; isSaving = true
         Task {
+            var failure: String?
             let saved: Bool
-            if let profile { saved = await model.update(profileID: profile.id, input: input) }
-            else { saved = await model.create(input: input, attemptID: attempt) }
+            if let profile {
+                saved = await model.update(profileID: profile.id, input: input) { failure = $0 }
+            } else {
+                saved = await model.create(input: input, attemptID: attempt) { failure = $0 }
+            }
             guard !Task.isCancelled else { return }
             isSaving = false
             if saved { dismiss() }
+            else { errorMessage = failure ?? "未能完成保存，请重试。" }
         }
     }
 }

@@ -236,8 +236,10 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
             XCTAssertEqual(handles.count, 2)
             XCTAssertEqual(old.detachCount, 1)
             XCTAssertFalse(old.detachedWhileObserving)
-            XCTAssertNil(try gate.withGPUAdmission { $0.finish() })
+            await flushDelegateDelivery()
             let replacement = try XCTUnwrap(handles.last)
+            XCTAssertEqual(replacement.startCount, 1, "新控制器就绪后必须实际请求恢复画中画")
+            XCTAssertNotNil(try gate.withGPUAdmission { _ in XCTFail("接替启动时仍须关闭 GPU") })
             coordinator.receiveDidStart(replacement.callbackObject)
             await flushDelegateDelivery()
             coordinator.receiveDidStart(old.callbackObject)
@@ -268,6 +270,8 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
                     return handle
                 })
             defer { coordinator.close() }
+            var restores = 0
+            coordinator.onRestore = { reply in restores += 1; reply(true) }
             coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
             if !failsInitially {
                 let old = try XCTUnwrap(old)
@@ -282,6 +286,7 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
                 XCTAssertEqual(factoryCalls, 2)
                 XCTAssertEqual(old.detachCount, 1)
             }
+            XCTAssertEqual(restores, failsInitially ? 0 : 1, "接替失败必须恢复全屏")
             XCTAssertFalse(coordinator.isActive)
             XCTAssertFalse(coordinator.isPossible)
             XCTAssertNil(coordinator.nativeControllerForTesting)
@@ -333,6 +338,219 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
         }
     }
 
+    func testReplacementWaitsForReadinessAndKeepsOnlyTheLatestPresentation() async throws {
+        let target = PiPTestTarget()
+        var handles: [FakePiPControllerHandle] = []
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { true }, makeController: { source, _ in
+                let handle = FakePiPControllerHandle(source: source)
+                handle.isPossible = handles.isEmpty
+                handles.append(handle)
+                return handle
+            })
+        defer { coordinator.close() }
+        coordinator.install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(), identity: makeIdentity(1))
+        let old = try XCTUnwrap(handles.first)
+        old.isPictureInPictureActive = true
+        coordinator.receiveDidStart(old.callbackObject)
+        await flushDelegateDelivery()
+        coordinator.retire(identity: makeIdentity(1))
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+        coordinator.retire(identity: makeIdentity(2))
+        let latestLayer = AVPlayerLayer()
+        coordinator.install(playerLayer: latestLayer, identity: makeIdentity(3))
+        XCTAssertEqual(handles.count, 1)
+        old.isPictureInPictureActive = false
+        coordinator.receiveDidStop(old.callbackObject)
+        await flushDelegateDelivery()
+        await flushDelegateDelivery()
+        let waiting = try XCTUnwrap(handles.last)
+        XCTAssertEqual(handles.count, 2)
+        XCTAssertTrue(waiting.contentSource?.playerLayer === latestLayer)
+        XCTAssertEqual(waiting.startCount, 0)
+
+        // 等待就绪期间再次替换，恢复意图也应交给最新画面。
+        coordinator.install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(), identity: makeIdentity(4))
+        await flushDelegateDelivery()
+        let replacement = try XCTUnwrap(handles.last)
+        XCTAssertEqual(handles.count, 3)
+        XCTAssertEqual(waiting.detachCount, 1)
+        replacement.sendPossibility(true)
+        replacement.sendPossibility(true)
+        await flushDelegateDelivery()
+        XCTAssertEqual(replacement.startCount, 1)
+        XCTAssertEqual(waiting.startCount, 0)
+        coordinator.receiveDidStart(replacement.callbackObject)
+        await flushDelegateDelivery()
+        XCTAssertTrue(coordinator.isActive)
+        XCTAssertEqual(target.stopCount, 0)
+    }
+
+    func testReturningToFullScreenCancelsReplacementDuringRetirementAndReadiness() async throws {
+        for restoreWhileRetiring in [true, false] {
+            let target = PiPTestTarget()
+            var handles: [FakePiPControllerHandle] = []
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, makeController: { source, _ in
+                    let handle = FakePiPControllerHandle(source: source)
+                    handle.isPossible = handles.isEmpty
+                    handles.append(handle)
+                    return handle
+                })
+            defer { coordinator.close() }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+            let old = try XCTUnwrap(handles.first)
+            old.isPictureInPictureActive = true
+            coordinator.receiveDidStart(old.callbackObject)
+            await flushDelegateDelivery()
+            coordinator.retire(identity: makeIdentity(1))
+            if restoreWhileRetiring { coordinator.stopForRestoration() }
+            old.isPictureInPictureActive = false
+            coordinator.receiveDidStop(old.callbackObject)
+            await flushDelegateDelivery()
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+            await flushDelegateDelivery()
+            if !restoreWhileRetiring { coordinator.stopForRestoration() }
+            let replacement = try XCTUnwrap(handles.last)
+            replacement.sendPossibility(true)
+            await flushDelegateDelivery()
+            XCTAssertEqual(replacement.startCount, 0, "返回全屏不能被迟到的就绪回调覆盖")
+            XCTAssertFalse(coordinator.isActive)
+            // 用户恢复完成后，未来转入后台仍允许系统重新开启画中画。
+            coordinator.receiveDidStart(replacement.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertTrue(coordinator.isActive)
+        }
+    }
+
+    func testReplacementStartFailureRestoresFullScreenWithoutClosingPlayback() async throws {
+        for deliversStopAfterFailure in [false, true] {
+            let target = PiPTestTarget()
+            var handles: [FakePiPControllerHandle] = []
+            let coordinator = IOSPictureInPictureCoordinator(target: target,
+                supportsPictureInPicture: { true }, makeController: { source, _ in
+                    let handle = FakePiPControllerHandle(source: source)
+                    handles.append(handle)
+                    return handle
+                })
+            defer { coordinator.close() }
+            var restores = 0
+            var stops = 0
+            coordinator.onRestore = { reply in restores += 1; reply(true) }
+            coordinator.onStopped = { stops += 1 }
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+            let old = try XCTUnwrap(handles.first)
+            old.isPictureInPictureActive = true
+            coordinator.receiveDidStart(old.callbackObject)
+            await flushDelegateDelivery()
+            coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+            old.isPictureInPictureActive = false
+            coordinator.receiveDidStop(old.callbackObject)
+            await flushDelegateDelivery()
+            await flushDelegateDelivery()
+            let replacement = try XCTUnwrap(handles.last)
+            XCTAssertEqual(replacement.startCount, 1)
+            coordinator.receiveFailure(replacement.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertEqual(restores, 1)
+            XCTAssertNotNil(coordinator.message)
+            if deliversStopAfterFailure {
+                coordinator.receiveDidStop(replacement.callbackObject)
+                await flushDelegateDelivery()
+            }
+            replacement.sendPossibility(true)
+            await flushDelegateDelivery()
+            XCTAssertEqual(replacement.startCount, 1, "失败后不能反复自动重试")
+            XCTAssertEqual(stops, 0)
+            coordinator.receiveDidStart(replacement.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertTrue(coordinator.isActive, "接替失败不能阻止之后的自动画中画")
+            coordinator.receiveDidStop(replacement.callbackObject)
+            await flushDelegateDelivery()
+            XCTAssertEqual(stops, 1, "新的画中画周期关闭时应正常关闭会话")
+        }
+    }
+
+    func testCloseDuringReplacementDiscardsPendingWindow() async throws {
+        let target = PiPTestTarget()
+        var handles: [FakePiPControllerHandle] = []
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { true }, makeController: { source, _ in
+                let handle = FakePiPControllerHandle(source: source)
+                handles.append(handle)
+                return handle
+            })
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+        let old = try XCTUnwrap(handles.first)
+        old.isPictureInPictureActive = true
+        coordinator.receiveDidStart(old.callbackObject)
+        await flushDelegateDelivery()
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+        coordinator.close()
+        coordinator.receiveDidStop(old.callbackObject)
+        await flushDelegateDelivery()
+        XCTAssertEqual(handles.count, 1)
+        XCTAssertFalse(coordinator.isActive)
+    }
+
+    func testNativeRestorationDuringRetirementCancelsReplacementStart() async throws {
+        let target = PiPTestTarget()
+        var handles: [FakePiPControllerHandle] = []
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { true }, makeController: { source, _ in
+                let handle = FakePiPControllerHandle(source: source)
+                handles.append(handle)
+                return handle
+            })
+        defer { coordinator.close() }
+        var restores = 0
+        coordinator.onRestore = { reply in restores += 1; reply(true) }
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+        let old = try XCTUnwrap(handles.first)
+        old.isPictureInPictureActive = true
+        coordinator.receiveDidStart(old.callbackObject)
+        await flushDelegateDelivery()
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+        let restored = await withCheckedContinuation { reply in
+            coordinator.receiveRestore(old.callbackObject) { reply.resume(returning: $0) }
+        }
+        XCTAssertTrue(restored)
+        old.isPictureInPictureActive = false
+        coordinator.receiveDidStop(old.callbackObject)
+        await flushDelegateDelivery()
+        await flushDelegateDelivery()
+        XCTAssertEqual(restores, 1)
+        XCTAssertEqual(handles.last?.startCount, 0)
+        let replacement = try XCTUnwrap(handles.last)
+        coordinator.receiveDidStart(replacement.callbackObject)
+        await flushDelegateDelivery()
+        XCTAssertTrue(coordinator.isActive, "全屏恢复意图不能阻止后续的自动画中画")
+    }
+
+    func testQueuedRestoreIntentSurvivesAnAlreadyInactivePresentationRetirement() async throws {
+        let target = PiPTestTarget()
+        var handles: [FakePiPControllerHandle] = []
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { true }, makeController: { source, _ in
+                let handle = FakePiPControllerHandle(source: source)
+                handles.append(handle)
+                return handle
+            })
+        defer { coordinator.close() }
+        var restores = 0
+        coordinator.onRestore = { reply in restores += 1; reply(true) }
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+        let old = try XCTUnwrap(handles.first)
+        coordinator.receiveDidStart(old.callbackObject)
+        await flushDelegateDelivery()
+        coordinator.receiveDidStop(old.callbackObject)
+        coordinator.receiveRestore(old.callbackObject) { _ in }
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(2))
+        await flushDelegateDelivery()
+        XCTAssertEqual(restores, 1, "退休控制器前必须兑现已经到达的全屏恢复请求")
+        XCTAssertEqual(handles.last?.startCount, 0)
+    }
+
     private func makeIdentity(_ nonce: UInt64) -> PresentationIdentity {
         let session = PlaybackSessionIdentity(sessionID: 1, requestID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!)
         let backend = PlaybackBackendIdentity(sessionIdentity: session, backendGeneration: 1)
@@ -348,6 +566,7 @@ private final class FakePiPControllerHandle: PiPControllerHandle {
     var nativeController: AVPictureInPictureController? { nil }
     var contentSource: AVPictureInPictureController.ContentSource?
     var isPictureInPictureActive = false
+    var isPossible = true
     private var possibleChange: (@Sendable (Bool) -> Void)?
     private(set) var startCount = 0
     private(set) var stopCount = 0
@@ -358,7 +577,11 @@ private final class FakePiPControllerHandle: PiPControllerHandle {
     init(source: AVPictureInPictureController.ContentSource) { contentSource = source }
     func observePossibility(_ change: @escaping @Sendable (Bool) -> Void) {
         possibleChange = change
-        change(true)
+        change(isPossible)
+    }
+    func sendPossibility(_ possible: Bool) {
+        isPossible = possible
+        possibleChange?(possible)
     }
     func cancelObservation() {
         guard possibleChange != nil else { return }
