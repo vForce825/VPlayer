@@ -160,6 +160,28 @@ final class IOSPictureInPictureCoordinatorTests: XCTestCase {
         XCTAssertEqual(target.pauseRequests, [])
         coordinator.close()
     }
+    func testUnsupportedPiPPreparationKeepsNormalPlaybackControlsUnobstructed() {
+        let target = PiPTestTarget()
+        let coordinator = IOSPictureInPictureCoordinator(target: target,
+            supportsPictureInPicture: { false }, makeController: { _, _ in
+                XCTFail("不支持画中画时不应创建原生控制器")
+                return nil
+            })
+        defer { coordinator.close() }
+        coordinator.install(playerLayer: AVPlayerLayer(), identity: makeIdentity(1))
+        coordinator.install(sampleBufferDisplayLayer: AVSampleBufferDisplayLayer(), identity: makeIdentity(2))
+        XCTAssertNil(coordinator.message)
+        XCTAssertFalse(coordinator.isPossible)
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "unsupported-pip",
+            streamURL: URL(fileURLWithPath: "/unsupported-pip"), title: "画中画回归夹具")
+        XCTAssertTrue(IOSPlayerControlsVisibility.allowsAutoHide(state: .playing(request),
+            isPresentingSettings: false, isVoiceOverRunning: false, isSceneActive: true,
+            hasPlaybackMessage: coordinator.message != nil))
+        coordinator.start()
+        XCTAssertNotNil(coordinator.message)
+        XCTAssertEqual(target.stopCount, 0)
+        XCTAssertTrue(target.pauseRequests.isEmpty)
+    }
     func testUnownedControllerCannotPauseOrRestoreAnotherSession() async {
         let target = PiPTestTarget()
         let coordinator = IOSPictureInPictureCoordinator(target: target)

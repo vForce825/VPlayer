@@ -220,10 +220,8 @@ final class PictureInPictureCoordinator: NSObject,
     }
     private func install(_ source: AVPictureInPictureController.ContentSource, identity: PresentationIdentity) {
         guard !closed, presentationIdentity != identity else { return }
-        guard supportsPictureInPicture() else {
-            message = "当前设备不支持画中画。后台音频仍由系统播放策略管理。"
-            return
-        }
+        // 被动准备不应产生提示或阻止普通播放的控件自动隐藏。
+        guard supportsPictureInPicture() else { return }
         pending = (identity, source)
         retireCurrent()
         installPendingIfPossible()
@@ -302,6 +300,10 @@ final class PictureInPictureCoordinator: NSObject,
     private var currentID: ObjectIdentifier? { controller.map { ObjectIdentifier($0.callbackObject) } }
     private var retiringID: ObjectIdentifier? { retiring.map { ObjectIdentifier($0.callbackObject) } }
     func start() {
+        guard supportsPictureInPicture() else {
+            message = "当前设备不支持画中画。后台音频仍由系统播放策略管理。"
+            return
+        }
         guard !closed, !starting, let controller, isPossible else {
             message = "画中画尚未就绪，请在画面开始播放后重试。"
             return
