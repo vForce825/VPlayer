@@ -7,6 +7,151 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class PlaybackAudioRouteServiceTests: XCTestCase {
+    func testSystemNotificationsSwitchAirPlayBluetoothAndSpeakerAfterStableSampling() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .airPlay)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        XCTAssertEqual(harness.committedBackend, .hlsAVPlayer)
+
+        for (ports, category, reason) in [
+            (PlaybackRoutePorts.bluetooth, AudioOutputRouteCategory.bluetooth, AVAudioSession.RouteChangeReason.oldDeviceUnavailable),
+            (.other, .other, .oldDeviceUnavailable),
+            (.airPlay, .airPlay, .newDeviceAvailable)
+        ] {
+            let received = RouteSnapshotRecorder()
+            harness.service.addSubscriber { received.append($0) }
+            let oldRevision = try XCTUnwrap(received.last).revision
+            let oldCalls = harness.sdk.lock.withLock { harness.sdk.routeCallCount }
+            harness.initialPorts = ports
+            harness.sdk.setOutputTiming(outputLatency: 0.125, ioBufferDuration: 0.010)
+            harness.registry.executor.sync {
+                harness.notificationCenter.post(name: AVAudioSession.routeChangeNotification,
+                    object: nil, userInfo: [AVAudioSessionRouteChangeReasonKey: reason.rawValue])
+                XCTAssertFalse(harness.registry.executor.safetyIngress.snapshot.routeObservationGateOpen,
+                    "通知返回前必须关闭旧输出权限")
+                XCTAssertEqual(received.last?.revision, oldRevision, "通知本身不能当作新路由的权威证据")
+            }
+            try await waitForNotificationSampler(harness, after: oldCalls)
+            XCTAssertEqual(received.last?.revision, oldRevision, "采样完成后仍需等待稳定窗口")
+            await harness.advanceThroughStabilityWindow()
+            let current = try XCTUnwrap(received.last)
+            XCTAssertEqual(current.category, category)
+            XCTAssertGreaterThan(current.revision, oldRevision)
+            XCTAssertEqual(current.outputLatency, 0.125, accuracy: 0.000_001)
+            XCTAssertEqual(current.ioBufferDuration, 0.010, accuracy: 0.000_001)
+            XCTAssertEqual(harness.registry.stableRouteCommitSnapshot()?.authority.semanticIdentity?.backend,
+                ports == .airPlay ? .hlsAVPlayer : .sampleBuffer)
+        }
+    }
+
+    func testNotificationBurstFencesImmediatelyWithoutWaitingForTheControlQueue() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        let oldCalls = harness.sdk.lock.withLock { harness.sdk.routeCallCount }
+        harness.initialPorts = .airPlay
+        let returned = DispatchSemaphore(value: 0)
+        harness.registry.executor.sync {
+            DispatchQueue.global().async {
+                for _ in 0..<100 {
+                    harness.notificationCenter.post(name: AVAudioSession.routeChangeNotification,
+                        object: nil, userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.newDeviceAvailable.rawValue])
+                }
+                returned.signal()
+            }
+            XCTAssertEqual(returned.wait(timeout: .now() + 2), .success,
+                "通知线程不能同步等待当前被占用的控制队列")
+            XCTAssertFalse(harness.registry.executor.safetyIngress.snapshot.routeObservationGateOpen)
+            XCTAssertEqual(harness.sdk.lock.withLock { harness.sdk.routeCallCount }, oldCalls)
+        }
+        try await waitForNotificationSampler(harness, after: oldCalls)
+        await harness.advanceThroughStabilityWindow()
+        XCTAssertEqual(harness.committedBackend, .hlsAVPlayer)
+        XCTAssertEqual(harness.sdk.lock.withLock { harness.sdk.routeCallCount }, oldCalls + 1,
+            "控制队列恢复后只需采样突发通知的最终状态")
+        XCTAssertEqual(harness.sdk.lock.withLock { harness.sdk.maxConcurrency }, 1)
+    }
+
+    func testUnboundAndRetiredNotificationCallbacksCannotAffectReboundSession() async throws {
+        let center = RouteNotificationTestCenter()
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth, notificationCenter: center)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        let registration = try XCTUnwrap(harness.registration)
+        let lateCallback = try XCTUnwrap(center.lastCallback)
+        harness.service.bindSession(registration: registration)
+        XCTAssertEqual(center.installedCount, 1, "重复绑定不能增加监听器")
+        harness.service.unbindSession()
+        let stoppedRevision = harness.registry.executor.safetyIngress.snapshot.throughRevision
+        let notification = Notification(name: AVAudioSession.routeChangeNotification,
+            userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue])
+        center.post(notification)
+        lateCallback(notification)
+        XCTAssertEqual(harness.registry.executor.safetyIngress.snapshot.throughRevision, stoppedRevision)
+        harness.service.bindSession(registration: registration)
+        lateCallback(notification)
+        XCTAssertEqual(harness.registry.executor.safetyIngress.snapshot.throughRevision, stoppedRevision,
+            "即使重新绑定同一个 registration，旧回调也必须失效")
+        let calls = harness.sdk.lock.withLock { harness.sdk.routeCallCount }
+        harness.initialPorts = .airPlay
+        center.post(notification)
+        try await waitForNotificationSampler(harness, after: calls)
+        await harness.advanceThroughStabilityWindow()
+        XCTAssertEqual(harness.committedBackend, .hlsAVPlayer)
+        XCTAssertEqual(center.installedCount, 2)
+        XCTAssertEqual(center.removedCount, 1)
+        harness.service.unbindSession()
+        XCTAssertEqual(center.removedCount, 2)
+    }
+
+    func testNotificationDuringObserverInstallationIsNotLost() async throws {
+        let center = RouteNotificationTestCenter(postDuringInstallation: true)
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth, notificationCenter: center)
+        try await harness.acquireWithoutNotification()
+        XCTAssertGreaterThan(harness.registry.executor.safetyIngress.snapshot.throughRevision, 0)
+        await harness.advanceThroughStabilityWindow()
+        XCTAssertEqual(harness.committedBackend, .sampleBuffer)
+        XCTAssertEqual(center.installedCount, 1)
+        XCTAssertEqual(harness.sdk.lock.withLock { harness.sdk.maxConcurrency }, 1)
+    }
+
+    func testMissingAndMalformedRouteReasonsDoNotStartSampling() async throws {
+        let harness = RouteServiceTestHarness(initialPorts: .bluetooth)
+        try await harness.acquireWithoutNotification()
+        await harness.advanceThroughStabilityWindow()
+        let before = harness.registry.executor.safetyIngress.snapshot.throughRevision
+        for payload: [AnyHashable: Any] in [[:], [AVAudioSessionRouteChangeReasonKey: "无效原因"]] {
+            harness.notificationCenter.post(name: AVAudioSession.routeChangeNotification, object: nil, userInfo: payload)
+        }
+        harness.registry.executor.sync {}
+        XCTAssertEqual(harness.registry.executor.safetyIngress.snapshot.throughRevision, before)
+        XCTAssertEqual(harness.sdk.lock.withLock { harness.sdk.routeCallCount }, 1)
+    }
+
+    func testDestroyingBoundServiceRemovesItsNativeObserver() async throws {
+        let center = RouteNotificationTestCenter()
+        var harness: RouteServiceTestHarness? = RouteServiceTestHarness(initialPorts: .bluetooth, notificationCenter: center)
+        try await harness?.acquireWithoutNotification()
+        weak var service: PlaybackAudioRouteService?
+        service = harness?.service
+        autoreleasepool { harness = nil }
+        XCTAssertNil(service, "监听闭包和共享事件源不能保留已销毁的服务")
+        XCTAssertEqual(center.installedCount, 1)
+        XCTAssertEqual(center.removedCount, 1)
+    }
+
+    private func waitForNotificationSampler(_ harness: RouteServiceTestHarness, after oldCalls: Int) async throws {
+        for _ in 0..<500 {
+            if harness.sdk.lock.withLock({ harness.sdk.routeCallCount }) > oldCalls,
+               case .pending(let pending) = harness.registry.outputRouteObservationSnapshot(),
+               let sampler = pending.sampler,
+               harness.registry.phase(of: sampler) == .terminal(.completed),
+               harness.clock.hasScheduledDeadlineTimer { return }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        XCTFail("系统通知没有自动完成路由采样和稳定窗口排期")
+    }
+
     func testAuthoritativeHDMISamplePublishesSystemOutputTiming() async throws {
         let harness = RouteServiceTestHarness(initialPorts: .hdmi)
         harness.sdk.setOutputTiming(outputLatency: 0.080, ioBufferDuration: 0.020)
@@ -369,6 +514,36 @@ final class PlaybackAudioRouteServiceTests: XCTestCase {
             harness.registry.executor.submit { continuation.resume() }
         }
         XCTAssertNil(harness.committedBackend) // Because session was unbound
+    }
+}
+
+private final class RouteNotificationTestCenter: NotificationCenter, @unchecked Sendable {
+    private let observationLock = NSLock()
+    private var installed = 0
+    private var removed = 0
+    private var callback: (@Sendable (Notification) -> Void)?
+    private let postDuringInstallation: Bool
+    init(postDuringInstallation: Bool = false) {
+        self.postDuringInstallation = postDuringInstallation
+        super.init()
+    }
+    required init?(coder: NSCoder) { fatalError("测试通知中心不支持解码") }
+    var installedCount: Int { observationLock.withLock { installed } }
+    var removedCount: Int { observationLock.withLock { removed } }
+    var lastCallback: (@Sendable (Notification) -> Void)? { observationLock.withLock { callback } }
+    override func addObserver(forName name: Notification.Name?, object: Any?, queue: OperationQueue?,
+        using block: @Sendable @escaping (Notification) -> Void) -> any NSObjectProtocol {
+        let token = super.addObserver(forName: name, object: object, queue: queue, using: block)
+        observationLock.withLock { installed += 1; callback = block }
+        if postDuringInstallation {
+            post(name: AVAudioSession.routeChangeNotification, object: nil,
+                userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.newDeviceAvailable.rawValue])
+        }
+        return token
+    }
+    override func removeObserver(_ observer: Any) {
+        observationLock.withLock { removed += 1 }
+        super.removeObserver(observer)
     }
 }
 

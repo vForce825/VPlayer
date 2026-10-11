@@ -24,15 +24,17 @@ final class RouteServiceTestHarness: @unchecked Sendable {
     let sdk: FakeAudioSessionSDK
     let owner: PlaybackAudioSessionOwner
     let service: PlaybackAudioRouteService
+    let notificationCenter: NotificationCenter
     
-    init(initialPorts: PlaybackRoutePorts) {
+    init(initialPorts: PlaybackRoutePorts, notificationCenter: NotificationCenter = NotificationCenter()) {
         self.initialPorts = initialPorts
         self.allocator = PlaybackIdentityAllocator()
         self.clock = ManualPlaybackClock(100)
         self.registry = ControlTaskRegistry(allocator: allocator, clock: clock)
         self.sdk = FakeAudioSessionSDK(initialPorts: initialPorts)
         self.owner = try! PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
-        self.service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        self.notificationCenter = notificationCenter
+        self.service = PlaybackAudioRouteService(registry: registry, owner: owner, notificationCenter: notificationCenter)
         self.sdk.harness = self
     }
 

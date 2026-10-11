@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFAudio
 import Foundation
 import Darwin
 import ObjectiveC
@@ -491,6 +492,33 @@ private final class Task9RouteGetterGateSDK: PlaybackAudioSessionSDK, @unchecked
 }
 
 final class Task9ReconstructedRegressionTests: XCTestCase {
+    func testSystemRouteNotificationsDriveBackendHandoffsWithoutManualResampling() async throws {
+        let center = NotificationCenter()
+        let fixture = try Task9RuntimeFixture(notificationCenter: center)
+        let request = fixture.request()
+        await fixture.controller.play(request)
+        XCTAssertEqual(fixture.factory.backends.count, 1)
+        for (index, ports, kind) in [(2, PlaybackRoutePorts.airPlay, PlaybackBackendKind.hlsAVPlayer),
+                                     (3, .bluetooth, .sampleBuffer)] {
+            fixture.sdk.lock.withLock { fixture.sdk.initialPorts = ports }
+            center.post(name: AVAudioSession.routeChangeNotification, object: nil,
+                userInfo: [AVAudioSessionRouteChangeReasonKey: AVAudioSession.RouteChangeReason.routeConfigurationChange.rawValue])
+            for _ in 0..<1_000 {
+                if fixture.factory.backends.count == index,
+                   fixture.factory.backends.last?.activationCount == 1,
+                   fixture.registry.outputResourceContextSnapshot()?.desiredBackendKind == kind { break }
+                try await Task.sleep(for: .milliseconds(2))
+            }
+            XCTAssertEqual(fixture.factory.backends.count, index, "系统通知必须自动启动新后端")
+            XCTAssertEqual(fixture.registry.outputResourceContextSnapshot()?.desiredBackendKind, kind)
+            XCTAssertEqual(fixture.factory.backends.last?.activationCount, 1)
+            XCTAssertEqual(fixture.factory.outputConcurrency.current, 1)
+            XCTAssertEqual(fixture.factory.outputConcurrency.maximum, 1, "路由交接不能让两个输出同时发声")
+        }
+        await fixture.controller.stop()
+        XCTAssertNil(fixture.registry.ownedResourceSnapshot())
+    }
+
     func testConcurrentSystemFoldCannotDeliverEndedBeforeEarlierBeganToProduction() async throws {
         let retirement = Task9OperationGate()
         let registry = ControlTaskRegistry(allocator: .init())
@@ -2693,11 +2721,12 @@ private struct Task9RuntimeFixture {
     let factory: Task9PreparedFactory
     let sdk: FakeAudioSessionSDK
     init(factory: Task9PreparedFactory = .init(), allocator: PlaybackIdentityAllocator = .init(),
-         clock: any PlaybackMonotonicClock = DispatchPlaybackMonotonicClock()) throws {
+         clock: any PlaybackMonotonicClock = DispatchPlaybackMonotonicClock(),
+         notificationCenter: NotificationCenter = .default) throws {
         registry = ControlTaskRegistry(allocator: allocator, clock: clock)
         sdk = FakeAudioSessionSDK(initialPorts: .hdmi)
         owner = try PlaybackAudioSessionOwner(registry: registry, sdk: sdk)
-        let service = PlaybackAudioRouteService(registry: registry, owner: owner)
+        let service = PlaybackAudioRouteService(registry: registry, owner: owner, notificationCenter: notificationCenter)
         controller = PlaybackController(registry: registry, audioSessionOwner: owner,
             routeService: service, backendFactory: factory)
         self.factory = factory

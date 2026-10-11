@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import AVFAudio
 import Darwin
 import Foundation
 import ObjectiveC
@@ -16,6 +17,7 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         let routeMonitorObject: Int
         let subscriberAdapterCapture: Int
         let resampleSyncBridge: Int
+        let notificationObserver: Int
         let weakTargetAllocationCharges: Int
 
         var timerSourceAndPermanentHandlerAllocationCharges: Int {
@@ -26,7 +28,7 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         }
         var total: Int {
             serviceObject + serviceLock + timerWrapper + timerSource + permanentHandlerCapture +
-                routeMonitorObject + subscriberAdapterCapture + resampleSyncBridge + weakTargetAllocationCharges
+                routeMonitorObject + subscriberAdapterCapture + resampleSyncBridge + notificationObserver + weakTargetAllocationCharges
         }
     }
 
@@ -42,6 +44,8 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
             subscriberAdapterCapture: 32 + 48,
             resampleSyncBridge: PlaybackExternalSyncProducerReservation.FixedLedgerCharge
                 .routeResampleSyncBridge.bytes,
+            // 原生 token 及包含弱引用、绑定 UUID 的回调；不保存逐通知任务或媒体数据。
+            notificationObserver: 64 + 32 + 48 + 16,
             weakTargetAllocationCharges: 32)
     }
     private let registry: ControlTaskRegistry
@@ -51,35 +55,57 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
     private var routeCommitHandler: (@Sendable (StableRouteCommitIdentity) -> Void)?
     private var routeUnavailableHandler: (@Sendable () -> Void)?
     private var sessionRegistration: PlaybackAudioSessionRegistration?
+    private let notificationCenter: NotificationCenter
+    private var routeObserver: NSObjectProtocol?
+    private var bindingID: UUID?
+    private var routeSamplingPending = false
     private let timer: any PlaybackDeadlineTimer
     // 只有唯一executor读写本槽；handler不捕获票或timer，不产生逐次arm逃逸环境。
     private var stabilityTicket: RouteStabilityTicket?
     private let lock = NSLock()
     private var revision: UInt64 = 0
     
-    init(registry: ControlTaskRegistry, owner: PlaybackAudioSessionOwner) {
+    init(registry: ControlTaskRegistry, owner: PlaybackAudioSessionOwner,
+         notificationCenter: NotificationCenter = .default) {
         PlaybackRuntimeAllocationReservations.validateRouteAndGlobalCaps()
         self.registry = registry
         self.owner = owner
         self.safetyIngress = registry.executor.safetyIngress
+        self.notificationCenter = notificationCenter
         self.timer = registry.makePlaybackDeadlineTimer()
         // 服务从创建到销毁始终拥有同一已激活源，尚未绑定session时仅无排期。
         timer.schedule(notAfterInstant: nil)
         timer.setEventHandler { [weak self] in self?.deliverStabilityWake() }
         timer.activate()
+        registry.executor.bindRouteSamplingService(self)
     }
 
     deinit {
+        if let routeObserver { notificationCenter.removeObserver(routeObserver) }
         timer.setEventHandler {}
         timer.cancel()
     }
     
     func bindSession(registration: PlaybackAudioSessionRegistration, initialSampler: ControlTaskTicket? = nil) {
         registry.executor.sync {
-            lock.withLock { self.sessionRegistration = registration }
-        }
-        if let sampler = initialSampler {
-            _ = owner.sample(sampler, receiver: self)
+            if !lock.withLock({ sessionRegistration === registration }) {
+                unbindSession()
+                let id = UUID()
+                lock.withLock {
+                    self.sessionRegistration = registration
+                    bindingID = id
+                }
+                // 先发布绑定再安装监听，安装过程中同步到达的通知也必须使旧输出失效。
+                routeObserver = notificationCenter.addObserver(forName: AVAudioSession.routeChangeNotification,
+                    object: nil, queue: nil) { [weak self] notification in
+                        guard let raw = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                              let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+                        self?.receiveRouteNotification(reason, bindingID: id)
+                    }
+            }
+            if let sampler = initialSampler {
+                _ = owner.sample(sampler, receiver: self)
+            }
         }
     }
     
@@ -87,7 +113,13 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
         registry.executor.sync {
             stabilityTicket = nil
             timer.schedule(notAfterInstant: nil)
-            lock.withLock { sessionRegistration = nil }
+            lock.withLock {
+                sessionRegistration = nil
+                bindingID = nil
+                routeSamplingPending = false
+            }
+            if let routeObserver { notificationCenter.removeObserver(routeObserver) }
+            routeObserver = nil
         }
     }
     
@@ -130,30 +162,47 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
     func resample(reason: AudioRouteChangeReason) {
         PlaybackExternalSyncProducerReservation().requireFixedLedgerCharge(
             .routeResampleSyncBridge, for: .audioPipelineRouteResample)
-        lock.lock()
-        let reg = sessionRegistration
-        self.revision += 1
-        let currentRevision = self.revision
-        lock.unlock()
-        guard let reg = reg else { return }
-        
-        let ingress = PlaybackRouteIngress(
-            sessionIdentity: reg.identity.sessionIdentity,
-            monitorLifecycle: reg.identity.monitorLifecycle,
-            notificationRevision: currentRevision,
-            reasonBits: 0,
-            topologyChangeHint: reason == .routeConfigurationChange || reason == .categoryChange,
-            outputConfigurationChanged: false,
-            observedRoute: nil
-        )
-        safetyIngress.receiveRegisteredRoute(ingress, registration: reg)
-        
-        registry.executor.sync {
-            let state = self.registry.outputRouteObservationSnapshot()
-            if case .pending(let pending) = state, let sampler = pending.sampler {
-                _ = self.owner.sample(sampler, receiver: self)
-            }
+        guard publishRouteIngress(topologyChangeHint: reason == .routeConfigurationChange || reason == .categoryChange) else { return }
+        registry.executor.sync { drainRouteSampling() }
+    }
+
+    private func receiveRouteNotification(_ reason: AVAudioSession.RouteChangeReason, bindingID: UUID) {
+        _ = publishRouteIngress(topologyChangeHint: reason == .routeConfigurationChange || reason == .categoryChange,
+            expectedBindingID: bindingID)
+    }
+
+    private func publishRouteIngress(topologyChangeHint: Bool, expectedBindingID: UUID? = nil) -> Bool {
+        lock.withLock {
+            guard let registration = sessionRegistration,
+                  expectedBindingID == nil || expectedBindingID == bindingID else { return false }
+            revision += 1
+            routeSamplingPending = true
+            // 同一把锁串行化解绑和发布；旧绑定的回调不能在重新绑定后撤销新路由。
+            // Cell 仅折叠固定状态并唤醒既有事件源，不调用 SDK 或反向进入服务锁。
+            safetyIngress.receiveRegisteredRoute(.init(
+                sessionIdentity: registration.identity.sessionIdentity,
+                monitorLifecycle: registration.identity.monitorLifecycle,
+                notificationRevision: revision, reasonBits: 0,
+                topologyChangeHint: topologyChangeHint,
+                outputConfigurationChanged: false, observedRoute: nil), registration: registration)
+            return true
         }
+    }
+
+    /// 在共享控制队列上领取唯一采样票；突发通知由既有 Cell 和事件源合并。
+    func drainRouteSampling() {
+        precondition(registry.executor.isIsolated)
+        let registration = lock.withLock { () -> PlaybackAudioSessionRegistration? in
+            guard routeSamplingPending else { return nil }
+            routeSamplingPending = false
+            return sessionRegistration
+        }
+        guard let registration,
+              case .pending(let pending) = registry.outputRouteObservationSnapshot(),
+              pending.ticket?.sessionIdentity == registration.identity.sessionIdentity,
+              pending.ticket?.monitorLifecycle == registration.identity.monitorLifecycle,
+              let sampler = pending.sampler else { return }
+        _ = owner.sample(sampler, receiver: self)
     }
     
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {

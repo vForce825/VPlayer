@@ -22,6 +22,7 @@ final class PlaybackControlExecutor: @unchecked Sendable {
     private let key = DispatchSpecificKey<UInt8>()
     private let source: any DispatchSourceUserDataOr
     private weak var eventDrainRegistry: ControlTaskRegistry?
+    private weak var routeSamplingService: PlaybackAudioRouteService?
 
     /// applyIngress只注册一次，而且必须有真实权威状态接收者。
     /// 它在executor及cell锁内同步运行，禁止重入、SDK调用、await及资源析构；
@@ -42,6 +43,7 @@ final class PlaybackControlExecutor: @unchecked Sendable {
         source.setEventHandler { [weak self] in
             guard let self else { return }
             _ = self.withSafetyIngressBarrier(operationDescriptor: .drain) { _ in }
+            self.routeSamplingService?.drainRouteSampling()
             self.eventDrainRegistry?.notifyPlaybackProgress()
             self.eventDrainRegistry?.drainOwnedEventRelays()
         }
@@ -59,6 +61,14 @@ final class PlaybackControlExecutor: @unchecked Sendable {
     }
 
     func signalOwnedEventDrain() { source.or(data: 1) }
+
+    /// 路由通知复用既有安全事件源，避免每次系统回调创建任务或同步等待控制队列。
+    func bindRouteSamplingService(_ service: PlaybackAudioRouteService) {
+        sync {
+            precondition(routeSamplingService == nil || routeSamplingService === service)
+            routeSamplingService = service
+        }
+    }
 
     /// deadline source与资源准备共用唯一串行executor，投递栈不会在等待CAS时与另一准备峰重叠。
     func makePlaybackDeadlineTimer(clock: any PlaybackMonotonicClock) -> any PlaybackDeadlineTimer {
