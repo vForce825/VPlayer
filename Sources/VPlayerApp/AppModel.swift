@@ -77,6 +77,7 @@ final class AppModel {
     private let now: @Sendable () -> Date
     private var matchByChannelID: [String: EPGMatchResult] = [:]
     private var manualMappingByChannelID: [String: String] = [:]
+    @ObservationIgnored private var programmeWindowDate: Date?
     private var reloadID: UUID?
     private var activeTransition: ActiveTransition?
     private var pendingCreation: PendingCreation?
@@ -191,6 +192,31 @@ final class AppModel {
         }
     }
 
+    /// 由前台视图任务持有，退出前台时取消；只重读本地 EPG，不触发订阅下载。
+    func maintainProgrammeWindow() async {
+        while !Task.isCancelled {
+            await refreshProgrammeWindowIfNeeded()
+            do { try await Task.sleep(for: .seconds(60)) }
+            catch { return }
+        }
+    }
+
+    @discardableResult
+    func refreshProgrammeWindowIfNeeded() async -> Bool {
+        guard !Task.isCancelled, hasAppliedLibrarySnapshot,
+              let activeProfileID = activeProfile?.id,
+              activeReloadIDs.isEmpty, activeMutationLease == nil,
+              queuedActiveMutations.isEmpty, activeTransition == nil else { return false }
+        let date = now()
+        // 每小时滚动未来 24 小时的窗口；系统时间向前或向后跳变也会重新读取。
+        if let programmeWindowDate,
+           date >= programmeWindowDate,
+           date.timeIntervalSince(programmeWindowDate) < 3_600 { return false }
+        return await reloadEPGOutcome(
+            activeProfileID: activeProfileID, reportsFailure: false
+        ) == .applied
+    }
+
     private func reload(scope: LibraryChangeSignal.ReloadScope) async -> Bool {
         while true {
             guard await waitForActiveMutationLaneIdle() else { return false }
@@ -254,6 +280,7 @@ final class AppModel {
                     matches: [:],
                     manualMappings: [:],
                     programmes: [:],
+                    programmeWindowDate: nil,
                     playbackChannelIdentities: [:],
                     terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
                 )
@@ -280,7 +307,8 @@ final class AppModel {
             )
             try Task.checkCancellation()
 
-            let windowStart = now().addingTimeInterval(-3_600)
+            let windowDate = now()
+            let windowStart = windowDate.addingTimeInterval(-3_600)
             let windowEnd = windowStart.addingTimeInterval(25 * 3_600)
 
             let manualMappings = try await repository.manualMappings(
@@ -326,6 +354,7 @@ final class AppModel {
                 matches: matching.matches,
                 manualMappings: matching.scopedManualMappings,
                 programmes: presentation.programmesByChannelID,
+                programmeWindowDate: windowDate,
                 playbackChannelIdentities: presentation.playbackChannelIdentities,
                 terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
             )
@@ -373,7 +402,9 @@ final class AppModel {
         }
     }
 
-    private func reloadEPGOutcome(activeProfileID: UUID) async -> ReloadOutcome {
+    private func reloadEPGOutcome(
+        activeProfileID: UUID, reportsFailure: Bool = true
+    ) async -> ReloadOutcome {
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
@@ -419,7 +450,8 @@ final class AppModel {
             )
             try Task.checkCancellation()
 
-            let windowStart = now().addingTimeInterval(-3_600)
+            let windowDate = now()
+            let windowStart = windowDate.addingTimeInterval(-3_600)
             let windowEnd = windowStart.addingTimeInterval(25 * 3_600)
             let programmesByXMLTVChannelID = try await repository.programmes(
                 profileID: activeProfileID,
@@ -447,6 +479,7 @@ final class AppModel {
                 matches: matching.matches,
                 manualMappings: matching.scopedManualMappings,
                 programmes: presentation.programmesByChannelID,
+                programmeWindowDate: windowDate,
                 terminalRefreshOverlayIDsAtStart: terminalRefreshOverlayIDsAtStart
             )
         } catch is CancellationError {
@@ -454,7 +487,7 @@ final class AppModel {
         } catch {
             guard reloadID == currentReloadID else { return .superseded }
             lastReloadFailure = ErrorDiagnosticSnapshot(error)
-            presentOperationError(error, operation: "读取 EPG 数据失败")
+            if reportsFailure { presentOperationError(error, operation: "读取 EPG 数据失败") }
             return .failedWhileCurrent
         }
     }
@@ -1119,6 +1152,7 @@ final class AppModel {
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
+        programmeWindowDate: Date,
         terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
     ) -> ReloadOutcome {
         guard reloadID == currentReloadID else { return .superseded }
@@ -1140,6 +1174,7 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
+        self.programmeWindowDate = programmeWindowDate
         hasAppliedLibrarySnapshot = true
         finishLoading(reloadID: currentReloadID)
         return .applied
@@ -1156,6 +1191,7 @@ final class AppModel {
         matches: [String: EPGMatchResult],
         manualMappings: [String: String],
         programmes: [String: [Programme]],
+        programmeWindowDate: Date?,
         playbackChannelIdentities: [String: PlaybackChannelIdentity],
         terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
     ) -> ReloadOutcome {
@@ -1176,6 +1212,7 @@ final class AppModel {
         self.matchByChannelID = matches
         self.manualMappingByChannelID = manualMappings
         self.programmesByChannelID = programmes
+        self.programmeWindowDate = programmeWindowDate
         hasAppliedLibrarySnapshot = true
         if let request = presentedPlaybackRequest,
            activeProfile?.id != request.sourceProfileID

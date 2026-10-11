@@ -22,6 +22,33 @@ final class M3UParserTests: XCTestCase {
         XCTAssertEqual(channels.map(\.order), [0, 1])
     }
 
+    func testLogoURLsResolveAgainstPlaylistLocation() throws {
+        let cases: [(String, String?)] = [
+            ("logos/news.png", "https://example.test/lists/logos/news.png"),
+            ("../logos/news.png", "https://example.test/logos/news.png"),
+            ("/logos/news.png", "https://example.test/logos/news.png"),
+            ("//cdn.example.test/news.png", "https://cdn.example.test/news.png"),
+            ("https://images.example.test/news.png", "https://images.example.test/news.png"),
+            ("", nil)
+        ]
+        for (value, expected) in cases {
+            let playlist = "#EXTM3U\n#EXTINF:-1 tvg-logo=\"\(value)\",新闻\nlive.ts\n"
+            let channels = try M3UParser().parse(
+                data: Data(playlist.utf8), sourceURL: sourceURL, profileID: profileID
+            )
+            XCTAssertEqual(channels.first?.logoURL?.absoluteString, expected, value)
+        }
+    }
+
+    func testLocalPlaylistResolvesRelativeLogoAsFileURL() throws {
+        let playlist = "#EXTM3U\n#EXTINF:-1 tvg-logo=\"logos/news.png\",新闻\nhttps://example.test/live\n"
+        let channels = try M3UParser().parse(
+            data: Data(playlist.utf8),
+            sourceURL: URL(fileURLWithPath: "/tmp/list/channels.m3u"), profileID: profileID
+        )
+        XCTAssertEqual(channels.first?.logoURL, URL(fileURLWithPath: "/tmp/list/logos/news.png"))
+    }
+
     func testDuplicateNormalizedURLKeepsFirstAndUnsupportedSchemesStayVisible() throws {
         let channels = try M3UParser().parse(
             data: FixtureLoader.data("playlists/duplicates-and-schemes.m3u"),

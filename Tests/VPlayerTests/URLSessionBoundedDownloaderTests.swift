@@ -125,6 +125,83 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         await assertDownloadsDirectoryBecomesEmpty()
     }
 
+    func testBodyIsWrittenWhileCompletionConsumerIsNotRunning() async throws {
+        let (delegate, stream, fileURL, _) = try makeDelegate(byteLimit: 512 * 1_024)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: request().url)
+        let response = HTTPURLResponse(url: request().url, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: nil)!
+        delegate.urlSession(session, dataTask: task, didReceive: response) { _ in }
+        for _ in 0..<512 {
+            delegate.urlSession(session, dataTask: task, didReceive: Data(repeating: 7, count: 1_024))
+        }
+        // 在读取异步结果之前就应完成落盘，正文不能等待消费者再检查或写入。
+        XCTAssertEqual(try Data(contentsOf: fileURL).count, 512 * 1_024)
+        delegate.urlSession(session, task: task, didCompleteWithError: nil)
+        var iterator = stream.makeAsyncIterator()
+        let result = try await iterator.next()
+        XCTAssertEqual(result?.byteCount, 512 * 1_024)
+        let end = try await iterator.next()
+        XCTAssertNil(end)
+    }
+
+    func testBurstOverflowIsRejectedAtReceptionAndLateCallbacksCannotWrite() async throws {
+        let (delegate, stream, fileURL, handle) = try makeDelegate(byteLimit: 1_024)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: request().url)
+        let response = HTTPURLResponse(url: request().url, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: nil)!
+        delegate.urlSession(session, dataTask: task, didReceive: response) { _ in }
+        delegate.urlSession(session, dataTask: task, didReceive: Data(repeating: 1, count: 512))
+        for _ in 0..<512 {
+            delegate.urlSession(session, dataTask: task, didReceive: Data(repeating: 2, count: 64 * 1_024))
+        }
+        XCTAssertEqual(try Data(contentsOf: fileURL).count, 512)
+        XCTAssertThrowsError(try handle.write(contentsOf: Data([0])))
+        delegate.urlSession(session, task: task, didCompleteWithError: URLError(.cancelled))
+        let error = await captureError {
+            var iterator = stream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        XCTAssertEqual(error as? RemoteDownloadError, .responseTooLarge(limit: 1_024))
+    }
+
+    func testFileWriteFailureSurvivesSubsequentCancellation() async throws {
+        let (delegate, stream, _, handle) = try makeDelegate(byteLimit: 1_024)
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.invalidateAndCancel() }
+        let task = session.dataTask(with: request().url)
+        let response = HTTPURLResponse(url: request().url, statusCode: 200,
+                                       httpVersion: "HTTP/1.1", headerFields: nil)!
+        delegate.urlSession(session, dataTask: task, didReceive: response) { _ in }
+        try handle.close()
+        delegate.urlSession(session, dataTask: task, didReceive: Data([1]))
+        delegate.cancel()
+        let error = await captureError {
+            var iterator = stream.makeAsyncIterator()
+            return try await iterator.next()
+        }
+        XCTAssertEqual((error as NSError?)?.domain, NSCocoaErrorDomain)
+    }
+
+    private func makeDelegate(byteLimit: Int64) throws -> (
+        URLSessionBoundedDownloader.SingleDownloadDelegate,
+        AsyncThrowingStream<DownloadedResource, any Error>, URL, FileHandle
+    ) {
+        try FileManager.default.createDirectory(at: downloadsDirectory, withIntermediateDirectories: true)
+        let fileURL = downloadsDirectory.appendingPathComponent(UUID().uuidString)
+        try Data().write(to: fileURL)
+        let handle = try FileHandle(forWritingTo: fileURL)
+        let (stream, continuation) = AsyncThrowingStream<DownloadedResource, any Error>
+            .makeStream(bufferingPolicy: .bufferingOldest(1))
+        return (URLSessionBoundedDownloader.SingleDownloadDelegate(
+            byteLimit: byteLimit, fileURL: fileURL, fileHandle: handle,
+            continuation: continuation
+        ), stream, fileURL, handle)
+    }
+
     func testDeclaredLengthOverLimitRejectsBeforeWritingBody() async {
         StubURLProtocol.enqueue(.init(
             response: .http(statusCode: 200, headers: ["Content-Length": "11"]),
@@ -204,12 +281,12 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         try FileManager.default.removeItem(at: result.temporaryFileURL)
     }
 
-    func testRedirectedPlaylistResolvesRelativeStreamsAndKeepsOriginalSubscription() async throws {
+    func testRedirectedPlaylistResolvesRelativeStreamsAndLogosAndKeepsOriginalSubscription() async throws {
         let originalURL = URL(string: "https://origin.example/api/list.m3u")!
         let finalURL = URL(string: "https://cdn.example/package/channels/list.m3u")!
         let payload = Data("""
         #EXTM3U
-        #EXTINF:-1,News
+        #EXTINF:-1 tvg-logo="../logos/news.png",News
         live/news.ts
         """.utf8)
         let container = try VPlayerModelContainer.make(inMemory: true)
@@ -238,6 +315,8 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
             XCTAssertEqual(channels.count, 1)
             XCTAssertEqual(channel.streamURL.absoluteString,
                            "https://cdn.example/package/channels/live/news.ts")
+            XCTAssertEqual(channel.logoURL?.absoluteString,
+                           "https://cdn.example/package/logos/news.png")
             if let firstChannelID { XCTAssertEqual(channel.id, firstChannelID) }
             firstChannelID = channel.id
             let profiles = try await repository.profiles()

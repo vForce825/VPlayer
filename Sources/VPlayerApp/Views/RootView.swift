@@ -6,6 +6,7 @@ import SwiftUI
 import VPlayerPlayback
 
 struct RootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     private enum InitialLibraryState {
         case loading
@@ -82,6 +83,10 @@ struct RootView: View {
             let failureMessage = model.alertMessage ?? "本地资料暂时无法读取，请重试。"
             model.dismissAlert()
             initialLibraryState = opened ? .ready : .failed(failureMessage)
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await model.maintainProgrammeWindow()
         }
         .alert(model.alertTitle, isPresented: Binding(
             get: { model.alertMessage != nil },

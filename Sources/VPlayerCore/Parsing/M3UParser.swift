@@ -44,7 +44,9 @@ public struct M3UParser: Sendable {
                 streamURL: streamURL,
                 tvgID: nonEmpty(attributes["tvg-id"]),
                 tvgName: nonEmpty(attributes["tvg-name"]),
-                logoURL: nonEmpty(attributes["tvg-logo"]).flatMap(URL.init(string:)),
+                logoURL: nonEmpty(attributes["tvg-logo"]).flatMap {
+                    URL(string: $0, relativeTo: sourceURL)?.absoluteURL
+                },
                 groupTitle: nonEmpty(attributes["group-title"]),
                 attributes: attributes,
                 order: channels.count

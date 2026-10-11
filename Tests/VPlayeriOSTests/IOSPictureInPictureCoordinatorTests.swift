@@ -8,6 +8,7 @@ import XCTest
 import SwiftUI
 import UIKit
 @testable import VPlayer
+@testable import VPlayerCore
 @testable import VPlayerPlayback
 
 @MainActor
@@ -397,6 +398,19 @@ final class IOSPlaybackSessionTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(10))
         }
         guard case .playing = model.state else { XCTFail("Fixture did not start"); session.close(); return }
+        let now = Date()
+        let programme = Programme(id: "tomorrow", xmltvChannelID: "news", start: now,
+            stop: now.addingTimeInterval(3_600), title: "次日节目", subtitle: nil,
+            summary: nil, categories: [])
+        let updated = PlayerChannelPresentation(request: request, logoURL: nil, programmes: [programme])
+        session.updatePresentation(updated)
+        XCTAssertEqual(session.presentation, updated)
+        XCTAssertTrue(session.model === model, "节目单更新应沿用播放会话")
+        guard case .playing = model.state else { XCTFail("更新节目单中断了播放"); session.close(); return }
+        let otherRequest = PlaybackRequest(sourceProfileID: UUID(), channelID: "other",
+            streamURL: URL(string: "https://example.invalid/other")!, title: "其他频道")
+        session.updatePresentation(.init(request: otherRequest, logoURL: nil, programmes: []))
+        XCTAssertEqual(session.presentation, updated, "旧会话不能接受其他频道的更新")
         session.isFullScreenPresented = false
         session.showFullScreen()
         session.start() // Reappearing must not register another playback owner.

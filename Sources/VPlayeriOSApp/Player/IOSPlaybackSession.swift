@@ -12,7 +12,7 @@ import VPlayerPlayback
 @MainActor
 @Observable
 final class IOSPlaybackSession {
-    let presentation: PlayerChannelPresentation
+    private(set) var presentation: PlayerChannelPresentation
     let model: FullScreenPlayerViewModel
     let mount: PlaybackPresentationHostMount
     let settings: PlaybackSettingsStore
@@ -47,6 +47,12 @@ final class IOSPlaybackSession {
             self.restoreFullScreen(completion: completion)
         }
     }
+    func updatePresentation(_ presentation: PlayerChannelPresentation) {
+        guard !isClosing, presentation.request == self.presentation.request else { return }
+        self.presentation = presentation
+        model.updateChannelPresentation(presentation)
+    }
+
     func start() {
         guard !isClosing, !hasStarted else { return }
         #if DEBUG

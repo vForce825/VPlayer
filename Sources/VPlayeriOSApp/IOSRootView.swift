@@ -50,12 +50,19 @@ struct IOSRootView: View {
             if !success { libraryFailure = model.alertMessage ?? "本地资料暂时无法读取，请重试。" }
             model.dismissAlert()
         }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await model.maintainProgrammeWindow()
+        }
         .onChange(of: scenePhase, initial: true) { _, phase in
             if phase == .active { dependencies.foregroundRefreshDriver.activate() }
             else { dependencies.foregroundRefreshDriver.deactivate() }
         }
         .onChange(of: reducedResourceUsage, initial: true) { _, value in
             dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(value)
+        }
+        .onChange(of: currentPlayerPresentation) { _, presentation in
+            if let presentation { session?.updatePresentation(presentation) }
         }
         .onChange(of: model.presentedPlaybackRequest) { _, request in replaceSession(for: request) }
         .onChange(of: session?.isClosing) { _, closing in
@@ -110,6 +117,15 @@ struct IOSRootView: View {
         }
     }
     #endif
+    private var currentPlayerPresentation: PlayerChannelPresentation? {
+        guard let request = model.presentedPlaybackRequest else { return nil }
+        let channel = model.channels.first { $0.id == request.channelID }
+        return PlayerChannelPresentation(
+            request: request, logoURL: channel?.logoURL,
+            programmes: model.programmesByChannelID[request.channelID, default: []]
+        )
+    }
+
     private var fullScreenBinding: Binding<Bool> {
         let owner = session
         return Binding(get: {

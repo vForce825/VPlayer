@@ -8,52 +8,57 @@ public actor URLSessionBoundedDownloader:
     BoundedHTTPDownloading,
     RemoteResourceDownloading {
     
-    private enum DownloadEvent: Sendable {
-        case responseURL(URL)
-        case data(Data)
-    }
+    // 文件句柄与终态共用一把锁，取消与 URLSession 回调不会同时写入或关闭文件。
+    final class SingleDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private let byteLimit: Int64
+        private let fileURL: URL
+        private let fileHandle: FileHandle
+        private let continuation: AsyncThrowingStream<DownloadedResource, any Error>.Continuation
+        private var responseURL: URL?
+        private var byteCount: Int64 = 0
+        private var finished = false
 
-    private final class SingleDownloadDelegate: NSObject, URLSessionDataDelegate, Sendable {
-        let byteLimit: Int64
-        let continuation: AsyncThrowingStream<DownloadEvent, any Error>.Continuation
-        
-        init(byteLimit: Int64, continuation: AsyncThrowingStream<DownloadEvent, any Error>.Continuation) {
+        init(
+            byteLimit: Int64,
+            fileURL: URL,
+            fileHandle: FileHandle,
+            continuation: AsyncThrowingStream<DownloadedResource, any Error>.Continuation
+        ) {
             self.byteLimit = byteLimit
+            self.fileURL = fileURL
+            self.fileHandle = fileHandle
             self.continuation = continuation
         }
-        
+
         func urlSession(
             _ session: URLSession,
             dataTask: URLSessionDataTask,
             didReceive response: URLResponse,
             completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
         ) {
-            guard let httpResponse = response as? HTTPURLResponse else {
-                continuation.yield(with: .failure(RemoteDownloadError.invalidResponse))
-                completionHandler(.cancel)
-                return
+            let disposition: URLSession.ResponseDisposition = lock.withLock {
+                guard !finished else { return .cancel }
+                guard let httpResponse = response as? HTTPURLResponse,
+                      let url = httpResponse.url,
+                      URLSessionBoundedDownloader.isRemoteHTTPURL(url) else {
+                    finishLocked(throwing: RemoteDownloadError.invalidResponse)
+                    return .cancel
+                }
+                guard (200..<300).contains(httpResponse.statusCode) else {
+                    finishLocked(throwing: RemoteDownloadError.httpStatus(httpResponse.statusCode))
+                    return .cancel
+                }
+                guard httpResponse.expectedContentLength <= byteLimit else {
+                    finishLocked(throwing: RemoteDownloadError.responseTooLarge(limit: byteLimit))
+                    return .cancel
+                }
+                responseURL = url
+                return .allow
             }
-            guard let responseURL = httpResponse.url,
-                  URLSessionBoundedDownloader.isRemoteHTTPURL(responseURL) else {
-                continuation.yield(with: .failure(RemoteDownloadError.invalidResponse))
-                completionHandler(.cancel)
-                return
-            }
-            guard (200..<300).contains(httpResponse.statusCode) else {
-                continuation.yield(with: .failure(RemoteDownloadError.httpStatus(httpResponse.statusCode)))
-                completionHandler(.cancel)
-                return
-            }
-            if httpResponse.expectedContentLength >= 0,
-               httpResponse.expectedContentLength > byteLimit {
-                continuation.yield(with: .failure(RemoteDownloadError.responseTooLarge(limit: byteLimit)))
-                completionHandler(.cancel)
-                return
-            }
-            continuation.yield(.responseURL(responseURL))
-            completionHandler(.allow)
+            completionHandler(disposition)
         }
-        
+
         func urlSession(
             _ session: URLSession,
             task: URLSessionTask,
@@ -61,36 +66,80 @@ public actor URLSessionBoundedDownloader:
             newRequest request: URLRequest,
             completionHandler: @escaping @Sendable (URLRequest?) -> Void
         ) {
-            guard URLSessionBoundedDownloader.isRemoteHTTPURL(request.url) else {
-                continuation.yield(with: .failure(RemoteDownloadError.invalidResponse))
-                completionHandler(nil)
-                task.cancel()
-                return
+            let allowed = lock.withLock {
+                guard !finished else { return false }
+                guard URLSessionBoundedDownloader.isRemoteHTTPURL(request.url) else {
+                    finishLocked(throwing: RemoteDownloadError.invalidResponse)
+                    return false
+                }
+                return true
             }
-            completionHandler(request)
+            completionHandler(allowed ? request : nil)
+            if !allowed { task.cancel() }
         }
-        
+
         func urlSession(
             _ session: URLSession,
             dataTask: URLSessionDataTask,
             didReceive data: Data
         ) {
-            continuation.yield(.data(data))
+            let shouldCancel = lock.withLock {
+                guard !finished else { return true }
+                guard responseURL != nil else {
+                    finishLocked(throwing: RemoteDownloadError.invalidResponse)
+                    return true
+                }
+                // 在接收端检查实际字节数，包含没有 Content-Length 或解压后的正文。
+                // 正文直接落盘，不在异步流中积压；减法比较也避免累计计数溢出。
+                guard Int64(data.count) <= byteLimit - byteCount else {
+                    finishLocked(throwing: RemoteDownloadError.responseTooLarge(limit: byteLimit))
+                    return true
+                }
+                do {
+                    try fileHandle.write(contentsOf: data)
+                    byteCount += Int64(data.count)
+                    return false
+                } catch {
+                    finishLocked(throwing: error)
+                    return true
+                }
+            }
+            if shouldCancel { dataTask.cancel() }
         }
-        
+
         func urlSession(
             _ session: URLSession,
             task: URLSessionTask,
             didCompleteWithError error: (any Error)?
         ) {
-            if let error {
-                let finalError = normalizedCompletionError(error)
-                continuation.finish(throwing: finalError)
-            } else {
-                continuation.finish()
+            lock.withLock {
+                finishLocked(throwing: error.map(normalizedCompletionError))
             }
         }
-        
+
+        func cancel() {
+            lock.withLock { finishLocked(throwing: RemoteDownloadError.cancelled) }
+        }
+
+        // 调用方须持锁；保留最先出现的错误，避免被随后到达的取消回调覆盖。
+        private func finishLocked(throwing error: (any Error)?) {
+            guard !finished else { return }
+            finished = true
+            var finalError = error
+            do { try fileHandle.close() }
+            catch { if finalError == nil { finalError = error } }
+            if let finalError {
+                continuation.finish(throwing: finalError)
+            } else if let responseURL {
+                continuation.yield(DownloadedResource(
+                    temporaryFileURL: fileURL, byteCount: byteCount, responseURL: responseURL
+                ))
+                continuation.finish()
+            } else {
+                continuation.finish(throwing: RemoteDownloadError.invalidResponse)
+            }
+        }
+
         private func normalizedCompletionError(_ error: any Error) -> any Error {
             if (error as? URLError)?.code == .cancelled
                 || (error as NSError).domain == NSURLErrorDomain
@@ -225,9 +274,14 @@ public actor URLSessionBoundedDownloader:
         
         let (fileURL, fileHandle) = try makeTemporaryFile()
         
-        let (stream, continuation) = AsyncThrowingStream<DownloadEvent, any Error>.makeStream()
-        let delegate = SingleDownloadDelegate(byteLimit: byteLimit, continuation: continuation)
-        
+        // 异步流只传递一个完成结果，不承载下载正文。
+        let (stream, continuation) = AsyncThrowingStream<DownloadedResource, any Error>
+            .makeStream(bufferingPolicy: .bufferingOldest(1))
+        let delegate = SingleDownloadDelegate(
+            byteLimit: byteLimit, fileURL: fileURL, fileHandle: fileHandle,
+            continuation: continuation
+        )
+
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let task = session.dataTask(with: request)
@@ -236,46 +290,27 @@ public actor URLSessionBoundedDownloader:
         
         return try await withTaskCancellationHandler {
             task.resume()
-            var byteCount: Int64 = 0
-            var responseURL: URL?
             do {
-                for try await event in stream {
-                    if Task.isCancelled {
-                        throw RemoteDownloadError.cancelled
-                    }
-                    switch event {
-                    case let .responseURL(url):
-                        responseURL = url
-                    case let .data(data):
-                        guard responseURL != nil else { throw RemoteDownloadError.invalidResponse }
-                        if byteCount + Int64(data.count) > byteLimit {
-                            throw RemoteDownloadError.responseTooLarge(limit: byteLimit)
-                        }
-                        try fileHandle.write(contentsOf: data)
-                        byteCount += Int64(data.count)
-                    }
-                }
-                try fileHandle.close()
-                if Task.isCancelled {
+                var iterator = stream.makeAsyncIterator()
+                guard let result = try await iterator.next() else {
                     throw RemoteDownloadError.cancelled
                 }
-                guard let responseURL else { throw RemoteDownloadError.invalidResponse }
-                return DownloadedResource(
-                    temporaryFileURL: fileURL, byteCount: byteCount, responseURL: responseURL
-                )
+                guard !Task.isCancelled else { throw RemoteDownloadError.cancelled }
+                return result
             } catch {
                 task.cancel()
-                continuation.finish()
-                try? fileHandle.close()
+                delegate.cancel()
                 try? fileManager.removeItem(at: fileURL)
+                if Task.isCancelled { throw RemoteDownloadError.cancelled }
                 throw error
             }
         } onCancel: {
             task.cancel()
-            continuation.finish(throwing: RemoteDownloadError.cancelled)
+            delegate.cancel()
         }
     }
     
+
     private func makeTemporaryFile() throws -> (URL, FileHandle) {
         try fileManager.createDirectory(
             at: downloadsDirectory,
