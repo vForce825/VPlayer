@@ -11,6 +11,35 @@ final class RefreshCoordinatorTests: XCTestCase {
     private let profileID = UUID(uuidString: "00000000-0000-0000-0000-000000000801")!
     private let now = Date(timeIntervalSince1970: 8_000)
 
+    func testURLRoundTripRegistersFreshAttemptAfterOldSharedFlight() async throws {
+        for resource in RefreshResource.allCases {
+            let original = makeProfile()
+            let repository = RepositorySpy(profiles: [original])
+            let downloader = FakeRemoteDownloader(data: [.playlist: validPlaylist(name: "当前频道"), .epg: validEPG()], isSuspended: true)
+            let joined = expectation(description: "新调用已加入旧下载")
+            let fixedNow = now
+            let coordinator = RefreshCoordinator(repository: repository, downloader: downloader, now: { fixedNow },
+                waiterRegistrationObserver: { if $0.waiterCount == 2 { joined.fulfill() } })
+            let first = Task { await coordinator.refresh(profileID: profileID, resources: [resource], trigger: .manual) }
+            await waitUntil { await downloader.invocationCount(for: resource) == 1 }
+            let changed = resource == .playlist
+                ? makeProfile(m3uURL: URL(string: "https://example.test/changed.m3u")!)
+                : makeProfile(epgURL: URL(string: "https://example.test/changed.xml")!)
+            await repository.replaceProfiles([changed], activeProfileID: profileID)
+            await repository.replaceProfiles([original], activeProfileID: profileID)
+            let latest = Task { await coordinator.refresh(profileID: profileID, resources: [resource], trigger: .manual) }
+            await fulfillment(of: [joined], timeout: 2)
+            await downloader.resume(resource)
+            let oldOutcome = await first.value
+            let newOutcome = await latest.value
+            XCTAssertEqual(oldOutcome.first?.succeeded, false)
+            XCTAssertEqual(newOutcome.first?.succeeded, true)
+            XCTAssertNotEqual(oldOutcome.first?.attemptID, newOutcome.first?.attemptID)
+            let downloads = await downloader.invocationCount(for: resource)
+            XCTAssertEqual(downloads, 2)
+        }
+    }
+
     func testPlaylistSuccessAndMalformedEPGHaveIndependentOutcomesAndSnapshots() async throws {
         let profile = makeProfile()
         let originalPlaylist = [channel(name: "Original")]

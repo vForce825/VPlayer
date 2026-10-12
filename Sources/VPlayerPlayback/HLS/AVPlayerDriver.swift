@@ -94,7 +94,7 @@ enum AVPlayerPlaybackEndBoundary: Sendable {
 struct AVPlayerNaturalEndObservation: Sendable, Equatable {
     let item: AVPlayerItemInstanceIdentity
     let expectedEndpoint: ExactMediaTime
-    /// Directly observed effective endpoint: explicit trim or native duration.
+    /// 直接观察到的终点：显式范围、原生时长或真实 EOS 后的直播窗口末端。
     let constrainedEndpoint: ExactMediaTime
     let firstCurrentTime: ExactMediaTime
     let stableCurrentTime: ExactMediaTime?
@@ -777,6 +777,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
     private(set) var naturalEndObservation: AVPlayerNaturalEndObservation?
     private var endpointBoundary = AVPlayerPlaybackEndBoundary.constrained
     private var nativeEndQuantum: NativeHLSFinalPresentationQuantum?
+    private var observedLiveEnd: ExactMediaTime?
     private var nativeEndQuantumWindow = NativeHLSQuantumWindow()
     nonisolated let nativeSelectionRevision = NativeHLSSelectionRevision()
     private(set) var naturalEndTerminalResult: AVPlayerNaturalEndTerminalResult?
@@ -1520,8 +1521,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                                    presentationQuantum: NativeHLSFinalPresentationQuantum?,
                                    item identity: AVPlayerItemInstanceIdentity) throws {
         guard currentItemIdentity == identity, let item, player.currentItem === item,
-              AVPlayerPlaybackEndBoundary.natural.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
-                  duration: item.duration) == time,
+              nativeNaturalEndpoint(item: identity) == time,
               presentationQuantum.map({ $0.duration == time && $0.isCurrent(item: identity, physical: item) }) ?? true else {
             throw AVPlayerItemCoordinatorFailure.invalidTimeline
         }
@@ -1557,7 +1557,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
             if let failure = validation.rejection {
                 throw reject(.refreshQuantum, cause: failure.cause, sdkIdentity: failure.sdkIdentity)
             }
-            observedDuration = try? ExactMediaTime(item.duration)
+            observedDuration = nativeNaturalEndpoint(item: identity)
             guard observedDuration == quantum.duration else { throw reject(.refreshDuration) }
         }
         var usedWrapperRenewal = false
@@ -1607,8 +1607,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
                   self.currentItemIdentity == observedIdentity,
                   self.item === item, self.player.currentItem === item,
                   let first = try? ExactMediaTime(self.player.currentTime()),
-                  let constrained = self.endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime,
-                      duration: item.duration) else {
+                  let constrained = self.effectiveEndpoint(item: item) else {
                 self.publishNaturalEnd(.failure(.staleItem), item: observedIdentity)
                 return
             }
@@ -1706,6 +1705,50 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         naturalEndTerminalHandler = handler
     }
 
+    /// 同一原生观察者实际收到 EOS 后补交事件，覆盖 ENDLIST 与终点观察安装交错。
+    /// 不以暂停或有限 duration 代替 EOS；物理 item、代次与原终点窗口仍需匹配。
+    func receiveObservedNativeEnd(item identity: AVPlayerItemInstanceIdentity, receipt: NativeHLSObservedEnd) {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              ObjectIdentifier(item) == receipt.physicalItem, case .natural = endpointBoundary,
+              let token = endpointObservationIdentity, endpointStabilityDeadline == nil,
+              !naturalEndTerminalIssued else { return }
+        nativeSelectionRevision.receiveNativeEnd(token: token)
+        eventHub.receiveEndpoint(item: identity, token: token)
+    }
+
+    /// 部分直播 item 收到真实 EOS 后 duration 仍为 indefinite。只在该通知的
+    /// 原物理 item 上记录已发布窗口终点，之后仍走同一帧量子与两次稳定时钟校验。
+    func registerObservedNativeEnd(_ receipt: NativeHLSObservedEnd, item identity: AVPlayerItemInstanceIdentity) {
+        guard currentItemIdentity == identity, let item, player.currentItem === item,
+              ObjectIdentifier(item) == receipt.physicalItem, item.status == .readyToPlay, item.error == nil,
+              item.duration.isIndefinite, !item.forwardPlaybackEndTime.isValid, observedLiveEnd == nil else { return }
+        observedLiveEnd = liveWindowEnd(item)
+    }
+
+    func nativeNaturalEndpoint(item identity: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        guard currentItemIdentity == identity, let item, player.currentItem === item else { return nil }
+        if let duration = AVPlayerPlaybackEndBoundary.natural.observedEndpoint(
+            forwardEnd: item.forwardPlaybackEndTime, duration: item.duration) { return duration }
+        guard item.duration.isIndefinite, !item.forwardPlaybackEndTime.isValid else { return nil }
+        guard observedLiveEnd == liveWindowEnd(item) else { return nil }
+        return observedLiveEnd
+    }
+
+    private func liveWindowEnd(_ item: AVPlayerItem) -> ExactMediaTime? {
+        item.seekableTimeRanges.reduce(nil) { latest, value in
+            guard let end = try? ExactMediaTime(CMTimeRangeGetEnd(value.timeRangeValue)), end.value > 0 else { return latest }
+            guard let latest else { return end }
+            return CMTimeCompare(latest.cmTime, end.cmTime) >= 0 ? latest : end
+        }
+    }
+
+    private func effectiveEndpoint(item: AVPlayerItem) -> ExactMediaTime? {
+        if case .natural = endpointBoundary, let identity = currentItemIdentity {
+            return nativeNaturalEndpoint(item: identity)
+        }
+        return endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration)
+    }
+
     nonisolated func naturalEndDeadlineFired(identity: UUID) {
         DispatchQueue.main.async { [weak self] in self?.completeNaturalEndRead(identity: identity) }
     }
@@ -1719,7 +1762,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let observation = naturalEndObservation, observation.item == identity,
               observation.stableCurrentTime == nil,
               observation.constrainedEndpoint == observation.expectedEndpoint,
-              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration),
+              let constraint = effectiveEndpoint(item: item),
               constraint == observation.expectedEndpoint,
               naturalEndAuthority?.activation == activation,
               naturalEndAuthority?.revalidateCurrentAuthority() == true,
@@ -1752,7 +1795,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
               let item, let currentItemIdentity, player.currentItem === item,
               let prior = naturalEndObservation, prior.item == currentItemIdentity,
               let stable = try? ExactMediaTime(player.currentTime()),
-              let constraint = endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration) else { return }
+              let constraint = effectiveEndpoint(item: item) else { return }
         if case .natural = endpointBoundary {
             guard checkNaturalEndPredicate(item.status == .readyToPlay, .confirmNotReady),
                   checkNaturalEndPredicate(item.error == nil, .confirmItemError),
@@ -1897,6 +1940,7 @@ final class SystemAVPlayerDriver: AVPlayerDriving, PlaybackNaturalEndDeadlineRec
         naturalEndTerminalIssued = false
         naturalEndTerminalConsumed = false
         naturalEndAuthority = nil
+        observedLiveEnd = nil
     }
 
     private func removeEndpointObserver() {

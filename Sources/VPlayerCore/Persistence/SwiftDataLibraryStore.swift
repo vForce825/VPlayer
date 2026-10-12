@@ -69,6 +69,31 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     /// one copy of the real profiles with seeded data.
     private var profileMirror: SourceProfileMirror?
     private var mirrorRecoveryStatus: LibraryRecoveryStatus = .current
+    private var recoveredInterruptedRefreshes = false
+
+    /// 仅在本进程开始调度前调用一次；保留已提交的频道和节目单。
+    public func recoverInterruptedRefreshes() throws {
+        guard !recoveredInterruptedRefreshes else { return }
+        _ = try commitIfChanged(.status) {
+            var changed = false
+            for profile in try modelContext.fetch(FetchDescriptor<SourceProfileRecord>()) {
+                if profile.m3uStateRaw == RefreshState.refreshing.rawValue {
+                    profile.m3uStateRaw = RefreshState.failed.rawValue
+                    profile.m3uErrorSummary = "上次刷新已中断，请重试。"
+                    profile.m3uAttemptID = nil
+                    changed = true
+                }
+                if profile.epgStateRaw == RefreshState.refreshing.rawValue {
+                    profile.epgStateRaw = RefreshState.failed.rawValue
+                    profile.epgErrorSummary = "上次刷新已中断，请重试。"
+                    profile.epgAttemptID = nil
+                    changed = true
+                }
+            }
+            return changed
+        }
+        recoveredInterruptedRefreshes = true
+    }
 
     public func recoveryStatus() -> LibraryRecoveryStatus { mirrorRecoveryStatus }
 

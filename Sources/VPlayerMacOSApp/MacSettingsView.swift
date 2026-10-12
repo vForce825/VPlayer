@@ -46,7 +46,7 @@ struct MacSettingsView: View {
         VStack(spacing: 12) {
             Image(systemName: "play.tv.fill").font(.system(size: 46)).foregroundStyle(.tint)
             Text("VPlayer").font(.title.bold())
-            Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.0") · macOS 27")
+            Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "2.1") · macOS 27")
                 .foregroundStyle(.secondary)
             Text("播放源、频道和节目单保存在本机，VPlayer 不提供直播内容。")
                 .font(.caption).multilineTextAlignment(.center)

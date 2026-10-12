@@ -44,6 +44,7 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
     private var presentation: PlayerChannelPresentation
     private var metadataDate = Date.now
     private var state: PlaybackState = .idle
+    private var hasEstablishedPlayback = false
     private var isValid = true
     private var artwork: Artwork?
     @ObservationIgnored private weak var owner: (any NowPlayingPlaybackTarget)?
@@ -94,6 +95,13 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
                 .stop { [weak self] in await self?.stop() },
             ]
         case .preparing, .buffering, .recovering:
+            if hasEstablishedPlayback {
+                return [
+                    .play { [weak self] in await self?.setPaused(false) },
+                    .pause { [weak self] in await self?.setPaused(true) },
+                    .stop { [weak self] in await self?.stop() },
+                ]
+            }
             return [.stop { [weak self] in await self?.stop() }]
         case .idle, .stopped, .failed:
             return []
@@ -104,7 +112,9 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
         guard isValid else { return }
         switch state {
         case .playing, .paused: await owner?.setPausedFromNowPlaying(paused)
-        case .idle, .preparing, .buffering, .recovering, .stopped, .failed: break
+        case .preparing, .buffering, .recovering:
+            if hasEstablishedPlayback { await owner?.setPausedFromNowPlaying(paused) }
+        case .idle, .stopped, .failed: break
         }
     }
 
@@ -113,7 +123,14 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
         await owner?.stopFromNowPlaying()
     }
 
-    func update(_ newState: PlaybackState) { state = newState }
+    func update(_ newState: PlaybackState) {
+        state = newState
+        switch newState {
+        case .playing, .paused: hasEstablishedPlayback = true
+        case .idle, .stopped, .failed: hasEstablishedPlayback = false
+        case .preparing, .buffering, .recovering: break
+        }
+    }
 
     func matches(_ request: PlaybackRequest) -> Bool { presentation.request.id == request.id }
 

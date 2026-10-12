@@ -93,12 +93,12 @@ final class MacApplicationState {
                   let request, let dependencies = self.dependencies else { return }
             let next = MacPlaybackSession(presentation: self.presentation(for: request), dependencies: dependencies)
             next.onStopped = { [weak self, weak next] in
-                guard let self, self.session === next else { return }
-                Task { await self.stopPlayback() }
+                guard let self, let next, self.session === next else { return }
+                Task { await self.stopPlayback(requestID: next.model.request.id) }
             }
             next.pictureInPicture.onStopped = { [weak self, weak next] in
-                guard let self, self.session === next, self.libraryWindow?.isVisible != true else { return }
-                Task { await self.stopPlayback() }
+                guard let self, let next, self.session === next, self.libraryWindow?.isVisible != true else { return }
+                Task { await self.stopPlayback(requestID: next.model.request.id) }
             }
             next.pictureInPicture.onRestore = { [weak self] completion in
                 guard let self else { completion(false); return }
@@ -117,7 +117,12 @@ final class MacApplicationState {
         guard let session else { return }
         session.updatePresentation(presentation(for: session.model.request))
     }
-    func stopPlayback() async {
+    func requestStopPlayback() {
+        guard let requestID = requestedPlaybackID else { return }
+        Task { await stopPlayback(requestID: requestID) }
+    }
+    func stopPlayback(requestID: UUID? = nil) async {
+        if let requestID, requestedPlaybackID != requestID { return }
         requestedPlaybackID = nil
         replacementGeneration = UUID()
         let pending = replacementTask
@@ -148,7 +153,7 @@ final class MacApplicationState {
     }
     func libraryWindowWillClose(_ window: NSWindow) {
         guard window === libraryWindow, session?.pictureInPicture.isActive != true else { return }
-        Task { await stopPlayback() }
+        requestStopPlayback()
     }
     private func restoreLibraryWindow(completion: @escaping @MainActor (Bool) -> Void) {
         NSApp.activate()

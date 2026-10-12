@@ -9,6 +9,28 @@ import XCTest
 
 @MainActor
 final class SwiftDataLibraryStoreTests: XCTestCase {
+    func testStartupRecoversInterruptedRefreshOnceWithoutLosingCachedChannels() async throws {
+        let (container, writer) = try makeStore()
+        let profile = try await writer.createProfile(input(name: "手动源"), now: date(10))
+        let cached = channel(profileID: profile.id, name: "已有频道", path: "cached")
+        try await writer.installPlaylist(profileID: profile.id, channels: [cached], fetchedAt: date(20))
+        let context = RefreshSourceContext(source: SourceURLIdentity(url: profile.m3uURL), attemptID: UUID())
+        let started = try await writer.beginRefresh(profileID: profile.id, resource: .playlist, context: context, at: date(30))
+        XCTAssertTrue(started)
+        let restarted = SwiftDataLibraryStore(modelContainer: container)
+        try await restarted.recoverInterruptedRefreshes()
+        let profiles = try await restarted.profiles()
+        let channels = try await restarted.channels(profileID: profile.id)
+        XCTAssertEqual(profiles.first?.m3uStatus.state, .failed)
+        XCTAssertNil(profiles.first?.m3uStatus.attemptID)
+        XCTAssertEqual(channels, [cached])
+        let retry = try await restarted.beginRefresh(profileID: profile.id, resource: .playlist, context: context, at: date(40))
+        XCTAssertTrue(retry)
+        try await restarted.recoverInterruptedRefreshes()
+        let retryProfiles = try await restarted.profiles()
+        XCTAssertEqual(retryProfiles.first?.m3uStatus.state, .refreshing, "再次准备不能取消本进程的新刷新")
+    }
+
     func testChannelQueryPreservesOrderAndStableIdentityAcrossReadBatches() async throws {
         let (container, writer) = try makeStore()
         let profile = try await writer.createProfile(input(name: "Home"), now: date(10))

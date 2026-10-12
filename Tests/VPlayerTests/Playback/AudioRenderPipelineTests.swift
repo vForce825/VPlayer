@@ -2555,6 +2555,47 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(harness.synchronizer.rateSnapshot.last?.1, sample.presentationTimeStamp)
     }
 
+    func test44100Hz1152SamplePrerollUsesExactSampleClock() throws {
+        let harness = try makeHarness()
+        harness.decoderFactory.pushBody = { sample in
+            [try self.makePCMBuffer(pts: sample.presentationTimeStamp, frameCount: 1_152, sampleRate: 44_100)]
+        }
+        let compressed = try XCTUnwrap(harness.renderers.snapshot.first)
+        let packetDuration = CMTime(value: 1_152, timescale: 44_100)
+        for index in 0..<10 {
+            try perform(on: harness.executor) {
+                try harness.pipeline.enqueue(try self.makeSample(
+                    id: UInt64(index + 1),
+                    pts: CMTimeMultiply(packetDuration, multiplier: Int32(index)),
+                    duration: packetDuration
+                ))
+            }
+        }
+        let transition = try beginFallbackAfterCompressedRetry(
+            initialRenderer: compressed,
+            in: harness,
+            reason: "force-pcm-preroll"
+        )
+        harness.synchronizer.completeRemoval(index: transition.removalIndex, didRemove: true)
+        drain(harness.executor)
+
+        let pcm = try XCTUnwrap(harness.renderers.snapshot.last)
+        pcm.configureReadiness(
+            ready: true,
+            sufficient: false,
+            maximumEnqueuesPerCallback: 10
+        )
+        pcm.fireReady()
+        drain(harness.executor)
+
+        XCTAssertEqual(pcm.snapshot.enqueuedPTS.count, 10)
+        XCTAssertTrue(
+            harness.pipeline.isReadyForPlayback,
+            "44.1 kHz 的十帧约 261 ms，连续覆盖不应因舍入被重置"
+        )
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testPCMQuarterSecondPrerollBecomesReadyWhenRendererBackpressuresBeforeSufficientFlag() throws {
         let harness = try makeHarness()
         harness.decoderFactory.pushBody = { sample in
@@ -7086,14 +7127,15 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
 
     private func makePCMBuffer(
         pts: CMTime,
-        frameCount: Int = 2
+        frameCount: Int = 2,
+        sampleRate: Int32 = 48_000
     ) throws -> CMSampleBuffer {
         let samples = [Float](repeating: 0, count: frameCount * 2)
         let bytes = samples.withUnsafeBytes { Data($0) }
         return try PCMSampleBufferBuilder.make(
             bytes: bytes,
             frameCount: frameCount,
-            sampleRate: 48_000,
+            sampleRate: sampleRate,
             channels: 2,
             channelOrder: .native,
             channelLayoutMask: 3,

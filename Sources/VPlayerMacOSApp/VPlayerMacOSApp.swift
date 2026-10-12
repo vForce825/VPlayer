@@ -46,8 +46,8 @@ struct MacPlayerCommands: Commands {
         }
         CommandMenu("播放") {
             Button(state.session?.model.isPaused == true ? "继续播放" : "暂停") { state.session?.model.togglePause() }
-                .keyboardShortcut("p").disabled(state.session == nil)
-            Button("停止播放") { Task { await state.stopPlayback() } }
+                .keyboardShortcut("p").disabled(state.session?.model.canControlPlayback != true)
+            Button("停止播放") { state.requestStopPlayback() }
                 .keyboardShortcut(".").disabled(state.session == nil)
             Button("显示或隐藏频道列表") {
                 guard let session = state.session else { return }

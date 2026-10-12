@@ -12,6 +12,7 @@ struct PlayerControlsOverlay: View {
     }
 
     let isPaused: Bool
+    var canControlPlayback = true
     let onBack: () -> Void
     let onPlayPause: () -> Void
     let onSettings: () -> Void
@@ -29,7 +30,7 @@ struct PlayerControlsOverlay: View {
                 }
                     .accessibilityIdentifier("player-back")
                     .focused($focusedControl, equals: .back)
-                Button(
+                if canControlPlayback { Button(
                     isPaused ? "播放" : "暂停",
                     systemImage: isPaused ? "play.fill" : "pause.fill"
                 ) {
@@ -38,6 +39,7 @@ struct PlayerControlsOverlay: View {
                 }
                 .accessibilityIdentifier("player-play-pause")
                 .focused($focusedControl, equals: .playPause)
+                }
                 Button("播放设置", systemImage: "gearshape") {
                     onInteraction()
                     onSettings()
@@ -51,6 +53,9 @@ struct PlayerControlsOverlay: View {
         .onMoveCommand { _ in onInteraction() }
         .onChange(of: focusedControl) { _, _ in onInteraction() }
         .onChange(of: isPaused) { _, _ in onInteraction() }
+        .onChange(of: canControlPlayback) { _, allowed in
+            if !allowed, focusedControl == .playPause { focusedControl = .back }
+        }
         .task {
             await Task.yield()
             focusedControl = initialControl
@@ -60,7 +65,7 @@ struct PlayerControlsOverlay: View {
     private var initialControl: Control {
         switch focusPolicy.initialPlayerControl {
         case .back: .back
-        case .playPause: .playPause
+        case .playPause: canControlPlayback ? .playPause : .back
         case .settings: .settings
         }
     }

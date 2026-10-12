@@ -29,14 +29,25 @@ struct VPFFVideoDecoder {
     void *context;
 };
 
+static void discard_token(VPFFVideoDecoder *decoder, int64_t token) {
+    VPFFVideoFrame discarded = {
+        .pts = token,
+        .abi_version = VPFF_VIDEO_DECODER_ABI_VERSION,
+        .struct_size = (uint32_t)sizeof(VPFFVideoFrame),
+        .discarded = 1,
+    };
+    decoder->callback(decoder->context, &discarded);
+}
+
 static int32_t deliver_frame(VPFFVideoDecoder *decoder, const AVFrame *frame) {
     // 损坏帧可能含有缺失参考帧造成的马赛克；等待后续完整帧，不中断解码会话。
     if ((frame->flags & AV_FRAME_FLAG_CORRUPT) != 0 || frame->decode_error_flags != 0) {
+        discard_token(decoder, frame->pts);
         return 0;
     }
     // Only the one planar layout this pipeline can turn into NV12. A decoder
     // that produced anything else would otherwise be read as 4:2:0 and torn.
-    if (frame->format != AV_PIX_FMT_YUV420P) {
+    if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P) {
         return VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT;
     }
     if (frame->data[0] == NULL || frame->data[1] == NULL || frame->data[2] == NULL ||
@@ -52,10 +63,10 @@ static int32_t deliver_frame(VPFFVideoDecoder *decoder, const AVFrame *frame) {
     }
 
     VPFFVideoRange range = VPFF_VIDEO_RANGE_UNKNOWN;
-    if (frame->color_range == AVCOL_RANGE_MPEG) {
-        range = VPFF_VIDEO_RANGE_VIDEO;
-    } else if (frame->color_range == AVCOL_RANGE_JPEG) {
+    if (frame->format == AV_PIX_FMT_YUVJ420P || frame->color_range == AVCOL_RANGE_JPEG) {
         range = VPFF_VIDEO_RANGE_FULL;
+    } else if (frame->color_range == AVCOL_RANGE_MPEG) {
+        range = VPFF_VIDEO_RANGE_VIDEO;
     }
 
     VPFFVideoFrame delivered = {
@@ -72,7 +83,8 @@ static int32_t deliver_frame(VPFFVideoDecoder *decoder, const AVFrame *frame) {
         .struct_size = (uint32_t)sizeof(VPFFVideoFrame),
         .is_interlaced = (frame->flags & AV_FRAME_FLAG_INTERLACED) != 0 ? 1 : 0,
         .top_field_first = (frame->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) != 0 ? 1 : 0,
-        .reserved = {0, 0},
+        .discarded = 0,
+        .reserved = {0},
         .range = range,
         .color_primaries = (int32_t)frame->color_primaries,
         .color_transfer = (int32_t)frame->color_trc,
@@ -289,6 +301,9 @@ int32_t vp_ffmpeg_video_decoder_push(
     // wanted was dropped upstream, and the next random-access unit recovers.
     if (result < 0 && result != AVERROR_INVALIDDATA) {
         return (int32_t)result;
+    }
+    if (result == AVERROR_INVALIDDATA && size > 0) {
+        discard_token(decoder, pts);
     }
     return drain(decoder, out_failure_token, out_has_failure_token);
 }

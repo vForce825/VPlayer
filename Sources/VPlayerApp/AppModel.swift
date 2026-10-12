@@ -82,6 +82,9 @@ final class AppModel {
     private var manualMappingByChannelID: [String: String] = [:]
     @ObservationIgnored private var programmeWindowDate: Date?
     private var reloadID: UUID?
+    // 未成功应用的较大范围更新不能被后来的增量读取覆盖。
+    private var requiresFullReload = false
+    private var requiresEPGReload = false
     @ObservationIgnored private var appliedReloadID: UUID?
     private var activeTransition: ActiveTransition?
     private var pendingCreation: PendingCreation?
@@ -256,6 +259,7 @@ final class AppModel {
     }
 
     private func reloadOutcome(onError: OperationErrorHandler? = nil) async -> ReloadOutcome {
+        requiresFullReload = true
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
@@ -383,6 +387,8 @@ final class AppModel {
     }
 
     private func reloadProfilesOutcome(activeProfileID: UUID) async -> ReloadOutcome {
+        if requiresFullReload { return await reloadOutcome() }
+        if requiresEPGReload { return await reloadEPGOutcome(activeProfileID: activeProfileID) }
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
@@ -416,6 +422,8 @@ final class AppModel {
     private func reloadEPGOutcome(
         activeProfileID: UUID, reportsFailure: Bool = true
     ) async -> ReloadOutcome {
+        if requiresFullReload { return await reloadOutcome() }
+        requiresEPGReload = true
         let currentReloadID = UUID()
         activeReloadIDs.insert(currentReloadID)
         defer { completeReload(currentReloadID) }
@@ -1185,6 +1193,7 @@ final class AppModel {
         guard let loadedActiveProfile = profiles.first(where: { $0.id == activeProfileID }) else {
             return .superseded
         }
+        requiresEPGReload = false
         _ = applyProfiles(
             profiles,
             preferredActiveProfile: loadedActiveProfile,
@@ -1223,6 +1232,8 @@ final class AppModel {
         terminalRefreshOverlayIDsAtStart: [RefreshKey: UUID]
     ) -> ReloadOutcome {
         guard reloadID == currentReloadID else { return .superseded }
+        requiresFullReload = false
+        requiresEPGReload = false
         _ = applyProfiles(
             profiles,
             preferredActiveProfile: activeProfile,

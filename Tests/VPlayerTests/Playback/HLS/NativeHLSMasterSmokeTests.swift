@@ -281,6 +281,14 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         for managed in [false, true] { try await verifyNaturalEOF(managed: managed, deadline: deadline) }
     }
 
+    func testRealNativeAndManagedLiveHLSStopAfterLaterEndList() async throws {
+        executionTimeAllowance = 240
+        let deadline = ContinuousClock.now + .seconds(210)
+        for managed in [false, true] {
+            try await verifyNaturalEOF(managed: managed, deadline: deadline, initiallyLive: true)
+        }
+    }
+
     func testNativeEOSFirstReadPrecedesRateAndControlSettlement() async throws {
         for rate in [Float(1), Float(0)] {
             try await verifyNativeEOSSettlement(firstRate: rate, outcome: .settled)
@@ -1005,9 +1013,13 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
         if let failure { throw failure }
     }
 
-    private func verifyNaturalEOF(managed: Bool, deadline: ContinuousClock.Instant) async throws {
+    private func verifyNaturalEOF(managed: Bool, deadline: ContinuousClock.Instant, initiallyLive: Bool = false) async throws {
         guard ContinuousClock.now < deadline else { throw HLSSourceError.deadline }
         let origin = try makeOrigin(bytes: fixtureBytes(), managed: managed)
+        let liveManifest = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:80\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:80,\npart.ts\n"
+        if initiallyLive {
+            origin.replace("/media.m3u8", resource: .init(data: Data(liveManifest.utf8), contentType: "application/vnd.apple.mpegurl"))
+        }
         var failure: (any Error)?
         do {
             try await withController(deadline: deadline) { [self] controller, registry, factory in
@@ -1029,13 +1041,27 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                 let player = try XCTUnwrap(backend.presentation?.avPlayerForNativeSmoke)
                 let physical = try XCTUnwrap(player.currentItem)
                 let activation = try XCTUnwrap(coordinator.currentActivation)
-                let endpoint = try ExactMediaTime(physical.duration)
+                if initiallyLive {
+                    guard case let .hls(graph) = coordinator.owned.source.topology else { return XCTFail("缺少初始清单") }
+                    XCTAssertTrue(graph.documents.values.filter { $0.kind == .media }.allSatisfy {
+                        !String(decoding: $0.rawData, as: UTF8.self).contains("#EXT-X-ENDLIST")
+                    })
+                    origin.replace("/media.m3u8", resource: .init(data: Data((liveManifest + "#EXT-X-ENDLIST\n").utf8),
+                        contentType: "application/vnd.apple.mpegurl"))
+                }
+                let endpoint: ExactMediaTime
+                if initiallyLive { endpoint = ExactMediaTime(value: 80, timescale: 1) }
+                else { endpoint = try ExactMediaTime(physical.duration) }
                 let snapshot = try await SystemNativeHLSAssetInspector(driver: driver).snapshot(item: coordinator.item, source: coordinator.owned)
                 XCTAssertTrue(coordinator.owned.facts.media.compactMap(\.video).allSatisfy {
                     $0.explicitSequenceFrameRate == MediaRational(num: 30, den: 1)
                 })
-                let quantum = try XCTUnwrap(snapshot.finalPresentationQuantum)
-                XCTAssertEqual(quantum.period, ExactMediaTime(value: 1, timescale: 30))
+                let period = ExactMediaTime(value: 1, timescale: 30)
+                if initiallyLive {
+                    XCTAssertNil(snapshot.duration, "尚未收到 EOS，直播窗口末端不能冒充自然终点")
+                } else {
+                    XCTAssertEqual(try XCTUnwrap(snapshot.finalPresentationQuantum).period, period)
+                }
                 XCTAssertEqual(endpoint, ExactMediaTime(value: 80, timescale: 1))
                 XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
                 XCTAssertNil(driver.naturalEndObservation)
@@ -1046,31 +1072,29 @@ final class NativeHLSMasterSmokeTests: XCTestCase {
                         self.naturalEOFEvidence(coordinator: coordinator, activation: activation, backend: backend,
                             driver: driver, player: player, physical: physical)
                     }) {
-                    coordinator.naturalEndVerifiedForTesting && driver.naturalEndObservation?.stableCurrentTime != nil
+                    coordinator.naturalEndVerifiedForTesting && registry.playbackStateSnapshot() == .stopped
+                        && registry.outputResourceContextSnapshot() == nil
                 }
-                let observation = try XCTUnwrap(driver.naturalEndObservation)
+                let observation = try XCTUnwrap(coordinator.verifiedNaturalEndObservationForTesting)
                 let stable = try XCTUnwrap(observation.stableCurrentTime)
                 XCTAssertEqual(observation.item, coordinator.item)
                 XCTAssertEqual(observation.expectedEndpoint, endpoint)
                 XCTAssertEqual(observation.constrainedEndpoint, endpoint)
                 XCTAssertEqual(observation.firstCurrentTime, stable)
-                let lower = try endpoint.subtracting(quantum.period)
+                let lower = try endpoint.subtracting(period)
                 // A settled output clock may be beyond duration. Its value
                 // cannot alter the exact untrimmed source endpoint above.
                 XCTAssertGreaterThan(CMTimeCompare(stable.cmTime, lower.cmTime), 0)
-                XCTAssertTrue(player.currentItem === physical)
+                XCTAssertNil(player.currentItem)
                 XCTAssertEqual(player.rate, 0)
                 XCTAssertEqual(player.timeControlStatus, .paused)
                 XCTAssertFalse(physical.forwardPlaybackEndTime.isValid)
-                XCTAssertTrue(coordinator.isPrepared)
-                XCTAssertEqual(coordinator.currentActivation, activation)
-                XCTAssertEqual(registry.outputResourceContextSnapshot()?.activation, activation)
-                XCTAssertEqual(backend.routedTransportForTesting, managed ? .proxy : .native)
+                XCTAssertFalse(coordinator.isPrepared)
+                XCTAssertNil(coordinator.currentActivation)
                 XCTAssertEqual(backend.generatedBundleCallsForTesting, 0)
                 XCTAssertEqual(origin.deniedCount, 0)
-                // EOF does not mint physical quiescence: withController still
-                // performs the original owned stop/disconnect/retirement below.
-                XCTAssertFalse(driver.disconnectedFromSystemAudio)
+                // 真正 EOF 完成后仍通过原停止流程断开并释放物理输出。
+                XCTAssertTrue(driver.disconnectedFromSystemAudio)
                 print("NATIVE_HLS_FULL_SOURCE_EOF managed=\(managed) verified=true end=\(stable.value)/\(stable.timescale)")
             }
         } catch { failure = error }

@@ -33,6 +33,7 @@ enum PlaybackPipelineEvent: Sendable, Equatable {
     // replace a newer media snapshot in the controller.
     case mediaInformation(PlaybackMediaInformation?, generation: MediaGeneration? = nil)
     case stopped
+    case backendStopped(prepareScope: PlaybackBackendPrepareFailureScope)
     case failed(PlaybackCoreError)
     /// 保留同一 backend 的 reprepare 会更换 ticket；迟到旧 producer 首错不得终止新 item。
     case backendFailed(ErrorDiagnosticSnapshot, prepareScope: PlaybackBackendPrepareFailureScope,

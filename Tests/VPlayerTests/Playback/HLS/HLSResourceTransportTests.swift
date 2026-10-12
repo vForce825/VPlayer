@@ -125,8 +125,8 @@ final class HLSResourceTransportTests: XCTestCase {
         await assertProtocolStopped(fixture)
     }
 
-    func testReadyTSStopsAtInitialBoundaryWithoutWaitingForUnknownLengthEOF() async throws {
-        let body = AcquisitionTSFixture.make(byteCount: AcquisitionTSFixture.mib, headersAt: 376)
+    func testReadyLowRateTSStopsBeforeOneMiBWithoutWaitingForUnknownLengthEOF() async throws {
+        let body = AcquisitionTSFixture.make(byteCount: 16 * 1_024, headersAt: 376)
         let fixture = AcquisitionHTTPFixture(body: body, finishes: false)
         defer { fixture.remove() }
         let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())

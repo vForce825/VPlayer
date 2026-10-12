@@ -10,6 +10,41 @@ import XCTest
 
 @MainActor
 final class RefreshLifecycleTests: XCTestCase {
+    func testBackgroundColdStartRestoresMirrorBeforeReadingProfiles() async throws {
+        let suite = "VPlayer.audit.background.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let mirror = SourceProfileMirror(defaults: defaults)
+        let original = SwiftDataLibraryStore(modelContainer: try VPlayerModelContainer.make(inMemory: true), profileMirror: mirror)
+        let input = try SourceProfileInput(name: "自动源", m3uURLString: "https://example.test/list.m3u",
+            epgURLString: "https://example.test/epg.xml", m3uRefreshInterval: .hourly, epgRefreshInterval: .manual).validated()
+        let profile = try await original.createProfile(input, now: Date(timeIntervalSince1970: 1))
+        let empty = SwiftDataLibraryStore(modelContainer: try VPlayerModelContainer.make(inMemory: true), profileMirror: mirror)
+        let refreshed = expectation(description: "后台恢复后刷新原有源")
+        let loader = LiveLibraryRuntimeLoader {
+            LiveLibraryRuntime(repository: empty, refresh: { id, resources, trigger in
+                XCTAssertEqual(id, profile.id)
+                XCTAssertEqual(resources, [.playlist])
+                refreshed.fulfill()
+                return resources.map { RefreshOutcome(resource: $0, succeeded: true, message: nil) }
+            }, prepare: {
+                _ = try await empty.synchronizeProfileMirror()
+                try await empty.recoverInterruptedRefreshes()
+            }, maintenance: {})
+        }
+        let scheduler = BackgroundSchedulerSpy()
+        let bootstrap = LiveAppBootstrap(runtimeLoader: loader, libraryChanges: LibraryChangeSignal(), backgroundScheduler: scheduler)
+        bootstrap.backgroundRefreshRegistrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await fulfillment(of: [refreshed], timeout: 3)
+        await eventually { !task.completions.isEmpty }
+        XCTAssertEqual(task.completions, [true])
+        XCTAssertFalse(scheduler.submissions.isEmpty)
+        let restored = try await empty.profiles()
+        XCTAssertEqual(restored.map(\.id), [profile.id])
+    }
+
     func testForegroundActivationReplacesAndDeactivationCancelsTheLoopTask() async {
         let probe = ForegroundLoopProbe()
         let driver = ForegroundRefreshDriver(
@@ -1037,17 +1072,21 @@ private actor ForegroundLoopProbe {
     }
 
     func waitForCancellationCount(_ expected: Int) async {
-        for _ in 0..<1_000 {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
             if cancellationCount >= expected { return }
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
         }
+        XCTFail("等待前台刷新取消超时：期望 \(expected)，实际 \(cancellationCount)")
     }
 
     func waitForSleepCount(_ expected: Int) async {
-        for _ in 0..<1_000 {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
             if sleepCount >= expected { return }
-            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(5))
         }
+        XCTFail("等待前台刷新循环启动超时：期望 \(expected)，实际 \(sleepCount)")
     }
 
     func sleepCountValue() -> Int {

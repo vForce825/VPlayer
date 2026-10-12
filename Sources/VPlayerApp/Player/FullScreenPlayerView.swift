@@ -132,6 +132,7 @@ struct FullScreenPlayerView: View {
             if shouldMountTransportOverlays {
                 PlayerControlsOverlay(
                     isPaused: model.isPaused,
+                    canControlPlayback: model.canControlPlayback,
                     onBack: close,
                     onPlayPause: model.togglePause,
                     onSettings: { showsSettings = true },
@@ -157,6 +158,9 @@ struct FullScreenPlayerView: View {
             )
             UIApplication.shared.isIdleTimerDisabled =
                 PlaybackIdleTimerPolicy.isDisabled(for: state)
+        }
+        .onChange(of: model.hasStoppedCurrentRequest) { _, stopped in
+            if stopped { close() }
         }
         .onChange(of: model.mediaInformation) { oldValue, newValue in
             guard oldValue == nil, newValue != nil, controlsVisibilityMode == .timed else {
@@ -195,49 +199,54 @@ struct FullScreenPlayerView: View {
 
     @ViewBuilder
     private var statusOverlay: some View {
-        switch model.state {
-        case .idle, .preparing:
-            ProgressView("正在准备播放…")
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("player-preparing")
-                .padding(24)
+        if model.isPaused {
+            Text("已暂停").padding(24)
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
-        case .buffering:
-            ProgressView("正在缓冲…")
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("player-buffering")
-                .padding(24)
-                .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
-        case .recovering:
-            ProgressView("正在恢复播放…")
-                .accessibilityElement(children: .combine)
-                .accessibilityIdentifier("player-recovering")
-                .padding(24)
-                .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
-        case let .failed(failure):
-            let showsRetry = PlayerFailureActionPolicy.showsRetry(for: failure)
-            let initialFocus: FailureControl = showsRetry ? .retry : .back
-            VStack(spacing: 20) {
-                Text(failure.userMessage)
-                HStack {
-                    if showsRetry {
-                        Button("重试", action: model.retry)
-                            .accessibilityIdentifier("player-retry")
-                            .focused($failureFocus, equals: .retry)
+        } else {
+            switch model.state {
+            case .idle, .preparing:
+                ProgressView("正在准备播放…")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("player-preparing")
+                    .padding(24)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            case .buffering:
+                ProgressView("正在缓冲…")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("player-buffering")
+                    .padding(24)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            case .recovering:
+                ProgressView("正在恢复播放…")
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("player-recovering")
+                    .padding(24)
+                    .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 12))
+            case let .failed(failure):
+                let showsRetry = PlayerFailureActionPolicy.showsRetry(for: failure)
+                let initialFocus: FailureControl = showsRetry ? .retry : .back
+                VStack(spacing: 20) {
+                    Text(failure.userMessage)
+                    HStack {
+                        if showsRetry {
+                            Button("重试", action: model.retry)
+                                .accessibilityIdentifier("player-retry")
+                                .focused($failureFocus, equals: .retry)
+                        }
+                        Button("返回", action: close)
+                            .accessibilityIdentifier("player-back")
+                            .focused($failureFocus, equals: .back)
+                        Button("播放设置") { showsSettings = true }
+                            .focused($failureFocus, equals: .settings)
                     }
-                    Button("返回", action: close)
-                        .accessibilityIdentifier("player-back")
-                        .focused($failureFocus, equals: .back)
-                    Button("播放设置") { showsSettings = true }
-                        .focused($failureFocus, equals: .settings)
+                    .defaultFocus($failureFocus, initialFocus)
                 }
-                .defaultFocus($failureFocus, initialFocus)
+                .padding(32)
+                .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 16))
+                .onAppear { failureFocus = initialFocus }
+            case .playing, .paused, .stopped:
+                EmptyView()
             }
-            .padding(32)
-            .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 16))
-            .onAppear { failureFocus = initialFocus }
-        case .playing, .paused, .stopped:
-            EmptyView()
         }
     }
 

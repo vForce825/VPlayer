@@ -12,6 +12,37 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testInitialConnectionHidesPauseButRebufferingPreservesLatestIntent() async throws {
+        let engine = ControlledViewModelPlaybackEngine()
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+        model.start()
+        try await eventually { await engine.subscriberCount == 1 }
+        await engine.emit(state: .buffering(request))
+        try await eventually { model.state == .buffering(request) }
+        XCTAssertFalse(model.canControlPlayback)
+        model.togglePause()
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        for state in [PlaybackState.buffering(request), .recovering(request)] {
+            await engine.emit(state: state)
+            try await eventually { model.state == state }
+            XCTAssertTrue(model.canControlPlayback)
+            await model.setPausedFromNowPlaying(true)
+            XCTAssertTrue(model.isPaused)
+            await engine.emit(state: .playing(request))
+            try await eventually { model.state == .playing(request) }
+            XCTAssertTrue(model.isPaused, "迟到的播放状态不能撤销暂停意图")
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertFalse(model.isPaused)
+        }
+        let pauses = await engine.operations.filter { $0.hasPrefix("pause:") }
+        XCTAssertEqual(pauses, ["pause:true:start", "pause:true:end", "pause:false:start", "pause:false:end",
+                               "pause:true:start", "pause:true:end", "pause:false:start", "pause:false:end"])
+        await model.stop()
+    }
+
     func testRemoteCommandsPreserveCompletedIntentUntilAuthoritativeAcknowledgementAfterRetry() async throws {
         for initiallyPaused in [false, true] {
             let engine = ControlledViewModelPlaybackEngine()

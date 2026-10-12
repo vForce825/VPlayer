@@ -13,6 +13,7 @@ final class MacPlayerOverlayState {
     private(set) var sidebarVisible = false
     var holdsControlsOpen = false
     var holdsSidebarOpen = false
+    var sidebarHasFocus = false
     private var hideTask: Task<Void, Never>?
     private var dismissedPointerLocation: CGPoint?
     private let delay: Duration
@@ -40,11 +41,11 @@ final class MacPlayerOverlayState {
     }
     func scheduleAutoHide(paused: Bool) {
         cancel()
-        guard !paused, !holdsControlsOpen, !holdsSidebarOpen else { return }
+        guard !paused, !holdsControlsOpen, !holdsSidebarOpen, !sidebarHasFocus else { return }
         let delay = delay
         hideTask = Task { @MainActor [weak self] in
             do { try await Task.sleep(for: delay) } catch { return }
-            guard let self, !self.holdsControlsOpen, !self.holdsSidebarOpen else { return }
+            guard let self, !self.holdsControlsOpen, !self.holdsSidebarOpen, !self.sidebarHasFocus else { return }
             self.controlsVisible = false
             self.informationVisible = false
             self.sidebarVisible = false

@@ -15,6 +15,19 @@ final class MacPlaybackSessionTests: XCTestCase {
         .init(sourceProfileID: UUID(), channelID: title,
               streamURL: URL(string: "https://example.invalid/live")!, title: title)
     }
+    func testDelayedStopCannotCancelNewlySelectedChannel() async throws {
+        let state = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: nil))
+        let old = request("旧频道")
+        state.replaceSession(for: old)
+        try await wait { state.session?.model.state == .playing(old) }
+        let latest = request("新频道")
+        state.replaceSession(for: latest)
+        await state.stopPlayback(requestID: old.id)
+        try await wait { state.session?.model.state == .playing(latest) }
+        XCTAssertEqual(state.session?.model.request.id, latest.id)
+        await state.shutdown()
+    }
+
     func testRapidChannelReplacementClosesPredecessorBeforeStartingFinalRequest() async throws {
         let state = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: nil))
         state.replaceSession(for: request("第一个频道"))

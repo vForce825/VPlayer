@@ -27,6 +27,7 @@ struct BorrowedFFmpegVideoFrame: @unchecked Sendable {
     let range: VideoFormatMetadata.Range
     let abiVersion: UInt32
     let structSize: UInt32
+    var discarded: Bool = false
 }
 
 struct FFmpegVideoPushResult: Equatable, Sendable {
@@ -95,7 +96,8 @@ private func liveFFmpegVideoCallback(
         topFieldFirst: frame.pointee.top_field_first != 0,
         range: range,
         abiVersion: frame.pointee.abi_version,
-        structSize: frame.pointee.struct_size
+        structSize: frame.pointee.struct_size,
+        discarded: frame.pointee.discarded != 0
     ))
 }
 
@@ -257,6 +259,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         let epoch: UInt64
         let colorAttachments: [CFString: Any]
         let surfaceScope: (any DecodedVideoSurfaceAdmitting)?
+        var warmupInputsRemaining: Int
     }
 
     /// CMBlockBuffer is a CoreFoundation type with no Sendable conformance, and
@@ -477,11 +480,13 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         }
         let extradata = Self.avccRecord(from: format)
         let attachments = Self.colorAttachments(from: format)
+        // 为帧线程和 H.264 最大 16 帧重排留出空间，同时不占满 64 个待处理槽。
+        let threadCount = min(max(1, ProcessInfo.processInfo.activeProcessorCount), Self.maximumPendingUnitCount / 2)
         // `push`, teardown and installation all share this queue. The epoch was
         // bumped before enqueue, so queued old work drains as cancellation.
         let handle = try api.create(
             extradata: extradata,
-            threadCount: Int32(max(1, ProcessInfo.processInfo.activeProcessorCount)),
+            threadCount: Int32(threadCount),
             receiver: { [weak self] frame in
                 self?.deliver(frame)
             }
@@ -496,7 +501,8 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 identity: identity,
                 epoch: replacementEpoch,
                 colorAttachments: attachments,
-                surfaceScope: surfaceScope
+                surfaceScope: surfaceScope,
+                warmupInputsRemaining: threadCount + 16
             )
             return true
         }
@@ -507,7 +513,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
         let dimensions = CMVideoFormatDescriptionGetDimensions(format)
         metrics?.recordDecoderSession(
             summary: "codec=avc1 \(dimensions.width)x\(dimensions.height) route=ffmpeg"
-                + " threads=\(ProcessInfo.processInfo.activeProcessorCount)"
+                + " threads=\(threadCount)"
         )
     }
 
@@ -671,12 +677,19 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
                 return
             }
             completion.schedule(disposition: { [weak self] in
-                guard let self,
-                      stateLock.withLock({
-                          active?.identity == identity
-                              && active?.epoch == submitted.epoch
-                      }) else { return .cancelled }
-                return production.produced ? .produced : .noFrame
+                guard let self else { return .cancelled }
+                return stateLock.withLock {
+                    guard active?.identity == identity, active?.epoch == submitted.epoch else { return .cancelled }
+                    if production.produced {
+                        active?.warmupInputsRemaining = 0
+                        return .produced
+                    }
+                    if let remaining = active?.warmupInputsRemaining, remaining > 0 {
+                        active?.warmupInputsRemaining = remaining - 1
+                        return .acceptedPending
+                    }
+                    return .noFrame
+                }
             })
         }
     }
@@ -742,8 +755,15 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
 
     private func deliver(_ frame: BorrowedFFmpegVideoFrame) {
         guard frame.abiVersion == VPFF_VIDEO_DECODER_ABI_VERSION,
-              Int(frame.structSize) >= MemoryLayout<VPFFVideoFrame>.size,
-              let luma = frame.luma,
+              Int(frame.structSize) >= MemoryLayout<VPFFVideoFrame>.size else { return }
+        if frame.discarded {
+            stateLock.withLock {
+                guard let active, pending[frame.token]?.epoch == active.epoch else { return }
+                pending.removeValue(forKey: frame.token)
+            }
+            return
+        }
+        guard let luma = frame.luma,
               let chromaB = frame.chromaB,
               let chromaR = frame.chromaR else { return }
         let state = stateLock.withLock {
@@ -928,6 +948,7 @@ final class FFmpegVideoDecoder: VideoDecoding, @unchecked Sendable {
             return [:]
         }
         let carried: [CFString] = [
+            kCVImageBufferPixelAspectRatioKey,
             kCVImageBufferColorPrimariesKey,
             kCVImageBufferTransferFunctionKey,
             kCVImageBufferYCbCrMatrixKey,

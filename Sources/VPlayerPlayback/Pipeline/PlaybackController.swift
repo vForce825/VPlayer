@@ -1620,6 +1620,10 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         } else {
             mayReceive = context.owner == nil
         }
+        if case let .backendStopped(scope) = event {
+            guard let ticket = context.prepareTicket, ticket.backendIdentity == backendIdentity,
+                  scope.matches(ticket) else { return }
+        }
         guard mayReceive else {
             #if DEBUG
             PlaybackDiagnosticTracker.shared.set("pipeline_event_has_owner")
@@ -1666,7 +1670,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             case .recovering:
                 publish(.recovering(request))
             }
-        case .stopped:
+        case .stopped, .backendStopped:
             beginOwnedBackendTerminal(context: context, terminalState: .stopped)
         case let .failed(error):
             terminalMetricsProvider = registry.terminalMetricsProjection(backendIdentity: backendIdentity)

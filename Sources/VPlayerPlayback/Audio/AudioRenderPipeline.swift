@@ -2330,11 +2330,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
               let format = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)?.pointee,
               asbd.mSampleRate.isFinite,
-              asbd.mSampleRate > 0 else { return }
-        let duration = CMTime(
-            seconds: Double(sampleCount) / asbd.mSampleRate,
-            preferredTimescale: 600_000
-        )
+              asbd.mSampleRate > 0,
+              asbd.mSampleRate <= Double(Int32.max),
+              asbd.mSampleRate.rounded() == asbd.mSampleRate else { return }
+        // 在样本时钟中保持精确时长；44.1 kHz 的 1152 样本不能先舍入到固定刻度。
+        let duration = CMTime(value: Int64(sampleCount), timescale: Int32(asbd.mSampleRate))
         let end = CMTimeAdd(pts, duration)
         guard duration.isNumeric,
               CMTimeCompare(duration, .zero) > 0,

@@ -926,6 +926,27 @@ final class VPlayerAppStartupTests: XCTestCase {
         XCTAssertEqual(attemptCount, 2)
     }
 
+    func testRuntimePreparationRetriesFailureAndSharesSuccessfulPreparation() async throws {
+        let repository = RepositorySpy(profiles: [])
+        let prepare = RetryingLibraryPrepareProbe()
+        let loader = LiveLibraryRuntimeLoader {
+            LiveLibraryRuntime(repository: repository, refresh: { _, _, _ in [] },
+                prepare: { try await prepare.run() }, maintenance: {})
+        }
+        do {
+            try await loader.prepare()
+            XCTFail("首次准备应返回注入的错误")
+        } catch is StartupProbeError {}
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<10 { group.addTask { try await loader.prepare() } }
+            try await group.waitForAll()
+        }
+        try await loader.prepare()
+        let attempts = await prepare.attemptCount
+        XCTAssertEqual(attempts, 2, "并发入口应共享一次成功准备；失败不能永久缓存")
+    }
+
     func testInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes() async {
         await assertInitialLibraryUsesPreparedCacheBeforeBlockedMaintenanceCompletes(
             prefersReducedResourceUsage: false

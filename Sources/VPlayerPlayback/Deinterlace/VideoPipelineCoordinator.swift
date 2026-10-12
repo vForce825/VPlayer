@@ -145,7 +145,7 @@ struct VideoRecoveryBudget: Sendable {
         case .produced:
             consecutiveNoFrameCount = 0
             return .none
-        case .cancelled:
+        case .cancelled, .acceptedPending:
             return .none
         case .noFrame:
             guard !recoveryInFlight, !exhausted else { return .none }

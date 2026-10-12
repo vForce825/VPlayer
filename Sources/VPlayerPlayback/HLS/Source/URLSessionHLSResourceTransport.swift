@@ -63,7 +63,8 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
     init(request: HLSResourceRequest, configuration: URLSessionConfiguration,
          preparationDiagnostics: HLSPreparationDiagnostics?) {
         self.request = request; self.configuration = configuration
-        acquisitionBoundary = request.maximumBytes
+        acquisitionBoundary = request.maximumTSContinuationBytes == nil
+            ? request.maximumBytes : min(request.maximumBytes, 16 * 1_024)
         self.preparationDiagnostics = preparationDiagnostics
     }
     func run() async throws -> HLSResourceResponse {
@@ -178,6 +179,10 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
             offset += count
             guard body.count == acquisitionBoundary else { return false }
             if body.first != 0x47 {
+                if acquisitionBoundary < request.maximumBytes {
+                    acquisitionBoundary = request.maximumBytes
+                    continue
+                }
                 // Non-TS keeps the original complete-at-limit contract. An
                 // exact-size manifest must be allowed to deliver its EOF; a
                 // later positive callback is rejected before appending bytes.
@@ -202,10 +207,14 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
                   body.count < ceiling else {
                 stoppedPrefix = true; return true
             }
-            if !reservedContinuation { body.reserveCapacity(ceiling); reservedContinuation = true }
-            // Production's 1 MiB initial limit gives at most 29 hints through
-            // 8 MiB; any smaller positive initial limit still gives at most 33.
-            acquisitionBoundary = min(ceiling, acquisitionBoundary + 256 * 1_024)
+            // 小前缀按倍增检测，避免低码率直播盲等 1 MiB；越过初始预算后
+            // 才预留扩展空间，仍受原绝对期限与 8 MiB 总上限约束。
+            if acquisitionBoundary < request.maximumBytes {
+                acquisitionBoundary = min(request.maximumBytes, acquisitionBoundary * 2)
+            } else {
+                if !reservedContinuation { body.reserveCapacity(ceiling); reservedContinuation = true }
+                acquisitionBoundary = min(ceiling, acquisitionBoundary + 256 * 1_024)
+            }
         }
         return false
     }

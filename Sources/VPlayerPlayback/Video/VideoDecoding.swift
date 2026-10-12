@@ -221,6 +221,8 @@ public struct VideoDecoderEventIdentity: Sendable, Hashable {
 
 public enum VideoDecoderSubmissionDisposition: Sendable, Equatable {
     case produced
+    /// 已接纳输入，解码器仍在进行帧线程预读或重排；真实停滞由进展超时判断。
+    case acceptedPending
     case noFrame
     case cancelled
 }

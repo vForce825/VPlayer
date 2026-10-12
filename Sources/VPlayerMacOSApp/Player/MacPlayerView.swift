@@ -74,7 +74,7 @@ struct MacPlayerView: View {
         .onDisappear { overlay.cancel() }
         .onChange(of: session.model.isPaused) { _, _ in reveal() }
         .onChange(of: session.model.hasStoppedCurrentRequest) { _, stopped in
-            if stopped { Task { await state.stopPlayback() } }
+            if stopped { Task { await state.stopPlayback(requestID: session.model.request.id) } }
         }
         .sheet(isPresented: $showsProgrammes) {
             MacProgrammeGuideView(presentation: session.presentation)
@@ -115,7 +115,7 @@ struct MacPlayerView: View {
                     .accessibilityValue(programme.progress.map { "\(Int($0 * 100))%" } ?? "暂无节目进度")
                     .help("当前节目播出进度").accessibilityIdentifier("player.programme-progress")
                 HStack(spacing: 16) {
-                    Button {
+                    if session.model.canControlPlayback { Button {
                         session.model.togglePause(); reveal()
                     } label: {
                         Image(systemName: session.model.isPaused ? "play.fill" : "pause.fill")
@@ -123,7 +123,8 @@ struct MacPlayerView: View {
                     }.help(session.model.isPaused ? "继续播放（空格）" : "暂停（空格）")
                         .accessibilityLabel(session.model.isPaused ? "播放" : "暂停")
                         .accessibilityIdentifier("player.play-pause")
-                    Button { Task { await state.stopPlayback() } } label: {
+                    }
+                    Button { Task { await state.stopPlayback(requestID: session.model.request.id) } } label: {
                         Label("停止", systemImage: "stop.fill")
                             .labelStyle(.titleAndIcon)
                             .padding(.horizontal, 6).frame(height: 34)
@@ -174,23 +175,23 @@ struct MacPlayerView: View {
         }
     }
     @ViewBuilder private var stateOverlay: some View {
-        switch session.model.state {
-        case .preparing, .buffering, .recovering:
-            VStack(spacing: 12) {
-                ProgressView().controlSize(.large)
-                Text(bufferingLabel).font(.callout)
-            }.padding(24).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        case .failed(let failure):
-            VStack(spacing: 16) {
-                Image(systemName: "exclamationmark.triangle").font(.largeTitle)
-                Text(failure.userMessage).multilineTextAlignment(.center)
-                Button("重新连接") {
-                    if let channel = state.model?.channels.first(where: { $0.id == session.model.request.channelID }) {
-                        state.model?.select(channel: channel)
-                    }
-                }
-            }.padding(28).frame(maxWidth: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-        default: EmptyView()
+        if session.model.isPaused { Text("已暂停").padding(24) }
+        else {
+            switch session.model.state {
+            case .preparing, .buffering, .recovering:
+                VStack(spacing: 12) {
+                    ProgressView().controlSize(.large)
+                    Text(bufferingLabel).font(.callout)
+                }.padding(24).background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            case .failed(let failure):
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle").font(.largeTitle)
+                    Text(failure.userMessage).multilineTextAlignment(.center)
+                    if PlayerFailureActionPolicy.showsRetry(for: failure) { Button("重试") { session.model.retry() } }
+                    Button("返回频道列表") { Task { await state.stopPlayback(requestID: session.model.request.id) } }
+                }.padding(28).frame(maxWidth: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+            default: EmptyView()
+            }
         }
     }
 }

@@ -277,6 +277,23 @@ actor LiveLibraryRuntimeLoader {
     private let factory: Factory
     private var loadedRuntime: LiveLibraryRuntime?
     private var runningLoad: RunningLoad?
+    private var preparationTask: Task<Void, Error>?
+    private var preparationID: UUID?
+
+    func prepare() async throws {
+        if let preparationTask { return try await preparationTask.value }
+        let runtime = try await load()
+        if let preparationTask { return try await preparationTask.value }
+        let id = UUID()
+        let task = Task { try await runtime.prepare() }
+        preparationID = id
+        preparationTask = task
+        do { try await task.value }
+        catch {
+            if preparationID == id { preparationTask = nil; preparationID = nil }
+            throw error
+        }
+    }
 
     init(factory: @escaping Factory) {
         self.factory = factory
@@ -350,6 +367,7 @@ private func makeProductionLibraryRuntime(
             if try await repository.synchronizeProfileMirror() > 0 {
                 logger.notice("Restored source profiles after a purged persistent store.")
             }
+            try await repository.recoverInterruptedRefreshes()
         },
         maintenance: {
             try await repository.purgeUnreferencedSnapshots()
@@ -408,6 +426,7 @@ final class LiveAppBootstrap {
 
         let loadProfiles: ForegroundRefreshDriver.LoadProfiles = {
             let runtime = try await runtimeLoader.load()
+            try await runtimeLoader.prepare()
             return try await runtime.repository.profiles()
         }
         let refresh: ForegroundRefreshDriver.Refresh = {
@@ -416,6 +435,7 @@ final class LiveAppBootstrap {
             trigger in
             do {
                 let runtime = try await runtimeLoader.load()
+                try await runtimeLoader.prepare()
                 return await runtime.refresh(profileID, resources, trigger)
             } catch {
                 return libraryFailureOutcomes(resources: resources, diagnostic: .init(error))
@@ -452,13 +472,14 @@ final class LiveAppBootstrap {
             return loadedDependencies
         }
 
+        let runtimeLoader = runtimeLoader
         let dependencies = AppDependencies(
             libraryStartup: LibraryStartup(maintenance: runtime.maintenance),
             foregroundRefreshDriver: foregroundRefreshDriver,
             backgroundRefreshRegistrar: backgroundRefreshRegistrar,
             repository: runtime.repository,
             refresh: runtime.refresh,
-            prepare: runtime.prepare,
+            prepare: { try await runtimeLoader.prepare() },
             libraryChanges: libraryChanges
         )
         loadedDependencies = dependencies

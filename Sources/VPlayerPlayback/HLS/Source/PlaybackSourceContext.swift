@@ -9,6 +9,7 @@ public enum HLSSourceError: Error, Sendable, Equatable {
     case network, unauthorized, deadline, byteLimit, graphLimit, redirectLimit
     case httpStatus(Int)
     case malformedManifest, unsupportedMedia, incompleteEvidence, capacity
+    case sourceGenerationChanged
 }
 
 public struct PlaybackSourceOrigin: Sendable, Hashable {

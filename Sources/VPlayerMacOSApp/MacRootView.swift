@@ -6,7 +6,10 @@ import SwiftUI
 import VPlayerCore
 
 struct MacRootView: View {
+    private enum SidebarFocus: Hashable { case search, channels, group, profile }
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @FocusState private var sidebarFocus: SidebarFocus?
     @Bindable var state: MacApplicationState
     @State private var searchText = ""
     @State private var selectedGroup: String?
@@ -101,6 +104,9 @@ struct MacRootView: View {
         }
         .animation(.easeInOut(duration: 0.2), value: state.session?.overlay.sidebarVisible)
         .onChange(of: model.presentedPlaybackRequest) { _, request in state.replaceSession(for: request) }
+        .onChange(of: sidebarFocus) { _, _ in updateSidebarFocus() }
+        .onChange(of: voiceOverEnabled) { _, _ in updateSidebarFocus() }
+        .onChange(of: state.session?.model.request.id) { _, _ in updateSidebarFocus() }
         .onChange(of: model.programmesByChannelID) { _, _ in state.refreshPresentation() }
         .onChange(of: model.channels) { _, _ in
             state.refreshPresentation()
@@ -141,9 +147,11 @@ struct MacRootView: View {
                     Task { _ = await model.activate(profileID: id) }
                 })) {
                     ForEach(model.profiles) { profile in Text(profile.name).tag(Optional(profile.id)) }
-                }.padding(.horizontal, 16).padding(.bottom, 12).disabled(model.isLoading)
+                }.focused($sidebarFocus, equals: .profile)
+                    .padding(.horizontal, 16).padding(.bottom, 12).disabled(model.isLoading)
             }
             TextField("搜索频道或分组", text: $searchText)
+                .focused($sidebarFocus, equals: .search)
                 .textFieldStyle(.roundedBorder).padding(.horizontal, 16).padding(.bottom, 12)
                 .accessibilityIdentifier("channels.search")
             if grouped, presentation.sections.count > 1 {
@@ -152,7 +160,8 @@ struct MacRootView: View {
                     ForEach(presentation.sections) { section in
                         Text(section.title ?? "其他").tag(Optional(section.title ?? "其他"))
                     }
-                }.padding(.horizontal, 16).padding(.bottom, 12)
+                }.focused($sidebarFocus, equals: .group)
+                    .padding(.horizontal, 16).padding(.bottom, 12)
             }
             Divider()
             if model.isLoading { ProgressView().controlSize(.small).padding(12) }
@@ -177,6 +186,7 @@ struct MacRootView: View {
                             .accessibilityIdentifier("channel.\(channel.id)")
                     }
                 }.listStyle(.inset)
+                .focused($sidebarFocus, equals: .channels)
                 .onKeyPress(.return) {
                     guard let selectedChannelID, let channel = channels.first(where: { $0.id == selectedChannelID }) else { return .ignored }
                     model.select(channel: channel)
@@ -191,6 +201,16 @@ struct MacRootView: View {
                 if model.staleEPGCoverageEnd != nil { Label("节目单待更新", systemImage: "clock.badge.exclamationmark") }
             }.font(.caption).foregroundStyle(.secondary).padding(12)
         }.background(.background)
+    }
+
+    private func updateSidebarFocus() {
+        guard let session = state.session else { return }
+        session.overlay.sidebarHasFocus = sidebarFocus != nil || voiceOverEnabled
+        if sidebarFocus != nil {
+            session.overlay.interact(paused: session.model.isPaused, revealSidebar: true)
+        } else {
+            session.overlay.scheduleAutoHide(paused: session.model.isPaused)
+        }
     }
 }
 

@@ -11,6 +11,21 @@ import VPlayerPlayback
 
 @MainActor
 final class NowPlayingIntegrationTests: XCTestCase {
+    func testSystemPauseRemainsAvailableWhenEstablishedPlaybackBuffers() async {
+        let owner = TestNowPlayingTarget()
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "buffer",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "测试频道")
+        let model = PlaybackNowPlayingModel(owner: owner,
+            presentation: .init(request: request, logoURL: nil, programmes: []))
+        model.update(.buffering(request))
+        XCTAssertEqual(model.commands.count, 1)
+        model.update(.playing(request))
+        model.update(.recovering(request))
+        XCTAssertEqual(model.commands.count, 3)
+        await model.setPaused(true)
+        XCTAssertEqual(owner.pauseCommands, [true])
+    }
+
     func testLiveMetadataAndOnlySupportedTransportCommands() throws {
         let coordinator = PlaybackNowPlayingCoordinator { _ in TestNowPlayingSession() }
         let target = TestNowPlayingTarget()

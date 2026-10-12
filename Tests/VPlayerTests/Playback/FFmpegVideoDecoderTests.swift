@@ -262,6 +262,62 @@ private func deliverTestFrame(
 }
 
 final class FFmpegVideoDecoderTests: XCTestCase {
+    func testDiscardedFramesReleaseTokensBeyondPendingCapacity() throws {
+        let captured = CapturedReceiver()
+        let handle = FakeFFmpegVideoDecoderHandle()
+        let executor = PlaybackSerialExecutor(label: "org.vplayer.tests.ffmpeg.discard")
+        let queue = DispatchQueue(label: "org.vplayer.tests.ffmpeg.discard.submit")
+        let events = DetailedFFmpegEventRecorder()
+        let decoder = FFmpegVideoDecoder(executor: executor, eventSink: { events.record($0) },
+            api: FakeFFmpegVideoDecoderAPI(captured: captured, handle: handle), submissionQueue: queue)
+        try configure(decoder, format: makeFormat(fieldCount: 2), queue: queue, executor: executor)
+        handle.handlePush { token in
+            captured.receiver?(BorrowedFFmpegVideoFrame(luma: nil, chromaB: nil, chromaR: nil,
+                lumaStride: 0, chromaBStride: 0, chromaRStride: 0, width: 0, height: 0,
+                token: token, isInterlaced: false, topFieldFirst: false, range: .unknown,
+                abiVersion: VPFF_VIDEO_DECODER_ABI_VERSION,
+                structSize: UInt32(MemoryLayout<VPFFVideoFrame>.size), discarded: true))
+            return .success
+        }
+        for index in 1...200 {
+            try decoder.decode(makeAccessUnit(id: UInt64(index)), flags: [])
+            queue.sync {}
+            drain(executor)
+        }
+        XCTAssertEqual(handle.tokens.count, 200)
+        let pendingCount = events.events.filter {
+            if case .completed(_, _, .acceptedPending) = $0 { return true }; return false
+        }.count
+        XCTAssertGreaterThan(pendingCount, 0)
+        XCTAssertLessThanOrEqual(pendingCount, 48, "预读宽限必须有界，后续无输出仍交给恢复预算")
+        XCTAssertTrue(events.events.contains {
+            if case .completed(_, _, .noFrame) = $0 { return true }; return false
+        })
+        XCTAssertEqual(handle.destroyCount, 0, "跳过坏帧不应积累到 64 个 token 后重建")
+        handle.handlePush { token in
+            deliverTestFrame(token: token, to: captured.receiver)
+            return .success
+        }
+        try decoder.decode(makeAccessUnit(id: 201), flags: [])
+        queue.sync {}
+        drain(executor)
+        XCTAssertTrue(events.events.contains { if case .frame(accessUnitID: 201, identity: _) = $0 { return true }; return false })
+    }
+
+    func testSoftwareDecodeCarriesPixelAspectRatio() throws {
+        let ratio = [kCVImageBufferPixelAspectRatioHorizontalSpacingKey: 16,
+                     kCVImageBufferPixelAspectRatioVerticalSpacingKey: 15] as CFDictionary
+        var format: CMVideoFormatDescription?
+        XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+            codecType: kCMVideoCodecType_H264, width: 720, height: 576,
+            extensions: [kCVImageBufferPixelAspectRatioKey: ratio] as CFDictionary,
+            formatDescriptionOut: &format), noErr)
+        let attachments = FFmpegVideoDecoder.colorAttachments(from: try XCTUnwrap(format))
+        let carried = try XCTUnwrap(attachments[kCVImageBufferPixelAspectRatioKey] as? [String: Int])
+        XCTAssertEqual(carried[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String], 16)
+        XCTAssertEqual(carried[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String], 15)
+    }
+
     private let generation = MediaGeneration(rawValue: 2)
 
     func testProgressiveDecoderFrameDoesNotInventBottomFieldOrder() throws {
@@ -522,7 +578,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
             // FFmpeg 已复制 compressed AU 后即可释放输入 admission；空包
             // drain 的重排序尾帧仍必须以该 AU 的原 identity 交付，二者
             // 不能绑成“等 frame 才完成”，否则连续无输出输入会堵住 HLS。
-            .completed(accessUnitID: 95, identity: identity, disposition: .noFrame),
+            .completed(accessUnitID: 95, identity: identity, disposition: .acceptedPending),
             .frame(accessUnitID: 95, identity: identity),
             .transition(token: drainToken, outcome: .completed),
         ])
@@ -737,7 +793,7 @@ final class FFmpegVideoDecoderTests: XCTestCase {
         )
         XCTAssertEqual(events.events, [
             .transition(token: configurationToken, outcome: .completed),
-            .completed(accessUnitID: 21, identity: identity, disposition: .noFrame),
+            .completed(accessUnitID: 21, identity: identity, disposition: .acceptedPending),
             .frame(accessUnitID: 21, identity: identity),
             .completed(accessUnitID: 22, identity: identity, disposition: .produced),
         ])

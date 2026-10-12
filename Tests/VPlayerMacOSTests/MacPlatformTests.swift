@@ -13,6 +13,19 @@ import XCTest
 
 @MainActor
 final class MacPlatformTests: XCTestCase {
+    func testKeyboardFocusKeepsSidebarOpenAfterPointerLeaves() async throws {
+        let overlay = MacPlayerOverlayState(delay: .milliseconds(20))
+        overlay.interact(paused: false, revealSidebar: true)
+        overlay.sidebarHasFocus = true
+        overlay.holdsSidebarOpen = false
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(overlay.sidebarVisible)
+        overlay.sidebarHasFocus = false
+        overlay.scheduleAutoHide(paused: false)
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertFalse(overlay.sidebarVisible)
+    }
+
     func testMacUsesDurableApplicationSupportStorage() throws {
         let root = try VPlayerModelContainer.persistentStoreRootURL()
         XCTAssertTrue(root.path.contains("Application Support"))

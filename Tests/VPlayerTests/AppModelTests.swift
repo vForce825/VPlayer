@@ -13,6 +13,25 @@ import XCTest
 
 @MainActor
 final class AppModelTests: XCTestCase {
+    func testEPGRefreshCannotSupersedeUnappliedPlaylistReload() async throws {
+        let date = Date(timeIntervalSince1970: 2_000_000_000)
+        let fixture = try await makeLoadedActiveBoundFixture(additionalProfiles: [], now: date)
+        let signal = LibraryChangeSignal()
+        let processed = expectation(description: "增量更新已完成")
+        let model = AppModel(repository: fixture.repository, refresh: { _, _, _ in [] },
+            libraryChanges: signal, libraryChangeProcessed: { _ in processed.fulfill() }, now: { date })
+        _ = await model.reload()
+        await fixture.repository.replaceChannels(profileID: fixture.activeProfile.id, channels: [fixture.manualChannel])
+        await fixture.repository.gateNextChannelRead()
+        let old = Task { await model.reload() }
+        await fixture.repository.waitUntilChannelReadIsBlocked()
+        signal.notify(profileID: fixture.activeProfile.id, resource: .epg)
+        await fulfillment(of: [processed], timeout: 3)
+        await fixture.repository.releaseChannelRead()
+        _ = await old.value
+        XCTAssertEqual(model.channels, [fixture.manualChannel], "EPG 重载必须携带尚未应用的频道更新")
+    }
+
     func testRecoveryCapacityWarningDoesNotBlockLibraryAndClearsAfterShrinking() async throws {
         let suite = "AppModelTests.recovery-capacity.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -1011,6 +1030,7 @@ final class AppModelTests: XCTestCase {
             failsRecordFailure: true
         )
         let changes = LibraryChangeSignal()
+        let presentationGate = AppModelAsyncGate()
         let firstCoordinator = RefreshCoordinator(
             repository: repository,
             downloader: AppModelRefreshDownloader(error: .cannotConnectToHost),
@@ -1042,6 +1062,7 @@ final class AppModelTests: XCTestCase {
                 )
             },
             libraryChanges: changes,
+            beforeLibraryPresentationApply: { await presentationGate.suspendIfArmed() },
             now: { clock.value }
         )
 
@@ -1080,7 +1101,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(snapshot.profiles.first?.m3uStatus.lastAttemptAt, secondStartedAt)
         XCTAssertEqual(snapshot.profiles.first?.m3uStatus.state, .refreshing)
 
-        await repository.gateNextProfileRead()
+        await presentationGate.arm()
         let automaticReload = expectation(description: "newer playlist truth is applied automatically")
         withObservationTracking {
             _ = model.profiles.first?.m3uStatus
@@ -1089,9 +1110,9 @@ final class AppModelTests: XCTestCase {
         }
         await secondDownloader.releaseCompletion()
         let secondOutcomes = await secondRefresh.value
-        await repository.waitUntilProfileReadIsBlocked()
+        await presentationGate.waitUntilSuspended()
         XCTAssertEqual(model.profiles.first?.m3uStatus.attemptID, firstAttemptID)
-        await repository.releaseProfileRead()
+        await presentationGate.release()
         await fulfillment(of: [automaticReload], timeout: 2)
 
         XCTAssertEqual(secondOutcomes.first?.attemptID, secondAttemptID)
@@ -1138,6 +1159,7 @@ final class AppModelTests: XCTestCase {
             name: "Inactive",
             now: firstStartedAt
         )
+        inactive.epgURL = URL(string: "https://example.test/inactive-epg.xml")!
         active.m3uStatus = ResourceRefreshStatus(
             lastAttemptAt: firstStartedAt.addingTimeInterval(-300),
             state: .failed,

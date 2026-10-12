@@ -205,6 +205,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
             registry?.requestBackendPublicationReplacement(self, watchdogActivation: activation) == true
         }
 
+        func requestSourceGenerationChange(activation: ActivationEpoch) -> Bool {
+            registry?.requestBackendPublicationReplacement(self, watchdogActivation: activation,
+                sourceGenerationChange: true) == true
+        }
+
         fileprivate func revalidatePreparation(ticket: PrepareTicket) -> Bool {
             guard let registry else { return false }
             // A native wait can return before the queued safety drain runs. Fold
@@ -851,6 +856,7 @@ final class ControlTaskRegistry: @unchecked Sendable {
         // activation, backend or work cycle. Fresh media progress cannot refill it.
         var watchdogRecoverySession: PlaybackSessionIdentity?
         var watchdogRecoveryCount: UInt8 = 0
+        var sourceChangesWithoutProgress: UInt8 = 0
         // 固定单槽只保存最新请求的原始身份/预算；前驱资源仍保留在resourceState直到原owner排空。
         var playbackRequestAdmission: CurrentPlaybackOperationDeadlineTicket?
         var stateSubscription: PlaybackStateSubscription?
@@ -8188,6 +8194,9 @@ final class ControlTaskRegistry: @unchecked Sendable {
             }
             let budgetResult = executor.performPlaybackBudget(.mediaProgress(receipt))
             accepted = !hasParent || budgetResult == .budget(.progressCompleted)
+            if accepted, requiringActivation != nil {
+                _ = try? transaction { _ in authority.sourceChangesWithoutProgress = 0 }
+            }
         }
         return accepted
     }
@@ -9445,7 +9454,8 @@ final class ControlTaskRegistry: @unchecked Sendable {
     /// output cleanup 状态机推进。
     private func requestBackendPublicationReplacement(
         _ capability: BackendPublicationReplacementAuthority,
-        watchdogActivation: ActivationEpoch? = nil
+        watchdogActivation: ActivationEpoch? = nil,
+        sourceGenerationChange: Bool = false
     ) -> Bool {
         var started = false
         var exhaustedOwner: OutputTransitionOwnerTicket?
@@ -9479,8 +9489,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     if authority.watchdogRecoverySession != context.sessionIdentity {
                         authority.watchdogRecoverySession = context.sessionIdentity
                         authority.watchdogRecoveryCount = 0
+                        authority.sourceChangesWithoutProgress = 0
                     }
-                    if authority.watchdogRecoveryCount >= 2 {
+                    let attempts = sourceGenerationChange
+                        ? authority.sourceChangesWithoutProgress : authority.watchdogRecoveryCount
+                    if attempts >= 2 {
                         exhaustedOwner = try beginOutputTransitionLocked(context: &context,
                             reason: .terminal, anchorInstant: monotonicClock.nowNanoseconds,
                             teardown: true, sourceActivation: watchdogActivation, output: &output)
@@ -9516,7 +9529,10 @@ final class ControlTaskRegistry: @unchecked Sendable {
                     originalContextNonce: context.contextNonce,
                     shouldReactivate: suspend.priorActivation != nil)
                 capability.consumed = true
-                if watchdogActivation != nil { authority.watchdogRecoveryCount += 1 }
+                if watchdogActivation != nil {
+                    if sourceGenerationChange { authority.sourceChangesWithoutProgress += 1 }
+                    else { authority.watchdogRecoveryCount += 1 }
+                }
                 return transition
             }
             guard let prepared else { return }
@@ -9526,8 +9542,11 @@ final class ControlTaskRegistry: @unchecked Sendable {
         }
         if let exhaustedOwner, let receiver = executor.sync({ terminalReceiver }) {
             return startOwnedTerminalCleanup(owner: exhaustedOwner, receiver: receiver,
-                terminalState: .failed(.init(code: "hls.watchdog.recovery-exhausted",
-                    userMessage: "播放持续停滞，已停止自动重试。请重试或切换频道。")))
+                terminalState: .failed(.init(code: sourceGenerationChange
+                    ? "hls.source.no-progress" : "hls.watchdog.recovery-exhausted",
+                    userMessage: sourceGenerationChange
+                    ? "播放源持续变化，暂时无法继续播放。请重试或切换频道。"
+                    : "播放持续停滞，已停止自动重试。请重试或切换频道。")))
         }
         return started
     }

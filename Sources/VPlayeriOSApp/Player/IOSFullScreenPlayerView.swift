@@ -71,7 +71,7 @@ struct IOSFullScreenPlayerView: View {
                         if let output = PlaybackMediaInformationPresentation(information: model.mediaInformation).airPlayOutputText {
                             Text(output).font(.caption)
                         }
-                        Button {
+                        if model.canControlPlayback { Button {
                             controls.userInteracted()
                             model.togglePause()
                         } label: {
@@ -80,6 +80,7 @@ struct IOSFullScreenPlayerView: View {
                         }
                         .accessibilityLabel(model.isPaused ? "播放" : "暂停")
                         .accessibilityIdentifier("player-play-pause")
+                        }
                     }
                     .padding().background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 16))
                     .contentShape(Rectangle())
@@ -142,23 +143,26 @@ struct IOSFullScreenPlayerView: View {
         }
     }
     @ViewBuilder private var status: some View {
-        switch model.state {
-        case .idle, .preparing: ProgressView("正在准备播放…").tint(.white)
-        case .buffering: ProgressView("正在缓冲…").tint(.white)
-        case .recovering: ProgressView("正在恢复播放…").tint(.white)
-        case let .failed(failure):
-            VStack(spacing: 16) {
-                Text(failure.userMessage)
-                if PlayerFailureActionPolicy.showsRetry(for: failure) {
-                    Button("重试") {
-                        controls.userInteracted()
-                        model.retry()
-                    }.accessibilityIdentifier("player-retry")
+        if model.isPaused { Text("已暂停").foregroundStyle(.white) }
+        else {
+            switch model.state {
+            case .idle, .preparing: ProgressView("正在准备播放…").tint(.white)
+            case .buffering: ProgressView("正在缓冲…").tint(.white)
+            case .recovering: ProgressView("正在恢复播放…").tint(.white)
+            case let .failed(failure):
+                VStack(spacing: 16) {
+                    Text(failure.userMessage)
+                    if PlayerFailureActionPolicy.showsRetry(for: failure) {
+                        Button("重试") {
+                            controls.userInteracted()
+                            model.retry()
+                        }.accessibilityIdentifier("player-retry")
+                    }
                 }
+                .padding(24).foregroundStyle(.white)
+                .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16))
+            case .playing, .paused, .stopped: EmptyView()
             }
-            .padding(24).foregroundStyle(.white)
-            .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16))
-        case .playing, .paused, .stopped: EmptyView()
         }
     }
     private func close() {

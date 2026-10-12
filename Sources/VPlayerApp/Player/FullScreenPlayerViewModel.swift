@@ -87,6 +87,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var awaitingAuthoritativePause: Bool?
     private var acceptsAuthoritativePauseState = false
     private var receivedRequestState = false
+    private var hasEstablishedPlayback = false
     private var started = false
     private var stopped = false
 
@@ -177,8 +178,17 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     var isPaused: Bool {
+        if !pendingPauseCommands.isEmpty || awaitingAuthoritativePause != nil { return desiredPaused }
         if case .paused = state { return true }
         return false
+    }
+
+    var canControlPlayback: Bool {
+        switch state {
+        case .playing, .paused: return true
+        case .preparing, .buffering, .recovering: return hasEstablishedPlayback
+        case .idle, .stopped, .failed: return false
+        }
     }
 
     func start() {
@@ -210,31 +220,13 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     func togglePause() {
-        switch state {
-        case .playing, .paused:
-            break
-        #if os(macOS)
-        case .buffering, .recovering: break
-        #else
-        case .buffering, .recovering: return
-        #endif
-        case .idle, .preparing, .stopped, .failed:
-            return
-        }
+        guard canControlPlayback else { return }
         enqueuePause(!desiredPaused)
     }
 
     func setPausedFromNowPlaying(_ paused: Bool) async {
         guard started, !stopped else { return }
-        switch state {
-        case .playing, .paused: break
-        #if os(macOS)
-        case .buffering, .recovering: break
-        #else
-        case .buffering, .recovering: return
-        #endif
-        case .idle, .preparing, .stopped, .failed: return
-        }
+        guard canControlPlayback else { return }
         // A drained worker can still be waiting for the state stream to
         // acknowledge its last command. Preserve that intent over stale state.
         if !acceptsAuthoritativePauseState,
@@ -785,8 +777,10 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         case .preparing, .buffering, .recovering:
             acceptsAuthoritativePauseState = true
         case .playing:
+            hasEstablishedPlayback = true
             applyAuthoritativePauseState(false)
         case .paused:
+            hasEstablishedPlayback = true
             applyAuthoritativePauseState(true)
         case .stopped, .failed:
             resetPauseIntent()
@@ -831,6 +825,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         pauseTask?.cancel()
         pauseTask = nil
         desiredPaused = false
+        hasEstablishedPlayback = false
         pendingPauseCommands.removeAll()
         awaitingAuthoritativePause = nil
         acceptsAuthoritativePauseState = false

@@ -10,7 +10,7 @@ import CryptoKit
 import Foundation
 
 enum NativeHLSSelectionInvalidationReason: String, Sendable {
-    case initial, unspecified, presentationSize, tracks, status, mediaSelection, accessLog, errorLog, failedToEnd
+    case initial, unspecified, presentationSize, tracks, status, duration, mediaSelection, accessLog, errorLog, failedToEnd
     case hdrEligibility, privateEOS, privateEOSRefresh
 }
 
@@ -396,17 +396,10 @@ final class SystemNativeHLSAssetInspector: NativeHLSAssetInspecting {
         }
         guard !expectsAudio || audio != nil, !expectsVideo || video != nil else { throw HLSSourceError.incompleteEvidence }
         try validate()
-        var duration: ExactMediaTime?
-        if case let .hls(graph) = source.source.topology {
-            let media = graph.orderedDocuments.filter { $0.kind == .media }
-            let end = Data("#EXT-X-ENDLIST".utf8)
-            let endCR = Data("#EXT-X-ENDLIST\r".utf8)
-            if !media.isEmpty, media.allSatisfy({ $0.rawData.split(separator: 10).contains { Data($0) == end || Data($0) == endCR } }) {
-                let time = try await item.asset.load(.duration)
-                try validate()
-                if let value = try? ExactMediaTime(time), value.value > 0 { duration = value }
-            }
-        }
+        // 直播可在播放期间收到 ENDLIST。首次清单不是永久事实；以当前
+        // AVPlayerItem 的自然终点为准；未知时长只允许真实 EOS 签发的
+        // 已发布窗口末端，最终仍需相同窗口、帧量子与稳定时钟验证。
+        let duration = driver.nativeNaturalEndpoint(item: identity)
         let quantum: NativeHLSFinalPresentationQuantum?
         if let duration, let videoQuantum, let video {
             quantum = .init(period: videoQuantum.period, duration: duration, item: identity,

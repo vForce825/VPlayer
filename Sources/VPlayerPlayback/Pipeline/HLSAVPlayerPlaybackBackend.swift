@@ -704,7 +704,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                     try NativeHLSItemCoordinator(driver: lease.driver, inspector: dependencies.makeInspector(lease.driver),
                         owned: original, invocation: invocation,
                         metadataChanged: { activation in await invocation.deliverNativeMediaInformation(activation: activation, invalidated: activation == nil) },
-                        failure: { [weak self] error, _ in self?.sourceTransportFailed(error, source: original, invocation: invocation) })
+                        failure: { [weak self] error, _ in self?.sourceTransportFailed(error, source: original, invocation: invocation) },
+                        ended: { [weak self] in
+                            self?.sourceEventSink(.backendStopped(prepareScope: .init(ticket: invocation.ticket)))
+                        })
                 }
                 let native = NativeHLSPlaybackBackend(owned: owned, coordinator: coordinator,
                     proxy: lock.withLock { sourceProxy }, lifecycle: invocation.outputLifecycleEpoch)
@@ -787,7 +790,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
         return executor.sync {
             guard let activation = lock.withLock({ ownedSource === owned ? sourceActivation : nil }),
                   backendPublicationReplacementAuthoritySlot.currentAuthority() === invocation.replacementAuthority else { return false }
-            return invocation.replacementAuthority.requestWatchdogRecovery(activation: activation)
+            return invocation.replacementAuthority.requestSourceGenerationChange(activation: activation)
         }
     }
     private func requestCompatibleAudio(_ owned: HLSOwnedSourcePlan, invocation: ControlTaskRegistry.BackendPrepareInvocation) -> Bool {
@@ -832,7 +835,12 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             "activation=\(admitted.0?.activationNonce ?? 0) reason=\(error) " +
             "native=\(lock.withLock { nativeAdapter != nil }) source-current=\(source.sourceIsCurrent)")
         #endif
-        if let activation = admitted.0, invocation.replacementAuthority.requestWatchdogRecovery(activation: activation) { return }
+        if let activation = admitted.0 {
+            let accepted = error == .sourceGenerationChanged
+                ? invocation.replacementAuthority.requestSourceGenerationChange(activation: activation)
+                : invocation.replacementAuthority.requestWatchdogRecovery(activation: activation)
+            if accepted { return }
+        }
         lock.withLock {
             // Creation and publication share the ownership lock. Retirement can
             // never miss a task that has already begun a receiver actor hop.

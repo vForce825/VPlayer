@@ -11,6 +11,14 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class VideoPipelineCoordinatorTests: XCTestCase {
+    func testAcceptedFrameThreadWarmupDoesNotConsumeRecoveryBudget() {
+        var budget = VideoRecoveryBudget(maximumRecoveriesPerMediaEpoch: 2)
+        for _ in 0..<32 { XCTAssertEqual(budget.observe(.acceptedPending), .none) }
+        XCTAssertEqual(budget.recoveriesConsumed, 0)
+        XCTAssertEqual(budget.observe(.produced), .none)
+        XCTAssertEqual(budget.requestRecovery(for: .stall), .recover(.stall))
+    }
+
     func testTrackFieldOrderRoutesMetalBeforeTheFirstDecodedFrame() throws {
         let harness = makeHarness()
 

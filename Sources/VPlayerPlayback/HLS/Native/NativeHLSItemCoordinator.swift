@@ -18,6 +18,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     private let prepareInvocation: ControlTaskRegistry.BackendPrepareInvocation
     private let metadataChanged: @Sendable (ActivationEpoch?) async -> Void
     private let failure: @MainActor @Sendable (HLSSourceError, ActivationEpoch?) -> Void
+    private let ended: @MainActor @Sendable () -> Void
     private let retention: HLSApplicationLifetimeCharge
     private var selected: NativeHLSSelectionSnapshot?
     private var pausedCursor: (time: ExactMediaTime, item: ObjectIdentifier)?
@@ -25,6 +26,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     private var authorization: ControlTaskRegistry.BackendPositiveRateInvocation?
     private var armed = false, prepared = false, retired = false, failureDelivered = false, stopInFlight = false
     private var installed = false, naturalEndVerified = false, progressReported = false
+    private var observedNativeEnd = false
     private var lastReceipt: AVPlayerQuiescenceReceipt?
     private var retirement: Task<Bool, Never>?
     private var stopTask: OutputPlayerStopTask?
@@ -34,11 +36,13 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     init(driver: any AVPlayerDriving, inspector: any NativeHLSAssetInspecting, owned: HLSOwnedSourcePlan,
          invocation: ControlTaskRegistry.BackendPrepareInvocation,
          metadataChanged: @escaping @Sendable (ActivationEpoch?) async -> Void,
-         failure: @escaping @MainActor @Sendable (HLSSourceError, ActivationEpoch?) -> Void) throws {
+         failure: @escaping @MainActor @Sendable (HLSSourceError, ActivationEpoch?) -> Void,
+         ended: @escaping @MainActor @Sendable () -> Void = {}) throws {
         retention = try HLSApplicationLifetimeCharge(bytes: 32 * 1_024)
         self.driver = driver; self.inspector = inspector; self.owned = owned; prepareInvocation = invocation
         item = .init(outputLifecycleEpoch: invocation.outputLifecycleEpoch, itemGeneration: invocation.outputLifecycleEpoch.outputNonce)
         self.metadataChanged = metadataChanged; self.failure = failure
+        self.ended = ended
     }
     var hasInstalledItem: Bool { installed || driver.currentItemIdentity == item }
     var isPrepared: Bool { prepared && !retired && !failureDelivered }
@@ -137,6 +141,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         }
         defer { if resuming { driver.finishPausedResumeCallbacks(item: item) } }
         lastReceipt = nil; stopTask = nil; pausedCursor = nil; naturalEndVerified = false
+        observedNativeEnd = false
         try driver.installTimeControlStatusRelay(item: item, activation: invocation.activation) { [weak self] status, item, activation in
             self?.observe(status, item: item, activation: activation)
         }
@@ -154,8 +159,8 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         diagnoseTransition(afterPreroll, from: snapshot, stage: "activate.prerolled")
         guard afterPreroll.permitsTransition(from: snapshot) else { throw HLSSourceError.unsupportedMedia }
         selected = afterPreroll
+        try driver.installNaturalEndTerminalHandler(item: item) { [weak self] capability, item in self?.naturalEnd(capability, item: item) }
         if let endpoint = afterPreroll.duration {
-            try driver.installNaturalEndTerminalHandler(item: item) { [weak self] capability, item in self?.naturalEnd(capability, item: item) }
             // Full native/proxy sources are not a generated trimmed interval.
             // Observe their SDK endpoint without rewriting the playback range.
             try driver.observeNaturalPlaybackEnd(expected: endpoint,
@@ -167,7 +172,18 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         armed = true
         diagnose("activate.played", authorityValidated: true)
         if let system = driver as? SystemAVPlayerDriver, let physical = system.nativeCurrentItem(item) {
-            monitor = try NativeHLSObservation(item: physical, driver: system) { [weak self] failed in await self?.refresh(failed: failed) }
+            monitor = try NativeHLSObservation(item: physical, driver: system) { [weak self] failed, observedEnd in
+                if let self, let observedEnd, !self.retired, self.authorization == invocation,
+                   invocation.revalidateCurrentAuthority() {
+                    self.observedNativeEnd = true
+                    system.registerObservedNativeEnd(observedEnd, item: self.item)
+                }
+                await self?.refresh(failed: failed)
+                if let observedEnd, let self, self.selected?.duration != nil,
+                   !self.retired, !self.failureDelivered, !self.naturalEndVerified, self.authorization == invocation {
+                    system.receiveObservedNativeEnd(item: self.item, receipt: observedEnd)
+                }
+            }
         }
         publishSelectedMediaInformation(afterPreroll)
         await metadataChanged(invocation.activation)
@@ -206,6 +222,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     #if DEBUG
     func observeSelectedFormatChangeForTesting() async { await refresh(failed: false) }
     var naturalEndVerifiedForTesting: Bool { naturalEndVerified }
+    private(set) var verifiedNaturalEndObservationForTesting: AVPlayerNaturalEndObservation?
     // One scalar slot, within this coordinator's existing 32 KiB reservation.
     // At most 384 ASCII bytes; no error object, source data or event history.
     // Keep it until this original coordinator dies, including after retirement.
@@ -213,7 +230,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
     #endif
     private func refresh(failed: Bool) async {
         diagnose("refresh.event", detail: "event-failed=\(failed)")
-        guard !retired, !failureDelivered, armed, let invocation = authorization, invocation.revalidateCurrentAuthority() else { return }
+        guard !retired, !failureDelivered, !naturalEndVerified, armed, let invocation = authorization, invocation.revalidateCurrentAuthority() else { return }
         if failed { fail(.network, stage: "observation.failed"); return }
         if owned.source.refreshReason() != nil { fail(.network, stage: "source.expired"); return }
         var step = "snapshot", attempts = 0
@@ -224,6 +241,9 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
                 if self.selected?.duration != nil {
                     step = "quantum-install"
                     try self.driver.updateNaturalPlaybackEndQuantum(snapshot.finalPresentationQuantum, item: self.item)
+                } else if let endpoint = snapshot.duration {
+                    try self.driver.observeNaturalPlaybackEnd(expected: endpoint,
+                        presentationQuantum: snapshot.finalPresentationQuantum, item: self.item)
                 }
             }, willInspect: { attempt in step = "snapshot"; attempts = attempt }) { try self.validateActive(invocation) }
             try validateActive(invocation)
@@ -305,14 +325,26 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         diagnose("observe.control", detail: "event-control=\(status.rawValue) event-item-match=\(self.item == item) event-activation-match=\(authorization?.activation == activation)")
         guard self.item == item, authorization?.activation == activation, authorization?.revalidateCurrentAuthority() == true,
               !retired, !stopInFlight, armed else { return }
-        if status == .paused, progress.hasObservedProgress, !naturalEndVerified, !driver.hasPendingNaturalEndVerification(item: item, activation: activation) {
+        if status == .paused, progress.hasObservedProgress, !observedNativeEnd, !naturalEndVerified,
+           !driver.hasPendingNaturalEndVerification(item: item, activation: activation) {
+            if selected?.duration == nil {
+                // 直播 EOS 与暂停通知可交错。没有 EOS 时，既有进展看门狗
+                // 仍会有界判停滞；暂停通知自身不证明网络错误或自然结束。
+                return
+            }
             fail(.network, stage: "playback.paused", detail: "event-control=\(status.rawValue)")
         }
     }
     private func naturalEnd(_ capability: AVPlayerNaturalEndTerminalCapability, item: AVPlayerItemInstanceIdentity) {
-        guard self.item == item, authorization?.revalidateCurrentAuthority() == true,
+        guard self.item == item, !retired, !failureDelivered, !naturalEndVerified,
+              authorization?.revalidateCurrentAuthority() == true,
               let result = driver.consumeNaturalEndTerminal(capability, item: item) else { return }
-        if case .success = result { naturalEndVerified = true; cancelProgress() }
+        if case .success = result {
+            #if DEBUG
+            if case let .success(observation) = result { verifiedNaturalEndObservationForTesting = observation }
+            #endif
+            naturalEndVerified = true; cancelProgress(); ended()
+        }
         else if case let .failure(reason) = result { fail(.network, stage: "naturalEnd.rejected", detail: naturalEndFailureDetail(reason)) }
     }
     private func naturalEndFailureDetail(_ reason: AVPlayerNaturalEndTerminalFailure) -> String {

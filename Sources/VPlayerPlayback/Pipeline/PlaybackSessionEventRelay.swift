@@ -37,7 +37,7 @@ enum PlaybackPipelineEventStorage {
         case videoSampleBuffer, videoRendererFailed, audioFormatDescription, audioFallbackDecode
         case audioRendererFailed, renderTextureMapping, metalCommand, cancelled
         case controlEventCapacityExceeded, outputActivationRejected, backendPublicationReplacementRejected
-        case presentedRetry, presentedChooseChannel, presentedDoNotRetry, unexpected, backendFailed
+        case presentedRetry, presentedChooseChannel, presentedDoNotRetry, unexpected, backendFailed, backendStopped
     }
 
     /// Executed before allocation/binding in Release too. A changed SDK payload
@@ -48,6 +48,7 @@ enum PlaybackPipelineEventStorage {
         validate(PlaybackMediaInformation?.self)
         validate(UnexpectedPayload.self)
         validate(BackendPayload.self)
+        validate(PlaybackBackendPrepareFailureScope.self)
         validate(FFmpegPayload.self)
         validate(VideoDecoderFailure.self)
         validate(String.self)
@@ -91,6 +92,7 @@ enum PlaybackPipelineEventStorage {
         precondition(kind(tag) == .empty, "pipeline payload initialized twice")
         switch event {
         case .stopped: tag.pointee = Tag.stopped.rawValue
+        case .backendStopped(let scope): put(scope, kind: .backendStopped, at: slot, tag: tag)
         case .ready(let cycle): put(cycle, kind: .ready, at: slot, tag: tag)
         case .phase(let phase, let cycle):
             switch phase {
@@ -150,6 +152,7 @@ enum PlaybackPipelineEventStorage {
         switch storedKind {
         case .empty: preconditionFailure("read from empty pipeline event slot")
         case .stopped: tag.pointee = emptyTag; return .stopped
+        case .backendStopped: return .backendStopped(prepareScope: take(PlaybackBackendPrepareFailureScope.self, at: slot, tag: tag))
         case .ready: return .ready(readinessCycle: take(UInt64.self, at: slot, tag: tag))
         case .buffering: return .phase(.buffering, readinessCycle: take(UInt64.self, at: slot, tag: tag))
         case .recovering: return .phase(.recovering, readinessCycle: take(UInt64.self, at: slot, tag: tag))
@@ -213,6 +216,7 @@ enum PlaybackPipelineEventStorage {
         case .mediaWithoutGeneration: slot.assumingMemoryBound(to: PlaybackMediaInformation?.self).deinitialize(count: 1)
         case .mediaWithGeneration: slot.assumingMemoryBound(to: MediaPayload.self).deinitialize(count: 1)
         case .backendFailed: slot.assumingMemoryBound(to: BackendPayload.self).deinitialize(count: 1)
+        case .backendStopped: slot.assumingMemoryBound(to: PlaybackBackendPrepareFailureScope.self).deinitialize(count: 1)
         case .unsupportedProtocol, .videoSampleBuffer, .videoRendererFailed, .audioRendererFailed, .metalCommand:
             slot.assumingMemoryBound(to: String.self).deinitialize(count: 1)
         case .demuxOpen, .demuxRead, .videoFormatDescription, .videoDecode, .audioFormatDescription, .audioFallbackDecode:

@@ -27,10 +27,29 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
     *count += 1;
 }
 
+static void vpff_record_frame(void *context, const VPFFVideoFrame *frame) {
+    *(VPFFVideoFrame *)context = *frame;
+}
+
 @interface VPFFmpegVideoDecoderNativeValidationTests : XCTestCase
 @end
 
 @implementation VPFFmpegVideoDecoderNativeValidationTests
+
+- (void)testFullRangePlanar420KeepsRangeAndDiscardHasNoPixels {
+    uint8_t y[256] = {0}, cb[64] = {0}, cr[64] = {0};
+    VPFFVideoFrame frame = {0};
+    int32_t status = vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
+        12, y, 16, cb, 8, cr, 8, 16, 16, vpff_record_frame, &frame, 0, 0);
+    XCTAssertEqual(status, 0);
+    XCTAssertEqual(frame.range, VPFF_VIDEO_RANGE_FULL);
+    XCTAssertEqual(frame.discarded, 0);
+    status = vp_ffmpeg_video_decoder_debug_deliver_synthetic_frame(
+        0, y, 16, cb, 8, cr, 8, 16, 16, vpff_record_frame, &frame, 1, 0);
+    XCTAssertEqual(status, 0);
+    XCTAssertEqual(frame.discarded, 1);
+    XCTAssertTrue(frame.luma == NULL && frame.chroma_b == NULL && frame.chroma_r == NULL);
+}
 
 - (void)testSyntheticFrameValidationRejectsEachInvalidLayoutIndependently {
     uint8_t luma[16 * 16] = {0};
@@ -118,7 +137,7 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
     XCTAssertEqual(callback_count, 1u);
 }
 
-- (void)testCorruptDecodedFramesDoNotReachTheVideoCallback {
+- (void)testCorruptDecodedFramesDeliverOnlyDiscardNotifications {
     uint8_t luma[16 * 16] = {0};
     uint8_t chroma_b[8 * 8] = {0};
     uint8_t chroma_r[8 * 8] = {0};
@@ -139,7 +158,7 @@ static void vpff_record_validation_callback(void *context, const VPFFVideoFrame 
             cases[index].frame_flags, cases[index].decode_error_flags
         );
         XCTAssertEqual(status, 0, @"case %lu", (unsigned long)index);
-        XCTAssertEqual(callback_count, 0u, @"case %lu", (unsigned long)index);
+        XCTAssertEqual(callback_count, 1u, @"case %lu", (unsigned long)index);
     }
 }
 

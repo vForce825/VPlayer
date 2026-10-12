@@ -629,6 +629,95 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testLiveSourceAcquiresNaturalEndpointAfterLaterEndList() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.naturalEndObservations, 0)
+            let coordinator = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting)
+            fixture.inspector.duration = ExactMediaTime(value: 80, timescale: 1)
+            await coordinator.observeSelectedFormatChangeForTesting()
+            XCTAssertEqual(fixture.driver.naturalEndObservations, 1)
+            XCTAssertEqual(fixture.driver.explicitEndMutations, 0)
+            await coordinator.observeSelectedFormatChangeForTesting()
+            XCTAssertEqual(fixture.driver.naturalEndObservations, 1, "后续元数据读取只更新同一终点观察")
+            XCTAssertNil(fixture.failure)
+        }
+    }
+
+    func testNormalSourceBoundariesDoNotConsumeStallRecoveryBudget() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            for index in 0..<4 {
+                let coordinator = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting)
+                let invocation = try XCTUnwrap(fixture.driver.lastPositiveInvocation)
+                XCTAssertTrue(invocation.completeObservedMediaProgress())
+                XCTAssertTrue(coordinator.owned.requestNewGeneration())
+                try await fixture.until { fixture.isPlaying && fixture.driver.plays == index + 2 }
+            }
+            XCTAssertNil(fixture.failure)
+        }
+    }
+
+    func testForwardDiscontinuityRequestsFreshProbeButCannotRewriteOldSegments() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let owned = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+            guard case let .hls(graph) = owned.source.topology else { return XCTFail("缺少 HLS 图") }
+            let original = try XCTUnwrap(graph.documents.values.first { $0.kind == .media })
+            let suffix = "#EXT-X-DISCONTINUITY\n#EXTINF:2,\nnext.ts\n"
+            let forwardGraph = try HLSManifestGraph.parse(data: original.rawData + Data(suffix.utf8), responseURL: original.responseURL)
+            let forward = try XCTUnwrap(forwardGraph.document(for: original.responseURL))
+            XCTAssertThrowsError(try owned.validateManifest(forward, original: original)) {
+                XCTAssertEqual($0 as? HLSSourceError, .sourceGenerationChanged)
+            }
+            let rewritten = String(decoding: original.rawData, as: UTF8.self)
+                .replacingOccurrences(of: "#EXTINF:2,", with: "#EXT-X-DISCONTINUITY\n#EXTINF:2,") + suffix
+            let invalidGraph = try HLSManifestGraph.parse(data: Data(rewritten.utf8), responseURL: original.responseURL)
+            let invalid = try XCTUnwrap(invalidGraph.document(for: original.responseURL))
+            XCTAssertThrowsError(try owned.validateManifest(invalid, original: original)) {
+                XCTAssertEqual($0 as? HLSSourceError, .unsupportedMedia)
+            }
+        }
+    }
+
+    func testNaturalEndEventRejectsOldPreparationAndStopsCurrentPreparation() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            await fixture.observeMetadata()
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            let old = try fixture.prepareInvocation().ticket
+            let source = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+            XCTAssertTrue(source.requestNewGeneration())
+            try await fixture.until { fixture.isPlaying && fixture.driver.plays == 2 }
+            let current = try fixture.prepareInvocation().ticket
+            let emit = try XCTUnwrap(fixture.factory.eventSink)
+            let count = fixture.metadata.count
+            emit(.backendStopped(prepareScope: .init(ticket: old)))
+            // 同一 relay 的后继消息作为处理栅栏，避免靠固定睡眠断言迟到事件。
+            emit(.mediaInformation(.init(width: 987, height: 654, scanMode: .progressive,
+                sourceFrameRate: nil, outputFrameRate: nil, isSmoothMotionEnhanced: false)))
+            try await fixture.until { fixture.metadata.count > count && fixture.metadata.last??.width == 987 }
+            XCTAssertTrue(fixture.isPlaying)
+            emit(.backendStopped(prepareScope: .init(ticket: current)))
+            try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+            XCTAssertEqual(fixture.registry.playbackStateSnapshot(), .stopped)
+        }
+    }
+
+    func testSourceGenerationWithoutProgressRemainsBounded() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.play(); try await fixture.until { fixture.isPlaying }
+            for index in 0..<2 {
+                let source = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+                XCTAssertTrue(source.requestNewGeneration())
+                try await fixture.until { fixture.isPlaying && fixture.driver.plays == index + 2 }
+            }
+            let source = try XCTUnwrap(fixture.factory.backend?.nativeCoordinatorForTesting?.owned)
+            _ = source.requestNewGeneration()
+            try await fixture.until { fixture.failure != nil }
+            XCTAssertEqual(fixture.driver.plays, 3)
+        }
+    }
+
     func testNativeFullSourceUsesObservationWithoutExplicitTrimMutation() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.inspector.duration = ExactMediaTime(value: 80, timescale: 1)
@@ -1290,6 +1379,7 @@ private final class NativeFixtureGate: @unchecked Sendable {
 private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sendable {
     nonisolated static let rootURL = URL(string: "https://native-fixture.invalid/master")!
     var backend: HLSAVPlayerPlaybackBackend?
+    var eventSink: (@Sendable (PlaybackPipelineEvent) -> Void)?
     let resolverCapture = NativeFixtureResolverCapture()
     var resolver: URLSessionPlaybackSourceResolver? { resolverCapture.current }
     private let driver: NativeFixtureDriver
@@ -1310,6 +1400,7 @@ private final class NativeFixtureFactory: PlaybackBackendFactory, @unchecked Sen
         channelID: String, url: URL, sourceContext: PlaybackSourceContext?,
         eventSink: @escaping @Sendable (PlaybackPipelineEvent) -> Void) async throws -> any PlaybackBackend {
         let context = try XCTUnwrap(sourceContext)
+        self.eventSink = eventSink
         let media = URL(string: "https://native-fixture.invalid/media")!
         let alternate = URL(string: "https://native-fixture.invalid/alternate")!
         let root = generated || singleMedia ? "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment.ts\n" :

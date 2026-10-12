@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#define VPFF_VIDEO_DECODER_ABI_VERSION ((uint32_t)1)
+#define VPFF_VIDEO_DECODER_ABI_VERSION ((uint32_t)2)
 #define VPFF_VIDEO_DECODER_ERROR_UNSUPPORTED_OUTPUT INT32_C(1)
 
 typedef struct VPFFVideoDecoder VPFFVideoDecoder;
@@ -39,7 +39,9 @@ typedef struct {
 
     uint8_t is_interlaced;
     uint8_t top_field_first;
-    uint8_t reserved[2];
+    /* 丢弃通知只携带 token，像素指针为空；接收者必须释放对应输入。 */
+    uint8_t discarded;
+    uint8_t reserved[1];
     VPFFVideoRange range;
     /* Raw ITU-T H.273 code points, translated by the caller. */
     int32_t color_primaries, color_transfer, color_matrix;

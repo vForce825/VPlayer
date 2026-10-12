@@ -174,6 +174,7 @@ public actor RefreshCoordinator {
         }
 
         let flightID: UUID
+        let joinedExistingFlight = inFlight[key] != nil
         if let existing = inFlight[key] {
             flightID = existing.id
         } else {
@@ -211,7 +212,7 @@ public actor RefreshCoordinator {
         }
 
         let waiterID = UUID()
-        return await withTaskCancellationHandler {
+        let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 guard var flight = inFlight[key], flight.id == flightID else {
                     continuation.resume(returning: Self.cancellationOutcome(
@@ -251,6 +252,17 @@ public actor RefreshCoordinator {
                 )
             }
         }
+        // URL 改回原值并不恢复旧 attempt 的提交资格。加入者需核对持久化
+        // attempt；配置已换代时等旧下载退场，再登记一次独立的刷新。
+        if joinedExistingFlight, !Task.isCancelled,
+           let current = try? await repository.profiles().first(where: { $0.id == profileID }),
+           SourceURLIdentity(url: current.sourceURL(for: resource)) == source {
+            let status = resource == .playlist ? current.m3uStatus : current.epgStatus
+            if status.attemptID != flightID {
+                return await refreshOne(profileID: profileID, resource: resource, trigger: trigger)
+            }
+        }
+        return outcome
     }
 
     private func cancelWaiter(

@@ -110,6 +110,19 @@ final class HLSOwnedSourcePlan: HLSGeneratedSourceContext, @unchecked Sendable {
                 $0.replacement == replacement && $0.replacementEncryption == new.initializationEncryption }
         }
         let maximumDiscontinuity = original.segments.map(\.discontinuity).max() ?? 0
+        if document.segments.contains(where: { $0.discontinuity > maximumDiscontinuity }) {
+            // 新节目必须重新探测，但不能把合法分界记为播放停滞。重叠部分
+            // 仍须与已授予的清单一致，防止修改旧片段冒充向前换代。
+            for segment in document.segments {
+                guard segment.discontinuity >= originalFirst.discontinuity else { throw HLSSourceError.unsupportedMedia }
+                if let previous = original.segments.first(where: { $0.mediaSequence == segment.mediaSequence }) {
+                    guard previous.range == segment.range, sameInitialization(previous, segment),
+                          previous.discontinuity == segment.discontinuity,
+                          sameProtection(previous.encryption, segment.encryption) else { throw HLSSourceError.unsupportedMedia }
+                }
+            }
+            throw HLSSourceError.sourceGenerationChanged
+        }
         for segment in document.segments {
             guard segment.discontinuity >= originalFirst.discontinuity, segment.discontinuity <= maximumDiscontinuity,
                   original.segments.contains(where: { sameInitialization($0, segment) }),

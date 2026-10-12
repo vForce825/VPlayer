@@ -41,7 +41,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: true
         GENERATE_INFOPLIST_FILE: true
@@ -83,7 +83,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: true
@@ -109,7 +109,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
         PRODUCT_NAME: VPlayer
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Sources/VPlayerApp/Resources/Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
@@ -209,7 +209,7 @@ targets:
         PRODUCT_NAME: VPlayerCore
         PRODUCT_MODULE_NAME: VPlayerCore
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core.ios
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: true
         GENERATE_INFOPLIST_FILE: true
@@ -255,7 +255,7 @@ targets:
         PRODUCT_NAME: VPlayerPlayback
         PRODUCT_MODULE_NAME: VPlayerPlayback
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback.ios
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         DEFINES_MODULE: YES
         GENERATE_INFOPLIST_FILE: true
@@ -311,7 +311,7 @@ targets:
         PRODUCT_NAME: VPlayer
         PRODUCT_MODULE_NAME: VPlayer
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         TARGETED_DEVICE_FAMILY: "1"
         SUPPORTS_MACCATALYST: false
@@ -406,7 +406,7 @@ targets:
         PRODUCT_NAME: VPlayerCore
         PRODUCT_MODULE_NAME: VPlayerCore
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.core.macos
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: true
         DEFINES_MODULE: true
@@ -452,7 +452,7 @@ targets:
         PRODUCT_NAME: VPlayerPlayback
         PRODUCT_MODULE_NAME: VPlayerPlayback
         PRODUCT_BUNDLE_IDENTIFIER: com.vplayer.playback.macos
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: true
         DEFINES_MODULE: true
@@ -514,7 +514,7 @@ targets:
         PRODUCT_NAME: VPlayer
         PRODUCT_MODULE_NAME: VPlayer
         PRODUCT_BUNDLE_IDENTIFIER: com.vforce.vplayer
-        MARKETING_VERSION: "2.0"
+        MARKETING_VERSION: "2.1"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Sources/VPlayerMacOSApp/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Sources/VPlayerMacOSApp/Resources/VPlayer.entitlements
