@@ -7,6 +7,22 @@ import XCTest
 @testable import VPlayerPlayback
 
 final class HLSOwnedProxyTransportTests: XCTestCase {
+    func testRealProxyForwardsSourceBoundaryAndRejectsRewrittenHistory() async throws {
+        for rewriteHistory in [false, true] {
+            let failures = OwnedProxyFailureRecorder()
+            try await OwnedProxyFixture.withFixture(failure: failures.record) { fixture in
+                let master = try await fixture.document(fixture.proxy.itemURL)
+                let mediaURL = try XCTUnwrap(master.variants.first?.url)
+                _ = try await fixture.document(mediaURL)
+                await fixture.transport.insertBoundary(rewritingHistory: rewriteHistory)
+                let result = try await fixture.read(mediaURL)
+                XCTAssertEqual(result.1.statusCode, 502)
+                XCTAssertEqual(failures.values, [rewriteHistory ? .unsupportedMedia : .sourceGenerationChanged],
+                    "HTTP 错误必须同时将准确原因传入后端，不能等到普通卡顿恢复")
+            }
+        }
+    }
+
     func testGeneratedManagedEndpointUsesOnlyTheAdmittedSelectedMediaRole() async throws {
         try await OwnedProxyFixture.withFixture(generated: true) { fixture in
             let media = try await fixture.document(fixture.proxy.itemURL)
@@ -159,6 +175,13 @@ private final class OwnedProxyGate: @unchecked Sendable {
     }
 }
 
+private final class OwnedProxyFailureRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [HLSSourceError] = []
+    var values: [HLSSourceError] { lock.withLock { stored } }
+    func record(_ error: HLSSourceError) { lock.withLock { stored.append(error) } }
+}
+
 private final class OwnedProxyFixture: @unchecked Sendable {
     let transport: RotatingOwnedProxyTransport
     let resolver: URLSessionPlaybackSourceResolver
@@ -174,7 +197,8 @@ private final class OwnedProxyFixture: @unchecked Sendable {
         configuration.timeoutIntervalForRequest = 5; configuration.timeoutIntervalForResource = 10
         client = URLSession(configuration: configuration)
     }
-    static func withFixture(generated: Bool = false, _ body: (OwnedProxyFixture) async throws -> Void) async throws {
+    static func withFixture(generated: Bool = false, failure: @escaping @Sendable (HLSSourceError) -> Void = { _ in },
+                            _ body: (OwnedProxyFixture) async throws -> Void) async throws {
         let transport = RotatingOwnedProxyTransport()
         let resolver = URLSessionPlaybackSourceResolver(transport: transport)
         let context = try sourceContext(url: RotatingOwnedProxyTransport.root, attributes: ["Authorization": "fixture credential"])
@@ -194,7 +218,8 @@ private final class OwnedProxyFixture: @unchecked Sendable {
             sourceCharge: sourceCharge, factsCharge: factsCharge)
         let lifecycle = OutputLifecycleEpoch(backendIdentity: owner.backendIdentity, outputNonce: owner.outputLifecycleNonce)
         let proxy = try await HLSByteProxy.start(source: source, lifecycle: lifecycle, resolver: resolver,
-            sourceRetention: sourceCharge, manifestAuthority: owned.makeProxyManifestAuthority(), useGeneratedSelectedService: generated, manifestTransport: transport)
+            sourceRetention: sourceCharge, manifestAuthority: owned.makeProxyManifestAuthority(), useGeneratedSelectedService: generated,
+            manifestTransport: transport, failure: failure)
         let fixture = OwnedProxyFixture(transport: transport, resolver: resolver, proxy: proxy, owned: owned)
         var failure: (any Error)?
         do { try await body(fixture) } catch { failure = error }
@@ -237,9 +262,11 @@ private actor RotatingOwnedProxyTransport: HLSResourceTransport {
     private var childCalls = 0
     private var keyByte: UInt8 = 0x11
     private var masterGate: OwnedProxyGate?
+    private var boundary: Bool?
     private(set) var observedHeaderOrigins: [(String, String?)] = []
     func setKey(_ byte: UInt8) { keyByte = byte }
     func holdNextMaster(_ gate: OwnedProxyGate) { masterGate = gate }
+    func insertBoundary(rewritingHistory: Bool) { boundary = rewritingHistory }
     func fetch(_ request: HLSResourceRequest) async throws -> HLSResourceResponse {
         if observedHeaderOrigins.count < 16 {
             observedHeaderOrigins.append((request.url.host ?? "", request.headers.fields(for: request.url)["Authorization"]))
@@ -258,7 +285,9 @@ private actor RotatingOwnedProxyTransport: HLSResourceTransport {
         } else {
             childCalls += 1
             let key = request.url.path == "/subtitle" ? "" : "#EXT-X-KEY:METHOD=AES-128,URI=\"https://signed-fixture.invalid/key\",IV=0x00000000000000000000000000000001\n"
-            text = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n\(key)#EXTINF:2,\npart?signature=\(childCalls)\n"
+            let before = boundary == true ? "#EXT-X-DISCONTINUITY\n" : ""
+            let after = boundary == nil ? "" : "#EXT-X-DISCONTINUITY\n#EXTINF:2,\nnext.ts\n"
+            text = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n\(key)\(before)#EXTINF:2,\npart?signature=\(childCalls)\n\(after)"
         }
         guard text.utf8.count <= request.maximumBytes else { throw HLSSourceError.byteLimit }
         return .init(responseURL: request.url, data: Data(text.utf8))

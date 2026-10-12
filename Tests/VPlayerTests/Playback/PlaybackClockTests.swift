@@ -566,6 +566,20 @@ final class PlaybackClockTests: XCTestCase {
         XCTAssertEqual(gate.cycleID, UInt64.max)
     }
 
+    func testDisplayModeBarrierSurvivesOtherReadinessCloseReasons() {
+        for reason in PlaybackReadinessCloseReason.allCases where reason != .displayModeSwitch {
+            let harness = makeGate(requiredVideoCount: 1)
+            makeReady(harness.gate, audioPTS: time(1), videoPTS: time(1))
+            harness.gate.close(.displayModeSwitch)
+            harness.gate.close(reason)
+            makeReady(harness.gate, audioPTS: time(4), videoPTS: time(5))
+            XCTAssertFalse(harness.gate.isOpen, "等待显示切换时，\(reason) 不能清除屏障")
+            XCTAssertEqual(harness.clock.anchors.count, 1)
+            XCTAssertTrue(harness.gate.reopenAfterDisplayModeSwitch())
+            XCTAssertEqual(harness.clock.anchors.count, 2)
+        }
+    }
+
     func testRunningGateSurvivesSnapshotsWithoutTheirOriginalCommonInterval() {
         let harness = makeGate(requiredVideoCount: 2)
         harness.gate.updateAudio(

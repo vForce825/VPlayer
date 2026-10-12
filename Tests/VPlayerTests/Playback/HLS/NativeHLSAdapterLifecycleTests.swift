@@ -658,6 +658,68 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testSourceBoundaryWhilePausedWaitsForResumeWithoutFailure() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            fixture.play(managed: true); try await fixture.until { fixture.isPlaying }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            let owned = try XCTUnwrap(backend.ownedSourceForTesting)
+            let invocation = try fixture.prepareInvocation()
+            await fixture.controller.setPaused(true)
+            for _ in 0..<4 {
+                await backend.sourceTransportFailedForTesting(.sourceGenerationChanged, source: owned, invocation: invocation)
+            }
+            XCTAssertNil(fixture.failure, "暂停时的节目分界不能被升级为播放失败")
+            XCTAssertEqual(fixture.driver.rate, 0)
+            let installs = fixture.driver.installs
+            let plays = fixture.driver.plays
+            await fixture.controller.setPaused(false)
+            try await fixture.until { fixture.isPlaying && fixture.driver.installs > installs }
+            XCTAssertEqual(fixture.driver.installs, installs + 1, "重复分界只触发一次换代")
+            XCTAssertEqual(fixture.driver.plays, plays + 1, "恢复不得先播放旧 item")
+            await fixture.controller.setPaused(true)
+            await backend.sourceTransportFailedForTesting(.sourceGenerationChanged, source: owned, invocation: invocation)
+            await fixture.controller.setPaused(false)
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.installs, installs + 1, "旧生命周期的通知不得污染后继暂停")
+            XCTAssertNil(fixture.failure)
+        }
+    }
+
+    func testSourceBoundaryDuringPreparationReplacesBeforeFirstPlay() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            let gate = fixture.hold(.format)
+            fixture.play(managed: true)
+            try await fixture.until { gate.entered }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            let owned = try XCTUnwrap(backend.ownedSourceForTesting)
+            await backend.sourceTransportFailedForTesting(.sourceGenerationChanged, source: owned,
+                                                          invocation: try fixture.prepareInvocation())
+            XCTAssertEqual(fixture.driver.plays, 0)
+            gate.release()
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.installs, 2)
+            XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertNil(fixture.failure)
+        }
+    }
+
+    func testPendingPausedSourceBoundaryDoesNotRestartAfterStop() async throws {
+        try await NativeAdapterFixture.withFixture(singleMedia: true) { fixture in
+            fixture.play(managed: true); try await fixture.until { fixture.isPlaying }
+            let backend = try XCTUnwrap(fixture.factory.backend)
+            let owned = try XCTUnwrap(backend.ownedSourceForTesting)
+            let invocation = try fixture.prepareInvocation()
+            await fixture.controller.setPaused(true)
+            await backend.sourceTransportFailedForTesting(.sourceGenerationChanged, source: owned, invocation: invocation)
+            await fixture.controller.stop()
+            await backend.sourceTransportFailedForTesting(.sourceGenerationChanged, source: owned, invocation: invocation)
+            XCTAssertEqual(fixture.driver.installs, 1)
+            XCTAssertEqual(fixture.driver.plays, 1)
+            XCTAssertNil(fixture.driver.currentItemIdentity)
+            XCTAssertNil(fixture.registry.outputResourceContextSnapshot())
+        }
+    }
+
     func testForwardDiscontinuityRequestsFreshProbeButCannotRewriteOldSegments() async throws {
         try await NativeAdapterFixture.withFixture { fixture in
             fixture.play(); try await fixture.until { fixture.isPlaying }

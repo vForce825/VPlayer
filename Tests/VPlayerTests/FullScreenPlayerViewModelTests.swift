@@ -12,6 +12,97 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testResumeAcknowledgementBeforeOrAfterReturnDoesNotMaskLaterSystemPause() async throws {
+        for (acknowledgementFirst, preparationDelivered) in [(true, true), (false, true), (true, false), (false, false)] {
+            let gate = ViewModelAsyncGate()
+            let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: gate])
+            let request = makeRequest()
+            let model = FullScreenPlayerViewModel(request: request, engine: engine,
+                presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+            model.start()
+            try await eventually { await engine.subscriberCount == 1 }
+            if preparationDelivered {
+                await engine.emit(state: .preparing(request))
+                try await eventually { model.state == .preparing(request) }
+            }
+            await engine.emit(state: .paused(request))
+            try await eventually { model.isPaused }
+            let resume = Task { await model.setPausedFromNowPlaying(false) }
+            try await eventually { await gate.hasWaiter }
+            if !acknowledgementFirst { await gate.open(); await resume.value }
+            await engine.emit(state: .playing(request))
+            try await eventually { model.state == .playing(request) }
+            if acknowledgementFirst { await gate.open(); await resume.value }
+            await engine.emit(state: .recovering(request))
+            try await eventually { model.state == .recovering(request) }
+            await engine.emit(state: .paused(request))
+            try await eventually { model.state == .paused(request) }
+            XCTAssertTrue(model.isPaused, "已确认的旧播放意图不能掩盖系统暂停")
+            await model.setPausedFromNowPlaying(false)
+            let operations = await engine.operations.filter { $0 == "pause:false:start" }
+            XCTAssertEqual(operations.count, 2, "系统暂停后一次 Play 必须重新进入引擎")
+            await model.stop()
+        }
+    }
+
+    func testAcknowledgedResumeKeepsSystemPauseThatArrivesBeforeCommandReturn() async throws {
+        let gate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: gate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+        model.start()
+        try await eventually { await engine.subscriberCount == 1 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.isPaused }
+        let resume = Task { await model.setPausedFromNowPlaying(false) }
+        try await eventually { await gate.hasWaiter }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        XCTAssertTrue(model.isPaused, "系统暂停不必等待已经确认的命令完成收尾")
+        let nextResume = Task { await model.setPausedFromNowPlaying(false) }
+        try await eventually { !model.isPaused }
+        await gate.open(); await resume.value
+        await nextResume.value
+        let operations = await engine.operations.filter { $0 == "pause:false:start" }
+        XCTAssertEqual(operations.count, 2)
+        await model.stop()
+    }
+
+    func testBurstReturningToAcknowledgedTargetDoesNotWaitForDuplicateEngineEvent() async throws {
+        let gate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(pauseGates: [1: gate])
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+        model.start()
+        try await eventually { await engine.subscriberCount == 1 }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        model.togglePause()
+        try await eventually { await gate.hasWaiter }
+        model.togglePause(); model.togglePause()
+        await engine.emit(state: .paused(request))
+        try await eventually { model.state == .paused(request) }
+        let drain = Task { await model.setPausedFromNowPlaying(true) }
+        await gate.open(); await drain.value
+        var operations = await engine.operations.filter { $0 == "pause:true:start" }
+        XCTAssertEqual(operations.count, 1, "尾部相同目标沿用已完成的命令")
+        await engine.emit(state: .playing(request))
+        try await eventually { model.state == .playing(request) }
+        XCTAssertFalse(model.isPaused, "之后的新系统状态不能被重复的等待意图遮蔽")
+        await model.setPausedFromNowPlaying(true)
+        operations = await engine.operations.filter { $0 == "pause:true:start" }
+        XCTAssertEqual(operations.count, 2)
+        await model.stop()
+    }
+
     func testInitialConnectionHidesPauseButRebufferingPreservesLatestIntent() async throws {
         let engine = ControlledViewModelPlaybackEngine()
         let request = makeRequest()

@@ -208,7 +208,8 @@ final class HLSProxySession: @unchecked Sendable {
         } catch {
             if !Task.isCancelled {
                 let error = (error as? HLSSourceError) ?? .network
-                if error == .unauthorized || error == .staleResolution || error == .unsupportedMedia { failure(error) }
+                if error == .unauthorized || error == .staleResolution || error == .unsupportedMedia
+                    || error == .sourceGenerationChanged { failure(error) }
                 try? await connection.sendStatus(error == .retired ? 410 : 502)
             }
         }

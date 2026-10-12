@@ -1930,7 +1930,8 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
 
     /// Task4/8/9 Registry 签发并已开放 interval 的唯一生产正 rate 入口。
     /// Coordinator 不生成第二份 permit；返回后 Registry 还会在原 command 上做最终 CAS。
-    func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws
+    func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
+                  beforePlayback: @Sendable () throws -> Bool = { false }) async throws
         -> BackendActivationResult {
         guard let item = request?.item,
               let invocationSnapshot = invocation.currentSnapshot,
@@ -1981,6 +1982,8 @@ final class AVPlayerItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             guard invocation.revalidateCurrentAuthority() else {
                 throw AVPlayerItemCoordinatorFailure.staleIdentity
             }
+            // 先绑定本次停止责任，再处理暂停期间积累的源换代；此前不触碰正 rate。
+            if try beforePlayback() { return .rejected }
             // Registry already owns an opened interval. Adopt its cleanup
             // responsibility before a fallible publication check, without
             // consuming positive-rate authority or performing a native effect.

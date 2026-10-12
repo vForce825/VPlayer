@@ -72,6 +72,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     private var nativeAdapter: NativeHLSPlaybackBackend?
     private var sourceBuilder: (any HLSOutputItemBundleBuilding)?
     private var sourceActivation: ActivationEpoch?
+    private var pendingSourceGenerationChange = false
     private var sourceFailureDelivered: OutputLifecycleEpoch?
     private var sourceFailureMetadata: HLSRuntimeFailureMetadataOwner?
     private var sourceFailureTask: Task<Void, Never>?
@@ -94,6 +95,11 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     #if DEBUG
     var nativeCoordinatorForTesting: NativeHLSItemCoordinator? { lock.withLock { nativeAdapter?.coordinator } }
     var ownedSourceForTesting: HLSOwnedSourcePlan? { lock.withLock { ownedSource } }
+    func sourceTransportFailedForTesting(_ error: HLSSourceError, source: HLSOwnedSourcePlan,
+                                        invocation: ControlTaskRegistry.BackendPrepareInvocation) async {
+        sourceTransportFailed(error, source: source, invocation: invocation)
+        await lock.withLock { sourceFailureTask }?.value
+    }
     var generatedItemURLForTesting: URL? { lock.withLock { bundle?.replacement.request.itemURL } }
     @MainActor var nativeSystemDriverForTesting: SystemAVPlayerDriver? {
         let lease = lock.withLock { sessionLease }
@@ -499,16 +505,19 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
     func activateOutput(
         invocation: ControlTaskRegistry.BackendPositiveRateInvocation
     ) async throws {
-        if sourceDependencies != nil { lock.withLock { sourceActivation = invocation.activation } }
         if let native = lock.withLock({ nativeAdapter }) {
-            try await native.coordinator.activate(invocation)
+            try await native.coordinator.activate(invocation, beforePlayback: {
+                try self.admitSourceActivation(invocation)
+            })
             lock.withLock { if activationTime == nil { activationTime = .now } }
             return
         }
         guard let coordinator = lock.withLock({ self.coordinator }) else {
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
-        switch try await coordinator.activate(invocation) {
+        switch try await coordinator.activate(invocation, beforePlayback: {
+            try self.admitSourceActivation(invocation)
+        }) {
         case .armed, .alreadyArmed:
             lock.withLock {
                 if self.activationTime == nil {
@@ -519,6 +528,19 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
         case .rejected:
             throw AVPlayerItemCoordinatorFailure.staleIdentity
         }
+    }
+
+    /// coordinator 先接管本次 activation 的停止责任，再发布给代理回调。
+    /// 暂停期间的节目分界只占一个标记；恢复时先换代，不让旧 item 短暂出声。
+    private func admitSourceActivation(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) throws -> Bool {
+        let pending = lock.withLock { () -> HLSOwnedSourcePlan? in
+            guard sourceDependencies != nil else { return nil }
+            sourceActivation = invocation.activation
+            return pendingSourceGenerationChange ? ownedSource : nil
+        }
+        guard let pending else { return false }
+        guard pending.requestNewGeneration() else { throw CancellationError() }
+        return true
     }
 
     func suspendOutput(
@@ -662,6 +684,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                       bundle == nil, preparingBundle == nil, sourceFailureTask == nil else { throw AVPlayerItemCoordinatorFailure.operationInFlight }
                 sourceScope = invocation.outputLifecycleEpoch; sourceFailureDelivered = nil
                 sourceFailureMetadata = failureMetadata; sourceActivation = nil; pendingCompatibleOwner = nil
+                pendingSourceGenerationChange = false
             }
         }) else { throw CancellationError() }
         var diagnostics: HLSPreparationDiagnostics? = HLSPreparationDiagnostics(metadataOwner: failureMetadata)
@@ -826,6 +849,10 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             guard sourceScope == invocation.outputLifecycleEpoch, let current = ownedSource,
                   current.plan.owner == source.plan.owner, current.source.generation == source.source.generation,
                   sourceFailureDelivered != invocation.outputLifecycleEpoch, let metadata = sourceFailureMetadata else { return nil }
+            if error == .sourceGenerationChanged, sourceActivation == nil {
+                pendingSourceGenerationChange = true
+                return nil
+            }
             sourceFailureDelivered = invocation.outputLifecycleEpoch
             return (sourceActivation, metadata)
         }
@@ -840,6 +867,16 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
                 ? invocation.replacementAuthority.requestSourceGenerationChange(activation: activation)
                 : invocation.replacementAuthority.requestWatchdogRecovery(activation: activation)
             if accepted { return }
+        }
+        if error == .sourceGenerationChanged {
+            // 暂停/中断可能已撤销 rate authority，而 suspend 尚未进入 backend。
+            // 沿原暂停收尾，下一次 activation 再消费；不得把正常分界升级为错误。
+            lock.withLock {
+                guard sourceScope == invocation.outputLifecycleEpoch else { return }
+                pendingSourceGenerationChange = true
+                sourceFailureDelivered = nil
+            }
+            return
         }
         lock.withLock {
             // Creation and publication share the ownership lock. Retirement can
@@ -861,6 +898,7 @@ final class HLSAVPlayerPlaybackBackend: PlaybackBackend,
             let result = (sourceFailureTask, ownedSource, nativeAdapter, sourceProxy, sourceBuilder,
                           sourceFailureMetadata, pendingCompatibleOwner)
             sourceScope = nil; sourceActivation = nil
+            pendingSourceGenerationChange = false
             sourceFailureTask = nil; sourceFailureDelivered = nil; pendingCompatibleOwner = nil
             ownedSource = nil; nativeAdapter = nil; sourceProxy = nil; sourceBuilder = nil; sourceFailureMetadata = nil
             return result

@@ -257,6 +257,38 @@ final class PlaybackPipelineTests: XCTestCase {
         XCTAssertEqual(harness.clock.snapshot().rate, 0)
     }
 
+    func testDisplaySwitchAndUserPauseRemainIndependentUntilBothAreReleased() async throws {
+        for pauseFirst in [false, true] {
+            for endBeforeResume in [false, true] {
+                let harness = makeHarness()
+                let generation = try await configure(harness)
+                harness.pipeline.setPlaybackRate(1)
+                try await openInitialSharedTimeline(harness, generation: generation)
+                if pauseFirst { harness.pipeline.setPaused(true, readinessCycle: 1) }
+                harness.pipeline.displayModeSwitchStarted()
+                if !pauseFirst { harness.pipeline.setPaused(true, readinessCycle: 1) }
+                if endBeforeResume { harness.pipeline.displayModeSwitchEnded() }
+                _ = await harness.pipeline.debugSnapshot()
+                XCTAssertEqual(harness.clock.snapshot().rate, 0)
+                XCTAssertEqual(harness.clock.snapshot().anchors.count, 1)
+
+                harness.pipeline.setPaused(false, readinessCycle: 2)
+                harness.pipeline.setPlaybackRate(1)
+                _ = await harness.pipeline.debugSnapshot()
+                if !endBeforeResume {
+                    XCTAssertEqual(harness.clock.snapshot().rate, 0, "显示设备未就绪时不能推进内容")
+                    XCTAssertEqual(harness.clock.snapshot().anchors.count, 1)
+                    harness.pipeline.displayModeSwitchEnded()
+                }
+                try await eventually { harness.clock.snapshot().rate == 1 }
+                XCTAssertEqual(harness.clock.snapshot().anchors.count, 2)
+                harness.pipeline.displayModeSwitchEnded()
+                _ = await harness.pipeline.debugSnapshot()
+                XCTAssertEqual(harness.clock.snapshot().anchors.count, 2, "重复结束通知不能重复恢复时钟")
+            }
+        }
+    }
+
     func testOutputRouteLossCannotReusePreviousRateGrant() async throws {
         let harness = makeHarness()
         let generation = try await configure(harness)

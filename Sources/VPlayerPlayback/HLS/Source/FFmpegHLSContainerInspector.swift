@@ -7,6 +7,22 @@ import Foundation
 
 public struct FFmpegHLSContainerInspector: HLSContainerInspecting {
     public init() {}
+    /// 参数集齐全后，复用正式探测的扫描类型判定。同步借用当前前缀，
+    /// 所有原生工作在下一次追加前结束；不猜测 unknown，也不另起 HTTP 请求。
+    static func needsMoreTSVideoEvidence(data: Data, deadline: UInt64,
+                                        interrupted: @escaping @Sendable () -> Bool) throws -> Bool {
+        let workspace = try HLSApplicationLifetimeCharge(bytes: HLSPreflightMemoryLimits.probeTemporary)
+        defer { withExtendedLifetime(workspace) {} }
+        let state = SourceInspectionState(input: data, diagnostics: nil, interrupted: interrupted)
+        let now = HLSMonotonicClock.now
+        guard now < deadline, !interrupted() else { return false }
+        var container: Int32 = 0
+        var diagnostic = VPFFSourceDiagnostic()
+        let result = state.inspectInput(completeness: .prefix,
+            timeout: Int64(min(10_000_000, (deadline - now) / 1_000)), container: &container, diagnostic: &diagnostic)
+        // 明确拒绝的输入交给正式探测报错；只为有效但不完整的视频证据续读。
+        return result >= 0 && container == 1 && state.needsMoreVideoEvidence
+    }
     public func inspect(data: Data, url: URL, deadline: UInt64) async throws -> HLSMediaFacts {
         try await inspect(data: data, url: url, deadline: deadline, completeness: .complete)
     }
@@ -71,7 +87,13 @@ private final class SourceInspectionState: @unchecked Sendable {
     private var unsupported = false
     private var input: Data?
     private var diagnostics: HLSPreparationDiagnostics?
-    init(input: Data, diagnostics: HLSPreparationDiagnostics?) { self.input = input; self.diagnostics = diagnostics }
+    private let interrupted: (@Sendable () -> Bool)?
+    init(input: Data, diagnostics: HLSPreparationDiagnostics?, interrupted: (@Sendable () -> Bool)? = nil) {
+        self.input = input; self.diagnostics = diagnostics; self.interrupted = interrupted
+    }
+    var needsMoreVideoEvidence: Bool {
+        videos.contains { $0.parameterSetsValidated && ($0.scan == .unknown || ($0.scan == .interlaced && $0.frameRate == nil)) }
+    }
     func rejectedContainer(_ diagnostic: VPFFSourceDiagnostic) { diagnostics?.rejectedContainer(diagnostic) }
     func releaseDiagnostics() { diagnostics = nil }
     /// Dispatch captures this small owner, not a separate input Data alias.
@@ -92,7 +114,7 @@ private final class SourceInspectionState: @unchecked Sendable {
                 }, Unmanaged.passUnretained(self).toOpaque(), &container, &diagnostic)
         }
     }
-    var isCancelled: Bool { lock.withLock { cancelled } }
+    var isCancelled: Bool { lock.withLock { cancelled } || interrupted?() == true }
     func cancel() { lock.withLock { cancelled = true } }
     func receive(_ track: VPFFSourceTrack) {
         guard track.sample_size <= 256*1_024, track.extradata_size <= 64*1_024, track.audio_format_sample_size <= 65_536,

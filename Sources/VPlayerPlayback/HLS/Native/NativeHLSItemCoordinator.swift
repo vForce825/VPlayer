@@ -105,12 +105,16 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         metadata.publish(.init(lifecycle: item.outputLifecycleEpoch, information: information))
     }
 
-    func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation) async throws {
+    func activate(_ invocation: ControlTaskRegistry.BackendPositiveRateInvocation,
+                  beforePlayback: @Sendable () throws -> Bool = { false }) async throws {
         guard isPrepared, let interval = invocation.currentSnapshot?.interval,
               interval.outputLifecycle == item.outputLifecycleEpoch, interval.itemGeneration == item.itemGeneration,
               !stopInFlight else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
         let alreadyArmed = armed && authorization == invocation
         authorization = invocation
+        // 本次 interval 已归本 coordinator 停止；旧暂停 receipt 不能接收新 stop。
+        if !alreadyArmed { stopTask = nil }
+        if try beforePlayback() { return }
         // Reload before EVERY rate admission, including ordinary pause/resume.
         // A same-size SPS or audio-format change cannot hide behind cached facts.
         let snapshot = try await selectionSnapshot(commit: { snapshot in

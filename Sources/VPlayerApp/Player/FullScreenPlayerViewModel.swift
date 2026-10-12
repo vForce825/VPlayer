@@ -33,6 +33,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private struct PendingPauseCommand: Equatable {
         let id: UUID
         let target: Bool
+        var acknowledgedState: Bool?
     }
 
     private struct PendingPresentationIntent {
@@ -84,6 +85,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var latestPresentationRevision: UInt64?
     private var desiredPaused = false
     private var pendingPauseCommands: [PendingPauseCommand] = []
+    private var dispatchedPauseCommandID: UUID?
     private var awaitingAuthoritativePause: Bool?
     private var acceptsAuthoritativePauseState = false
     private var receivedRequestState = false
@@ -301,7 +303,9 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
 
     private func nextPauseCommand(lifecycle: UInt64, playback: UInt64) -> PendingPauseCommand? {
         guard isCurrent(lifecycle: lifecycle, playback: playback) else { return nil }
-        return pendingPauseCommands.first
+        let command = pendingPauseCommands.first
+        dispatchedPauseCommandID = command?.id
+        return command
     }
 
     private func finishPauseWorker(_ id: UUID) {
@@ -793,11 +797,22 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     private func applyAuthoritativePauseState(_ paused: Bool) {
-        guard acceptsAuthoritativePauseState,
-              pendingPauseCommands.isEmpty else { return }
+        if !pendingPauseCommands.isEmpty {
+            // 状态流可先于命令返回。只记录实际发出的这一条命令的确认，
+            // 尚未执行的尾部意图不接受确认；确认后的系统状态也随该命令退休。
+            if let index = pendingPauseCommands.firstIndex(where: { $0.id == dispatchedPauseCommandID }),
+               pendingPauseCommands[index].target == paused || pendingPauseCommands[index].acknowledgedState != nil {
+                pendingPauseCommands[index].acknowledgedState = paused
+                if pendingPauseCommands.count == 1 { desiredPaused = paused }
+            }
+            return
+        }
         if let awaitingAuthoritativePause {
             guard awaitingAuthoritativePause == paused else { return }
             self.awaitingAuthoritativePause = nil
+            acceptsAuthoritativePauseState = true
+        } else {
+            guard acceptsAuthoritativePauseState else { return }
         }
         desiredPaused = paused
     }
@@ -811,9 +826,22 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
               let commandIndex = pendingPauseCommands.firstIndex(where: {
                   $0.id == command.id
               }) else { return }
-        pendingPauseCommands.remove(at: commandIndex)
+        let retired = pendingPauseCommands.remove(at: commandIndex)
+        if dispatchedPauseCommandID == retired.id { dispatchedPauseCommandID = nil }
+        // 连续切换可能让尾部又回到正在执行的目标。合并同一意图，避免
+        // 引擎对重复操作不再发布状态、界面却重新等待一份不会到来的确认。
+        if let tail = pendingPauseCommands.first, tail.target == retired.target,
+           retired.acknowledgedState == nil || retired.acknowledgedState == tail.target {
+            pendingPauseCommands.removeFirst()
+        }
         if pendingPauseCommands.isEmpty {
-            awaitingAuthoritativePause = command.target
+            if let acknowledged = retired.acknowledgedState {
+                awaitingAuthoritativePause = nil
+                acceptsAuthoritativePauseState = true
+                desiredPaused = acknowledged
+            } else {
+                awaitingAuthoritativePause = command.target
+            }
         }
     }
 
@@ -827,6 +855,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         desiredPaused = false
         hasEstablishedPlayback = false
         pendingPauseCommands.removeAll()
+        dispatchedPauseCommandID = nil
         awaitingAuthoritativePause = nil
         acceptsAuthoritativePauseState = false
     }

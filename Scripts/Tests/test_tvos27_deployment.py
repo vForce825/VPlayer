@@ -62,15 +62,15 @@ class TVOS27DeploymentTests(unittest.TestCase):
         self.assertEqual(int(expected_count.group(1)), len(configured_floors),
                          'The Swift regression must include VPlayerHLSAcceptanceTests')
 
-    def test_version_two_matches_source_and_generated_products(self):
+    def test_version_two_point_one_matches_source_and_generated_products(self):
         spec = (ROOT / 'project.yml').read_text()
         project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()
         configured = re.findall(r'MARKETING_VERSION: "([0-9.]+)"', spec)
         generated = re.findall(r'MARKETING_VERSION = ([0-9.]+);', project)
         self.assertEqual(len(configured), 9)
-        self.assertEqual(set(configured), {'2.0'})
+        self.assertEqual(set(configured), {'2.1'})
         self.assertEqual(len(generated), 18)
-        self.assertEqual(set(generated), {'2.0'})
+        self.assertEqual(set(generated), {'2.1'})
 
     def test_standalone_builds_use_same_floor(self):
         for name in ('Scripts/build-metal-libraries.sh', 'Scripts/test-release-startup.sh'):

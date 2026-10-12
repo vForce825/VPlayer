@@ -9,6 +9,92 @@ import VPlayerCore
 
 @MainActor
 final class HLSResourceTransportTests: XCTestCase {
+    func testContinuousInterlacedTSWaitsForScanEvidenceAfterParameterSetsAreReady() async throws {
+        let root = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "SourcePlanning", withExtension: nil))
+        let body = try Data(contentsOf: root.appendingPathComponent("interlaced-h264-aac.ts"))
+        let fixture = AcquisitionHTTPFixture(body: body, chunkSizes: [16 * 1_024], finishes: false)
+        defer { fixture.remove() }
+        let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
+        let facts = try await FFmpegHLSContainerInspector().inspect(data: response.data, url: fixture.url,
+            deadline: HLSMonotonicClock.deadline(seconds: 10), completeness: .prefix)
+        XCTAssertEqual(facts.video?.scan, .interlaced)
+        XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+        XCTAssertNotNil(facts.video?.frameRate)
+        XCTAssertLessThan(response.data.count, AcquisitionTSFixture.mib)
+        XCTAssertEqual(fixture.startedRequests.count, 1)
+        let context = try sourceContext(url: fixture.url)
+        let source = ResolvedPlaybackSource(context: context, responseURL: fixture.url, generation: 1,
+            topology: .media(response.data), mediaCompleteness: .prefix)
+        let plan = try HLSPlaybackPlanner.makePlan(source: source,
+            facts: .init(source: source, media: [facts], complete: true, inspectedBytes: response.data.count),
+            capabilities: .init(videoProfiles: [.h264: [100]], supportsGenerated: true))
+        XCTAssertEqual(plan.video, .deinterlaceAndEncode)
+        print("TS_SCAN_ACQUISITION bytes=\(response.data.count) scan=interlaced plan=deinterlaceAndEncode")
+        await assertProtocolStopped(fixture)
+    }
+
+    func testProgressiveTSStillStartsBeforeOneMiBAndLargeFirstFrameRemainsSupported() async throws {
+        let bundle = Bundle(for: Self.self)
+        let sourceRoot = try XCTUnwrap(bundle.url(forResource: "SourcePlanning", withExtension: nil))
+        let progressive = try XCTUnwrap(bundle.url(forResource: "progressive-h264-aac", withExtension: "ts"))
+        for url in [progressive, sourceRoot.appendingPathComponent("large-au.ts")] {
+            let body = try Data(contentsOf: url)
+            let fixture = AcquisitionHTTPFixture(body: body, finishes: false)
+            defer { fixture.remove() }
+            let response = try await fetchCheckingDiagnosticRetirement(fixture.transport, fixture.request())
+            let facts = try await FFmpegHLSContainerInspector().inspect(data: response.data, url: fixture.url,
+                deadline: HLSMonotonicClock.deadline(seconds: 10), completeness: .prefix)
+            XCTAssertEqual(facts.video?.scan, .progressive)
+            XCTAssertEqual(facts.video?.parameterSetsValidated, true)
+            if url == progressive { XCTAssertLessThan(response.data.count, AcquisitionTSFixture.mib) }
+            XCTAssertLessThan(response.data.count, body.count)
+            XCTAssertEqual(fixture.startedRequests.count, 1)
+            await assertProtocolStopped(fixture)
+        }
+    }
+
+    func testIncompleteScanKeepsFiniteEOFByteCapCancellationAndDeadline() async throws {
+        let root = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "SourcePlanning", withExtension: nil))
+        let body = try Data(contentsOf: root.appendingPathComponent("interlaced-h264-aac.ts"))
+        var count = 16 * 1_024
+        while count < body.count {
+            let prefix = body.prefix(count)
+            let hint = prefix.withUnsafeBytes {
+                vp_ffmpeg_source_ts_acquisition_hint($0.bindMemory(to: UInt8.self).baseAddress, $0.count, { _ in 0 }, nil)
+            }
+            if hint == VPFF_SOURCE_ACQUISITION_READY { break }
+            count *= 2
+        }
+        XCTAssertLessThan(count, body.count)
+        let prefix = Data(body.prefix(count))
+        let facts = try await FFmpegHLSContainerInspector().inspect(data: prefix, url: root,
+            deadline: HLSMonotonicClock.deadline(seconds: 10), completeness: .prefix)
+        XCTAssertEqual(facts.video?.scan, .unknown, "夹具必须覆盖参数集齐全、扫描证据不足的时刻")
+        for mode in ["eof", "cap", "cancel", "deadline"] {
+            let delivered = expectation(description: "前缀已送达 \(mode)")
+            let fixture = AcquisitionHTTPFixture(body: prefix, finishes: mode == "eof", timedOut: mode == "deadline",
+                delivered: { delivered.fulfill() })
+            defer { fixture.remove() }
+            let request = try fixture.request(maximum: mode == "cap" ? count / 2 : AcquisitionTSFixture.mib,
+                continuation: mode == "cap" ? count : 8 * AcquisitionTSFixture.mib)
+            let task = Task { try await self.fetchCheckingDiagnosticRetirement(fixture.transport, request) }
+            await fulfillment(of: [delivered], timeout: 2)
+            if mode == "cancel" { task.cancel() }
+            do {
+                let response = try await task.value
+                XCTAssertTrue(mode == "eof" || mode == "cap")
+                XCTAssertEqual(response.data, prefix)
+                XCTAssertEqual(response.completeness, mode == "eof" ? .complete : .prefix)
+            } catch {
+                if mode == "cancel" { XCTAssertTrue(error is CancellationError) }
+                else if mode == "deadline" { XCTAssertEqual(error as? HLSSourceError, .deadline) }
+                else { throw error }
+            }
+            XCTAssertEqual(fixture.startedRequests.count, 1)
+            if mode == "cap" || mode == "cancel" { await assertProtocolStopped(fixture) }
+        }
+    }
+
     private func transport() -> URLSessionHLSResourceTransport {
         URLSessionHLSResourceTransport { let c = URLSessionConfiguration.ephemeral; c.protocolClasses = [SourceHTTPProtocol.self]; return c }
     }

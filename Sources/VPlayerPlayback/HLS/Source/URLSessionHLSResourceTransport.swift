@@ -200,10 +200,17 @@ private final class BoundedSourceTransfer: NSObject, URLSessionDataDelegate, @un
                     }, Unmanaged.passUnretained(self).toOpaque())
             }
             if stopForInterruption() { return true }
-            // READY and STOP only end acquisition. Neither bypasses the full
-            // inspector/planner. A raw TS boundary intentionally cancels even
-            // when Content-Length is absent or an EOF callback is still queued.
-            guard hint == VPFF_SOURCE_ACQUISITION_NEEDS_MORE,
+            var needsMore = hint == VPFF_SOURCE_ACQUISITION_NEEDS_MORE
+            if hint == VPFF_SOURCE_ACQUISITION_READY, body.count < ceiling {
+                do {
+                    needsMore = try FFmpegHLSContainerInspector.needsMoreTSVideoEvidence(
+                        data: body, deadline: request.deadline, interrupted: { self.isInterrupted })
+                } catch { failure = error; return true }
+            }
+            if stopForInterruption() { return true }
+            // READY 仅表示参数集齐全。扫描证据也充分后才停止采集；最终
+            // inspector/planner 仍完整验证输入，且原字节/时间预算不变。
+            guard needsMore,
                   body.count < ceiling else {
                 stoppedPrefix = true; return true
             }

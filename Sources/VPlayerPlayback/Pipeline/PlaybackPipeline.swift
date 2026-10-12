@@ -2934,7 +2934,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 
     private func displayModeSwitchStartedIsolated() {
         assertIsolated()
-        guard !terminal, !paused else { return }
+        guard !terminal else { return }
         preparedAnchor = nil
         readyPublished = false
         pendingDisplayTimingReset = true
@@ -2952,8 +2952,11 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private func displayModeSwitchEndedIsolated() {
         assertIsolated()
         finishModeSwitchSignpostIsolated()
-        guard !terminal, !paused, let readiness else { return }
+        guard !terminal, let readiness else { return }
         _ = readiness.reopenAfterDisplayModeSwitch()
+        // 暂停时仍须结清显示屏障；prepareAnchorIsolated 会保留暂停屏障，
+        // 后续恢复不需要等待已经发生过的第二次显示结束通知。
+        guard !paused else { return }
         if readiness.isOpen,
            tracks?.video == nil
                 || (videoCoordinator.isClassificationResolved

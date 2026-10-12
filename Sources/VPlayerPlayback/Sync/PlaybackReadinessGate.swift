@@ -289,7 +289,8 @@ public final class PlaybackReadinessGate {
         } else {
             audio = nil
             video = nil
-            waitingForDisplayModeEnd = false
+            // 媒体就绪、用户暂停与物理显示切换互不结清。只有对应的
+            // 显示结束事件（或显示控制器的有界恢复）才能解除此屏障。
         }
     }
 

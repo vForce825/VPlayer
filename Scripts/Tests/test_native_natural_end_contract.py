@@ -53,7 +53,19 @@ class NativeNaturalEndContract(unittest.TestCase):
 
     def test_same_endpoint_policy_is_checked_on_both_reads_and_pending_eof(self):
         source = (ROOT / 'Sources/VPlayerPlayback/HLS/AVPlayerDriver.swift').read_text()
-        self.assertGreaterEqual(source.count('endpointBoundary.observedEndpoint('), 3)
+        first_read = source.split('eventHub.installEndpoint(endpoint: time, token: observationIdentity)', 1)[1].split('let hub = eventHub', 1)[0]
+        pending = source.split('func hasPendingNaturalEndVerification(item identity:', 1)[1].split('private func completeNaturalEndRead(', 1)[0]
+        final_read = source.split('private func completeNaturalEndRead(', 1)[1].split('private func cancelNaturalEndDeadline(', 1)[0]
+        for read in (first_read, pending, final_read):
+            self.assertIn('effectiveEndpoint(item: item)', read)
+        helper = source.split('private func effectiveEndpoint(item: AVPlayerItem)', 1)[1].split('nonisolated func naturalEndDeadlineFired', 1)[0]
+        self.assertIn('if case .natural = endpointBoundary, let identity = currentItemIdentity', helper)
+        self.assertIn('return nativeNaturalEndpoint(item: identity)', helper)
+        self.assertIn('return endpointBoundary.observedEndpoint(forwardEnd: item.forwardPlaybackEndTime, duration: item.duration)', helper)
+        native = source.split('func nativeNaturalEndpoint(item identity:', 1)[1].split('private func liveWindowEnd(', 1)[0]
+        self.assertIn('currentItemIdentity == identity, let item, player.currentItem === item', native)
+        self.assertIn('AVPlayerPlaybackEndBoundary.natural.observedEndpoint(', native)
+        self.assertIn('guard observedLiveEnd == liveWindowEnd(item) else { return nil }', native)
         self.assertIn('prior.firstCurrentTime == stable', source)
         self.assertIn('constraint == prior.expectedEndpoint', source)
         self.assertIn('endpointBoundary.containsFinalClock(stable, expected: prior.expectedEndpoint', source)
@@ -88,13 +100,20 @@ class NativeNaturalEndContract(unittest.TestCase):
 
     def test_smoke_covers_actual_natural_eof_and_retains_active_authority(self):
         source = (ROOT / 'Tests/VPlayerTests/Playback/HLS/NativeHLSMasterSmokeTests.swift').read_text()
-        self.assertIn('naturalEndObservation?.stableCurrentTime != nil', source)
+        self.assertIn('let observation = try XCTUnwrap(coordinator.verifiedNaturalEndObservationForTesting)', source)
+        self.assertIn('let stable = try XCTUnwrap(observation.stableCurrentTime)', source)
         self.assertIn('executionTimeAllowance = 240', source)
         self.assertIn('let deadline = ContinuousClock.now + .seconds(210)', source)
         self.assertIn('verifyNaturalEOF(managed: managed, deadline: deadline)', source)
         completion_wait = source.split('phase: "full-eof-completion", managed: managed,', 1)[1].split('let observation =', 1)[0]
         self.assertIn('deadline: deadline, detail:', completion_wait)
-        self.assertIn('coordinator.naturalEndVerifiedForTesting && driver.naturalEndObservation?.stableCurrentTime != nil', completion_wait)
+        self.assertIn('coordinator.naturalEndVerifiedForTesting && registry.playbackStateSnapshot() == .stopped', completion_wait)
+        self.assertIn('registry.outputResourceContextSnapshot() == nil', completion_wait)
+        for predicate in ('XCTAssertEqual(observation.firstCurrentTime, stable)',
+                          'XCTAssertGreaterThan(CMTimeCompare(stable.cmTime, lower.cmTime), 0)',
+                          'XCTAssertNil(player.currentItem)', 'XCTAssertEqual(player.rate, 0)',
+                          'XCTAssertTrue(driver.disconnectedFromSystemAudio)'):
+            self.assertIn(predicate, source)
         self.assertIn('guard predicate(), ContinuousClock.now < deadline', source)
         self.assertIn('withController(deadline: deadline)', source)
         self.assertIn('ContinuousClock().sleep(until: deadline)', source)
