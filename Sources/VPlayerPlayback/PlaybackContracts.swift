@@ -95,6 +95,22 @@ public protocol RequestScopedPlaybackControlling: PlaybackEngine {
     func stop(requestID: UUID) async
 }
 
+/// 命令回执与可合并的播放状态流分离；准入不承诺未来一定到达目标播放状态。
+public enum PlaybackPauseCommandResult: Equatable, Sendable {
+    case accepted
+    case rejected(PlaybackPauseCommandRejection)
+    case superseded
+}
+
+public enum PlaybackPauseCommandRejection: Equatable, Sendable {
+    case audioInterruption
+    case unavailable
+}
+
+public protocol PlaybackPauseCommandAcknowledging: RequestScopedPlaybackControlling {
+    func setPausedAcknowledged(_ paused: Bool, requestID: UUID) async -> PlaybackPauseCommandResult
+}
+
 public extension PlaybackEngine {
     func setTuning(_ tuning: PlaybackTuning) async {}
 }

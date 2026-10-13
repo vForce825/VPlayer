@@ -760,7 +760,11 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
             try await fixture.until { fixture.metadata.count > count && fixture.metadata.last??.width == 987 }
             XCTAssertTrue(fixture.isPlaying)
             emit(.backendStopped(prepareScope: .init(ticket: current)))
-            try await fixture.until { fixture.registry.outputResourceContextSnapshot() == nil }
+            // 资源清空先于公开终态发布；两者都完成才代表自然结束已处理完毕。
+            try await fixture.until {
+                fixture.registry.outputResourceContextSnapshot() == nil &&
+                    fixture.registry.playbackStateSnapshot() == .stopped
+            }
             XCTAssertEqual(fixture.registry.playbackStateSnapshot(), .stopped)
         }
     }

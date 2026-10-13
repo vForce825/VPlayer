@@ -94,6 +94,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var stopped = false
 
     private(set) var state: PlaybackState = .idle
+    private(set) var playbackControlMessage: String?
     private(set) var presentation: IdentifiedPlaybackPresentation?
     private(set) var presentationMountOwnership: PresentationMountOwnership?
     private(set) var mediaInformation: PlaybackMediaInformation?
@@ -236,7 +237,11 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
            awaitingAuthoritativePause == nil {
             desiredPaused = isPaused
         }
-        if desiredPaused != paused { enqueuePause(paused) }
+        // 明确回执的核心自己处理幂等；队列已空时仍转发新的系统命令。
+        // 已接受的恢复可能还在执行，此时界面仍为 paused，新的 Pause 必须能取消恢复。
+        let forwardsAcknowledgedCommand = engine is any PlaybackPauseCommandAcknowledging &&
+            pendingPauseCommands.isEmpty && awaitingAuthoritativePause == nil
+        if desiredPaused != paused || forwardsAcknowledgedCommand { enqueuePause(paused) }
         // A retiring worker can still be physically suspended. Its completion
         // starts the one successor worker; never overlap physical command lanes.
         await pauseWorkerTask?.value
@@ -254,6 +259,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     private func enqueuePause(_ paused: Bool) {
+        playbackControlMessage = nil
         desiredPaused = paused
         let command = PendingPauseCommand(id: UUID(), target: paused)
         if pauseWorkerTask != nil, pauseTask == nil {
@@ -288,13 +294,18 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         let task = Task { @MainActor [weak self] in
             defer { self?.finishPauseWorker(workerID) }
             while let command = self?.nextPauseCommand(lifecycle: lifecycle, playback: playback) {
-                if let scoped = engine as? any RequestScopedPlaybackControlling {
+                let result: PlaybackPauseCommandResult?
+                if let acknowledging = engine as? any PlaybackPauseCommandAcknowledging {
+                    result = await acknowledging.setPausedAcknowledged(command.target, requestID: requestID)
+                } else if let scoped = engine as? any RequestScopedPlaybackControlling {
                     await scoped.setPaused(command.target, requestID: requestID)
+                    result = nil
                 } else {
                     await engine.setPaused(command.target)
+                    result = nil
                 }
                 guard !Task.isCancelled else { return }
-                self?.retirePauseCommand(command, lifecycle: lifecycle, playback: playback)
+                self?.retirePauseCommand(command, result: result, lifecycle: lifecycle, playback: playback)
             }
         }
         pauseWorkerTask = task
@@ -780,7 +791,9 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         switch newState {
         case .preparing, .buffering, .recovering:
             acceptsAuthoritativePauseState = true
+            if pendingPauseCommands.isEmpty, awaitingAuthoritativePause == nil { desiredPaused = false }
         case .playing:
+            playbackControlMessage = nil
             hasEstablishedPlayback = true
             applyAuthoritativePauseState(false)
         case .paused:
@@ -819,6 +832,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
 
     private func retirePauseCommand(
         _ command: PendingPauseCommand,
+        result: PlaybackPauseCommandResult?,
         lifecycle: UInt64,
         playback: UInt64
     ) {
@@ -828,6 +842,24 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
               }) else { return }
         let retired = pendingPauseCommands.remove(at: commandIndex)
         if dispatchedPauseCommandID == retired.id { dispatchedPauseCommandID = nil }
+        if let result, result != .accepted {
+            // 拒绝回执不经可合并的状态流确认，也不能替未发出的尾部指令结账。
+            // 后继意图继续走同一工作者；只有队列清空才撤回本次乐观显示。
+            if pendingPauseCommands.isEmpty {
+                awaitingAuthoritativePause = nil
+                acceptsAuthoritativePauseState = true
+                desiredPaused = state == .paused(request)
+                switch result {
+                case .rejected(.audioInterruption):
+                    // 恢复中的暂停按钮仍用于取消自动恢复；拒绝播放不能反转它的动作。
+                    playbackControlMessage = "上次播放被系统音频中断阻止，请在中断结束后重试。"
+                case .rejected(.unavailable):
+                    playbackControlMessage = "上次操作未能完成，请重试。"
+                case .superseded, .accepted: break
+                }
+            }
+            return
+        }
         // 连续切换可能让尾部又回到正在执行的目标。合并同一意图，避免
         // 引擎对重复操作不再发布状态、界面却重新等待一份不会到来的确认。
         if let tail = pendingPauseCommands.first, tail.target == retired.target,
@@ -835,7 +867,10 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             pendingPauseCommands.removeFirst()
         }
         if pendingPauseCommands.isEmpty {
-            if let acknowledged = retired.acknowledgedState {
+            // 明确回执结清的是这条命令，不承诺未来一定出现 playing/paused。
+            // 系统可在准入后再次中断；此后即使 paused 被去重，也应允许再次播放。
+            let completedPauseState = result == .accepted ? state == .paused(request) : nil
+            if let acknowledged = retired.acknowledgedState ?? completedPauseState {
                 awaitingAuthoritativePause = nil
                 acceptsAuthoritativePauseState = true
                 desiredPaused = acknowledged
@@ -853,6 +888,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         pauseTask?.cancel()
         pauseTask = nil
         desiredPaused = false
+        playbackControlMessage = nil
         hasEstablishedPlayback = false
         pendingPauseCommands.removeAll()
         dispatchedPauseCommandID = nil

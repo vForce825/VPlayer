@@ -133,6 +133,7 @@ struct FullScreenPlayerView: View {
                 PlayerControlsOverlay(
                     isPaused: model.isPaused,
                     canControlPlayback: model.canControlPlayback,
+                    playbackControlMessage: model.playbackControlMessage,
                     onBack: close,
                     onPlayPause: model.togglePause,
                     onSettings: { showsSettings = true },

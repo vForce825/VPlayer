@@ -13,6 +13,7 @@ struct PlayerControlsOverlay: View {
 
     let isPaused: Bool
     var canControlPlayback = true
+    var playbackControlMessage: String?
     let onBack: () -> Void
     let onPlayPause: () -> Void
     let onSettings: () -> Void
@@ -23,6 +24,13 @@ struct PlayerControlsOverlay: View {
     var body: some View {
         VStack {
             Spacer()
+            if let playbackControlMessage {
+                Text(playbackControlMessage).font(.callout)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityIdentifier("player-control-message")
+            }
             HStack(spacing: 36) {
                 Button("返回", systemImage: "chevron.backward") {
                     onInteraction()

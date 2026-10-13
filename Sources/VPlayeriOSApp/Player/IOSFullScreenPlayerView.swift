@@ -63,6 +63,10 @@ struct IOSFullScreenPlayerView: View {
                     .onTapGesture { controls.userInteracted() }
                     Spacer()
                     VStack(spacing: 12) {
+                        if let message = model.playbackControlMessage {
+                            Text(message).font(.caption)
+                                .accessibilityIdentifier("player-control-message")
+                        }
                         if let message = session.pictureInPicture.message {
                             Text(message).font(.caption).accessibilityIdentifier("player-pip-message")
                         }

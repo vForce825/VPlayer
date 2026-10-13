@@ -19,7 +19,7 @@ final class DefaultAudioSessionCompletionReceiver: PlaybackAudioSessionCompletio
     func receiveAudioSessionCompletion(permit: AudioSessionBlockingCallPermit, completion: AudioSessionBlockingCallCompletion) {}
 }
 
-public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControlling, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackMediaInformationPreparing, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
+public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledging, PlaybackPresentationControlling, PlaybackMetricsProviding, PlaybackMediaInformationProviding, PlaybackMediaInformationPreparing, PlaybackOwnedInterruptionCleanupReceiving, PlaybackBackendMediaInformationReceiving {
     private let registry: ControlTaskRegistry
     private let deadlineScheduler: PlaybackDeadlineScheduler
     private let audioSessionOwner: PlaybackAudioSessionOwner
@@ -765,14 +765,18 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
     }
 
     public func setPaused(_ paused: Bool) async {
-        await setPaused(paused, expectedRequestID: nil)
+        _ = await setPaused(paused, expectedRequestID: nil)
     }
 
     public func setPaused(_ paused: Bool, requestID: UUID) async {
+        _ = await setPaused(paused, expectedRequestID: requestID)
+    }
+
+    public func setPausedAcknowledged(_ paused: Bool, requestID: UUID) async -> PlaybackPauseCommandResult {
         await setPaused(paused, expectedRequestID: requestID)
     }
 
-    private func setPaused(_ paused: Bool, expectedRequestID: UUID?) async {
+    private func setPaused(_ paused: Bool, expectedRequestID: UUID?) async -> PlaybackPauseCommandResult {
         #if DEBUG
         if expectedRequestID != nil { await requestScopedControlCheckpoint?(.pauseIngress) }
         #endif
@@ -783,16 +787,19 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         guard !Task.isCancelled,
               let request = controllerState.request,
               expectedRequestID.map({ $0 == request.id }) ?? true,
-              let controlRun = admittedRun, controlRun.requestID == request.id else { return }
+              let controlRun = admittedRun, controlRun.requestID == request.id else { return .superseded }
         switch registry.playbackStateSnapshot() {
         case .failed, .stopped, .idle:
-            return
+            return .rejected(.unavailable)
         case .preparing, .buffering, .recovering, .playing, .paused:
             break
         }
         
-        guard let context = registry.outputResourceContextSnapshot() else { return }
+        guard let context = registry.outputResourceContextSnapshot() else { return .superseded }
         let safety = registry.executor.safetyIngress.snapshot
+        // 中断未结束时无法兑现播放；拒绝必须先于用户意图和命令修订号的修改。
+        // 否则一次无效点击会取消手动暂停，甚至在系统允许时意外自动播放。
+        if !paused, safety.interruptionState == .began { return .rejected(.audioInterruption) }
         let resumeEpoch = AudioSessionLifecycleEpoch(safety)
         // Safety callbacks fold synchronously before their actor messages arrive.
         // Admit this action against that current physical state, even if the
@@ -806,29 +813,37 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
         if !duplicatePause && !duplicateResume { userControlRevision &+= 1 }
         let controlRevision = userControlRevision
         let sessionIdentity = context.sessionIdentity
-        guard sessionIdentity.requestID == request.id else { return }
+        guard sessionIdentity.requestID == request.id else { return .superseded }
         if !paused, requiresExplicitResume {
+            if resumeRequestInFlight == resumeEpoch { return .accepted }
+            guard let run = admittedRun, let lease = registry.audioSessionLease(session: sessionIdentity) else {
+                return .rejected(.unavailable)
+            }
+            let previousUserPaused = controllerState.userPaused
             controllerState.userPaused = false
             publish(.paused(request))
-            guard safety.interruptionState != .began, resumeRequestInFlight != resumeEpoch,
-                  let run = admittedRun, let lease = registry.audioSessionLease(session: sessionIdentity) else { return }
             resumeRequestInFlight = resumeEpoch
             await registry.joinOwnedTerminalCleanup()
             guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
-                  AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
+                  AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return .superseded }
             if let retained = registry.outputResourceContextSnapshot(), let owner = retained.owner,
                owner.reason == .recovery, retained.pendingReset == nil {
+                // 新中断可能早于旧 SDK 激活返回；当时排空证明尚不能成立。
+                // 本次显式重试重新核验真实终态，不能永久沿用上次未完成的排空结果。
+                _ = registry.settleOutputInterruptionDrain(owner: owner)
                 _ = try? registry.finishRetainedOutputCleanup(owner: owner)
             }
             if !audioSessionOwner.requestResume(for: lease, expectedEpoch: resumeEpoch) {
                 clearResumeRequest(matching: resumeEpoch)
+                controllerState.userPaused = previousUserPaused
+                return .rejected(.unavailable)
             }
             if context.phase == .pendingLeaseAcquisition, resumeRequestInFlight == resumeEpoch {
                 // 此session仍由原acquisition等待者消费真实active completion，不启动第二prepare。
                 resumeVetoRequired = false
                 systemPauseRequired = false
             }
-            return
+            return .accepted
         }
         let userControl = OutputUserControlRequest(
             kind: paused ? .pause : .resume,
@@ -840,10 +855,10 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             resetPreRouteBinding: context.resetPreRouteBinding
         )
         let controlResult = registry.performOutputUserControl(userControl)
-        if case .rejected = controlResult { return }
+        if case .rejected = controlResult { return .rejected(.unavailable) }
         if paused { resumeRequestInFlight = nil }
         
-        guard controllerState.userPaused != paused else { return }
+        guard controllerState.userPaused != paused else { return .accepted }
         controllerState.userPaused = paused
         advanceReadinessCycle()
         // The existing recovery owner may already be draining the old output.
@@ -854,18 +869,18 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             // The original acquisition caller still owns physical settlement and
             // preparation; there is no backend to suspend or pause owner to create.
             publish(paused ? .paused(request) : (systemPauseRequired ? .recovering(request) : .preparing(request)))
-            return
+            return .accepted
         }
         if context.phase == .pendingSuccessorLease {
             publish(paused ? .paused(request) : .recovering(request))
-            guard !paused, let run = admittedRun else { return }
+            guard !paused, let run = admittedRun else { return .accepted }
             if context.pendingReset != nil {
                 await continueResetRecovery(identity: run)
             } else if safety.interruptionState != .began, let lease = registry.audioSessionLease(session: sessionIdentity) {
                 resumeRequestInFlight = resumeEpoch
                 await registry.joinOwnedTerminalCleanup()
                 guard isCurrent(run), ownsUserControl(controlRun, revision: controlRevision),
-                      AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return }
+                      AudioSessionLifecycleEpoch(registry.executor.safetyIngress.snapshot) == resumeEpoch else { return .superseded }
                 if let owner = registry.outputResourceContextSnapshot()?.owner {
                     _ = try? registry.finishRetainedOutputCleanup(owner: owner)
                 }
@@ -873,12 +888,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                     clearResumeRequest(matching: resumeEpoch)
                 }
             }
-            return
+            return .accepted
         }
         if context.phase == .installed && !context.prepared {
             // prepare在原command中继续；只折叠意图，完成CAS之后才可领取一次activation。
             publish(paused ? .paused(request) : (systemPauseRequired ? .recovering(request) : .preparing(request)))
-            return
+            return .accepted
         }
         
         if paused {
@@ -889,7 +904,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 original.contextNonce == context.contextNonce,
                 original.sessionIdentity == sessionIdentity,
                 original.candidateBackendIdentity == context.candidateBackendIdentity,
-                let stop = original.suspend else { return }
+                let stop = original.suspend else { return .superseded }
             // The MainActor relay can start this exact runner after user-control
             // ingress revokes rate and before this actor admits the pause owner.
             // First-start remains strict; losing that race still joins the same
@@ -897,12 +912,12 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             _ = registry.startOutputSuspendOperation(stop.task, owner: owner)
             guard case .succeeded = await registry.joinOutputBackendOperation(stop.task),
                   ownsUserControl(controlRun, revision: controlRevision),
-                  registry.finishOutputPause(owner: owner) else { return }
+                  registry.finishOutputPause(owner: owner) else { return .superseded }
             // A prepare notification can lose to this pause owner. Replay after
             // the retained pause settles, even when there will be no activation.
             refreshPreparedMediaInformation(for: stop.lifecycle)
             await watchdog.disarm(session: sessionIdentity, controlRevision: controlRevision)
-            guard ownsUserControl(controlRun, revision: controlRevision) else { return }
+            guard ownsUserControl(controlRun, revision: controlRevision) else { return .superseded }
             registry.updatePreparedSampleBufferPause(contextNonce: original.contextNonce,
                 paused: true, readinessCycle: controllerState.readinessCycle)
             publish(.paused(request))
@@ -910,9 +925,9 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             publish(.recovering(request))
         } else {
             guard let activation = try? registry.beginOutputActivation(contextNonce: context.contextNonce),
-                  registry.startOutputActivationOperation(activation) else { return }
+                  registry.startOutputActivationOperation(activation) else { return .superseded }
             let outcome = await registry.joinOutputBackendOperation(activation)
-            guard ownsUserControl(controlRun, revision: controlRevision) else { return }
+            guard ownsUserControl(controlRun, revision: controlRevision) else { return .superseded }
             switch outcome {
             case .succeeded:
                 break // The resumed item must establish fresh media-clock progress.
@@ -920,8 +935,8 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
                 if let context = registry.outputResourceContextSnapshot() {
                     beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
                 }
-                return
-            case .canceled: return
+                return .superseded
+            case .canceled: return .superseded
             }
             registry.updatePreparedSampleBufferPause(contextNonce: context.contextNonce,
                 paused: false, readinessCycle: controllerState.readinessCycle)
@@ -929,6 +944,7 @@ public actor PlaybackController: PlaybackEngine, RequestScopedPlaybackControllin
             // reports a later ready event after reopening the shared timebase.
             publish(context.desiredBackendKind == .hlsAVPlayer ? .playing(request) : .preparing(request))
         }
+        return .accepted
     }
 
     /// This marker only coalesces controller actions; Registry still owns physical permission.

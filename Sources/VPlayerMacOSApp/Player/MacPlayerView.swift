@@ -114,6 +114,10 @@ struct MacPlayerView: View {
                     .tint(.white).accessibilityLabel("当前节目播出进度")
                     .accessibilityValue(programme.progress.map { "\(Int($0 * 100))%" } ?? "暂无节目进度")
                     .help("当前节目播出进度").accessibilityIdentifier("player.programme-progress")
+                if let message = session.model.playbackControlMessage {
+                    Text(message).font(.caption)
+                        .accessibilityIdentifier("player-control-message")
+                }
                 HStack(spacing: 16) {
                     if session.model.canControlPlayback { Button {
                         session.model.togglePause(); reveal()

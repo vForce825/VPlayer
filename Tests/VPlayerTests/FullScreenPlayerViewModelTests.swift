@@ -12,6 +12,226 @@ import XCTest
 
 @MainActor
 final class FullScreenPlayerViewModelTests: XCTestCase {
+    func testRejectedPlayDuringInterruptionDoesNotSwallowNextExplicitPlay() async throws {
+        let fixture = ControllerRecoveryFixture(channelID: "interrupted-manual-pause",
+            owner: RecordingPlaybackAudioSessionOwner())
+        let model = FullScreenPlayerViewModel(request: fixture.request, engine: fixture.controller,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            presentationMount: DefaultPlaybackPresentationMount(), settings: makeSettings())
+        model.start()
+        do {
+            try await eventually { fixture.first.snapshot().starts.count == 1 }
+            fixture.first.emit(.ready(readinessCycle: 0))
+            try await eventually { model.state == .playing(fixture.request) }
+            await model.setPausedFromNowPlaying(true)
+            try await eventually { model.state == .paused(fixture.request) }
+            fixture.owner.monitor.emit(.interruptionBegan)
+            try await eventually { await fixture.controller.audioSessionInterruptedForTesting }
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertTrue(model.isPaused, "被系统阻止的播放不能把按钮变成暂停")
+            XCTAssertNotNil(model.playbackControlMessage)
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertTrue(model.isPaused, "重复被拒也不能留下等待播放确认的意图")
+            XCTAssertEqual(fixture.owner.sdk.activateCallCount, 1)
+            fixture.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+            try await eventually { !(await fixture.controller.audioSessionInterruptedForTesting) }
+            await model.setPausedFromNowPlaying(false)
+            try await eventually { fixture.successor.snapshot().starts.count == 1 }
+            let cycle = await fixture.controller.readinessCycleForTesting
+            fixture.successor.emit(.ready(readinessCycle: cycle))
+            try await eventually { model.state == .playing(fixture.request) && !model.isPaused }
+            XCTAssertNil(model.playbackControlMessage)
+        } catch {
+            await model.stop()
+            throw error
+        }
+        await model.stop()
+        await fixture.owner.registry.joinOwnedTerminalCleanup()
+    }
+
+    func testRejectedSystemPlayDuringRecoveryKeepsVisiblePauseAction() async throws {
+        let fixture = ControllerRecoveryFixture(channelID: "rejected-play-while-recovering",
+            owner: RecordingPlaybackAudioSessionOwner())
+        let model = FullScreenPlayerViewModel(request: fixture.request, engine: fixture.controller,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            presentationMount: DefaultPlaybackPresentationMount(), settings: makeSettings())
+        model.start()
+        do {
+            try await eventually { fixture.first.snapshot().starts.count == 1 }
+            fixture.first.emit(.ready(readinessCycle: 0))
+            try await eventually { model.state == .playing(fixture.request) }
+            fixture.owner.monitor.emit(.interruptionBegan)
+            try await eventually { model.state == .recovering(fixture.request) }
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertNotNil(model.playbackControlMessage)
+            XCTAssertFalse(model.isPaused, "恢复期间仍显示暂停，允许用户取消自动恢复")
+            model.togglePause()
+            try await eventually {
+                model.state == .paused(fixture.request) &&
+                    fixture.owner.registry.executor.safetyIngress.snapshot.userPaused
+            }
+            fixture.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+            try await eventually { !(await fixture.controller.audioSessionInterruptedForTesting) }
+            XCTAssertTrue(model.isPaused)
+            XCTAssertEqual(fixture.owner.sdk.activateCallCount, 1)
+            XCTAssertTrue(fixture.successor.snapshot().starts.isEmpty,
+                "可见的暂停按钮必须发送暂停，不能因上次播放被拒而错误发送播放")
+        } catch {
+            await model.stop()
+            throw error
+        }
+        await model.stop()
+        await fixture.owner.registry.joinOwnedTerminalCleanup()
+    }
+
+    func testRejectedCommandKeepsLatestTailAndDuplicatePauseNeedsNoNewStateEvent() async throws {
+        for latestPause in [true, false] {
+            let gate = ViewModelAsyncGate()
+            let engine = AcknowledgedViewModelPlaybackEngine(gate: gate)
+            let request = makeRequest()
+            let model = FullScreenPlayerViewModel(request: request, engine: engine,
+                presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+            model.start()
+            try await eventually { await engine.hasSubscriber }
+            await engine.emit(state: .preparing(request))
+            try await eventually { model.state == .preparing(request) }
+            await engine.emit(state: .paused(request))
+            try await eventually { model.isPaused }
+            model.togglePause()
+            try await eventually { await gate.hasWaiter }
+            model.togglePause()
+            if !latestPause { model.togglePause() }
+            let drain = Task { await model.setPausedFromNowPlaying(latestPause) }
+            await gate.open(); await drain.value
+            let targets = await engine.targets
+            XCTAssertEqual(targets, [false, latestPause], "被拒的头部不能吞掉尚未发出的尾部")
+            XCTAssertTrue(model.isPaused, "命令结束后仍以实际暂停状态显示，不能把准入当成已经播放")
+            XCTAssertNil(model.playbackControlMessage, "旧拒绝不能覆盖后继操作")
+            await engine.emit(state: .playing(request))
+            try await eventually { model.state == .playing(request) }
+            XCTAssertFalse(model.isPaused, "已接受的重复暂停不应等待被状态流去重的确认")
+            await model.stop()
+        }
+    }
+
+    func testAcceptedCommandDoesNotRequireAnUncoalescedTargetStateToAllowRetry() async throws {
+        let gate = ViewModelAsyncGate()
+        await gate.open()
+        let engine = AcknowledgedViewModelPlaybackEngine(gate: gate, firstResult: .accepted)
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(request: request, engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() }, settings: makeSettings())
+        model.start()
+        try await eventually { await engine.hasSubscriber }
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        await engine.emit(state: .paused(request))
+        try await eventually { model.isPaused }
+        await model.setPausedFromNowPlaying(false)
+        // 核心接受恢复后又被系统打断；paused 相同值被合并，没有新状态事件。
+        XCTAssertTrue(model.isPaused)
+        await model.setPausedFromNowPlaying(false)
+        var targets = await engine.targets
+        XCTAssertEqual(targets, [false, false])
+        await engine.emit(state: .preparing(request))
+        try await eventually { model.state == .preparing(request) }
+        XCTAssertFalse(model.isPaused)
+        model.togglePause()
+        await model.setPausedFromNowPlaying(true)
+        targets = await engine.targets
+        XCTAssertEqual(targets, [false, false, true], "恢复已进入准备时，按钮必须发暂停而非再次播放")
+        await model.stop()
+    }
+
+    func testSystemPauseCancelsAcceptedResumeBeforeAudioActivationReturns() async throws {
+        let fixture = ControllerRecoveryFixture(channelID: "pause-accepted-audio-resume",
+            owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true))
+        let model = FullScreenPlayerViewModel(request: fixture.request, engine: fixture.controller,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            presentationMount: DefaultPlaybackPresentationMount(), settings: makeSettings())
+        model.start()
+        do {
+            try await eventually { fixture.first.snapshot().starts.count == 1 }
+            fixture.first.emit(.ready(readinessCycle: 0))
+            try await eventually { model.state == .playing(fixture.request) }
+            fixture.owner.monitor.emit(.interruptionBegan)
+            try await eventually { await fixture.controller.audioSessionInterruptedForTesting }
+            fixture.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+            try await eventually { model.state == .paused(fixture.request) }
+            await model.setPausedFromNowPlaying(false)
+            try await eventually { fixture.owner.sdk.activateCallCount == 2 }
+            XCTAssertTrue(model.isPaused, "准入不等于已经恢复播放")
+            await model.setPausedFromNowPlaying(true)
+            XCTAssertTrue(fixture.owner.registry.executor.safetyIngress.snapshot.userPaused,
+                "实际仍为暂停时，系统 Pause 也必须送达核心以撤回已接受的恢复")
+            fixture.owner.completeDeferredExplicitResume()
+            try await eventually {
+                guard let context = fixture.owner.registry.outputResourceContextSnapshot() else { return false }
+                return context.pendingActivationCall == nil
+            }
+            XCTAssertTrue(fixture.successor.snapshot().starts.isEmpty)
+            XCTAssertTrue(model.isPaused)
+        } catch {
+            fixture.owner.completeDeferredExplicitResume()
+            await model.stop()
+            throw error
+        }
+        await model.stop()
+        await fixture.owner.registry.joinOwnedTerminalCleanup()
+    }
+
+    func testAcceptedAudioResumeSupersededByNewInterruptionAllowsNextPlay() async throws {
+        let fixture = ControllerRecoveryFixture(channelID: "accepted-play-interrupted-again",
+            owner: RecordingPlaybackAudioSessionOwner(deferFirstExplicitResume: true))
+        let model = FullScreenPlayerViewModel(request: fixture.request, engine: fixture.controller,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            presentationMount: DefaultPlaybackPresentationMount(), settings: makeSettings())
+        model.start()
+        do {
+            try await eventually { fixture.first.snapshot().starts.count == 1 }
+            fixture.first.emit(.ready(readinessCycle: 0))
+            try await eventually { model.state == .playing(fixture.request) }
+            await model.setPausedFromNowPlaying(true)
+            try await eventually { model.state == .paused(fixture.request) }
+            fixture.owner.monitor.emit(.interruptionBegan)
+            try await eventually { await fixture.controller.audioSessionInterruptedForTesting }
+            fixture.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+            try await eventually { !(await fixture.controller.audioSessionInterruptedForTesting) }
+            await model.setPausedFromNowPlaying(false)
+            try await eventually { fixture.owner.sdk.activateCallCount == 2 }
+            fixture.owner.monitor.emit(.interruptionBegan)
+            try await eventually { await fixture.controller.audioSessionInterruptedForTesting }
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertTrue(model.isPaused)
+            XCTAssertNotNil(model.playbackControlMessage)
+            fixture.owner.monitor.emit(.interruptionEnded(shouldResume: false))
+            try await eventually { !(await fixture.controller.audioSessionInterruptedForTesting) }
+            await model.setPausedFromNowPlaying(false)
+            XCTAssertTrue(model.isPaused, "旧 SDK 未返回时，重试被拒仍应保留播放入口")
+            XCTAssertEqual(fixture.owner.sdk.activateCallCount, 2)
+            fixture.owner.completeDeferredExplicitResume()
+            // 原 SDK 激活已失效，但仍需真实返回并完成排空，才能测试下一次可执行的播放。
+            try await eventually {
+                guard let context = fixture.owner.registry.outputResourceContextSnapshot() else { return false }
+                return fixture.owner.registry.isTerminal(context.reservation.workGroup)
+            }
+            await model.setPausedFromNowPlaying(false)
+            try await eventually { fixture.successor.snapshot().starts.count == 1 }
+            let cycle = await fixture.controller.readinessCycleForTesting
+            fixture.successor.emit(.ready(readinessCycle: cycle))
+            try await eventually { model.state == .playing(fixture.request) && !model.isPaused }
+            XCTAssertEqual(fixture.owner.sdk.activateCallCount, 3)
+            XCTAssertEqual(fixture.outputConcurrency.maximum, 1)
+            XCTAssertNil(model.playbackControlMessage)
+        } catch {
+            fixture.owner.completeDeferredExplicitResume()
+            await model.stop()
+            throw error
+        }
+        await model.stop()
+        await fixture.owner.registry.joinOwnedTerminalCleanup()
+    }
+
     func testResumeAcknowledgementBeforeOrAfterReturnDoesNotMaskLaterSystemPause() async throws {
         for (acknowledgementFirst, preparationDelivered) in [(true, true), (false, true), (true, false), (false, false)] {
             let gate = ViewModelAsyncGate()
@@ -2178,12 +2398,13 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         )
     }
 
-    private func eventually(_ predicate: @escaping () async -> Bool) async throws {
+    private func eventually(file: StaticString = #filePath, line: UInt = #line,
+                            _ predicate: @escaping () async -> Bool) async throws {
         for _ in 0..<200 {
             if await predicate() { return }
             try await Task.sleep(for: .milliseconds(5))
         }
-        XCTFail("condition not reached")
+        XCTFail("condition not reached", file: file, line: line)
     }
 
     private func waitUntil(
@@ -2826,8 +3047,37 @@ private actor ViewModelPlaybackEngine: PlaybackEngine, PlaybackPresentationContr
 
 }
 
-/// Models acquisition parked on the manual reset gate: cancellation does not
-/// release its continuation; request revocation (or replacement) does.
+/// 独立控制命令回执和状态快照，覆盖状态去重及晚回执的交叠顺序。
+private actor AcknowledgedViewModelPlaybackEngine: PlaybackPauseCommandAcknowledging {
+    let base: ControlledViewModelPlaybackEngine
+    let firstResult: PlaybackPauseCommandResult
+    private(set) var targets: [Bool] = []
+    private var continuation: AsyncStream<PlaybackState>.Continuation?
+    var hasSubscriber: Bool { continuation != nil }
+
+    init(gate: ViewModelAsyncGate, firstResult: PlaybackPauseCommandResult = .rejected(.audioInterruption)) {
+        base = .init(pauseGates: [1: gate]); self.firstResult = firstResult
+    }
+    func events() -> AsyncStream<PlaybackState> {
+        let pair = AsyncStream.makeStream(of: PlaybackState.self, bufferingPolicy: .bufferingNewest(1))
+        continuation = pair.continuation
+        return pair.stream
+    }
+    func emit(state: PlaybackState) { continuation?.yield(state) }
+    func play(_ request: PlaybackRequest) async { await base.play(request) }
+    func stop() async { continuation?.finish(); continuation = nil; await base.stop() }
+    func stop(requestID: UUID) async { await stop() }
+    func setPaused(_ paused: Bool) async { await base.setPaused(paused) }
+    func setPaused(_ paused: Bool, requestID: UUID) async { await setPaused(paused) }
+    func setPausedAcknowledged(_ paused: Bool, requestID: UUID) async -> PlaybackPauseCommandResult {
+        targets.append(paused)
+        let first = targets.count == 1
+        await base.setPaused(paused)
+        return first ? firstResult : .accepted
+    }
+}
+
+/// 模拟等待手动复位的采集；取消不释放 continuation，撤销或替换请求才释放。
 private actor ResetGatedViewModelPlaybackEngine: RequestScopedPlaybackControlling {
     private var parked: CheckedContinuation<Void, Never>?
     private(set) var currentRequestID: UUID?

@@ -431,7 +431,7 @@ final class PlaybackControllerTests: XCTestCase {
             await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
                 if checkpoint == .pauseIngress { await gate.wait() }
             }
-            let oldCommand = Task { await controller.setPaused(paused, requestID: request.id) }
+            let oldCommand = Task { await controller.setPausedAcknowledged(paused, requestID: request.id) }
             try await eventually { gate.waiterCount == 1 }
             // FullScreen's failure/retry path cancels the originating command,
             // then intentionally reuses this exact request UUID for its new run.
@@ -446,7 +446,8 @@ final class PlaybackControllerTests: XCTestCase {
             XCTAssertEqual(before, expected)
             let pauseCount = replacement.snapshot().pauses.count
             gate.open()
-            await oldCommand.value
+            let result = await oldCommand.value
+            XCTAssertEqual(result, .superseded)
             let after = await controller.currentStateForTesting
             XCTAssertEqual(after, expected)
             XCTAssertEqual(replacement.snapshot().pauses.count, pauseCount)
@@ -532,7 +533,7 @@ final class PlaybackControllerTests: XCTestCase {
             await controller.setRequestScopedControlCheckpointForTesting { checkpoint in
                 if checkpoint == .pauseIngress { await gate.wait() }
             }
-            let obsoletePause = Task { await controller.setPaused(paused, requestID: firstRequest.id) }
+            let obsoletePause = Task { await controller.setPausedAcknowledged(paused, requestID: firstRequest.id) }
             try await eventually { gate.waiterCount == 1 }
             await controller.play(replacementRequest)
             let cycle = await controller.readinessCycleForTesting
@@ -540,7 +541,8 @@ final class PlaybackControllerTests: XCTestCase {
             try await eventually { await controller.currentStateForTesting == .playing(replacementRequest) }
             let pauseCountBeforeRelease = replacement.snapshot().pauses.count
             gate.open()
-            await obsoletePause.value
+            let result = await obsoletePause.value
+            XCTAssertEqual(result, .superseded)
             let state = await controller.currentStateForTesting
             XCTAssertEqual(state, .playing(replacementRequest))
             XCTAssertEqual(replacement.snapshot().pauses.count, pauseCountBeforeRelease)
@@ -1758,25 +1760,31 @@ final class PlaybackControllerTests: XCTestCase {
         await f.controller.stop()
     }
 
-    func testUserResumeDuringInterruptionKeepsSystemPauseUntilOwnerEndsIt() async throws {
+    func testRejectedResumeDuringInterruptionPreservesManualPauseAfterItEnds() async throws {
         let f = ControllerRecoveryFixture(channelID: "user-resume-during-interruption", owner: RecordingPlaybackAudioSessionOwner())
         try await start(f)
         _ = f.owner.monitor.emit(.interruptionBegan)
         try await eventually { f.first.snapshot().completedStopCount == 1 }
         await f.controller.setPaused(true)
-        await f.controller.setPaused(false)
+        let rejected = await f.controller.setPausedAcknowledged(false, requestID: f.request.id)
+        XCTAssertEqual(rejected, .rejected(.audioInterruption))
         XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
         XCTAssertTrue(f.successor.snapshot().starts.isEmpty)
         let interrupted = await f.controller.currentStateForTesting
         XCTAssertEqual(interrupted, .paused(f.request),
             "A user resume action cannot cross the still-active physical interruption")
         _ = f.owner.monitor.emit(.interruptionEnded(shouldResume: true))
+        try await eventually { !(await f.controller.audioSessionInterruptedForTesting) }
+        XCTAssertTrue(f.successor.snapshot().starts.isEmpty, "未获准的播放不能取消手动暂停")
+        XCTAssertEqual(f.owner.sdk.activateCallCount, 1)
+        let accepted = await f.controller.setPausedAcknowledged(false, requestID: f.request.id)
+        XCTAssertEqual(accepted, .accepted)
         try await eventually { f.successor.snapshot().starts.count == 1 }
         XCTAssertEqual(f.first.snapshot().completedStopCount, 1)
         XCTAssertEqual(f.factory.makeCountSnapshot, 2)
         XCTAssertEqual(f.outputConcurrency.maximum, 1)
-        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [2])
-        f.successor.emit(.ready(readinessCycle: 2))
+        XCTAssertEqual(f.successor.snapshot().startReadinessCycles, [3])
+        f.successor.emit(.ready(readinessCycle: 3))
         try await eventually { await f.controller.currentStateForTesting == .playing(f.request) }
         await f.controller.stop()
     }
@@ -1936,7 +1944,7 @@ final class PlaybackControllerTests: XCTestCase {
     }
 }
 
-private final class ControllerRecoveryFixture: @unchecked Sendable {
+final class ControllerRecoveryFixture: @unchecked Sendable {
     let owner: RecordingPlaybackAudioSessionOwner
     let outputConcurrency = PipelineOutputConcurrency()
     let first: FakeControllerPipeline
@@ -1955,7 +1963,7 @@ private final class ControllerRecoveryFixture: @unchecked Sendable {
     }
 }
 
-private final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwner, @unchecked Sendable {
+final class RecordingPlaybackAudioSessionOwner: PlaybackAudioSessionOwner, @unchecked Sendable {
     enum Event: Equatable {
         case acquire(PlaybackAudioSessionLease)
         case requestResume(PlaybackAudioSessionLease)
