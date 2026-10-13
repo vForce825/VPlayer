@@ -700,7 +700,9 @@ final class IOSNativePictureInPictureTests: XCTestCase {
             dependencies: dependencies)
         let previousKeyWindow = scene.windows.first { $0.isKeyWindow }
         let window = UIWindow(windowScene: scene)
-        window.rootViewController = UIHostingController(rootView: NativePiPSmokeRoot(session: session))
+        window.rootViewController = UIHostingController(rootView: NativePiPSmokeRoot(session: session,
+            library: AppModel(repository: dependencies.repository, refresh: dependencies.refresh),
+            browsingSettings: dependencies.channelBrowsingSettings))
         window.makeKeyAndVisible()
         defer {
             window.isHidden = true
@@ -807,9 +809,12 @@ private enum NativePiPTestFailure: Error { case timeout, wrongBackend }
 
 private struct NativePiPSmokeRoot: View {
     @Bindable var session: IOSPlaybackSession
+    let library: AppModel
+    let browsingSettings: ChannelBrowsingSettingsStore
     var body: some View {
         if session.isFullScreenPresented {
-            IOSFullScreenPlayerView(session: session, onClose: {})
+            IOSFullScreenPlayerView(session: session, library: library,
+                browsingSettings: browsingSettings, onClose: {})
         } else {
             Color.black.ignoresSafeArea()
         }

@@ -112,6 +112,67 @@ struct IOSChannelInformationView: View {
     }
 
     private func programmeRow(_ programme: Programme) -> some View {
+        IOSProgrammeRow(programme: programme)
+    }
+}
+
+struct IOSProgrammeGuideView: View {
+    let presentation: PlayerChannelPresentation
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
+    @State private var detent: PresentationDetent = .large
+
+    var body: some View {
+        NavigationStack {
+            TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
+                let programme = ChannelProgrammePresentation.resolve(programmes: presentation.programmes, at: tick.date)
+                let upcoming = presentation.programmes.filter { $0.start >= tick.date && $0.stop > $0.start }
+                List {
+                    Section {
+                        Text(presentation.request.title).font(.headline)
+                    }
+                    Section("当前节目") {
+                        if let current = programme.current {
+                            IOSProgrammeRow(programme: current)
+                            if let progress = programme.progress {
+                                ProgressView(value: progress).accessibilityLabel("节目播出进度")
+                            }
+                        } else {
+                            Text("暂无当前节目").foregroundStyle(.secondary)
+                        }
+                    }
+                    Section("后续节目") {
+                        if upcoming.isEmpty {
+                            Text("暂无后续节目").foregroundStyle(.secondary)
+                        } else {
+                            ForEach(upcoming) { IOSProgrammeRow(programme: $0) }
+                        }
+                    }
+                    if presentation.programmes.isEmpty {
+                        Section {
+                            Text("暂时没有可用的节目单，可在“播放列表”中刷新节目单。")
+                                .font(.footnote).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("节目单")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("完成") { dismiss() }.accessibilityIdentifier("player.programmes.done")
+                }
+            }
+        }
+        .presentationDetents([.medium, .large], selection: $detent)
+        .presentationDragIndicator(.visible)
+    }
+}
+
+private struct IOSProgrammeRow: View {
+    let programme: Programme
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(programme.title).font(.headline)
             Text("\(programme.start.formatted(date: .abbreviated, time: .shortened)) – \(programme.stop.formatted(date: .abbreviated, time: .shortened))")

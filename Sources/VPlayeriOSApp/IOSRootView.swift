@@ -93,7 +93,11 @@ struct IOSRootView: View {
         } message: { Text(model.alertMessage ?? "") }
         .fullScreenCover(isPresented: fullScreenBinding) {
             if let active = session {
-                IOSFullScreenPlayerView(session: active) { model.dismissPlayback() }
+                IOSFullScreenPlayerView(session: active, library: model,
+                    browsingSettings: dependencies.channelBrowsingSettings) {
+                        guard model.presentedPlaybackRequest?.id == active.id else { return }
+                        model.dismissPlayback()
+                    }
                     .id(active.id)
                     .interactiveDismissDisabled()
                     #if DEBUG

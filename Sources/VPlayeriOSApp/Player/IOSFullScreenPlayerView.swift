@@ -4,94 +4,52 @@
 
 import SwiftUI
 import UIKit
+import VPlayerCore
 import VPlayerPlayback
 
 struct IOSFullScreenPlayerView: View {
     @Bindable var session: IOSPlaybackSession
+    @Bindable var library: AppModel
+    let browsingSettings: ChannelBrowsingSettingsStore
     let onClose: () -> Void
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverRunning
-    @State private var showsSettings = false
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
+    @State private var panel: Panel?
     @State private var controls = IOSPlayerControlsVisibility()
+    private enum Panel: String, Identifiable {
+        case channels, programmes, more
+        var id: String { rawValue }
+    }
     private var model: FullScreenPlayerViewModel { session.model }
     private var allowsAutoHide: Bool {
         IOSPlayerControlsVisibility.allowsAutoHide(state: model.state,
-            isPresentingSettings: showsSettings, isVoiceOverRunning: isVoiceOverRunning,
+            isPresentingSettings: panel != nil, isVoiceOverRunning: isVoiceOverRunning,
             isSceneActive: scenePhase == .active,
-            hasPlaybackMessage: session.pictureInPicture.message != nil)
+            hasPlaybackMessage: session.pictureInPicture.message != nil || model.playbackControlMessage != nil)
     }
     // Pin immediately when presentation conditions change, including before
     // onChange invalidates a previously scheduled timeout.
     private var areControlsVisible: Bool { controls.isVisible || !allowsAutoHide }
 
     var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-            IOSPlaybackHostView(session: session).ignoresSafeArea()
-            // This is a sibling behind the controls, not a gesture on their
-            // ancestor: a transport/settings tap cannot also toggle the bars.
-            Color.clear.contentShape(Rectangle()).ignoresSafeArea()
-                .onTapGesture { controls.backgroundTapped() }
-                .accessibilityHidden(true)
-            status
-            if areControlsVisible {
-                VStack {
-                    HStack {
-                        Button { close() } label: {
-                            Image(systemName: "chevron.left").frame(width: 44, height: 44)
-                        }
-                        .accessibilityLabel("关闭播放").accessibilityIdentifier("player-back")
-                        Text(session.presentation.request.title).font(.headline).lineLimit(1)
-                        Spacer()
-                        Button {
-                            controls.userInteracted()
-                            session.pictureInPicture.start()
-                        } label: {
-                            Image(systemName: "pip.enter").frame(width: 44, height: 44)
-                        }
-                        .disabled(!session.pictureInPicture.isPossible)
-                        .accessibilityLabel("画中画").accessibilityIdentifier("player-pip")
-                        Button {
-                            controls.userInteracted()
-                            showsSettings = true
-                        } label: {
-                            Image(systemName: "gearshape").frame(width: 44, height: 44)
-                        }.accessibilityLabel("播放设置").accessibilityIdentifier("player-settings")
+        GeometryReader { geometry in
+            ZStack {
+                Color.black.ignoresSafeArea()
+                IOSPlaybackHostView(session: session).ignoresSafeArea()
+                // 背景手势与控件互为兄弟，暂停、换台和面板按钮不会同时触发隐藏。
+                Color.clear.contentShape(Rectangle()).ignoresSafeArea()
+                    .onTapGesture { controls.backgroundTapped() }
+                    .accessibilityHidden(true)
+                centerControls
+                if areControlsVisible {
+                    VStack(spacing: 0) {
+                        topControls
+                        Spacer(minLength: 0)
+                        programmeFooter(isCompact: geometry.size.width > geometry.size.height)
                     }
-                    .padding(.horizontal, 8).background(.black.opacity(0.55))
-                    .contentShape(Rectangle())
-                    .onTapGesture { controls.userInteracted() }
-                    Spacer()
-                    VStack(spacing: 12) {
-                        if let message = model.playbackControlMessage {
-                            Text(message).font(.caption)
-                                .accessibilityIdentifier("player-control-message")
-                        }
-                        if let message = session.pictureInPicture.message {
-                            Text(message).font(.caption).accessibilityIdentifier("player-pip-message")
-                        }
-                        Text(PlaybackMediaInformationPresentation(information: model.mediaInformation).visualText)
-                            .font(.caption)
-                        if let output = PlaybackMediaInformationPresentation(information: model.mediaInformation).airPlayOutputText {
-                            Text(output).font(.caption)
-                        }
-                        if model.canControlPlayback { Button {
-                            controls.userInteracted()
-                            model.togglePause()
-                        } label: {
-                            Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
-                                .font(.title).frame(width: 60, height: 52)
-                        }
-                        .accessibilityLabel(model.isPaused ? "播放" : "暂停")
-                        .accessibilityIdentifier("player-play-pause")
-                        }
-                    }
-                    .padding().background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 16))
-                    .contentShape(Rectangle())
-                    .onTapGesture { controls.userInteracted() }
-                    .padding(.bottom, 16)
+                    .foregroundStyle(.white)
                 }
-                .foregroundStyle(.white)
             }
         }
         .statusBarHidden(!areControlsVisible)
@@ -127,27 +85,160 @@ struct IOSFullScreenPlayerView: View {
             controls.setAutoHideAllowed(false)
             UIApplication.shared.isIdleTimerDisabled = false
         }
-        .sheet(isPresented: $showsSettings) {
-            NavigationStack {
-                List {
-                    Section("视频缓冲") { PlaybackBufferRows(playback: session.settings) }
-                    Section("反交错缓冲") { DeinterlaceBufferRows(playback: session.settings) }
+        .sheet(item: $panel) { panel in
+            switch panel {
+            case .channels:
+                IOSPlayerChannelPickerView(model: library, grouping: browsingSettings.grouping) { channel in
+                    controls.userInteracted()
+                    guard channel.id != session.presentation.request.channelID ||
+                        channel.sourceProfileID != session.presentation.request.sourceProfileID else { return }
+                    library.select(channel: channel)
                 }
-                .navigationTitle("播放设置")
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("完成") {
-                            controls.userInteracted()
-                            showsSettings = false
-                        }
-                        .accessibilityIdentifier("player.settings.done")
-                    }
-                }
+            case .programmes:
+                IOSProgrammeGuideView(presentation: session.presentation)
+            case .more:
+                IOSPlayerMoreView(session: session, onDismiss: dismissPanel, onClose: close)
             }
         }
     }
+
+    private var topControls: some View {
+        HStack(spacing: 12) {
+            Button { close() } label: { controlIcon("chevron.left") }
+                .accessibilityLabel("关闭播放").accessibilityIdentifier("player-back")
+            Spacer(minLength: 0)
+            Button {
+                controls.userInteracted()
+                session.pictureInPicture.start()
+            } label: { controlIcon("pip.enter") }
+                .disabled(!session.pictureInPicture.isPossible)
+                .accessibilityLabel("画中画").accessibilityIdentifier("player-pip")
+            Button { present(.more) } label: { controlIcon("ellipsis") }
+                .accessibilityLabel("更多播放操作").accessibilityIdentifier("player-more")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 8)
+        .background(LinearGradient(colors: [.black.opacity(0.7), .clear], startPoint: .top, endPoint: .bottom))
+        .contentShape(Rectangle())
+        .onTapGesture { controls.userInteracted() }
+    }
+
+    private func controlIcon(_ symbol: String) -> some View {
+        Image(systemName: symbol).font(.title3.weight(.medium))
+            .frame(width: 44, height: 44)
+            .background(.white.opacity(0.10), in: Circle())
+    }
+
+    private var centerControls: some View {
+        VStack(spacing: 16) {
+            status
+            if areControlsVisible, model.canControlPlayback {
+                Button {
+                    controls.userInteracted()
+                    model.togglePause()
+                } label: {
+                    Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
+                        .font(.title).frame(width: 72, height: 72)
+                        .background(.black.opacity(0.5), in: Circle())
+                }
+                .accessibilityLabel(model.isPaused ? "播放" : "暂停")
+                .accessibilityIdentifier("player-play-pause")
+            }
+        }
+        .padding(24).foregroundStyle(.white)
+    }
+
+    private func programmeFooter(isCompact: Bool) -> some View {
+        TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
+            let programme = ChannelProgrammePresentation.resolve(programmes: session.presentation.programmes, at: tick.date)
+            VStack(alignment: .leading, spacing: 10) {
+                playbackMessages
+                if isCompact {
+                    HStack(alignment: .bottom, spacing: 24) {
+                        programmeSummary(programme, isCompact: true)
+                        footerActions
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                } else {
+                    programmeSummary(programme, isCompact: false)
+                    footerActions
+                }
+            }
+            .padding(.horizontal, 24).padding(.top, 24).padding(.bottom, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
+            .contentShape(Rectangle())
+            .onTapGesture { controls.userInteracted() }
+        }
+    }
+
+    @ViewBuilder private var playbackMessages: some View {
+        if let message = model.playbackControlMessage {
+            Text(message).font(.caption).accessibilityIdentifier("player-control-message")
+        }
+        if let message = session.pictureInPicture.message {
+            Text(message).font(.caption).accessibilityIdentifier("player-pip-message")
+        }
+    }
+
+    private func programmeSummary(_ programme: ChannelProgrammePresentation, isCompact: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(session.presentation.request.title)
+                .font(.title2.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(isCompact ? 1 : 2)
+                .accessibilityAddTraits(.isHeader)
+                .accessibilityIdentifier("player.channel-name")
+            if let current = programme.current {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(current.title).font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(isCompact ? 1 : 2)
+                        .accessibilityIdentifier("player.current-programme")
+                    HStack(spacing: 12) {
+                        Text("\(current.start.formatted(date: .omitted, time: .shortened)) – \(current.stop.formatted(date: .omitted, time: .shortened))")
+                            .font(.caption).monospacedDigit().foregroundStyle(.white.opacity(0.65))
+                            .fixedSize(horizontal: true, vertical: false)
+                        if let progress = programme.progress, !isCompact {
+                            ProgressView(value: progress).tint(.white.opacity(0.55))
+                                .accessibilityLabel("节目播出进度")
+                        }
+                    }
+                }
+            }
+            if let next = programme.next {
+                Text("接下来 · \(next.title)").font(.caption).foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1).accessibilityIdentifier("player.next-programme")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var footerActions: some View {
+        HStack(spacing: 12) {
+            Button { present(.channels) } label: { footerAction("换台", symbol: "list.bullet") }
+                .accessibilityIdentifier("player-channels")
+            Button { present(.programmes) } label: { footerAction("节目单", symbol: "calendar") }
+                .accessibilityIdentifier("player-programmes")
+        }
+    }
+
+    private func footerAction(_ title: String, symbol: String) -> some View {
+        Label(title, systemImage: symbol).font(.subheadline.weight(.medium))
+            .padding(.horizontal, 18).frame(maxWidth: .infinity, minHeight: 44)
+            .background(.white.opacity(0.10), in: Capsule())
+    }
+
+    private func present(_ panel: Panel) {
+        controls.userInteracted()
+        self.panel = panel
+    }
+
+    private func dismissPanel() {
+        controls.userInteracted()
+        panel = nil
+    }
     @ViewBuilder private var status: some View {
-        if model.isPaused { Text("已暂停").foregroundStyle(.white) }
+        if model.isPaused { EmptyView() }
         else {
             switch model.state {
             case .idle, .preparing: ProgressView("正在准备播放…").tint(.white)
@@ -176,6 +267,72 @@ struct IOSFullScreenPlayerView: View {
     private func updateIdleTimer() {
         UIApplication.shared.isIdleTimerDisabled = scenePhase == .active &&
             PlaybackIdleTimerPolicy.isDisabled(for: model.state)
+    }
+}
+
+private struct IOSPlayerMoreView: View {
+    let session: IOSPlaybackSession
+    let onDismiss: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    NavigationLink {
+                        informationView
+                    } label: { Label("画面信息", systemImage: "info.circle") }
+                    .accessibilityIdentifier("player-media-information")
+                    NavigationLink {
+                        settingsView
+                    } label: { Label("播放设置", systemImage: "gearshape") }
+                    .accessibilityIdentifier("player-settings")
+                }
+                Section {
+                    Button("停止播放", role: .destructive, action: onClose)
+                        .accessibilityIdentifier("player-stop")
+                }
+            }
+            .navigationTitle("更多播放操作")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { doneButton(identifier: "player.more.done") }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var settingsView: some View {
+        List {
+            Section("视频缓冲") { PlaybackBufferRows(playback: session.settings) }
+            Section("反交错缓冲") { DeinterlaceBufferRows(playback: session.settings) }
+        }
+        .navigationTitle("播放设置")
+        .toolbar { doneButton(identifier: "player.settings.done") }
+    }
+
+    private var informationView: some View {
+        let presentation = PlaybackMediaInformationPresentation(information: session.model.mediaInformation)
+        return List {
+            Section("画面") {
+                if session.model.mediaInformation?.isAudioOnly == true {
+                    Text("仅音频，当前播放源没有视频画面。")
+                } else {
+                    Text(presentation.visualText.isEmpty ? "暂未取得画面信息" : presentation.visualText)
+                        .accessibilityLabel(presentation.accessibilityText.isEmpty ? "暂未取得画面信息" : presentation.accessibilityText)
+                }
+            }
+            if let output = presentation.airPlayOutputText {
+                Section("输出") { Text(output) }
+            }
+        }
+        .navigationTitle("画面信息")
+        .toolbar { doneButton(identifier: "player.media.done") }
+    }
+
+    @ToolbarContentBuilder private func doneButton(identifier: String) -> some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button("完成", action: onDismiss).accessibilityIdentifier(identifier)
+        }
     }
 }
 

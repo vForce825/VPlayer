@@ -97,10 +97,10 @@ final class IOSLibraryFlowTests: XCTestCase {
         let playerContainerExists = app.descendants(matching: .any)
             .matching(identifier: "player-full-screen").firstMatch.exists
         let miniPlayerExists = app.buttons["player-mini-resume"].exists
-        let channelNavigationExists = app.navigationBars["频道"].exists
+        let channelNavigationExists = app.staticTexts["channel.title"].exists
         let closeByLabel = app.descendants(matching: .any)
             .matching(NSPredicate(format: "label == %@", "关闭播放"))
-        let knownIdentifiers = ["player-back", "player-full-screen", "player-pip", "player-settings"]
+        let knownIdentifiers = ["player-back", "player-full-screen", "player-pip", "player-more"]
         let closeElements = closeByLabel.allElementsBoundByIndex.prefix(3).map { element in
             let identifier = knownIdentifiers.contains(element.identifier) ? element.identifier : "other"
             return "role=\(element.elementType.rawValue):id=\(identifier):hit=\(element.isHittable):frame=\(element.frame)"
@@ -173,7 +173,10 @@ final class IOSLibraryFlowTests: XCTestCase {
             require(pause, in: app, stage: stage + "-transport-presented", timeout: 5)
         }
         if pause.label == "暂停" {
-            pause.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+            // 直接点击语义控件，避免坐标定位反复读取布局而越过自动隐藏期限。
+            pause.tap()
+            XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 2),
+                          failureDetails(in: app, stage: stage + "-paused-before-inspection"))
         }
     }
     private func assertPlayerControls(in app: XCUIApplication, stage: String,
@@ -188,7 +191,7 @@ final class IOSLibraryFlowTests: XCTestCase {
             failureDetails(in: app, stage: stage + "-screen-is-not-button"), file: file, line: line)
         let screen = screens.firstMatch
         for (identifier, label) in [("player-back", "关闭播放"), ("player-pip", "画中画"),
-                                     ("player-settings", "播放设置")] {
+                                     ("player-more", "更多播放操作")] {
             let buttons = identified(identifier, in: screen.descendants(matching: .button))
             XCTAssertEqual(buttons.count, 1, failureDetails(in: app, stage: stage + "-" + identifier),
                 file: file, line: line)
@@ -274,9 +277,9 @@ final class IOSLibraryFlowTests: XCTestCase {
     func testChannelBrowserDisplaysRenamedActivePlaylist() {
         let app = launch()
         defer { app.terminate() }
-        let profile = app.staticTexts["channel.active-playlist"]
+        let profile = app.buttons["channel.active-playlist"]
         require(profile, in: app, stage: "channel-active-playlist", timeout: 15)
-        XCTAssertEqual(profile.label, "测试播放列表")
+        XCTAssertEqual(profile.value as? String, "测试播放列表")
         app.tabBars.buttons["播放列表"].tap()
         app.buttons["编辑"].tap()
         let name = app.textFields["source.editor.name"]
@@ -297,7 +300,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(app.buttons["编辑"], in: app, stage: "channel-playlist-renamed", timeout: 5, hittable: true)
         app.tabBars.buttons["频道"].tap()
         require(profile, in: app, stage: "channel-playlist-name-updated", timeout: 5)
-        XCTAssertEqual(profile.label, "新的播放列表")
+        XCTAssertEqual(profile.value as? String, "新的播放列表")
     }
     func testGroupMenuJumpsToDistantSectionsAndStaysReachable() {
         continueAfterFailure = false
@@ -310,14 +313,23 @@ final class IOSLibraryFlowTests: XCTestCase {
         let lastGroup = app.buttons["channel.focus-probe.060"]
         let groups = app.buttons["channel.groups"]
         require(first, in: app, stage: "group-jump-initial", timeout: 15, hittable: true)
-        require(app.navigationBars["频道"], in: app, stage: "group-jump-navigation-title", timeout: 3)
+        require(app.staticTexts["channel.title"], in: app, stage: "group-jump-navigation-title", timeout: 3)
         let browserScreenshot = XCTAttachment(screenshot: app.screenshot())
         browserScreenshot.name = "频道列表与分组入口"
         browserScreenshot.lifetime = .keepAlways
         add(browserScreenshot)
+        app.swipeUp()
+        let scrolledScreenshot = XCTAttachment(screenshot: app.screenshot())
+        scrolledScreenshot.name = "导航内播放列表名称与滚动边缘"
+        scrolledScreenshot.lifetime = .keepAlways
+        add(scrolledScreenshot)
         XCTAssertFalse(lastGroup.isHittable)
         groups.tap()
         app.buttons["channel.group.诊断分组 4"].tap()
+        let jumpedScreenshot = XCTAttachment(screenshot: app.screenshot())
+        jumpedScreenshot.name = "分组定位后的导航与首个频道"
+        jumpedScreenshot.lifetime = .keepAlways
+        add(jumpedScreenshot)
         require(lastGroup, in: app, stage: "group-jump-distant", timeout: 5, hittable: true)
         XCTAssertFalse(first.isHittable)
         require(groups, in: app, stage: "group-jump-menu-still-reachable", timeout: 3, hittable: true)
@@ -326,13 +338,119 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(first, in: app, stage: "group-jump-return", timeout: 5, hittable: true)
         XCTAssertFalse(app.buttons["player-back"].exists)
     }
+
+    func testNavigationPlaylistPickerKeepsCurrentSelectionAndVisibleChannels() {
+        let app = launch()
+        defer { app.terminate() }
+        let picker = app.buttons["channel.active-playlist"]
+        require(picker, in: app, stage: "navigation-playlist-picker", timeout: 15, hittable: true)
+        XCTAssertEqual(picker.value as? String, "测试播放列表")
+        picker.tap()
+        let current = app.buttons["测试播放列表"]
+        require(current, in: app, stage: "navigation-current-playlist", timeout: 5, hittable: true)
+        current.tap()
+        require(app.buttons["channel.http"], in: app, stage: "navigation-current-playlist-unchanged", timeout: 5,
+            hittable: true)
+        XCTAssertEqual(picker.value as? String, "测试播放列表")
+        XCTAssertFalse(app.buttons["player-back"].exists)
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+    }
+
+    func testPlayerProgrammeGuideAndMediaInformationPreservePlaybackSession() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "programme-player-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        pauseBeforeControlInspection(in: app, stage: "programme-player")
+        let identity = playerSessionIdentity(in: app)
+        XCTAssertEqual(app.staticTexts["player.channel-name"].label, "测试频道")
+        XCTAssertEqual(app.staticTexts["player.current-programme"].label, "正在播出")
+        XCTAssertTrue(app.staticTexts["player.next-programme"].label.contains("接下来"))
+        let portrait = XCTAttachment(screenshot: app.screenshot())
+        portrait.name = "播放页频道主标题与辅助节目信息"
+        portrait.lifetime = .keepAlways
+        add(portrait)
+
+        app.buttons["player-programmes"].tap()
+        require(app.buttons["player.programmes.done"], in: app, stage: "programme-guide", timeout: 5, hittable: true)
+        XCTAssertTrue(app.staticTexts["正在播出"].exists)
+        XCTAssertTrue(app.staticTexts["接下来"].exists)
+        app.buttons["player.programmes.done"].tap()
+        require(app.buttons["player-more"], in: app, stage: "programme-guide-return", timeout: 5, hittable: true)
+        assertPlayerSession(identity, in: app)
+
+        app.buttons["player-more"].tap()
+        require(app.buttons["player-media-information"], in: app, stage: "media-more", timeout: 5, hittable: true)
+        app.buttons["player-media-information"].tap()
+        require(app.buttons["player.media.done"], in: app, stage: "media-information", timeout: 5, hittable: true)
+        app.buttons["player.media.done"].tap()
+        require(app.buttons["player-back"], in: app, stage: "media-information-return", timeout: 5, hittable: true)
+        assertPlayerSession(identity, in: app)
+        app.buttons["player-back"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "programme-player-closed", timeout: 5, hittable: true)
+        XCTAssertFalse(app.buttons["player-mini-resume"].exists)
+    }
+
+    func testPlayerChannelPickerCancelsRejectsAndSwitchesWithinFullScreen() {
+        let app = launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.http"], in: app, stage: "switch-initial-channel", timeout: 15)
+        app.buttons["channel.http"].tap()
+        pauseBeforeControlInspection(in: app, stage: "switch-initial-player")
+        let initialIdentity = playerSessionIdentity(in: app)
+
+        app.buttons["player-channels"].tap()
+        require(app.buttons["player.channels.done"], in: app, stage: "switch-cancel-picker", timeout: 5,
+            hittable: true)
+        app.buttons["player.channels.done"].tap()
+        require(app.buttons["player-channels"], in: app, stage: "switch-cancel-return", timeout: 5,
+            hittable: true)
+        assertPlayerSession(initialIdentity, in: app)
+
+        app.buttons["player-channels"].tap()
+        let unsupported = app.buttons["player.switch.channel.udp"]
+        require(unsupported, in: app, stage: "switch-unsupported-channel", timeout: 5, hittable: true)
+        unsupported.tap()
+        require(app.staticTexts["player.channels.message"], in: app, stage: "switch-unsupported-reason", timeout: 3)
+        XCTAssertTrue(app.buttons["player.channels.done"].exists)
+        app.buttons["player.channels.done"].tap()
+        require(app.buttons["player-channels"], in: app, stage: "switch-unsupported-return", timeout: 5,
+            hittable: true)
+        assertPlayerSession(initialIdentity, in: app)
+
+        app.buttons["player-channels"].tap()
+        require(app.buttons["player.switch.channel.http"], in: app, stage: "switch-current-channel", timeout: 5,
+            hittable: true)
+        app.buttons["player.switch.channel.http"].tap()
+        require(app.buttons["player-channels"], in: app, stage: "switch-current-return", timeout: 5, hittable: true)
+        assertPlayerSession(initialIdentity, in: app)
+
+        app.buttons["player-channels"].tap()
+        let next = app.buttons["player.switch.channel.grouped"]
+        require(next, in: app, stage: "switch-next-channel", timeout: 5, hittable: true)
+        next.tap()
+        pauseBeforeControlInspection(in: app, stage: "switch-next-player")
+        XCTAssertEqual(app.staticTexts["player.channel-name"].label, "另一组频道")
+        let nextIdentity = playerSessionIdentity(in: app)
+        XCTAssertNotEqual(nextIdentity, initialIdentity)
+        assertPlayerSession(nextIdentity, in: app, allowsPreviousClose: true)
+        XCTAssertFalse(app.buttons["player-mini-resume"].exists)
+        app.buttons["player-programmes"].tap()
+        require(app.buttons["player.programmes.done"], in: app, stage: "switch-next-empty-guide", timeout: 5,
+            hittable: true)
+        XCTAssertTrue(app.staticTexts["暂无当前节目"].exists)
+        app.buttons["player.programmes.done"].tap()
+        require(app.buttons["player-back"], in: app, stage: "switch-next-guide-return", timeout: 5, hittable: true)
+        app.buttons["player-back"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "switch-close-return", timeout: 5, hittable: true)
+    }
     private func tapPlayerBackground(in app: XCUIApplication) {
         let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
         if !screen.exists {
             require(screen, in: app, stage: "controls-background-screen", timeout: 5)
         }
-        // The observed center is outside the top bar and bottom transport card.
-        screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        // 暂停按钮位于画面中央，背景操作选择顶部栏与中央控件之间的空白区域。
+        screen.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.3)).tap()
     }
     private func assertSystemStatusBar(_ expected: String, in app: XCUIApplication,
                                        isPresented: Bool = true,
@@ -364,7 +482,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertTrue(value.hasPrefix("session="), failureDetails(in: app, stage: "controls-session-identity"))
         return value
     }
-    private func assertPlayerSession(_ identity: String, in app: XCUIApplication) {
+    private func assertPlayerSession(_ identity: String, in app: XCUIApplication, allowsPreviousClose: Bool = false) {
         XCTAssertEqual(playerSessionIdentity(in: app), identity, "Controls must not replace the playback session")
         let presented = app.descendants(matching: .any).matching(identifier: "ios.playback.route.presented").firstMatch
         XCTAssertTrue(presented.exists, "The presented playback route probe must exist")
@@ -372,7 +490,15 @@ final class IOSLibraryFlowTests: XCTestCase {
         for expected in ["session=true", "matching=true", "closing=false", "fullScreen=true"] {
             XCTAssertTrue(snapshot.contains(expected), failureDetails(in: app, stage: "controls-session-preserved"))
         }
-        XCTAssertFalse(snapshot.contains("session-close:"), "Controls must not stop playback")
+        if !allowsPreviousClose {
+            XCTAssertFalse(snapshot.contains("session-close:"), "Controls must not stop playback")
+        }
+    }
+    private func openPlaybackSettings(in app: XCUIApplication, stage: String) {
+        app.buttons["player-more"].tap()
+        require(app.buttons["player-settings"], in: app, stage: stage + "-more", timeout: 5, hittable: true)
+        app.buttons["player-settings"].tap()
+        require(app.buttons["player.settings.done"], in: app, stage: stage + "-settings", timeout: 5, hittable: true)
     }
     func testPlaybackControlsBackgroundTapAndIdleTimeoutPreserveSession() {
         let app = launch()
@@ -418,12 +544,12 @@ final class IOSLibraryFlowTests: XCTestCase {
         pause.tap()
         XCTAssertTrue(pause.wait(for: \.label, toEqual: "暂停", timeout: 2),
                       "Tapping Play must leave the transport visible, without a second background toggle")
-        app.buttons["player-settings"].tap()
+        openPlaybackSettings(in: app, stage: "control-taps")
         let done = app.buttons["player.settings.done"]
         require(done, in: app, stage: "control-taps-settings", timeout: 3, hittable: true)
         XCTAssertFalse(done.waitForNonExistence(timeout: 4), "Settings remain open beyond the idle timeout")
         done.tap()
-        require(pause, in: app, stage: "control-taps-settings-return", timeout: 2, hittable: true)
+        requireTransientControl(pause, in: app, stage: "control-taps-settings-return", timeout: 2)
         XCTAssertEqual(pause.label, "暂停")
         pause.tap()
         XCTAssertTrue(pause.wait(for: \.label, toEqual: "播放", timeout: 3))
@@ -489,7 +615,7 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertFalse(back.waitForNonExistence(timeout: 4), "Failure cannot hide the exit or settings")
         tapPlayerBackground(in: app)
         XCTAssertTrue(back.isHittable)
-        XCTAssertTrue(app.buttons["player-settings"].isHittable)
+        XCTAssertTrue(app.buttons["player-more"].isHittable)
         back.tap()
         require(app.buttons["channel.http"], in: app, stage: "failure-controls-closed", timeout: 5, hittable: true)
     }
@@ -611,7 +737,15 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCUIDevice.shared.orientation = .landscapeLeft
         XCTAssertTrue(app.buttons["player-back"].exists, failureDetails(in: app, stage: "after-rotation"))
         assertPlayerControls(in: app, stage: "after-rotation")
-        app.buttons["player-settings"].tap()
+        XCTAssertGreaterThan(app.frame.width, app.frame.height, "旋转后应实际进入横屏")
+        for identifier in ["player-back", "player-play-pause", "player-pip", "player-more", "player-channels", "player-programmes"] {
+            XCTAssertTrue(app.frame.contains(app.buttons[identifier].frame), "横屏控件超出可见区域：\(identifier)")
+        }
+        let landscape = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        landscape.name = "新版播放页横屏布局"
+        landscape.lifetime = .keepAlways
+        add(landscape)
+        openPlaybackSettings(in: app, stage: "rotation")
         require(app.buttons["player.settings.done"], in: app, stage: "settings-presented", timeout: 5)
         app.buttons["player.settings.done"].tap()
         require(app.buttons["player-back"], in: app, stage: "after-settings-player-back", timeout: 5)
