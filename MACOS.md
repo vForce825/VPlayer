@@ -30,6 +30,26 @@ xcodebuild archive -project VPlayer.xcodeproj -scheme VPlayerMacOSRelease \
 
 此命令使用本机开发证书，需将团队 ID 替换为证书所属团队。归档内的应用位于 `Products/Applications/VPlayer.app`，可复制到个人 `~/Applications` 目录运行。应用与两个内嵌框架必须由同一开发团队签名，保留沙盒与强化运行时。正式分发需使用对应渠道的签名、公证或商店流程。
 
+上传前必须核对实际签名应用，不能只检查源码权限文件。以下命令验证归档应用的签名，并确认沙盒与网络客户端权限开启、网络服务器权限不存在；若导出流程重新签名，还需将 `app` 改为最终导出应用的路径，再执行同一检查。只有检查成功的产物才能继续上传。
+
+```sh
+set -e
+app="build/VPlayerMacOS.xcarchive/Products/Applications/VPlayer.app"
+codesign --verify --deep --strict "$app"
+codesign -d --entitlements :- "$app" > build/macos-signed-entitlements.plist
+python3 - <<'PY'
+import plistlib
+from pathlib import Path
+
+entitlements = plistlib.loads(Path("build/macos-signed-entitlements.plist").read_bytes())
+if (entitlements.get("com.apple.security.app-sandbox") is not True
+        or entitlements.get("com.apple.security.network.client") is not True
+        or "com.apple.security.network.server" in entitlements):
+    raise SystemExit("签名权限检查失败：应保留沙盒与网络客户端权限，且不得包含网络服务器权限")
+print("实际签名权限检查通过")
+PY
+```
+
 CI 可用 `CODE_SIGN_IDENTITY=-` 仅检查归档构建与资源完整性；临时签名的 Release 不作为可直接安装运行的交付物，否则强化运行时会拒绝加载内嵌框架。从临时签名的调试版切换到开发证书版时，macOS 可能要求用户确认访问原有应用数据。
 
 测试另需 `ffmpeg` 命令行工具（`brew install ffmpeg`），用于将已入库的 16 秒夹具无损重封装为 60 秒连续时间戳媒体；临时产物只保存在 `build/macos-test-fixtures`。它是测试依赖，应用仍使用仓库独立构建并审计的 FFmpeg 库。
@@ -107,7 +127,7 @@ Scripts/test-macos.sh --headless --tests RefreshCoordinatorTests
 
 睡眠与唤醒进入现有播放中断和恢复流程。播放过程中防止显示器因闲置休眠，暂停或停止后释放对应活动。切换 App 或播放窗口失去焦点不会停止直播。应用退出时等待播放器清理完成。
 
-沙盒开启网络客户端与服务器权限：客户端用于访问远端播放源，服务器用于已有 HLS 管线的本地回环服务。使用同一份 FFmpeg 源码锁、组件限制、许可设置和归档审计，Mac 产物位于 `Vendor/FFmpeg/Artifacts-macOS`，不覆盖其他平台产物。
+沙盒仅开启网络客户端权限，用于获取播放列表、节目单和远端媒体；不申请网络服务器权限。Mac 的播放输出（包括系统 AirPlay 音频设备）沿用本地 sample-buffer 管线，不依赖应用内的 HLS 回环服务器。测试夹具服务器由外部测试脚本启动，不需要应用的服务器权限。权限源文件、`project.yml` 与生成项目的 Debug/Release 配置由 `Scripts/Tests/test_macos_network_entitlements.py` 交叉检查，正式上传前另行核对实际签名产物。使用同一份 FFmpeg 源码锁、组件限制、许可设置和归档审计，Mac 产物位于 `Vendor/FFmpeg/Artifacts-macOS`，不覆盖其他平台产物。
 
 Mac 沿用 HTTP/HTTPS 播放协议。画中画使用公开 AppKit API 实现的置顶浮动窗口：可拖动、等比例缩放、暂停、继续和返回播放窗口，闲置时隐藏控制按钮；关闭主窗口后仍能播放并重新打开主窗口。视频视图在主窗口与浮窗之间移动，始终复用同一个渲染器，不重复拉流或创建第二套解码器。
 

@@ -3,6 +3,7 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
+python3 Scripts/Tests/test_macos_network_entitlements.py
 mkdir -p build
 scheme=VPlayerMacOS
 if [[ "${1:-}" == "--headless" ]]; then scheme=VPlayerMacOSHeadless; shift; fi
