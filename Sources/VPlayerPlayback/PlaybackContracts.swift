@@ -140,15 +140,10 @@ public struct PlaybackTuning: Sendable, Equatable {
     /// frame-count bound silently halves for interlaced content — which is
     /// exactly the material that needs the buffer most.
     ///
-    /// The default has to cover two opposing margins at once: the anchor sits
-    /// `maximumAnchorLag` behind the newest frame so a supply hiccup does not
-    /// let the clock overtake it, and whatever is left over is the room video
-    /// has to creep further ahead before the horizon starts discarding. One
-    /// second could not hold both — halving the anchor lag to stop the
-    /// discarding just moved the failure to the other side and re-anchored on
-    /// every hiccup instead.
+    /// 默认保留一秒视频，兼顾直播响应与缓冲余量。供帧波动较大时，
+    /// 用户可以增加缓冲；时钟锚点余量始终随所选时长一起调整。
     public static let videoBufferSecondsChoices: [Double] = [0.5, 1, 2, 4]
-    public static let defaultVideoBufferSeconds: Double = 2
+    public static let defaultVideoBufferSeconds: Double = 1
     /// How many deinterlace inputs may wait for the GPU before work is shed.
     /// Shedding here starts the cascade on a live stream: the lost field pair
     /// puts video behind the clock, a live source cannot be caught up, and the

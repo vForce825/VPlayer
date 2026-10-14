@@ -60,20 +60,80 @@ struct MacSettingsView: View {
 
 struct MacPlaybackSettingsForm: View {
     @Bindable var settings: PlaybackSettingsStore
+    @State private var selection: BufferSelection?
+
+    private enum BufferSelection: String, Identifiable {
+        case video = "视频缓冲"
+        case deinterlace = "反交错缓冲"
+        var id: Self { self }
+    }
+
     var body: some View {
-        Form {
-            Picker("视频缓冲", selection: $settings.videoBufferSeconds) {
-                ForEach(PlaybackTuning.videoBufferSecondsChoices, id: \.self) { seconds in
-                    Text(PlaybackBufferRows.videoBufferTitle(seconds)).tag(seconds)
-                }
-            }.accessibilityIdentifier("settings.buffer.video.current")
-            Picker("反交错缓冲", selection: $settings.deinterlaceBufferFrames) {
-                ForEach(PlaybackTuning.deinterlaceBufferFramesChoices, id: \.self) { frames in
-                    Text(DeinterlaceBufferRows.title(frames)).tag(frames)
-                }
-            }.accessibilityIdentifier("settings.buffer.deinterlace.current")
-            Text("更大的缓冲可改善网络波动时的播放稳定性，同时增加直播延迟。")
+        VStack(alignment: .leading, spacing: 12) {
+            Form {
+                summary(.video, value: PlaybackBufferRows.videoBufferTitle(settings.videoBufferSeconds),
+                    identifier: "settings.buffer.video.current")
+                summary(.deinterlace, value: DeinterlaceBufferRows.title(settings.deinterlaceBufferFrames),
+                    identifier: "settings.buffer.deinterlace.current")
+            }
+            .formStyle(.grouped)
+            .frame(height: 130)
+            Text("修改立即用于当前播放，并保存到本机的所有频道。")
                 .font(.caption).foregroundStyle(.secondary)
-        }.padding()
+            Button("恢复播放默认设置") { settings.restoreDefaults() }
+                .disabled(settings.tuning == .default)
+                .accessibilityIdentifier("settings.playback.reset")
+            Text("恢复为视频缓冲 \(PlaybackBufferRows.videoBufferTitle(PlaybackTuning.default.videoBufferSeconds, marksDefault: false))、反交错缓冲 \(DeinterlaceBufferRows.title(PlaybackTuning.default.deinterlaceBufferFrames, marksDefault: false))。仅恢复播放设置。")
+                .font(.caption).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal)
+        .frame(height: 300)
+        .popover(item: $selection) { choice in
+            VStack(spacing: 12) {
+                HStack {
+                    Text(choice.rawValue).font(.headline)
+                    Spacer()
+                    Button("完成") { selection = nil }
+                        .accessibilityIdentifier("settings.buffer.options.done")
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    switch choice {
+                    case .video:
+                        PlaybackBufferRows(playback: settings)
+                        explanation(PlaybackSettingsExplanation.videoBuffer)
+                    case .deinterlace:
+                        DeinterlaceBufferRows(playback: settings)
+                        explanation(PlaybackSettingsExplanation.deinterlaceBuffer)
+                        Text("帧率增强").font(.headline)
+                        explanation(PlaybackSettingsExplanation.frameRateEnhancement)
+                    }
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(16)
+            .frame(width: 390)
+        }
+    }
+
+    private func summary(_ choice: BufferSelection, value: String, identifier: String) -> some View {
+        Button { selection = choice } label: {
+            HStack {
+                Text(choice.rawValue)
+                Spacer()
+                Text(value).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(choice.rawValue)
+        .accessibilityValue(value)
+        .accessibilityIdentifier(identifier)
+    }
+
+    private func explanation(_ text: String) -> some View {
+        Text(text).font(.callout).foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }

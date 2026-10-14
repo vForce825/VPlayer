@@ -11,16 +11,12 @@ struct IOSSettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                SettingsSummaryLink(title: "视频缓冲",
-                    value: PlaybackBufferRows.videoBufferTitle(playback.videoBufferSeconds),
-                    identifier: "settings.buffer.video.current") { VideoBufferSelectionView(playback: playback) }
-                SettingsSummaryLink(title: "反交错缓冲",
-                    value: DeinterlaceBufferRows.title(playback.deinterlaceBufferFrames),
-                    identifier: "settings.buffer.deinterlace.current") { DeinterlaceBufferSelectionView(playback: playback) }
+                PlaybackSettingsSections(playback: playback)
                 Picker("频道排列", selection: $channelBrowsing.grouping) {
                     Text("按播放列表分组").tag(ChannelGrouping.playlistGroups)
                     Text("按原始顺序平铺").tag(ChannelGrouping.playlistOrder)
                 }
+                PlaybackSettingsResetSection(playback: playback)
                 Section("隐私") {
                     Text("播放列表、节目单和设置保存在本机。VPlayer 不包含账号、广告或分析跟踪功能。")
                         .font(.footnote)

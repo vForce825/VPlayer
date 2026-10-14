@@ -342,8 +342,8 @@ private struct IOSPlayerMoreView: View {
 
     private var settingsView: some View {
         List {
-            Section("视频缓冲") { PlaybackBufferRows(playback: session.settings) }
-            Section("反交错缓冲") { DeinterlaceBufferRows(playback: session.settings) }
+            PlaybackSettingsSections(playback: session.settings)
+            PlaybackSettingsResetSection(playback: session.settings)
         }
         .navigationTitle("播放设置")
         .toolbar { doneButton(identifier: "player.settings.done") }

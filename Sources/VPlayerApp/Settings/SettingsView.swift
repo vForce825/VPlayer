@@ -19,20 +19,7 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             List {
-                SettingsSummaryLink(
-                    title: "视频缓冲",
-                    value: PlaybackBufferRows.videoBufferTitle(playback.videoBufferSeconds),
-                    identifier: "settings.buffer.video.current"
-                ) {
-                    VideoBufferSelectionView(playback: playback)
-                }
-                SettingsSummaryLink(
-                    title: "反交错缓冲",
-                    value: DeinterlaceBufferRows.title(playback.deinterlaceBufferFrames),
-                    identifier: "settings.buffer.deinterlace.current"
-                ) {
-                    DeinterlaceBufferSelectionView(playback: playback)
-                }
+                PlaybackSettingsSections(playback: playback)
                 SettingsSummaryLink(
                     title: "频道排列",
                     value: groupingTitle(channelBrowsing.grouping),
@@ -40,6 +27,7 @@ struct SettingsView: View {
                 ) {
                     ChannelGroupingSelectionView(channelBrowsing: channelBrowsing)
                 }
+                PlaybackSettingsResetSection(playback: playback)
                 Section("法律") {
                     NavigationLink("隐私政策") {
                         PrivacyStatementView()

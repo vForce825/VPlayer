@@ -13,19 +13,59 @@ struct IOSChannelInformationView: View {
     @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var showsMapping = false
     @State private var copiedStreamURL = false
+    @State private var selectedTab: InformationTab = .overview
+
+    private enum InformationTab: String, CaseIterable, Identifiable {
+        case overview = "概览"
+        case programmes = "节目单"
+        var id: Self { self }
+    }
 
     var body: some View {
         NavigationStack {
-            TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
-                let programmes = model.programmesByChannelID[channel.id, default: []]
-                List {
-                    basicInformation
-                    epgInformation
-                    IOSProgrammeSections(guide: IOSProgrammeGuidePresentation(programmes: programmes, at: tick.date))
+            VStack(spacing: 0) {
+                channelHeading
+                Picker("频道信息内容", selection: $selectedTab) {
+                    ForEach(InformationTab.allCases) { tab in
+                        Text(tab.rawValue).tag(tab)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("channel.info.tabs")
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+                TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
+                    let programmes = model.programmesByChannelID[channel.id, default: []]
+                    let guide = IOSProgrammeGuidePresentation(programmes: programmes, at: tick.date)
+                    List {
+                        switch selectedTab {
+                        case .overview:
+                            currentProgrammeSummary(guide: guide)
+                            streamInformation
+                            matchedProgrammeInformation
+                            originalSourceFields
+                        case .programmes:
+                            if guide.days.isEmpty {
+                                ContentUnavailableView("暂无节目单", systemImage: "list.bullet.rectangle",
+                                    description: Text("请在“概览”中检查节目单匹配，或在“播放列表”中刷新节目单。"))
+                                    .listRowBackground(Color.clear)
+                            } else {
+                                IOSProgrammeSections(guide: guide)
+                            }
+                        }
+                    }
+                    .id(selectedTab)
+                    .accessibilityIdentifier(selectedTab == .overview ? "channel.info.overview" : "channel.info.programmes")
+                    .listSectionSpacing(.compact)
+                    .contentMargins(.top, 8, for: .scrollContent)
+                    .scrollEdgeEffectStyle(.hard, for: .top)
                 }
             }
+            .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("频道信息")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
+            .toolbarBackgroundVisibility(.visible, for: .navigationBar)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("完成") { dismiss() }
@@ -39,59 +79,140 @@ struct IOSChannelInformationView: View {
         }
     }
 
-    private var basicInformation: some View {
-        Section("基础信息") {
-            LabeledContent("频道名称") {
-                Text(channel.displayName).textSelection(.enabled)
+    private var channelHeading: some View {
+        HStack(spacing: 12) {
+            ChannelLogoView(url: channel.logoURL, imagePadding: 4, placeholderVerticalPadding: 8)
+                .frame(width: 48, height: 44)
+                .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 10))
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(channel.displayName).font(.title3.weight(.semibold))
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
                     .accessibilityIdentifier("channel.info.name")
+                let group = originalValue(channel.groupTitle) ?? ChannelSectionBuilder.ungroupedTitle
+                if let profile = model.profiles.first(where: { $0.id == channel.sourceProfileID }) {
+                    Text("\(profile.name) · \(group)")
+                        .accessibilityLabel("播放列表，\(profile.name)，分组，\(group)")
+                        .font(.subheadline).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text(group).font(.subheadline).foregroundStyle(.secondary)
+                }
             }
-            if let profile = model.profiles.first(where: { $0.id == channel.sourceProfileID }) {
-                LabeledContent("播放列表", value: profile.name)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 8)
+        .padding(.bottom, 16)
+    }
+
+    private func currentProgrammeSummary(guide: IOSProgrammeGuidePresentation) -> some View {
+        Section {
+            if let current = guide.days.lazy.flatMap(\.rows).first(where: \.isCurrent) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ViewThatFits(in: .horizontal) {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            Text("正在播出").font(.caption).foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                            currentProgrammeTime(current.timeRange)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("正在播出").font(.caption).foregroundStyle(.secondary)
+                            currentProgrammeTime(current.timeRange)
+                        }
+                    }
+                    Text(current.programme.title).font(.headline)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("channel.info.current.title")
+                    if let progress = current.progress {
+                        ProgressView(value: progress).tint(.accentColor)
+                            .accessibilityLabel("节目播出进度")
+                    }
+                }
+                .padding(.vertical, 4)
+            } else {
+                Text("暂无当前节目").foregroundStyle(.secondary)
+                    .accessibilityIdentifier("channel.info.current.empty")
             }
-            let groupTitle = channel.groupTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            LabeledContent("频道分组", value: groupTitle.isEmpty ? ChannelSectionBuilder.ungroupedTitle : groupTitle)
+        }
+    }
+
+    private func currentProgrammeTime(_ timeRange: String) -> some View {
+        Text(timeRange).font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
+            .accessibilityLabel("播出时间，\(timeRange.replacingOccurrences(of: " – ", with: " 至 "))")
+            .accessibilityIdentifier("channel.info.current.time")
+    }
+
+    private var streamInformation: some View {
+        Section("播放链接") {
             VStack(alignment: .leading, spacing: 8) {
-                Text("播放链接").font(.subheadline).foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    Text("频道播放地址").font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button {
+                        UIPasteboard.general.string = channel.streamURL.absoluteString
+                        copiedStreamURL = true
+                    } label: {
+                        Label(copiedStreamURL ? "已复制" : "复制", systemImage: "doc.on.doc")
+                            .font(.caption)
+                            .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel(copiedStreamURL ? "已复制播放链接" : "复制播放链接")
+                    .accessibilityIdentifier("channel.info.copy")
+                }
                 Text(channel.streamURL.absoluteString)
                     .font(.callout)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("channel.info.stream-url")
-                Button {
-                    UIPasteboard.general.string = channel.streamURL.absoluteString
-                    copiedStreamURL = true
-                } label: {
-                    Label(copiedStreamURL ? "已复制播放链接" : "复制播放链接", systemImage: "doc.on.doc")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityIdentifier("channel.info.copy")
             }
             .padding(.vertical, 4)
         }
     }
 
-    private var epgInformation: some View {
-        Section("EPG 信息") {
+    private var matchedProgrammeInformation: some View {
+        Section("节目单匹配结果") {
             if let id = model.matchedEPGChannelID(for: channel) {
-                if let epgChannel = model.epgChannels.first(where: { $0.id == id }),
-                   let name = epgChannel.displayNames.first {
-                    LabeledContent("EPG 频道", value: name)
-                }
-                LabeledContent("EPG 频道 ID", value: id).textSelection(.enabled)
-                LabeledContent("匹配方式", value: model.manualEPGChannelID(for: channel) == id ? "手动映射" : "自动匹配")
+                let name = model.epgChannels.first(where: { $0.id == id })?.displayNames
+                    .first(where: { originalValue($0) != nil }) ?? "未提供名称"
+                informationField("节目单频道", value: name, identifier: "channel.info.epg.name")
+                informationField("频道 ID", value: id, identifier: "channel.info.epg.id")
+                informationField("匹配方式", value: model.manualEPGChannelID(for: channel) == id ? "手动映射" : "自动匹配",
+                    identifier: "channel.info.epg.method")
             } else {
-                Text("尚未匹配 EPG 频道").foregroundStyle(.secondary)
-            }
-            if let id = channel.tvgID, !id.isEmpty {
-                LabeledContent("列表中的 EPG ID", value: id).textSelection(.enabled)
-            }
-            if let name = channel.tvgName, !name.isEmpty {
-                LabeledContent("列表中的 EPG 名称", value: name)
+                Text("尚未匹配节目单频道").foregroundStyle(.secondary)
+                    .accessibilityIdentifier("channel.info.epg.unmatched")
             }
             Button("设置 EPG") { showsMapping = true }
                 .accessibilityIdentifier("channel.info.mapping")
         }
     }
 
+    private var originalSourceFields: some View {
+        Section("播放源原始字段") {
+            informationField("EPG ID", value: originalValue(channel.tvgID) ?? "未提供",
+                identifier: "channel.info.source.epg-id")
+            informationField("EPG 名称", value: originalValue(channel.tvgName) ?? "未提供",
+                identifier: "channel.info.source.epg-name")
+        }
+    }
+
+    private func informationField(_ title: String, value: String, identifier: String) -> some View {
+        LabeledContent(title) {
+            Text(value).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier(identifier)
+        }
+    }
+
+    private func originalValue(_ value: String?) -> String? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
+    }
 }
 
 struct IOSProgrammeGuideView: View {

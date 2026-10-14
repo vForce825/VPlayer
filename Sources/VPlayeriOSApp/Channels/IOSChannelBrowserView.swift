@@ -26,7 +26,8 @@ struct IOSChannelBrowserView: View {
                         description: Text("请在“播放列表”中刷新频道列表。"))
                 } else {
                     channelList
-                        .searchable(text: $searchText, prompt: "搜索频道")
+                        .searchable(text: $searchText,
+                            placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索频道")
                 }
             }
             .navigationTitle("频道")
@@ -196,43 +197,73 @@ struct IOSPlayerChannelPickerView: View {
         NavigationStack {
             let presentation = ChannelBrowserPresentation(channels: model.channels,
                 searchText: searchText, grouping: grouping)
-            List {
-                if let selectionMessage {
-                    Text(selectionMessage).font(.callout).foregroundStyle(.red)
-                        .accessibilityIdentifier("player.channels.message")
-                }
-                if presentation.sections.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
-                }
-                ForEach(presentation.sections) { section in
-                    Section {
-                        ForEach(section.channels) { channel in
-                            Button { select(channel) } label: {
-                                HStack(spacing: 12) {
-                                    IOSChannelRow(channel: channel,
-                                        programmes: model.programmesByChannelID[channel.id, default: []])
-                                    if model.presentedPlaybackRequest?.channelID == channel.id {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .foregroundStyle(.tint)
-                                            .accessibilityLabel("正在播放")
+            ScrollViewReader { proxy in
+                List {
+                    if let selectionMessage {
+                        Text(selectionMessage).font(.callout).foregroundStyle(.red)
+                            .accessibilityIdentifier("player.channels.message")
+                    }
+                    if presentation.sections.isEmpty {
+                        ContentUnavailableView.search(text: searchText)
+                    }
+                    ForEach(presentation.sections) { section in
+                        Section {
+                            ForEach(section.channels) { channel in
+                                Button { select(channel) } label: {
+                                    HStack(spacing: 12) {
+                                        IOSChannelRow(channel: channel,
+                                            programmes: model.programmesByChannelID[channel.id, default: []])
+                                        if model.presentedPlaybackRequest?.channelID == channel.id {
+                                            Image(systemName: "checkmark.circle.fill")
+                                                .foregroundStyle(.tint)
+                                                .accessibilityLabel("正在播放")
+                                        }
                                     }
                                 }
+                                .buttonStyle(.plain)
+                                .accessibilityAddTraits(model.presentedPlaybackRequest?.channelID == channel.id ? .isSelected : [])
+                                .accessibilityIdentifier("player.switch.\(channel.attributes["ui-test-id"] ?? channel.id)")
+                                .id(channel.id)
                             }
-                            .buttonStyle(.plain)
-                            .accessibilityAddTraits(model.presentedPlaybackRequest?.channelID == channel.id ? .isSelected : [])
-                            .accessibilityIdentifier("player.switch.\(channel.attributes["ui-test-id"] ?? channel.id)")
+                        } header: {
+                            if let title = section.title { Text(title) }
                         }
-                    } header: {
-                        if let title = section.title { Text(title) }
+                        .id("player.channels.section.\(section.id)")
                     }
                 }
-            }
-            .searchable(text: $searchText, prompt: "搜索频道")
-            .navigationTitle("换台")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("完成") { dismiss() }.accessibilityIdentifier("player.channels.done")
+                .searchable(text: $searchText,
+                    placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索频道")
+                .scrollEdgeEffectStyle(.hard, for: .top)
+                .navigationTitle("换台")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
+                .toolbarBackgroundVisibility(.visible, for: .navigationBar)
+                .task {
+                    if let currentID = model.presentedPlaybackRequest?.channelID {
+                        proxy.scrollTo(currentID, anchor: .center)
+                    }
+                }
+                .toolbar {
+                    if presentation.showsGroupRail {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Menu {
+                                ForEach(presentation.sections) { section in
+                                    Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
+                                        withAnimation {
+                                            proxy.scrollTo("player.channels.section.\(section.id)", anchor: .top)
+                                        }
+                                    }
+                                    .accessibilityIdentifier("player.channels.group.\(section.id)")
+                                }
+                            } label: {
+                                Label("分组", systemImage: "list.bullet")
+                            }
+                            .accessibilityIdentifier("player.channels.groups")
+                        }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("完成") { dismiss() }.accessibilityIdentifier("player.channels.done")
+                    }
                 }
             }
         }

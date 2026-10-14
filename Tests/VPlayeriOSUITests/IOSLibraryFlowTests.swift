@@ -163,6 +163,20 @@ final class IOSLibraryFlowTests: XCTestCase {
         app.launch()
         return app
     }
+    private func revealInformationField(_ element: XCUIElement, in app: XCUIApplication, stage: String) {
+        for _ in 0..<5 {
+            if element.exists {
+                let frame = element.frame
+                let tabs = app.segmentedControls["channel.info.tabs"].frame
+                if !frame.isEmpty, frame.minY >= tabs.maxY,
+                   frame.maxY <= app.frame.maxY - 20, element.isHittable { return }
+            }
+            app.swipeUp()
+        }
+        require(element, in: app, stage: stage, timeout: 3, hittable: true)
+        XCTAssertGreaterThanOrEqual(element.frame.minY, app.segmentedControls["channel.info.tabs"].frame.maxY)
+        XCTAssertLessThanOrEqual(element.frame.maxY, app.frame.maxY - 20)
+    }
     private func pauseBeforeControlInspection(in app: XCUIApplication, stage: String) {
         let pause = app.buttons["player-play-pause"]
         // Use the existing five-second presentation budget for the transport
@@ -232,17 +246,32 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(information, in: app, stage: "channel-information-button", timeout: 15, hittable: true)
         information.tap()
         require(app.navigationBars["频道信息"], in: app, stage: "channel-information-sheet", timeout: 5)
-        // LabeledContent 会把字段名和值合并为一个辅助功能标签。
+        let tabs = app.segmentedControls["channel.info.tabs"]
+        require(tabs, in: app, stage: "channel-information-tabs", timeout: 3, hittable: true)
+        XCTAssertTrue(tabs.buttons["概览"].isSelected)
         XCTAssertTrue(app.staticTexts["channel.info.name"].label.contains("测试频道"))
+        XCTAssertTrue(app.staticTexts["channel.info.current.title"].label.contains("正在播出"))
+        XCTAssertTrue(app.staticTexts["channel.info.current.time"].label.contains(" 至 "))
         XCTAssertTrue(app.staticTexts["channel.info.stream-url"].label.contains(
             "https://relay.fixture.invalid/rtp/239.1.1.1:5000"))
         app.buttons["channel.info.copy"].tap()
         XCTAssertTrue(app.buttons["channel.info.copy"].label.contains("已复制"))
         let informationScreenshot = XCTAttachment(screenshot: app.screenshot())
-        informationScreenshot.name = "频道基础信息"
+        informationScreenshot.name = "频道概览与播放链接"
         informationScreenshot.lifetime = .keepAlways
         add(informationScreenshot)
-        app.swipeUp()
+        revealInformationField(app.staticTexts["channel.info.source.epg-name"], in: app,
+            stage: "channel-information-original-fields")
+        // 匹配结果使用节目单名称，原始字段保留 M3U 中不同的名称。
+        XCTAssertTrue(app.staticTexts["channel.info.epg.name"].label.contains("测试频道"))
+        XCTAssertTrue(app.staticTexts["channel.info.epg.method"].label.contains("自动匹配"))
+        XCTAssertTrue(app.staticTexts["channel.info.source.epg-id"].label.contains("fixture-channel"))
+        XCTAssertTrue(app.staticTexts["channel.info.source.epg-name"].label.contains("测频道"))
+        let fields = XCTAttachment(screenshot: app.screenshot())
+        fields.name = "节目单匹配结果与下方原始字段"
+        fields.lifetime = .keepAlways
+        add(fields)
+        tabs.buttons["节目单"].tap()
         require(app.staticTexts["programme.current.title"], in: app, stage: "channel-information-current-programme", timeout: 3)
         require(app.staticTexts["programme.next.title"], in: app, stage: "channel-information-next-programme", timeout: 3)
         XCTAssertTrue(app.staticTexts["programme.current.time"].label.contains(" 至 "))
@@ -251,6 +280,15 @@ final class IOSLibraryFlowTests: XCTestCase {
         programmeScreenshot.name = "频道节目单"
         programmeScreenshot.lifetime = .keepAlways
         add(programmeScreenshot)
+        let disclosure = app.buttons["programme.current.disclosure"]
+        if disclosure.exists { disclosure.tap() }
+        else { app.otherElements["programme.current.disclosure"].tap() }
+        require(app.staticTexts["这是一段用于验证节目详情展开与收起的合成简介。"], in: app,
+            stage: "channel-information-programme-details", timeout: 3)
+        tabs.buttons["概览"].tap()
+        require(app.buttons["channel.info.copy"], in: app, stage: "channel-information-return-overview", timeout: 3,
+            hittable: true)
+        XCTAssertTrue(app.buttons["channel.info.copy"].label.contains("已复制"))
         XCTAssertFalse(app.buttons["player-back"].exists, "查看频道信息不能启动播放")
         app.buttons["channel.info.done"].tap()
         require(app.buttons["channel.http"], in: app, stage: "channel-information-dismissed", timeout: 5,
@@ -268,12 +306,35 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(information, in: app, stage: "unmatched-information-button", timeout: 15, hittable: true)
         information.tap()
         require(app.navigationBars["频道信息"], in: app, stage: "unmatched-information-sheet", timeout: 5)
-        app.swipeUp()
-        require(app.staticTexts["尚未匹配 EPG 频道"], in: app, stage: "unmatched-information-status", timeout: 3)
+        let tabs = app.segmentedControls["channel.info.tabs"]
+        tabs.buttons["节目单"].tap()
+        require(app.staticTexts["暂无节目单"], in: app, stage: "unmatched-programme-guide", timeout: 3)
+        tabs.buttons["概览"].tap()
+        revealInformationField(app.staticTexts["channel.info.epg.unmatched"], in: app,
+            stage: "unmatched-information-status")
         app.buttons["channel.info.mapping"].tap()
         require(app.buttons["mapping.save"], in: app, stage: "information-epg-mapping", timeout: 5)
         app.buttons["取消"].tap()
         require(app.buttons["channel.info.done"], in: app, stage: "information-mapping-cancelled", timeout: 3)
+        XCTAssertTrue(tabs.buttons["概览"].isSelected)
+        app.buttons["channel.info.mapping"].tap()
+        require(app.buttons["mapping.fixture-channel"], in: app, stage: "information-mapping-choice", timeout: 3,
+            hittable: true)
+        app.buttons["mapping.fixture-channel"].tap()
+        app.buttons["mapping.save"].tap()
+        require(app.staticTexts["channel.info.epg.method"], in: app, stage: "information-mapping-saved", timeout: 5)
+        XCTAssertTrue(app.staticTexts["channel.info.epg.method"].label.contains("手动映射"))
+        XCTAssertTrue(app.staticTexts["channel.info.epg.id"].label.contains("fixture-channel"))
+        revealInformationField(app.staticTexts["channel.info.source.epg-name"], in: app,
+            stage: "information-mapping-preserves-original-fields")
+        XCTAssertTrue(app.staticTexts["channel.info.source.epg-id"].label.contains("未提供"))
+        XCTAssertTrue(app.staticTexts["channel.info.source.epg-name"].label.contains("未提供"))
+        let mapping = XCTAttachment(screenshot: app.screenshot())
+        mapping.name = "手动映射结果与未提供的原始字段"
+        mapping.lifetime = .keepAlways
+        add(mapping)
+        tabs.buttons["节目单"].tap()
+        require(app.staticTexts["programme.current.title"], in: app, stage: "information-mapping-updated-guide", timeout: 3)
         app.buttons["channel.info.done"].tap()
         XCTAssertFalse(app.alerts.firstMatch.exists, "查看组播频道信息不能触发播放协议错误")
         XCTAssertFalse(app.buttons["player-back"].exists)
@@ -473,6 +534,97 @@ final class IOSLibraryFlowTests: XCTestCase {
         app.buttons["player-back"].tap()
         require(app.buttons["channel.http"], in: app, stage: "switch-close-return", timeout: 5, hittable: true)
     }
+    func testPlayerChannelPickerStartsAtCurrentChannelAndSupportsGroupJumpAndSearch() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-ui-fixture", "seeded", "-ui-card-focus-diagnostics",
+                               "-uiTestResetPlaybackSettings", "-ui-playback-fixture", "preparing",
+                               "-ui-playback-route-diagnostics"]
+        app.launch()
+        defer { app.terminate() }
+        require(app.buttons["channel.groups"], in: app, stage: "picker-source-groups", timeout: 15, hittable: true)
+        app.buttons["channel.groups"].tap()
+        app.buttons["channel.group.诊断分组 4"].tap()
+        let source = app.buttons["channel.focus-probe.060"]
+        require(source, in: app, stage: "picker-source-fourth-group", timeout: 5, hittable: true)
+        source.tap()
+        require(app.buttons["player-channels"], in: app, stage: "picker-current-player", timeout: 5, hittable: true)
+        let identity = playerSessionIdentity(in: app)
+        app.buttons["player-channels"].tap()
+        let current = app.buttons["player.switch.channel.focus-probe.060"]
+        require(current, in: app, stage: "picker-current-visible-on-open", timeout: 5, hittable: true)
+        XCTAssertTrue(current.isSelected)
+        let groups = app.buttons["player.channels.groups"]
+        require(groups, in: app, stage: "picker-visible-groups", timeout: 3, hittable: true)
+        let search = app.searchFields.firstMatch
+        require(search, in: app, stage: "picker-top-search", timeout: 3, hittable: true)
+        XCTAssertLessThan(search.frame.maxY, current.frame.minY)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "换台首屏定位当前频道与顶部搜索"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        groups.tap()
+        app.buttons["player.channels.group.诊断分组 1"].tap()
+        require(app.buttons["player.switch.channel.focus-probe.000"], in: app,
+            stage: "picker-first-group-jump", timeout: 5, hittable: true)
+        search.tap()
+        search.typeText("诊断分组 3")
+        let result = app.buttons["player.switch.channel.focus-probe.040"]
+        require(result, in: app, stage: "picker-group-search", timeout: 5, hittable: true)
+        XCTAssertFalse(current.isHittable)
+        // 原生搜索激活时接管导航栏，先关闭搜索，再退出换台面板。
+        app.buttons["关闭"].tap()
+        require(app.buttons["player.channels.done"], in: app,
+            stage: "picker-search-dismissed", timeout: 5, hittable: true)
+        app.buttons["player.channels.done"].tap()
+        require(app.buttons["player-channels"], in: app, stage: "picker-cancel-search", timeout: 5, hittable: true)
+        assertPlayerSession(identity, in: app)
+        app.buttons["player-channels"].tap()
+        require(current, in: app, stage: "picker-reopen-current-position", timeout: 5, hittable: true)
+        app.buttons["player.channels.done"].tap()
+        app.buttons["player-back"].tap()
+    }
+
+    func testPlaybackSettingsShareSelectionsAndRestoreDefaultsAcrossEntrypoints() {
+        let app = launch(playbackFixture: "preparing")
+        defer { app.terminate() }
+        app.tabBars.buttons["设置"].tap()
+        let video = app.buttons["settings.buffer.video.current"]
+        require(video, in: app, stage: "settings-summary", timeout: 5, hittable: true)
+        XCTAssertEqual(video.value as? String, "1 秒（默认）")
+        video.tap()
+        app.buttons["settings.buffer.video.4"].tap()
+        app.navigationBars.buttons.firstMatch.tap()
+        XCTAssertEqual(video.value as? String, "4 秒")
+        app.tabBars.buttons["频道"].tap()
+        app.buttons["channel.http"].tap()
+        require(app.buttons["player-more"], in: app, stage: "settings-player", timeout: 5, hittable: true)
+        let identity = playerSessionIdentity(in: app)
+        openPlaybackSettings(in: app, stage: "settings-shared")
+        XCTAssertEqual(video.value as? String, "4 秒")
+        XCTAssertFalse(app.buttons["settings.buffer.video.4"].exists)
+        let root = XCTAttachment(screenshot: app.screenshot())
+        root.name = "播放中设置摘要与即时生效说明"
+        root.lifetime = .keepAlways
+        add(root)
+        app.buttons["settings.buffer.deinterlace.current"].tap()
+        app.buttons["settings.buffer.deinterlace.16"].tap()
+        let options = XCTAttachment(screenshot: app.screenshot())
+        options.name = "反交错缓冲与帧率增强说明"
+        options.lifetime = .keepAlways
+        add(options)
+        app.navigationBars.buttons.firstMatch.tap()
+        app.buttons["settings.playback.reset"].tap()
+        XCTAssertEqual(video.value as? String, "1 秒（默认）")
+        XCTAssertEqual(app.buttons["settings.buffer.deinterlace.current"].value as? String, "8 帧（默认）")
+        app.buttons["player.settings.done"].tap()
+        assertPlayerSession(identity, in: app)
+        app.buttons["player-back"].tap()
+        app.tabBars.buttons["设置"].tap()
+        XCTAssertEqual(video.value as? String, "1 秒（默认）")
+        XCTAssertFalse(app.buttons["settings.playback.reset"].isEnabled)
+    }
+
     private func tapPlayerBackground(in app: XCUIApplication) {
         let screen = identified("player-full-screen", in: app.descendants(matching: .any)).firstMatch
         if !screen.exists {

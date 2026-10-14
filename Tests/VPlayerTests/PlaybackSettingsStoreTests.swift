@@ -18,6 +18,7 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         var store: PlaybackSettingsStore? = PlaybackSettingsStore(defaults: defaults)
         XCTAssertEqual(store?.videoBufferSeconds, PlaybackTuning.default.videoBufferSeconds)
+        XCTAssertEqual(store?.videoBufferSeconds, 1)
         XCTAssertEqual(store?.deinterlaceBufferFrames, 8)
 
         store?.videoBufferSeconds = 4
@@ -74,5 +75,29 @@ final class PlaybackSettingsStoreTests: XCTestCase {
                 CMTimeGetSeconds(tuning.videoBufferHorizon)
             )
         }
+    }
+
+    func testPreviouslySavedTwoSecondChoiceIsPreserved() {
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.set(2, forKey: PlaybackSettingsStore.videoBufferSecondsKey)
+        XCTAssertEqual(PlaybackSettingsStore(defaults: defaults).videoBufferSeconds, 2)
+    }
+
+    func testRestoreDefaultsPersistsBothValuesAndNotifiesOnce() {
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = PlaybackSettingsStore(defaults: defaults)
+        store.videoBufferSeconds = 4
+        store.deinterlaceBufferFrames = 16
+        var observed: [PlaybackTuning] = []
+        store.setTuningChangeHandler { observed.append($0) }
+
+        store.restoreDefaults()
+        store.restoreDefaults()
+
+        XCTAssertEqual(observed, [.default])
+        XCTAssertEqual(store.tuning, .default)
+        XCTAssertEqual(PlaybackSettingsStore(defaults: defaults).tuning, .default)
+        XCTAssertEqual(defaults.double(forKey: PlaybackSettingsStore.videoBufferSecondsKey), 1)
+        XCTAssertEqual(defaults.integer(forKey: PlaybackSettingsStore.deinterlaceBufferFramesKey), 8)
     }
 }

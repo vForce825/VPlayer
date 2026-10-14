@@ -72,7 +72,7 @@ final class VPlayerUITests: XCTestCase {
         let videoSummary = app.buttons["settings.buffer.video.current"]
         let channelSummary = app.buttons["settings.channels.current"]
         XCTAssertTrue(videoSummary.waitForExistence(timeout: 3))
-        XCTAssertEqual(videoSummary.value as? String, "2 秒（默认）")
+        XCTAssertEqual(videoSummary.value as? String, "1 秒（默认）")
         XCTAssertEqual(channelSummary.value as? String, "按播放列表分组（默认）")
         XCTAssertTrue(app.buttons["settings.privacy"].exists)
         XCTAssertFalse(app.buttons["settings.open-source"].exists)
@@ -83,8 +83,23 @@ final class VPlayerUITests: XCTestCase {
         focusSettingsRow(videoSummary, in: app)
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.buttons["settings.buffer.video.2"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.buttons["settings.buffer.video.2"].isSelected)
+        XCTAssertTrue(app.buttons["settings.buffer.video.1"].isSelected)
+        focusSettingsRow(app.buttons["settings.buffer.video.4"], in: app)
+        XCUIRemote.shared.press(.select)
         XCUIRemote.shared.press(.menu)
+        XCTAssertEqual(videoSummary.value as? String, "4 秒")
+
+        let reset = app.buttons["settings.playback.reset"]
+        focusSettingsRow(reset, in: app)
+        XCUIRemote.shared.press(.select)
+        XCTAssertEqual(videoSummary.value as? String, "1 秒（默认）")
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "tvOS设置摘要与恢复播放默认设置"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+        // 恢复后按钮不可用，先回到顶部，再继续检查频道与隐私入口。
+        XCUIRemote.shared.press(.up)
+        XCUIRemote.shared.press(.up)
 
         focusSettingsRow(channelSummary, in: app)
         XCUIRemote.shared.press(.select)
