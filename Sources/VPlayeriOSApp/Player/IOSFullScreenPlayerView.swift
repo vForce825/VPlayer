@@ -182,12 +182,15 @@ struct IOSFullScreenPlayerView: View {
 
     private func programmeSummary(_ programme: ChannelProgrammePresentation, isCompact: Bool) -> some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(session.presentation.request.title)
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(.white)
-                .lineLimit(isCompact ? 1 : 2)
-                .accessibilityAddTraits(.isHeader)
-                .accessibilityIdentifier("player.channel-name")
+            VStack(alignment: .leading, spacing: 6) {
+                Text(session.presentation.request.title)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(isCompact ? 1 : 2)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier("player.channel-name")
+                mediaInformation
+            }
             if let current = programme.current {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(current.title).font(.subheadline)
@@ -211,6 +214,42 @@ struct IOSFullScreenPlayerView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var mediaInformation: some View {
+        if model.mediaInformation?.isAudioOnly != true {
+            let media = PlaybackMediaInformationPresentation(information: model.mediaInformation)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { mediaInformationItems(media) }
+                    .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 6) { mediaInformationItems(media) }
+            }
+            .font(.footnote).monospacedDigit()
+            .foregroundStyle(.white.opacity(0.7))
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(media.accessibilityText)
+            .accessibilityIdentifier("player.media-status")
+        }
+    }
+
+    @ViewBuilder private func mediaInformationItems(_ media: PlaybackMediaInformationPresentation) -> some View {
+        if let resolution = media.visualResolutionText {
+            Text(resolution)
+        }
+        if let frameRate = media.visualFrameRateText {
+            if media.showsEnhancedFrameRateHighlight {
+                Text(frameRate)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.green)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(.green.opacity(0.2), in: Capsule())
+            } else {
+                Text(frameRate)
+            }
+        }
+        if media.visualResolutionText == nil, media.visualFrameRateText == nil {
+            Text(media.visualText)
+        }
     }
 
     private var footerActions: some View {

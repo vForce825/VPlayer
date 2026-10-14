@@ -50,9 +50,10 @@ struct IOSChannelBrowserView: View {
     }
 
     private var navigationHeading: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("频道")
                 .font(.title2.weight(.bold))
+                .fixedSize(horizontal: true, vertical: false)
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("channel.title")
             if let profile = model.activeProfile {
@@ -72,11 +73,15 @@ struct IOSChannelBrowserView: View {
                     }
                 } label: {
                     HStack(spacing: 5) {
-                        Text(profile.name).lineLimit(1)
-                        Image(systemName: "chevron.down").font(.caption2.weight(.semibold))
+                        Text(profile.name).lineLimit(1).truncationMode(.tail)
+                        Image(systemName: "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .fixedSize()
                     }
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    // 原生工具栏菜单按标签的固有宽度布局，需在标签内限制长名称。
+                    .frame(maxWidth: 140, alignment: .leading)
                 }
                 .buttonStyle(.plain)
                 .disabled(model.isLoading)
@@ -85,7 +90,6 @@ struct IOSChannelBrowserView: View {
                 .accessibilityIdentifier("channel.active-playlist")
             }
         }
-        .padding(.vertical, 4)
         .frame(maxWidth: 240, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
     }

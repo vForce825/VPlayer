@@ -357,7 +357,7 @@ final class IOSLibraryFlowTests: XCTestCase {
     }
 
     func testPlayerProgrammeGuideAndMediaInformationPreservePlaybackSession() {
-        let app = launch()
+        let app = launch(playbackFixture: "media-information")
         defer { app.terminate() }
         require(app.buttons["channel.http"], in: app, stage: "programme-player-channel", timeout: 15)
         app.buttons["channel.http"].tap()
@@ -366,8 +366,12 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCTAssertEqual(app.staticTexts["player.channel-name"].label, "测试频道")
         XCTAssertEqual(app.staticTexts["player.current-programme"].label, "正在播出")
         XCTAssertTrue(app.staticTexts["player.next-programme"].label.contains("接下来"))
+        let media = identified("player.media-status", in: app.descendants(matching: .any)).firstMatch
+        require(media, in: app, stage: "player-enhanced-media-information", timeout: 3)
+        XCTAssertEqual(media.label, "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 50 帧")
+        XCTAssertTrue(app.frame.contains(media.frame))
         let portrait = XCTAttachment(screenshot: app.screenshot())
-        portrait.name = "播放页频道主标题与辅助节目信息"
+        portrait.name = "播放页频道信息与绿底帧率增强标记"
         portrait.lifetime = .keepAlways
         add(portrait)
 
@@ -727,7 +731,7 @@ final class IOSLibraryFlowTests: XCTestCase {
             sheetFrame: CGRect(x: 11, y: 127, width: 400, height: 750)))
     }
     func testRotationAndPlaybackSettingsKeepPlayerSession() {
-        let app = launch()
+        let app = launch(playbackFixture: "media-information")
         defer { app.terminate() }
         require(app.buttons["channel.http"], in: app, stage: "rotation-initial-channel", timeout: 15)
         app.buttons["channel.http"].tap()
@@ -741,8 +745,11 @@ final class IOSLibraryFlowTests: XCTestCase {
         for identifier in ["player-back", "player-play-pause", "player-pip", "player-more", "player-channels", "player-programmes"] {
             XCTAssertTrue(app.frame.contains(app.buttons[identifier].frame), "横屏控件超出可见区域：\(identifier)")
         }
+        let media = identified("player.media-status", in: app.descendants(matching: .any)).firstMatch
+        XCTAssertEqual(media.label, "1920 乘 1080 隔行扫描，从每秒 25 帧增强到每秒 50 帧")
+        XCTAssertTrue(app.frame.contains(media.frame), "横屏画面规格应完整可见")
         let landscape = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
-        landscape.name = "新版播放页横屏布局"
+        landscape.name = "播放页横屏画面规格与帧率增强标记"
         landscape.lifetime = .keepAlways
         add(landscape)
         openPlaybackSettings(in: app, stage: "rotation")
