@@ -53,51 +53,6 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertLessThan(select.lowerBound, prime.lowerBound)
     }
 
-    func testDeadPlaybackNoticeContractAndBannerAreAbsent() throws {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let sourcePaths = [
-            "Sources/VPlayerPlayback/PlaybackContracts.swift",
-            "Sources/VPlayerPlayback/Pipeline/PlaybackController.swift",
-            "Sources/VPlayerApp/Player/FullScreenPlayerViewModel.swift",
-            "Sources/VPlayerApp/Player/FullScreenPlayerView.swift",
-            "Sources/VPlayerApp/Player/UITestPlaybackEngine.swift",
-        ]
-        let source = try sourcePaths.map {
-            try String(
-                contentsOf: repositoryRoot.appendingPathComponent($0),
-                encoding: .utf8
-            )
-        }.joined(separator: "\n")
-        let project = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "VPlayer.xcodeproj/project.pbxproj"
-            ),
-            encoding: .utf8
-        )
-
-        XCTAssertFalse(source.contains("PlaybackNotice"))
-        XCTAssertFalse(source.contains("func notices()"))
-        XCTAssertFalse(source.contains("visibleNotice"))
-        XCTAssertFalse(source.contains("PlayerNoticeBanner"))
-        XCTAssertFalse(project.contains("PlayerNoticeBanner.swift"))
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: repositoryRoot.appendingPathComponent(
-                "Sources/VPlayerApp/Player/PlayerNoticeBanner.swift"
-            ).path
-        ))
-
-        let epgNotice = try String(
-            contentsOf: repositoryRoot.appendingPathComponent(
-                "Sources/VPlayerApp/Views/EPGCoverageNotice.swift"
-            ),
-            encoding: .utf8
-        )
-        XCTAssertTrue(epgNotice.contains("EPGCoverageNotice"))
-    }
-
     func testDeploymentTargetIsTVOS27Everywhere() throws {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

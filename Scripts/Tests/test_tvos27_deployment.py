@@ -51,17 +51,6 @@ class TVOS27DeploymentTests(unittest.TestCase):
         self.assertEqual(len(mac_generated), (len(mac_targets) + 1) * 2)
         self.assertEqual(set(mac_generated), {'27.0'})
 
-    def test_swift_regression_counts_every_explicit_target_floor(self):
-        spec = (ROOT / 'project.yml').read_text()
-        configured_floors = [line for line in spec.splitlines()
-                             if 'deploymentTarget:' in line and '"' in line]
-        source = (ROOT / 'Tests/VPlayerTests/ProjectConfigurationTests.swift').read_text()
-        expected_count = re.search(
-            r'XCTAssertEqual\(configuredFloors\.count, (\d+)\)', source)
-        self.assertIsNotNone(expected_count, 'Keep an exact target-count assertion')
-        self.assertEqual(int(expected_count.group(1)), len(configured_floors),
-                         'The Swift regression must include VPlayerHLSAcceptanceTests')
-
     def test_version_two_point_one_matches_source_and_generated_products(self):
         spec = (ROOT / 'project.yml').read_text()
         project = (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text()

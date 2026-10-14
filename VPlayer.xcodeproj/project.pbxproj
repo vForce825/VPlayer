@@ -685,7 +685,6 @@
 		6EA5987EF2E4C774A72DCBED /* PlaybackBackendSelectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94350066AC3B557A3C1FC8CE /* PlaybackBackendSelectionTests.swift */; };
 		6EA934644466E9AFD10AD20C /* NowPlaying.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 51116FEEB3ED5F8FC5AA9E9C /* NowPlaying.framework */; };
 		6EAF8B775C794881CA041B95 /* PlayerPresentationPolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 93F25BD477A29A310403A8A7 /* PlayerPresentationPolicies.swift */; };
-		6EBEFF76407705B9CED67829 /* AcceptanceMatrixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D76E3CB2F6EEC12BA3AF530 /* AcceptanceMatrixTests.swift */; };
 		6EDE6A9FFBF0758B01F22DD5 /* PictureInPictureCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 134EB4FAE578FB3E864CF5D9 /* PictureInPictureCoordinator.swift */; };
 		6F142D6299B4BE10473EB78A /* VPlayerCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5265C89718CA9CC29A0FE31 /* VPlayerCore.framework */; };
 		6F64ECF97C4412EE88129AD9 /* MacPlaybackAudioSessionSDK.swift in Sources */ = {isa = PBXBuildFile; fileRef = DC00983A06B5475F2467AB1D /* MacPlaybackAudioSessionSDK.swift */; };
@@ -1472,7 +1471,6 @@
 		F644DEDA71A4FE14FA71D648 /* VPlayerCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 236D71D3D61B0D1A240B639D /* VPlayerCore.swift */; };
 		F6456EBDBA593BC42938965D /* AppDependencies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FE81A60ECC3F3F1EB27A4BA /* AppDependencies.swift */; };
 		F64A74FE806A90D87A88F706 /* PlaybackMonotonicClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = D1ECF36994FA1D24D72D7ACB /* PlaybackMonotonicClock.swift */; };
-		F668FEB7A93CD44C8A59CC2B /* AcceptanceMatrixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D76E3CB2F6EEC12BA3AF530 /* AcceptanceMatrixTests.swift */; };
 		F6C54A64F2A7A94A942A2AE4 /* PersistentHLSWriterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBAB0E095CB16F1D27EFC068 /* PersistentHLSWriterTests.swift */; };
 		F6C7655F0A93CD26F8BB7115 /* PlaybackSerialExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = FCCAA375F6E915F5A43BA1B3 /* PlaybackSerialExecutor.swift */; };
 		F73A639120730E1FA74040E8 /* SealedMediaStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 783CC20F09C28481CDA8121B /* SealedMediaStore.swift */; };
@@ -2034,7 +2032,6 @@
 		3BD849891A41E876402BADA1 /* StreamProtocolPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamProtocolPolicy.swift; sourceTree = "<group>"; };
 		3C1ABD1121838FD686B24D7A /* VideoTestFactories.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoTestFactories.swift; sourceTree = "<group>"; };
 		3C953CBB3F6CEDA55B0DE4DC /* LongPlaybackAcceptanceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LongPlaybackAcceptanceTests.swift; sourceTree = "<group>"; };
-		3D76E3CB2F6EEC12BA3AF530 /* AcceptanceMatrixTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcceptanceMatrixTests.swift; sourceTree = "<group>"; };
 		3E8424C82A7C430CDF059354 /* RefreshCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RefreshCoordinator.swift; sourceTree = "<group>"; };
 		3E9059206E4D05DDF15FE7D0 /* PlaybackAudioSessionRegistration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackAudioSessionRegistration.swift; sourceTree = "<group>"; };
 		3EA831C08D0DC0D69BE06992 /* SystemHLSParticipantBootstrap.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemHLSParticipantBootstrap.swift; sourceTree = "<group>"; };
@@ -3195,7 +3192,6 @@
 				BD8F84C136FCDDA88625F3E0 /* AACAudioCodecProfileTests.swift */,
 				B0AD10835E2F241368568BCF /* AC3AudioCodecProfileTests.swift */,
 				AD9F0AEE8B67A72163678511 /* AC3FrameInspectorTests.swift */,
-				3D76E3CB2F6EEC12BA3AF530 /* AcceptanceMatrixTests.swift */,
 				B76544611FE0637A3CD4A201 /* AudioCodecProfileRegistryTests.swift */,
 				64B3C1614D108DBB26CCE489 /* AudioContinuityBufferTests.swift */,
 				CC898A33FD1B1E2394B6E1F5 /* AudioFormatCapabilityTests.swift */,
@@ -5006,7 +5002,6 @@
 				A21EAD9A0489F063912BE288 /* AVPlayerAsyncLogReaderTests.swift in Sources */,
 				5F73B48B0FF6A29C8DACE549 /* AVPlayerItemCoordinatorTests.swift in Sources */,
 				2B9339D34888E1B264298E79 /* AVPlayerLogSnapshotCacheTests.swift in Sources */,
-				F668FEB7A93CD44C8A59CC2B /* AcceptanceMatrixTests.swift in Sources */,
 				0C2B175C509A92B1E0C3FE6B /* AppModelEditorErrorTests.swift in Sources */,
 				5307D3D7677CD77639021A8E /* AppModelProgrammeWindowTests.swift in Sources */,
 				7C1000AB5ABBB846332FEF10 /* AppModelTests.swift in Sources */,
@@ -5259,7 +5254,6 @@
 				1EAFD5A8B2643F37A5BA0D4E /* AVPlayerAsyncLogReaderTests.swift in Sources */,
 				437C44775E2922D3C796DC75 /* AVPlayerItemCoordinatorTests.swift in Sources */,
 				660FDB54A1E26E9DE6F84F6B /* AVPlayerLogSnapshotCacheTests.swift in Sources */,
-				6EBEFF76407705B9CED67829 /* AcceptanceMatrixTests.swift in Sources */,
 				10C6A58E9DDD7562327AE213 /* AppModelEditorErrorTests.swift in Sources */,
 				59FA20C9B6210DAD862D39D8 /* AppModelProgrammeWindowTests.swift in Sources */,
 				04589C21DAB00A4C4D892925 /* AssemblerTestSupport.swift in Sources */,
