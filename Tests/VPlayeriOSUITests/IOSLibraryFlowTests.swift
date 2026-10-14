@@ -937,4 +937,138 @@ final class IOSLibraryFlowTests: XCTestCase {
         XCUIDevice.shared.orientation = .portrait
         app.buttons["player-back"].tap()
     }
+
+    private func requireOrientation(_ landscape: Bool, in app: XCUIApplication,
+                                    file: StaticString = #filePath, line: UInt = #line) {
+        let predicate = NSPredicate { _, _ in
+            landscape ? app.frame.width > app.frame.height : app.frame.height > app.frame.width
+        }
+        let ready = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: app)], timeout: 5)
+        XCTAssertEqual(ready, .completed, ready == .completed ? "" : failureDetails(in: app,
+            stage: "orientation-\(landscape ? "landscape" : "portrait")-\(app.frame)"), file: file, line: line)
+    }
+
+    func testForceLandscapePlaybackPersistsLocksAndRestoresOnClose() {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launch(playbackFixture: "preparing")
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        app.tabBars.buttons["设置"].tap()
+        let toggle = app.switches["settings.playback.force-landscape"]
+        require(toggle, in: app, stage: "landscape-global-toggle", timeout: 5, hittable: true)
+        XCTAssertEqual(toggle.value as? String, "0")
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        requireOrientation(false, in: app)
+        let settings = XCTAttachment(screenshot: app.screenshot())
+        settings.name = "强制横屏播放设置与适用范围"
+        settings.lifetime = .keepAlways
+        add(settings)
+        app.tabBars.buttons["频道"].tap()
+        app.buttons["channel.http"].tap()
+        require(app.buttons["player-back"], in: app, stage: "landscape-auto-entry", timeout: 5, hittable: true)
+        requireOrientation(true, in: app)
+        let identity = playerSessionIdentity(in: app)
+        XCUIDevice.shared.orientation = .landscapeRight
+        XCUIDevice.shared.orientation = .portrait
+        requireOrientation(true, in: app)
+        app.buttons["player-channels"].tap()
+        require(app.buttons["player.channels.done"], in: app, stage: "landscape-picker", timeout: 5, hittable: true)
+        requireOrientation(true, in: app)
+        app.buttons["player.channels.done"].tap()
+        assertPlayerSession(identity, in: app)
+        let player = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        player.name = "设备竖向时强制横屏播放"
+        player.lifetime = .keepAlways
+        add(player)
+        app.buttons["player-channels"].tap()
+        app.buttons["player.channels.groups"].tap()
+        app.buttons["player.channels.group.第二分组"].tap()
+        let next = app.buttons["player.switch.channel.grouped"]
+        require(next, in: app, stage: "landscape-switch-next", timeout: 5, hittable: true)
+        next.tap()
+        require(app.buttons["player-back"], in: app, stage: "landscape-after-switch", timeout: 5, hittable: true)
+        requireOrientation(true, in: app)
+        let nextIdentity = playerSessionIdentity(in: app)
+        XCTAssertNotEqual(identity, nextIdentity)
+        assertPlayerSession(nextIdentity, in: app, allowsPreviousClose: true)
+        app.buttons["player-programmes"].tap()
+        require(app.buttons["player.programmes.done"], in: app, stage: "landscape-programmes", timeout: 5, hittable: true)
+        requireOrientation(true, in: app)
+        app.buttons["player.programmes.done"].tap()
+        app.buttons["player-back"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "landscape-close-restores-library", timeout: 5, hittable: true)
+        requireOrientation(false, in: app)
+
+        app.terminate()
+        app.launchArguments.removeAll { $0 == "-uiTestResetPlaybackSettings" }
+        app.launch()
+        require(app.buttons["channel.http"], in: app, stage: "landscape-relaunch", timeout: 15, hittable: true)
+        app.tabBars.buttons["设置"].tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.tabBars.buttons["频道"].tap()
+        app.buttons["channel.http"].tap()
+        require(app.buttons["player-back"], in: app, stage: "landscape-persisted-entry", timeout: 5, hittable: true)
+        requireOrientation(true, in: app)
+        app.buttons["player-back"].tap()
+        requireOrientation(false, in: app)
+    }
+
+    func testForceLandscapePlaybackCanChangeDuringPlaybackAndReset() {
+        XCUIDevice.shared.orientation = .portrait
+        let app = launch(playbackFixture: "preparing")
+        defer { app.terminate(); XCUIDevice.shared.orientation = .portrait }
+        require(app.buttons["channel.http"], in: app, stage: "landscape-live-initial-channel", timeout: 15, hittable: true)
+        app.buttons["channel.http"].tap()
+        require(app.buttons["player-more"], in: app, stage: "landscape-live-player", timeout: 5, hittable: true)
+        let identity = playerSessionIdentity(in: app)
+        openPlaybackSettings(in: app, stage: "landscape-live-settings")
+        let settingsList = identified("player.settings.list", in: app.descendants(matching: .any)).firstMatch
+        let toggle = app.switches["settings.playback.force-landscape"]
+        for _ in 0..<3 {
+            if toggle.isHittable { break }
+            settingsList.swipeUp()
+        }
+        require(toggle, in: app, stage: "landscape-live-toggle", timeout: 3, hittable: true)
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        requireOrientation(true, in: app)
+        let landscapeSettings = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        landscapeSettings.name = "播放中开启强制横屏"
+        landscapeSettings.lifetime = .keepAlways
+        add(landscapeSettings)
+        for _ in 0..<3 {
+            if toggle.isHittable { break }
+            settingsList.swipeUp()
+        }
+        require(toggle, in: app, stage: "landscape-live-off-toggle", timeout: 3, hittable: true)
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        requireOrientation(false, in: app)
+        toggle.coordinate(withNormalizedOffset: CGVector(dx: 0.9, dy: 0.5)).tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        requireOrientation(true, in: app)
+        require(app.buttons["player.settings.done"], in: app, stage: "landscape-live-settings-survives", timeout: 5,
+            hittable: true)
+        app.buttons["player.settings.done"].tap()
+        assertPlayerSession(identity, in: app)
+        openPlaybackSettings(in: app, stage: "landscape-live-reset")
+        let reset = app.buttons["settings.playback.reset"]
+        for _ in 0..<3 {
+            if reset.isHittable { break }
+            settingsList.swipeUp()
+        }
+        require(reset, in: app, stage: "landscape-reset-exists", timeout: 3)
+        XCTAssertTrue(reset.isEnabled)
+        require(reset, in: app, stage: "landscape-reset-visible", timeout: 3, hittable: true)
+        reset.tap()
+        requireOrientation(false, in: app)
+        XCTAssertEqual(toggle.value as? String, "0")
+        require(app.buttons["player.settings.done"], in: app, stage: "landscape-reset-restores-device", timeout: 5,
+            hittable: true)
+        app.buttons["player.settings.done"].tap()
+        assertPlayerSession(identity, in: app)
+        app.buttons["player-back"].tap()
+        app.tabBars.buttons["设置"].tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+    }
 }

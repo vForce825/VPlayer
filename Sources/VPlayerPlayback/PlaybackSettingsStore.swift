@@ -10,6 +10,12 @@ import Observation
 public final class PlaybackSettingsStore {
     public static let videoBufferSecondsKey = "playback.videoBufferSeconds"
     public static let deinterlaceBufferFramesKey = "playback.deinterlaceBufferFrames"
+    #if os(iOS)
+    public static let forceLandscapePlaybackKey = "playback.forceLandscape"
+    public var forceLandscapePlayback: Bool {
+        didSet { defaults.set(forceLandscapePlayback, forKey: Self.forceLandscapePlaybackKey) }
+    }
+    #endif
     private let defaults: UserDefaults
     @ObservationIgnored private var tuningChangeHandler: (@MainActor (PlaybackTuning) -> Void)?
     @ObservationIgnored private var isRestoringDefaults = false
@@ -37,6 +43,14 @@ public final class PlaybackSettingsStore {
         )
     }
 
+    public var isAtDefaults: Bool {
+        #if os(iOS)
+        tuning == .default && !forceLandscapePlayback
+        #else
+        tuning == .default
+        #endif
+    }
+
     public init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         // `PlaybackTuning` rejects values outside its own choices, so reading a
@@ -48,6 +62,9 @@ public final class PlaybackSettingsStore {
         )
         self.videoBufferSeconds = storedTuning.videoBufferSeconds
         self.deinterlaceBufferFrames = storedTuning.deinterlaceBufferFrames
+        #if os(iOS)
+        self.forceLandscapePlayback = defaults.bool(forKey: Self.forceLandscapePlaybackKey)
+        #endif
     }
 
     public func setTuningChangeHandler(
@@ -57,12 +74,16 @@ public final class PlaybackSettingsStore {
     }
 
     public func restoreDefaults() {
-        guard tuning != .default else { return }
+        guard !isAtDefaults else { return }
+        let tuningChanged = tuning != .default
         // 两项一起通知播放引擎，避免恢复过程中应用一份中间设置。
         isRestoringDefaults = true
         videoBufferSeconds = PlaybackTuning.default.videoBufferSeconds
         deinterlaceBufferFrames = PlaybackTuning.default.deinterlaceBufferFrames
+        #if os(iOS)
+        forceLandscapePlayback = false
+        #endif
         isRestoringDefaults = false
-        tuningChangeHandler?(tuning)
+        if tuningChanged { tuningChangeHandler?(tuning) }
     }
 }

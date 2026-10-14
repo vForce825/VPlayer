@@ -8,6 +8,7 @@ import VPlayerPlayback
 
 @main
 struct VPlayeriOSApp: App {
+    @UIApplicationDelegateAdaptor(IOSApplicationDelegate.self) private var appDelegate
     private let bootstrap = LiveAppBootstrap.production()
     private let videoProcessingLifecycle = IOSVideoProcessingLifecycle()
     private let initialDependencies: AppDependencies?
@@ -16,6 +17,7 @@ struct VPlayeriOSApp: App {
         if configuration.resetsPlaybackSettings {
             for key in [PlaybackSettingsStore.videoBufferSecondsKey,
                         PlaybackSettingsStore.deinterlaceBufferFramesKey,
+                        PlaybackSettingsStore.forceLandscapePlaybackKey,
                         ChannelBrowsingSettingsStore.storageKey] {
                 UserDefaults.standard.removeObject(forKey: key)
             }

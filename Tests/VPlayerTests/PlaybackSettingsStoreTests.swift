@@ -100,4 +100,35 @@ final class PlaybackSettingsStoreTests: XCTestCase {
         XCTAssertEqual(defaults.double(forKey: PlaybackSettingsStore.videoBufferSecondsKey), 1)
         XCTAssertEqual(defaults.integer(forKey: PlaybackSettingsStore.deinterlaceBufferFramesKey), 8)
     }
+
+    #if os(iOS)
+    func testForceLandscapeDefaultsOffPersistsAndDoesNotChangeEngineTuning() {
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = PlaybackSettingsStore(defaults: defaults)
+        XCTAssertFalse(store.forceLandscapePlayback)
+        var observed: [PlaybackTuning] = []
+        store.setTuningChangeHandler { observed.append($0) }
+
+        store.forceLandscapePlayback = true
+
+        XCTAssertTrue(PlaybackSettingsStore(defaults: defaults).forceLandscapePlayback)
+        XCTAssertFalse(store.isAtDefaults)
+        XCTAssertEqual(store.tuning, .default)
+        XCTAssertTrue(observed.isEmpty)
+    }
+
+    func testRestoreDefaultsAlsoClearsForceLandscapeWithoutReconfiguringUnchangedBuffers() {
+        let defaults = UserDefaults(suiteName: suite)!
+        let store = PlaybackSettingsStore(defaults: defaults)
+        store.forceLandscapePlayback = true
+        var observed: [PlaybackTuning] = []
+        store.setTuningChangeHandler { observed.append($0) }
+
+        store.restoreDefaults()
+
+        XCTAssertTrue(store.isAtDefaults)
+        XCTAssertFalse(PlaybackSettingsStore(defaults: defaults).forceLandscapePlayback)
+        XCTAssertTrue(observed.isEmpty)
+    }
+    #endif
 }

@@ -217,10 +217,14 @@ struct PlaybackSettingsResetSection: View {
     var body: some View {
         Section {
             Button("恢复播放默认设置") { playback.restoreDefaults() }
-                .disabled(playback.tuning == .default)
+                .disabled(playback.isAtDefaults)
                 .accessibilityIdentifier("settings.playback.reset")
         } footer: {
+            #if os(iOS)
+            Text("恢复为视频缓冲 \(PlaybackBufferRows.videoBufferTitle(PlaybackTuning.default.videoBufferSeconds, marksDefault: false))、反交错缓冲 \(DeinterlaceBufferRows.title(PlaybackTuning.default.deinterlaceBufferFrames, marksDefault: false))，并关闭强制横屏播放。仅恢复播放设置。")
+            #else
             Text("恢复为视频缓冲 \(PlaybackBufferRows.videoBufferTitle(PlaybackTuning.default.videoBufferSeconds, marksDefault: false))、反交错缓冲 \(DeinterlaceBufferRows.title(PlaybackTuning.default.deinterlaceBufferFrames, marksDefault: false))。仅恢复播放设置。")
+            #endif
         }
     }
 }

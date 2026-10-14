@@ -1481,6 +1481,7 @@
 		F7B4935C71B25112F87F08CD /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 66AD65AF4E3E185685F2B892 /* Metal.framework */; };
 		F7CCFA1A453F059CA6405120 /* NativeHLSCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE4571A26EB4E20BA436AA94 /* NativeHLSCapabilities.swift */; };
 		F82BB6BC9E7ED3B6245BB359 /* Task10ControllerReviewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 138C380B57EA361DD6E4C2CA /* Task10ControllerReviewTests.swift */; };
+		F82FE037DE98D793F7105718 /* IOSPlaybackOrientation.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACD0C3011D43ACDE23AFD128 /* IOSPlaybackOrientation.swift */; };
 		F8726497F6E769F20E4C2011 /* PlaybackReadinessGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38CD3F35D0C9F65CC0186CC7 /* PlaybackReadinessGate.swift */; };
 		F8ED899A7FED7D28430DD5EE /* PlaybackSourceResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D46ADA3E5EFCB8D23B02CA7 /* PlaybackSourceResolverTests.swift */; };
 		F8FC3F6B81801639FCEF81DB /* LoopbackHTTPServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7F4BC0556DE491CF0B611DB /* LoopbackHTTPServer.swift */; };
@@ -2294,6 +2295,7 @@
 		AC433A3486018D693213676F /* HLSOwnedSourcePlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HLSOwnedSourcePlan.swift; sourceTree = "<group>"; };
 		AC63480E9661F482E6714895 /* AVPlayerLogSnapshotCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AVPlayerLogSnapshotCache.swift; sourceTree = "<group>"; };
 		ACAB249AA0692A963B6D5160 /* VideoAccessUnitBacking.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoAccessUnitBacking.swift; sourceTree = "<group>"; };
+		ACD0C3011D43ACDE23AFD128 /* IOSPlaybackOrientation.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSPlaybackOrientation.swift; sourceTree = "<group>"; };
 		AD9F0AEE8B67A72163678511 /* AC3FrameInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AC3FrameInspectorTests.swift; sourceTree = "<group>"; };
 		ADCA6ED0EE93E975848994DA /* VPlayerMacOSUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = VPlayerMacOSUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		ADEE9270141173EE733B80F3 /* ReleaseIdentityFixture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleaseIdentityFixture.swift; sourceTree = "<group>"; };
@@ -3728,6 +3730,7 @@
 			isa = PBXGroup;
 			children = (
 				16C05FC7F8A188B92CD2BA83 /* IOSFullScreenPlayerView.swift */,
+				ACD0C3011D43ACDE23AFD128 /* IOSPlaybackOrientation.swift */,
 				A068063F0CAD03938513F1EB /* IOSPlaybackPresentationHost.swift */,
 				09D00EB6950CE64545987F6E /* IOSPlaybackSession.swift */,
 				E8239D02F9966237DA5AC9EB /* IOSVideoProcessingLifecycle.swift */,
@@ -4913,6 +4916,7 @@
 				0367EE5BBA9AAC8AC2E6178B /* IOSChannelInformationView.swift in Sources */,
 				CC1F64EFC245EB2474D1CF78 /* IOSChannelRow.swift in Sources */,
 				349FE996DDE03C3B6F8822A4 /* IOSFullScreenPlayerView.swift in Sources */,
+				F82FE037DE98D793F7105718 /* IOSPlaybackOrientation.swift in Sources */,
 				21CB9A7371F153D7E5BCAF56 /* IOSPlaybackPresentationHost.swift in Sources */,
 				FCC8127EABF9505B63F4521A /* IOSPlaybackSession.swift in Sources */,
 				FADFAA22DFE16C019EA79076 /* IOSProgrammeGuidePresentation.swift in Sources */,

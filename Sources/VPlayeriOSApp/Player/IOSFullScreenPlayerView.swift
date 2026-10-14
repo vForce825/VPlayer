@@ -57,6 +57,10 @@ struct IOSFullScreenPlayerView: View {
             IOSStatusBarAppearanceRefresh(isHidden: !areControlsVisible)
                 .frame(width: 0, height: 0).accessibilityHidden(true)
         }
+        .overlay(alignment: .topLeading) {
+            IOSPlaybackOrientationPreference(playback: session.settings, session: session)
+                .frame(width: 1, height: 1).allowsHitTesting(false).accessibilityHidden(true)
+        }
         // Preserve individual control labels/actions. VoiceOver pins the bars,
         // and its escape gesture remains an explicit, accessible close action.
         .accessibilityElement(children: .contain)
@@ -343,8 +347,10 @@ private struct IOSPlayerMoreView: View {
     private var settingsView: some View {
         List {
             PlaybackSettingsSections(playback: session.settings)
+            IOSPlaybackOrientationSettingsSection(playback: session.settings)
             PlaybackSettingsResetSection(playback: session.settings)
         }
+        .accessibilityIdentifier("player.settings.list")
         .navigationTitle("播放设置")
         .toolbar { doneButton(identifier: "player.settings.done") }
     }
