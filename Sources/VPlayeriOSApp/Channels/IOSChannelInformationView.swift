@@ -18,29 +18,10 @@ struct IOSChannelInformationView: View {
         NavigationStack {
             TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
                 let programmes = model.programmesByChannelID[channel.id, default: []]
-                let presentation = ChannelProgrammePresentation.resolve(programmes: programmes, at: tick.date)
-                let upcoming = programmes.filter { $0.start >= tick.date && $0.stop > $0.start }
                 List {
                     basicInformation
                     epgInformation
-                    Section("当前节目") {
-                        if let current = presentation.current {
-                            programmeRow(current)
-                            if let progress = presentation.progress {
-                                ProgressView(value: progress)
-                                    .accessibilityLabel("当前节目进度")
-                            }
-                        } else {
-                            Text("暂无当前节目").foregroundStyle(.secondary)
-                        }
-                    }
-                    Section("后续节目") {
-                        if upcoming.isEmpty {
-                            Text("暂无后续节目").foregroundStyle(.secondary)
-                        } else {
-                            ForEach(upcoming) { programme in programmeRow(programme) }
-                        }
-                    }
+                    IOSProgrammeSections(guide: IOSProgrammeGuidePresentation(programmes: programmes, at: tick.date))
                 }
             }
             .navigationTitle("频道信息")
@@ -111,9 +92,6 @@ struct IOSChannelInformationView: View {
         }
     }
 
-    private func programmeRow(_ programme: Programme) -> some View {
-        IOSProgrammeRow(programme: programme)
-    }
 }
 
 struct IOSProgrammeGuideView: View {
@@ -125,29 +103,15 @@ struct IOSProgrammeGuideView: View {
     var body: some View {
         NavigationStack {
             TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
-                let programme = ChannelProgrammePresentation.resolve(programmes: presentation.programmes, at: tick.date)
-                let upcoming = presentation.programmes.filter { $0.start >= tick.date && $0.stop > $0.start }
                 List {
                     Section {
-                        Text(presentation.request.title).font(.headline)
+                        Text(presentation.request.title).font(.title3.weight(.semibold))
+                            .accessibilityAddTraits(.isHeader)
+                            .listRowBackground(Color.clear)
+                            .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 0, trailing: 4))
                     }
-                    Section("当前节目") {
-                        if let current = programme.current {
-                            IOSProgrammeRow(programme: current)
-                            if let progress = programme.progress {
-                                ProgressView(value: progress).accessibilityLabel("节目播出进度")
-                            }
-                        } else {
-                            Text("暂无当前节目").foregroundStyle(.secondary)
-                        }
-                    }
-                    Section("后续节目") {
-                        if upcoming.isEmpty {
-                            Text("暂无后续节目").foregroundStyle(.secondary)
-                        } else {
-                            ForEach(upcoming) { IOSProgrammeRow(programme: $0) }
-                        }
-                    }
+                    IOSProgrammeSections(guide: IOSProgrammeGuidePresentation(
+                        programmes: presentation.programmes, at: tick.date))
                     if presentation.programmes.isEmpty {
                         Section {
                             Text("暂时没有可用的节目单，可在“播放列表”中刷新节目单。")
@@ -155,6 +119,8 @@ struct IOSProgrammeGuideView: View {
                         }
                     }
                 }
+                .listSectionSpacing(.compact)
+                .contentMargins(.top, 12, for: .scrollContent)
             }
             .navigationTitle("节目单")
             .navigationBarTitleDisplayMode(.inline)
@@ -169,21 +135,98 @@ struct IOSProgrammeGuideView: View {
     }
 }
 
-private struct IOSProgrammeRow: View {
-    let programme: Programme
+private struct IOSProgrammeSections: View {
+    let guide: IOSProgrammeGuidePresentation
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(programme.title).font(.headline)
-            Text("\(programme.start.formatted(date: .abbreviated, time: .shortened)) – \(programme.stop.formatted(date: .abbreviated, time: .shortened))")
-                .font(.caption).monospacedDigit().foregroundStyle(.secondary)
-            if let subtitle = programme.subtitle, !subtitle.isEmpty {
-                Text(subtitle).font(.subheadline)
-            }
-            if let summary = programme.summary, !summary.isEmpty {
-                Text(summary).font(.subheadline).foregroundStyle(.secondary)
+        if !guide.hasCurrent {
+            Section { Text("暂无当前节目").foregroundStyle(.secondary) }
+        }
+        ForEach(guide.days) { day in
+            Section(day.title) {
+                ForEach(day.rows) { row in
+                    IOSProgrammeRow(row: row)
+                        .listRowBackground(row.isCurrent ? Color.accentColor.opacity(0.08) : nil)
+                }
             }
         }
-        .padding(.vertical, 4)
+        if !guide.hasUpcoming {
+            Section { Text("暂无后续节目").foregroundStyle(.secondary) }
+        }
+    }
+}
+
+private struct IOSProgrammeRow: View {
+    let row: IOSProgrammeGuidePresentation.Row
+    @State private var isExpanded = false
+    private var details: [String] {
+        [row.programme.subtitle, row.programme.summary].compactMap {
+            guard let value = $0?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
+            return value
+        }
+    }
+
+    var body: some View {
+        Group {
+            if details.isEmpty {
+                summary
+            } else {
+                DisclosureGroup(isExpanded: $isExpanded) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(Array(details.enumerated()), id: \.offset) { _, text in
+                            Text(text).font(.subheadline).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(.vertical, 8)
+                    .accessibilityIdentifier("\(row.accessibilityPrefix).details")
+                } label: { summary }
+                .tint(.secondary)
+                .accessibilityIdentifier("\(row.accessibilityPrefix).disclosure")
+            }
+        }
+        .padding(.vertical, 8)
+    }
+
+    private var summary: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .firstTextBaseline, spacing: 12) {
+                    timeRange.fixedSize(horizontal: true, vertical: false)
+                    Spacer(minLength: 0)
+                    status
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    timeRange
+                    status
+                }
+            }
+            Text(row.programme.title).font(.headline).foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("\(row.accessibilityPrefix).title")
+            if let progress = row.progress, let remaining = row.remainingText {
+                VStack(alignment: .leading, spacing: 6) {
+                    ProgressView(value: progress).tint(.accentColor)
+                        .accessibilityLabel("节目播出进度")
+                    Text(remaining).font(.caption).foregroundStyle(.secondary)
+                        .accessibilityIdentifier("programme.current.remaining")
+                }
+            }
+        }
+    }
+
+    private var timeRange: some View {
+        Text(row.timeRange).font(.subheadline.weight(.semibold)).monospacedDigit()
+            .foregroundStyle(row.isCurrent ? Color.accentColor : Color.primary)
+            .accessibilityLabel("播出时间，\(row.timeRange.replacingOccurrences(of: " – ", with: " 至 "))")
+            .accessibilityIdentifier("\(row.accessibilityPrefix).time")
+    }
+
+    @ViewBuilder private var status: some View {
+        if row.isCurrent {
+            Text("正在播出").font(.caption.weight(.medium)).foregroundStyle(Color.accentColor)
+        } else if row.isNext {
+            Text("下一节目").font(.caption).foregroundStyle(.secondary)
+        }
     }
 }

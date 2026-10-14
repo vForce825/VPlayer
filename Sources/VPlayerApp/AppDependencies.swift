@@ -1147,6 +1147,8 @@ private actor SeededLibrarySeeder {
           <channel id="fixture-channel"><display-name>测试频道</display-name></channel>
           <programme channel="fixture-channel" start="\(currentStart)" stop="\(currentStop)">
             <title>正在播出</title>
+            <sub-title>合成节目副标题</sub-title>
+            <desc>这是一段用于验证节目详情展开与收起的合成简介。</desc>
           </programme>
           <programme channel="fixture-channel" start="\(currentStop)" stop="\(nextStop)">
             <title>接下来</title>

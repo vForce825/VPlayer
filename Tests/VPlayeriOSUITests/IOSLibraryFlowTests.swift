@@ -225,7 +225,8 @@ final class IOSLibraryFlowTests: XCTestCase {
         }
     }
     func testChannelInformationShowsMetadataAndEPGWithoutStartingPlayback() {
-        let app = launch()
+        // 此处只验证信息面板及播放入口；准备态固定控件，暂停和自动隐藏另有专门验收。
+        let app = launch(playbackFixture: "preparing")
         defer { app.terminate() }
         let information = app.buttons["channel.info.channel.http"]
         require(information, in: app, stage: "channel-information-button", timeout: 15, hittable: true)
@@ -242,8 +243,10 @@ final class IOSLibraryFlowTests: XCTestCase {
         informationScreenshot.lifetime = .keepAlways
         add(informationScreenshot)
         app.swipeUp()
-        require(app.staticTexts["正在播出"], in: app, stage: "channel-information-current-programme", timeout: 3)
-        require(app.staticTexts["接下来"], in: app, stage: "channel-information-next-programme", timeout: 3)
+        require(app.staticTexts["programme.current.title"], in: app, stage: "channel-information-current-programme", timeout: 3)
+        require(app.staticTexts["programme.next.title"], in: app, stage: "channel-information-next-programme", timeout: 3)
+        XCTAssertTrue(app.staticTexts["programme.current.time"].label.contains(" 至 "))
+        XCTAssertTrue(app.staticTexts["programme.next.time"].label.contains(" 至 "))
         let programmeScreenshot = XCTAttachment(screenshot: app.screenshot())
         programmeScreenshot.name = "频道节目单"
         programmeScreenshot.lifetime = .keepAlways
@@ -253,9 +256,10 @@ final class IOSLibraryFlowTests: XCTestCase {
         require(app.buttons["channel.http"], in: app, stage: "channel-information-dismissed", timeout: 5,
                 hittable: true)
         app.buttons["channel.http"].tap()
-        pauseBeforeControlInspection(in: app, stage: "channel-information-playback")
-        assertPlayerControls(in: app, stage: "channel-information-playback")
+        require(app.buttons["player-back"], in: app, stage: "channel-information-playback", timeout: 5, hittable: true)
         app.buttons["player-back"].tap()
+        require(app.buttons["channel.http"], in: app, stage: "channel-information-playback-closed", timeout: 5,
+                hittable: true)
     }
     func testUnmatchedChannelInformationCanOpenEPGMapping() {
         let app = launch()
@@ -377,8 +381,29 @@ final class IOSLibraryFlowTests: XCTestCase {
 
         app.buttons["player-programmes"].tap()
         require(app.buttons["player.programmes.done"], in: app, stage: "programme-guide", timeout: 5, hittable: true)
-        XCTAssertTrue(app.staticTexts["正在播出"].exists)
-        XCTAssertTrue(app.staticTexts["接下来"].exists)
+        let currentTime = app.staticTexts["programme.current.time"]
+        let currentTitle = app.staticTexts["programme.current.title"]
+        require(currentTime, in: app, stage: "programme-guide-current-time", timeout: 3)
+        XCTAssertTrue(currentTime.label.contains(" 至 "))
+        XCTAssertTrue(app.staticTexts["programme.next.time"].label.contains(" 至 "))
+        XCTAssertLessThan(currentTime.frame.maxY, currentTitle.frame.minY)
+        XCTAssertTrue(app.staticTexts["programme.current.remaining"].exists)
+        XCTAssertFalse(app.staticTexts["合成节目副标题"].exists)
+        let guide = XCTAttachment(screenshot: app.screenshot())
+        guide.name = "节目单完整时间行与当前节目"
+        guide.lifetime = .keepAlways
+        add(guide)
+        let disclosure = identified("programme.current.disclosure", in: app.descendants(matching: .any)).firstMatch
+        disclosure.tap()
+        require(app.staticTexts["合成节目副标题"], in: app, stage: "programme-guide-expanded-details", timeout: 3)
+        XCTAssertTrue(app.staticTexts["这是一段用于验证节目详情展开与收起的合成简介。"].exists)
+        XCTAssertTrue(currentTime.exists, "展开简介后起止时间应始终可见")
+        let expanded = XCTAttachment(screenshot: app.screenshot())
+        expanded.name = "节目简介展开后保留完整时间行"
+        expanded.lifetime = .keepAlways
+        add(expanded)
+        disclosure.tap()
+        XCTAssertFalse(app.staticTexts["合成节目副标题"].exists)
         app.buttons["player.programmes.done"].tap()
         require(app.buttons["player-more"], in: app, stage: "programme-guide-return", timeout: 5, hittable: true)
         assertPlayerSession(identity, in: app)
