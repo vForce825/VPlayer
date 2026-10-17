@@ -1751,7 +1751,8 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
     func testProductionInterlacedCadenceEncodesBothProgressiveFieldsAt50p() throws {
         let harness = try BranchHarness(
             capacity: 2,
-            cadencePolicy: HLSInterlacedYADIFPolicy.cadence
+            cadencePolicy: HLSInterlacedYADIFPolicy.cadence,
+            outputFrameRate: MediaRational(num: 50, den: 1)
         )
         let batch = try harness.makeYADIFBatch(
             accessUnitID: 1,
@@ -2052,7 +2053,8 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
     func testYADIFGapFillSynthesizesContinuousFramesFromLastSurface() throws {
         let harness = try BranchHarness(
             capacity: 4,
-            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500)
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1)
         )
         XCTAssertEqual(harness.branch.receive(
             .batch(try harness.makeYADIFBatch(
@@ -2094,7 +2096,8 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
     func testYADIFGapFillSnapsTransportClockJitterToFieldCadence() throws {
         let harness = try BranchHarness(
             capacity: 6,
-            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500)
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1)
         )
         XCTAssertEqual(harness.branch.receive(
             .batch(try harness.makeYADIFBatch(
@@ -2128,6 +2131,267 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
             2,
             "广播时钟的 1 tick 抖动不能被误判成非法时间；真正缺少的两场仍须补齐"
         )
+    }
+
+    func testFrozen50pCadenceCorrectsLogged3510DurationAndBothFieldTimestamps() throws {
+        let harness = try BranchHarness(capacity: 6,
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1))
+        let first = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1,
+            presentationTimeStamp: CMTime(value: 11_815_200, timescale: 180_000))
+        let short = try harness.makeYADIFBatch(accessUnitID: 2, firstSequence: 3,
+            presentationTimeStamp: CMTime(value: 11_822_400, timescale: 180_000),
+            sourceDuration: CMTime(value: 3_510, timescale: 90_000))
+        let recovery = try harness.makeYADIFBatch(accessUnitID: 3, firstSequence: 5,
+            presentationTimeStamp: CMTime(value: 11_829_420, timescale: 180_000),
+            sourceDuration: CMTime(value: 3_690, timescale: 90_000))
+        for batch in [first, short, recovery] {
+            XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+        }
+        for _ in 0..<6 {
+            harness.drain()
+            harness.encoder.completeFirstSuccessfully()
+        }
+        harness.drain()
+        XCTAssertNil(harness.branch.terminal)
+        let frames = harness.encoder.submittedFrames
+        XCTAssertEqual(frames.count, 6)
+        for (index, frame) in frames.enumerated() {
+            XCTAssertEqual(CMTimeCompare(frame.duration, CMTime(value: 3_600, timescale: 180_000)), 0)
+            XCTAssertEqual(CMTimeCompare(frame.presentationTimeStamp,
+                CMTime(value: 11_815_200 + Int64(index) * 3_600, timescale: 180_000)), 0)
+        }
+        XCTAssertTrue(frames.allSatisfy { $0.identity.gapFillOrdinal == 0 })
+        harness.branch.cancel()
+        XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+        harness.drain()
+        XCTAssertEqual(harness.admission.usage.count, 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
+    func testFrozenCadenceBoundsPerFieldDurationCorrectionBeforeSurfaceLease() throws {
+        for sourceTicks in [3_419, 3_420, 3_780, 3_781] {
+            let harness = try BranchHarness(capacity: 2,
+                gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+                outputFrameRate: MediaRational(num: 50, den: 1))
+            let batch = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1,
+                sourceDuration: CMTime(value: Int64(sourceTicks), timescale: 90_000))
+            XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+            harness.drain()
+            if (3_420...3_780).contains(sourceTicks) {
+                XCTAssertEqual(harness.encoder.submittedFrames.count, 2)
+                XCTAssertNil(harness.branch.terminal)
+                XCTAssertTrue(harness.encoder.submittedFrames.allSatisfy {
+                    CMTimeCompare($0.duration, CMTime(value: 1, timescale: 50)) == 0
+                })
+            } else {
+                XCTAssertTrue(harness.encoder.submittedFrames.isEmpty)
+                XCTAssertEqual(harness.branch.terminal, .failed(.invalidFrame(.invalidTime)))
+                XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 1), 0)
+                XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 2), 0)
+            }
+            harness.branch.cancel()
+            XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+            harness.drain()
+            XCTAssertEqual(harness.admission.usage.count, 0)
+            XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+        }
+    }
+
+    func testFrozenCadenceRejectsCumulativePositiveAndNegativeDurationDrift() throws {
+        for sourceTicks in [3_510, 3_690] {
+            let harness = try BranchHarness(capacity: 4,
+                gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+                outputFrameRate: MediaRational(num: 50, den: 1))
+            let first = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1)
+            XCTAssertEqual(harness.branch.receive(.batch(first), generation: harness.generation), .accepted)
+            for _ in 0..<2 {
+                harness.drain()
+                harness.encoder.completeFirstSuccessfully()
+            }
+            for index in 0..<11 {
+                let batch = try harness.makeYADIFBatch(accessUnitID: UInt64(index + 2),
+                    firstSequence: UInt64(index * 2 + 3),
+                    presentationTimeStamp: CMTime(value: 7_200 + Int64(index * sourceTicks * 2), timescale: 180_000),
+                    sourceDuration: CMTime(value: Int64(sourceTicks), timescale: 90_000),
+                    reusingSurfacesFrom: first)
+                XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+                harness.drain()
+                if index < 10 {
+                    XCTAssertNil(harness.branch.terminal, "第 \(index + 1) 批仍在半场累计修正界限内")
+                    for _ in 0..<2 {
+                        harness.encoder.completeFirstSuccessfully()
+                        harness.drain()
+                    }
+                }
+            }
+            XCTAssertEqual(harness.branch.terminal, .failed(.invalidFrame(.invalidTime)))
+            XCTAssertEqual(harness.encoder.submittedFrames.count, 22,
+                "第十一批必须整批拒绝，不能通过重复补帧掩盖持续的帧率变化")
+            XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 23), 0)
+            XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 24), 0)
+            XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+            harness.drain()
+            XCTAssertEqual(harness.admission.usage.count, 0)
+            XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+        }
+    }
+
+    func testFrozen5994pCadenceKeepsExactRationalGridAcrossBalancedJitter() throws {
+        let harness = try BranchHarness(capacity: 4,
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 60_000, den: 1_001))
+        let sourceDuration = CMTime(value: 1_001, timescale: 30_000)
+        let first = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1,
+            sourceDuration: sourceDuration)
+        for index in 0..<120 {
+            let jitter = CMTime(value: index.isMultiple(of: 2) ? 2 : -2, timescale: 90_000)
+            let batch = try harness.makeYADIFBatch(accessUnitID: UInt64(index + 1),
+                firstSequence: UInt64(index * 2 + 1),
+                presentationTimeStamp: CMTime(value: Int64(index) * 2_002, timescale: 60_000),
+                sourceDuration: CMTimeAdd(sourceDuration, jitter), reusingSurfacesFrom: first)
+            XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+            for _ in 0..<2 {
+                harness.drain()
+                harness.encoder.completeFirstSuccessfully()
+            }
+            harness.drain()
+            XCTAssertNil(harness.branch.terminal)
+        }
+        let frames = harness.encoder.submittedFrames
+        XCTAssertEqual(frames.count, 240)
+        for (index, frame) in frames.enumerated() {
+            XCTAssertEqual(CMTimeCompare(frame.duration, CMTime(value: 1_001, timescale: 60_000)), 0)
+            XCTAssertEqual(CMTimeCompare(frame.presentationTimeStamp,
+                CMTime(value: Int64(index) * 1_001, timescale: 60_000)), 0)
+            XCTAssertFalse(frame.presentationTimeStamp.flags.contains(.hasBeenRounded))
+            XCTAssertFalse(frame.duration.flags.contains(.hasBeenRounded))
+            XCTAssertEqual(frame.identity.gapFillOrdinal, 0)
+        }
+        harness.branch.cancel()
+        XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+        harness.drain()
+        XCTAssertEqual(harness.admission.usage.count, 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
+    func testFrozenCadenceAcceptsHistoricalRoundedFlagsAt50pAnd5994p() throws {
+        for (numerator, denominator) in [(Int32(50), Int32(1)), (60_000, 1_001)] {
+            let harness = try BranchHarness(capacity: 4,
+                gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+                outputFrameRate: MediaRational(num: numerator, den: denominator))
+            let sourceDuration = CMTime(value: Int64(denominator) * 2, timescale: numerator,
+                flags: [.valid, .hasBeenRounded], epoch: 0)
+            for index in 0..<2 {
+                let numericPTS = CMTimeAdd(CMTime(
+                    value: Int64(numerator) * 10 + Int64(index * 2) * Int64(denominator),
+                    timescale: numerator), CMTime(value: index == 0 ? 0 : 1, timescale: 90_000))
+                let sourcePTS = CMTime(value: numericPTS.value, timescale: numericPTS.timescale,
+                    flags: [.valid, .hasBeenRounded], epoch: numericPTS.epoch)
+                let batch = try harness.makeYADIFBatch(accessUnitID: UInt64(index + 1),
+                    firstSequence: UInt64(index * 2 + 1), presentationTimeStamp: sourcePTS,
+                    sourceDuration: sourceDuration)
+                XCTAssertTrue(batch.outputs[0].frame.presentationTimeStamp.flags.contains(.hasBeenRounded))
+                XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+                for _ in 0..<2 {
+                    harness.drain()
+                    harness.encoder.completeFirstSuccessfully()
+                }
+                harness.drain()
+                XCTAssertNil(harness.branch.terminal)
+            }
+            XCTAssertEqual(harness.encoder.submittedFrames.count, 4)
+            for (index, frame) in harness.encoder.submittedFrames.enumerated() {
+                XCTAssertEqual(CMTimeCompare(frame.presentationTimeStamp,
+                    CMTime(value: Int64(numerator) * 10 + Int64(index) * Int64(denominator), timescale: numerator)), 0)
+                XCTAssertEqual(CMTimeCompare(frame.duration,
+                    CMTime(value: Int64(denominator), timescale: numerator)), 0)
+                XCTAssertFalse(frame.presentationTimeStamp.flags.contains(.hasBeenRounded))
+                XCTAssertFalse(frame.duration.flags.contains(.hasBeenRounded))
+            }
+            harness.branch.cancel()
+            XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+            harness.drain()
+            XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+        }
+    }
+
+    func testFrozenCadenceRejectsNewUnrepresentableTimingArithmetic() throws {
+        let harness = try BranchHarness(capacity: 2,
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1))
+        // 该精确起点再加 1/50 需要大于 Int32.max 的分母，不能无损写回 CMTime。
+        let sourcePTS = CMTime(value: Int64(Int32.max) * 10 + 1, timescale: Int32.max)
+        XCTAssertTrue(CMTimeAdd(sourcePTS, CMTime(value: 1, timescale: 50))
+            .flags.contains(.hasBeenRounded))
+        let batch = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1,
+            presentationTimeStamp: sourcePTS)
+        XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation), .accepted)
+        harness.drain()
+        XCTAssertEqual(harness.branch.terminal, .failed(.invalidFrame(.arithmeticOverflow)))
+        XCTAssertTrue(harness.encoder.submittedFrames.isEmpty)
+        XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 1), 0)
+        XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 2), 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
+    func testFrozenCadenceRejectsReversedFieldsBeforeEitherSurfaceLease() throws {
+        let harness = try BranchHarness(capacity: 2,
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1))
+        let batch = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1)
+        let reversed = VideoProcessingFrameBatch(first: batch.outputs[1], remaining: [batch.outputs[0]])
+        XCTAssertEqual(harness.branch.receive(.batch(reversed), generation: harness.generation), .accepted)
+        harness.drain()
+        XCTAssertEqual(harness.branch.terminal, .failed(.invalidFrame(.nonIncreasingPresentationTimestamp)))
+        XCTAssertTrue(harness.encoder.submittedFrames.isEmpty)
+        XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 1), 0)
+        XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 2), 0)
+        XCTAssertEqual(harness.admission.usage.count, 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
+    func testFrozenCadenceRejectsNonzeroInitialTimestampEpochBeforeAdmission() throws {
+        let harness = try BranchHarness(capacity: 2,
+            gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+            outputFrameRate: MediaRational(num: 50, den: 1))
+        let batch = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1,
+            presentationTimeStamp: CMTime(value: 10, timescale: 1, flags: .valid, epoch: 1))
+        XCTAssertEqual(harness.branch.receive(.batch(batch), generation: harness.generation),
+            .rejected(.invalidFrame(.invalidTime)))
+        harness.drain()
+        XCTAssertTrue(harness.encoder.submittedFrames.isEmpty)
+        XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 1), 0)
+        XCTAssertEqual(harness.admission.usage.count, 0)
+        XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+    }
+
+    func testFrozenCadenceStillRejectsRepeatedBackwardAndExcessiveForwardPTS() throws {
+        for nextPTS in [CMTime(value: 1, timescale: 50),
+                        CMTime(value: 3_599, timescale: 180_000),
+                        CMTime(value: 503, timescale: 50)] {
+            let harness = try BranchHarness(capacity: 4,
+                gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
+                outputFrameRate: MediaRational(num: 50, den: 1))
+            let first = try harness.makeYADIFBatch(accessUnitID: 1, firstSequence: 1)
+            XCTAssertEqual(harness.branch.receive(.batch(first), generation: harness.generation), .accepted)
+            for _ in 0..<2 {
+                harness.drain()
+                harness.encoder.completeFirstSuccessfully()
+            }
+            let invalid = try harness.makeYADIFBatch(accessUnitID: 2, firstSequence: 3,
+                presentationTimeStamp: nextPTS, reusingSurfacesFrom: first)
+            XCTAssertEqual(harness.branch.receive(.batch(invalid), generation: harness.generation), .accepted)
+            harness.drain()
+            let expected: VTVideoEncoderFailure = CMTimeCompare(nextPTS, CMTime(value: 1, timescale: 50)) <= 0
+                ? .nonIncreasingPresentationTimestamp : .invalidTime
+            XCTAssertEqual(harness.branch.terminal, .failed(.invalidFrame(expected)))
+            XCTAssertEqual(harness.encoder.submittedFrames.count, 2)
+            XCTAssertEqual(harness.leaseRecorder.acquisitionCount(for: 3), 0)
+            XCTAssertTrue(harness.encoder.waitUntilCancelCallbackDelivered())
+            harness.drain()
+            XCTAssertEqual(harness.applicationLedger.chargedBytes, 0)
+        }
     }
 
     func testPermanentBatchCapacityRejectsWithoutAcquiringEitherFieldLease() throws {
@@ -2189,7 +2453,8 @@ final class HLSVideoTranscodeBranchTests: XCTestCase {
     }
 
     func testFrozenFormatRejectsWholeBatchBeforeAnyFrameIsSubmitted() throws {
-        let harness = try BranchHarness(capacity: 4)
+        let harness = try BranchHarness(capacity: 4,
+            outputFrameRate: MediaRational(num: 50, den: 1))
         let changedMetadata = harness.makeMetadata(
             sampleAspectRatio: MediaRational(num: 1, den: 1),
             contentLightLevelInfo: Data([9, 8, 7, 6])
@@ -2521,6 +2786,7 @@ private final class BranchHarness: @unchecked Sendable {
         retainOutputEnvelopes: Bool = false,
         gapPolicy: HLSVideoGapPolicy = .strict,
         cadencePolicy: HLSVideoTranscodeCadencePolicy = .preserveAllFields,
+        outputFrameRate: MediaRational? = nil,
         applicationLedger: HLSDeliveryApplicationChargeLedger = .init()
     ) throws {
         format = VideoEncodingInputFormatSignature(
@@ -2550,6 +2816,7 @@ private final class BranchHarness: @unchecked Sendable {
             maximumPendingFrameCount: capacity,
             gapPolicy: gapPolicy,
             cadencePolicy: cadencePolicy,
+            outputFrameRate: outputFrameRate,
             admission: admission,
             encoder: encoder,
             workQueue: workQueue,
@@ -2573,7 +2840,8 @@ private final class BranchHarness: @unchecked Sendable {
         presentationTimeStamp: CMTime = .zero,
         sourceDuration: CMTime = CMTime(value: 1, timescale: 25),
         firstParity: FieldParity = .top,
-        metadata: VideoFormatMetadata? = nil
+        metadata: VideoFormatMetadata? = nil,
+        reusingSurfacesFrom reused: VideoProcessingFrameBatch? = nil
     ) throws -> VideoProcessingFrameBatch {
         let fieldDuration = CMTimeMultiplyByRatio(
             sourceDuration,
@@ -2594,7 +2862,8 @@ private final class BranchHarness: @unchecked Sendable {
                     presentationTimeStamp: presentationTimeStamp,
                     duration: fieldDuration,
                     generation: generation,
-                    metadata: metadata
+                    metadata: metadata,
+                    pixelBuffer: reused?.outputs.first?.frame.pixelBuffer
                 ),
                 origin: .metalYADIF(field: firstParity),
                 resolvedFieldOrder: order
@@ -2606,7 +2875,8 @@ private final class BranchHarness: @unchecked Sendable {
                     presentationTimeStamp: CMTimeAdd(presentationTimeStamp, fieldDuration),
                     duration: fieldDuration,
                     generation: generation,
-                    metadata: metadata
+                    metadata: metadata,
+                    pixelBuffer: reused?.outputs.last?.frame.pixelBuffer
                 ),
                 origin: .metalYADIF(field: secondParity),
                 resolvedFieldOrder: order
@@ -2661,10 +2931,11 @@ private final class BranchHarness: @unchecked Sendable {
         presentationTimeStamp: CMTime,
         duration: CMTime,
         generation: MediaGeneration,
-        metadata: VideoFormatMetadata?
+        metadata: VideoFormatMetadata?,
+        pixelBuffer: CVPixelBuffer? = nil
     ) throws -> VideoPresentationFrame {
         VideoPresentationFrame(
-            pixelBuffer: try makePixelBuffer(),
+            pixelBuffer: try pixelBuffer ?? makePixelBuffer(),
             presentationTimeStamp: presentationTimeStamp,
             duration: duration,
             generation: generation,

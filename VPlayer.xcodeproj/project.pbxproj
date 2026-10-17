@@ -6266,7 +6266,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
@@ -6290,7 +6290,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core;
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
@@ -6359,7 +6359,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
 				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
@@ -6383,7 +6383,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_NAME = VPlayer;
 				SDKROOT = appletvos;
@@ -6448,7 +6448,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core.macos;
 				PRODUCT_MODULE_NAME = VPlayerCore;
 				PRODUCT_NAME = VPlayerCore;
@@ -6547,7 +6547,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core;
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
@@ -6580,7 +6580,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback.ios;
 				PRODUCT_MODULE_NAME = VPlayerPlayback;
@@ -6617,7 +6617,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback.macos;
 				PRODUCT_MODULE_NAME = VPlayerPlayback;
@@ -6652,7 +6652,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback.macos;
 				PRODUCT_MODULE_NAME = VPlayerPlayback;
@@ -6724,7 +6724,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback.ios;
 				PRODUCT_MODULE_NAME = VPlayerPlayback;
@@ -6773,7 +6773,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core.macos;
 				PRODUCT_MODULE_NAME = VPlayerCore;
 				PRODUCT_NAME = VPlayerCore;
@@ -6800,7 +6800,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core.ios;
 				PRODUCT_MODULE_NAME = VPlayerCore;
 				PRODUCT_NAME = VPlayerCore;
@@ -6830,7 +6830,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;
@@ -6945,7 +6945,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.core.ios;
 				PRODUCT_MODULE_NAME = VPlayerCore;
 				PRODUCT_NAME = VPlayerCore;
@@ -7048,7 +7048,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;
@@ -7098,7 +7098,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				OTHER_LDFLAGS = "$(inherited) -lz";
 				PRODUCT_BUNDLE_IDENTIFIER = com.vplayer.playback;
 				PUBLIC_HEADERS_FOLDER_PATH = "$(CONTENTS_FOLDER_PATH)/Headers";
@@ -7129,7 +7129,7 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 27.0;
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;
@@ -7151,7 +7151,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 2.1;
+				MARKETING_VERSION = 2.1.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.vforce.vplayer;
 				PRODUCT_MODULE_NAME = VPlayer;
 				PRODUCT_NAME = VPlayer;

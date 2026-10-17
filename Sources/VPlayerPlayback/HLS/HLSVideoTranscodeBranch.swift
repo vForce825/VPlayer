@@ -1719,6 +1719,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
     private let encoder: any HLSVideoEncoding
     private let gapPolicy: HLSVideoGapPolicy
     private let cadencePolicy: HLSVideoTranscodeCadencePolicy
+    private let outputFrameRate: MediaRational?
     private let admission: HLSDataPlaneAdmission
     private let workQueue: DispatchQueue
     private let surfaceLeaseFactory: SurfaceLeaseFactory
@@ -1744,6 +1745,9 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
     private var frozenHardwareProof: VTHardwareEncoderProof?
     private var publishedFrameCount: UInt64 = 0
     private var gapFillReference: GapFillReference?
+    private var lastSourcePresentationTimeStamp: CMTime?
+    private var lastCanonicalEnd: CMTime?
+    private var cumulativeDurationCorrection = CMTime.zero
     private var encoderCancellationWasRequested = false
     /// 只由 encoder 的 cancel completion 写入；terminal 枚举本身不能替代该事实。
     private var encoderRetirementReceipt: Bool?
@@ -1757,6 +1761,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         maximumPendingFrameCount: Int,
         gapPolicy: HLSVideoGapPolicy = .strict,
         cadencePolicy: HLSVideoTranscodeCadencePolicy = .preserveAllFields,
+        outputFrameRate: MediaRational? = nil,
         admission: HLSDataPlaneAdmission? = nil,
         encoder: any HLSVideoEncoding,
         outputSink: @escaping OutputSink
@@ -1767,6 +1772,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             maximumPendingFrameCount: maximumPendingFrameCount,
             gapPolicy: gapPolicy,
             cadencePolicy: cadencePolicy,
+            outputFrameRate: outputFrameRate,
             admission: admission,
             encoder: encoder,
             workQueue: DispatchQueue(
@@ -1787,6 +1793,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         maximumPendingFrameCount: Int,
         gapPolicy: HLSVideoGapPolicy = .strict,
         cadencePolicy: HLSVideoTranscodeCadencePolicy = .preserveAllFields,
+        outputFrameRate: MediaRational? = nil,
         admission: HLSDataPlaneAdmission? = nil,
         encoder: any HLSVideoEncoding,
         workQueue: DispatchQueue,
@@ -1797,6 +1804,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         self.inputFormat = inputFormat
         self.gapPolicy = gapPolicy
         self.cadencePolicy = cadencePolicy
+        self.outputFrameRate = outputFrameRate
         self.admission = admission ?? HLSDataPlaneAdmission(
             capacity: max(0, maximumPendingFrameCount),
             maximumBytes: HLSDeliveryApplicationChargeLedger.documentedApplicationHardBytes
@@ -1992,9 +2000,21 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         }
 
         var timingAdjustment = CMTime.zero
+        let canonicalDuration: CMTime?
+        var nextDurationCorrection = cumulativeDurationCorrection
         do {
+            canonicalDuration = try constantCadenceDuration(
+                for: outputs, cumulativeCorrection: &nextDurationCorrection)
             if let first = outputs.first {
-                if let gapFrames = try makeGapFillFramesIsolated(before: first) {
+                if canonicalDuration != nil, case .strict = gapPolicy,
+                   let lastCanonicalEnd,
+                   CMTimeCompare(first.frame.presentationTimeStamp, lastCanonicalEnd) != 0 {
+                    throw VTVideoEncoderFailure.invalidTime
+                }
+                if let gapFrames = try makeGapFillFramesIsolated(before: first,
+                    presentationTimeStamp: canonicalDuration.map { _ in
+                        Self.existingTimingValue(first.frame.presentationTimeStamp)
+                    }) {
                     timingAdjustment = gapFrames.timingAdjustment
                     if !gapFrames.frames.isEmpty {
                         try enqueueIsolated(
@@ -2019,10 +2039,30 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             prepared = try zip(outputs, leases).enumerated().map { index, pair in
                 let (output, lease) = pair
                 let frame = output.frame
-                let adjustedPresentationTimeStamp = CMTimeAdd(
-                    frame.presentationTimeStamp,
-                    timingAdjustment
-                )
+                let duration = canonicalDuration ?? frame.duration
+                let adjustedPresentationTimeStamp: CMTime
+                if let canonicalDuration {
+                    guard let first = outputs.first, let ordinal = Int32(exactly: index) else {
+                        throw VTVideoEncoderFailure.arithmeticOverflow
+                    }
+                    adjustedPresentationTimeStamp = CMTimeAdd(
+                        CMTimeAdd(Self.existingTimingValue(first.frame.presentationTimeStamp), timingAdjustment),
+                        CMTimeMultiply(canonicalDuration, multiplier: ordinal))
+                    let adjustment = CMTimeSubtract(adjustedPresentationTimeStamp,
+                        Self.existingTimingValue(frame.presentationTimeStamp))
+                    let limit = CMTimeMultiplyByRatio(canonicalDuration, multiplier: 1, divisor: 2)
+                    let end = CMTimeAdd(adjustedPresentationTimeStamp, canonicalDuration)
+                    guard !adjustedPresentationTimeStamp.flags.contains(.hasBeenRounded),
+                          end.isNumeric, !end.flags.contains(.hasBeenRounded),
+                          adjustment.isNumeric, !adjustment.flags.contains(.hasBeenRounded),
+                          CMTimeCompare(adjustment, limit) <= 0,
+                          CMTimeCompare(adjustment, CMTimeMultiply(limit, multiplier: -1)) >= 0 else {
+                        throw VTVideoEncoderFailure.invalidTime
+                    }
+                } else {
+                    adjustedPresentationTimeStamp = CMTimeAdd(
+                        frame.presentationTimeStamp, timingAdjustment)
+                }
                 guard adjustedPresentationTimeStamp.isNumeric else {
                     throw VTVideoEncoderFailure.arithmeticOverflow
                 }
@@ -2053,7 +2093,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
                         identity: identity,
                         pixelBuffer: frame.pixelBuffer,
                         presentationTimeStamp: adjustedPresentationTimeStamp,
-                        duration: frame.duration,
+                        duration: duration,
                         presentationOrigin: output.origin,
                         reliableFieldOrder: output.resolvedFieldOrder,
                         inputFormatSignature: inputFormat,
@@ -2068,7 +2108,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
                     pixelBuffer: frame.pixelBuffer,
                     surfaceLease: encodingLease,
                     presentationTimeStamp: adjustedPresentationTimeStamp,
-                    duration: frame.duration,
+                    duration: duration,
                     presentationOrigin: output.origin,
                     reliableFieldOrder: output.resolvedFieldOrder,
                     inputFormatSignature: inputFormat
@@ -2097,12 +2137,89 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             failIsolated(.invalidFrame(.unexpected(PlaybackErrorDiagnostics.snapshot(error))))
             return
         }
+        if canonicalDuration != nil, let last = prepared.last {
+            lastSourcePresentationTimeStamp = outputs.last.map {
+                Self.existingTimingValue($0.frame.presentationTimeStamp)
+            }
+            lastCanonicalEnd = CMTimeAdd(last.presentationTimeStamp, last.duration)
+            cumulativeDurationCorrection = nextDurationCorrection
+        }
         gapFillReference = nextGapFillReference
         driveIsolated()
     }
 
+    /// HLS 已向编码器和播放列表声明固定场率；滑动 PTS 中位数的小幅波动
+    /// 不能改变该输出合同。只允许单场时长的 ±5% 修正（50p 为 ±1ms）。
+    /// PTS 仍由 gapPolicy 限制在既有网格半场内，并保留有界前向补帧；
+    /// 网格始终推进 canonical duration，绝不按新的源 duration 重新锚定。
+    /// 整代有符号时长修正累计不得超过半场，防止持续变帧率通过反复补帧被掩盖。
+    /// 真正丢帧的 PTS 空洞不计入该预算，因为它没有修改真实帧的持续时间。
+    private func constantCadenceDuration(
+        for outputs: [VideoProcessingOutputFrame],
+        cumulativeCorrection: inout CMTime
+    ) throws -> CMTime? {
+        guard let outputFrameRate else { return nil }
+        guard outputFrameRate.num > 0, outputFrameRate.den > 0 else {
+            throw VTVideoEncoderFailure.invalidTime
+        }
+        let duration = CMTime(value: Int64(outputFrameRate.den), timescale: outputFrameRate.num)
+        let tolerance = CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 20)
+        let cumulativeLimit = CMTimeMultiplyByRatio(duration, multiplier: 1, divisor: 2)
+        guard duration.isNumeric, tolerance.isNumeric, cumulativeLimit.isNumeric,
+              !tolerance.flags.contains(.hasBeenRounded),
+              !cumulativeLimit.flags.contains(.hasBeenRounded),
+              CMTimeCompare(tolerance, .zero) > 0 else {
+            throw VTVideoEncoderFailure.invalidTime
+        }
+        var previousPTS = lastSourcePresentationTimeStamp
+        var previousBatchEnd: CMTime?
+        for output in outputs {
+            let frame = output.frame
+            let sourcePTS = Self.existingTimingValue(frame.presentationTimeStamp)
+            let sourceDuration = Self.existingTimingValue(frame.duration)
+            guard case .metalYADIF = output.origin else {
+                throw VTVideoEncoderFailure.invalidTime
+            }
+            if let previousPTS,
+               CMTimeCompare(sourcePTS, previousPTS) <= 0 {
+                throw VTVideoEncoderFailure.nonIncreasingPresentationTimestamp
+            }
+            if let previousBatchEnd,
+               CMTimeCompare(sourcePTS, previousBatchEnd) != 0 {
+                throw VTVideoEncoderFailure.invalidTime
+            }
+            let difference = CMTimeSubtract(sourceDuration, duration)
+            guard difference.isNumeric, !difference.flags.contains(.hasBeenRounded),
+                  CMTimeCompare(difference, tolerance) <= 0,
+                  CMTimeCompare(difference, CMTimeMultiply(tolerance, multiplier: -1)) >= 0 else {
+                throw VTVideoEncoderFailure.invalidTime
+            }
+            cumulativeCorrection = CMTimeAdd(cumulativeCorrection, difference)
+            guard cumulativeCorrection.isNumeric, !cumulativeCorrection.flags.contains(.hasBeenRounded),
+                  CMTimeCompare(cumulativeCorrection, cumulativeLimit) <= 0,
+                  CMTimeCompare(cumulativeCorrection, CMTimeMultiply(cumulativeLimit, multiplier: -1)) >= 0 else {
+                throw VTVideoEncoderFailure.invalidTime
+            }
+            previousPTS = sourcePTS
+            let end = CMTimeAdd(sourcePTS, sourceDuration)
+            guard end.isNumeric, !end.flags.contains(.hasBeenRounded) else {
+                throw VTVideoEncoderFailure.arithmeticOverflow
+            }
+            previousBatchEnd = end
+        }
+        return duration
+    }
+
+    /// preflight 已验证 numeric 和 epoch。transport 量化留下的 rounded 标记
+    /// 描述过去的操作；保留原有数值及 epoch，仅让后续标记反映本次算术精度。
+    /// 既有量化误差仍受单场、累计修正及 PTS 半场界限约束。
+    private static func existingTimingValue(_ time: CMTime) -> CMTime {
+        CMTime(value: time.value, timescale: time.timescale, flags: .valid, epoch: time.epoch)
+    }
+
     private func makeGapFillFramesIsolated(
-        before next: VideoProcessingOutputFrame
+        before next: VideoProcessingOutputFrame,
+        presentationTimeStamp: CMTime? = nil
     ) throws -> (
         frames: [VideoEncodingFrame],
         admissionTail: HLSVideoBatchAdmissionTail,
@@ -2111,6 +2228,7 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         guard let reference = gapFillReference else {
             return nil
         }
+        let nextPTS = presentationTimeStamp ?? next.frame.presentationTimeStamp
         gapFillReference = nil
         defer { reference.reservoir.close() }
         guard case .metalYADIF = reference.presentationOrigin,
@@ -2120,11 +2238,11 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
         let resolution = try gapPolicy.resolve(
             previousPresentationTimeStamp: reference.presentationTimeStamp,
             previousDuration: reference.duration,
-            nextPresentationTimeStamp: next.frame.presentationTimeStamp
+            nextPresentationTimeStamp: nextPTS
         )
         let timingAdjustment = CMTimeSubtract(
             resolution.canonicalNextPresentationTimeStamp,
-            next.frame.presentationTimeStamp
+            nextPTS
         )
         guard timingAdjustment.isNumeric else {
             throw VTVideoEncoderFailure.arithmeticOverflow

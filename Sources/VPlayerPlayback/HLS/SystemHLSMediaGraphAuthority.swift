@@ -251,6 +251,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
         private let outputSemaphore: DispatchSemaphore
         private let inputCapacityWakeup: HLSVideoInputCapacityWakeup
         private let writerCapacityWakeup: WriterCapacityWakeup
+        private let encodedVideoEnvelope: WriterEncodedVideoEnvelope
         private weak var authority: SystemHLSMediaGraphAuthority?
         private var writer: SegmentedFMP4Writer?
         private var lastWrittenPTS: CMTime?
@@ -277,6 +278,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
              outputSemaphore: DispatchSemaphore,
              inputCapacityWakeup: HLSVideoInputCapacityWakeup,
              writerCapacityWakeup: WriterCapacityWakeup,
+             encodedVideoEnvelope: WriterEncodedVideoEnvelope,
              authority: SystemHLSMediaGraphAuthority) {
             self.publication = publication
             self.binding = binding
@@ -285,6 +287,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
             self.outputSemaphore = outputSemaphore
             self.inputCapacityWakeup = inputCapacityWakeup
             self.writerCapacityWakeup = writerCapacityWakeup
+            self.encodedVideoEnvelope = encodedVideoEnvelope
             self.authority = authority
             boundary.installAudioBoundaryAdvanceSink { [weak self] in
                 guard let self else { return }
@@ -540,7 +543,10 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 "au\($0.accessUnitID)-seq\($0.sequenceNumber)-g\($0.generation.rawValue)"
             } ?? "nil"
             let currentSource = output.sourceIdentity
-            return "duration=\(HLSInterlacedOutputDiagnostic.time(duration)) " +
+            // 先放精确准入拒绝原因，避免错误快照的 256 字节上限截掉定位字段。
+            // writer 只提供静态原因与数值，不包含源地址、媒体内容或凭据。
+            let admission = (writer?.admissionFailureDiagnostic).map { "\($0) " } ?? ""
+            return admission + "duration=\(HLSInterlacedOutputDiagnostic.time(duration)) " +
                 "lastPTS=\(lastPTS) " +
                 "lastDuration=\(lastDuration) " +
                 "formatMatchesFirst=\(formatMatches) " +
@@ -565,7 +571,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                     binding: currentBinding, trackKind: .video, sourceFormatHint: format,
                     boundarySession: boundary.session,
                     compressedFormatConfiguration: nil,
-                    videoCadencePolicy: .strict, relay: relay,
+                    videoCadencePolicy: .strict, encodedVideoEnvelope: encodedVideoEnvelope, relay: relay,
                     systemFactory: AVAssetSegmentedFMP4SystemWriterFactory(acceptanceProbe: acceptanceProbe),
                     writerWindowContinuation: continuation, acceptanceProbe: acceptanceProbe)
             }
@@ -1504,6 +1510,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 expectedVideoStart: start, outputSemaphore: interlacedOutputSemaphore,
                 inputCapacityWakeup: inputWakeup,
                 writerCapacityWakeup: writerCapacityWakeup,
+                encodedVideoEnvelope: encoder.writerEnvelope,
                 authority: self)
             let transcode = HLSVideoTranscodeBranch(
                 generation: timed.source.generation, inputFormat: input,
@@ -1513,6 +1520,7 @@ final class SystemHLSMediaGraphAuthority: SystemHLSDeliveryGraphAuthority, @unch
                 // 同时保持有界，且所有合成帧只共享上一张 surface。
                 gapPolicy: .fillForwardGaps(maximumSyntheticFrameCount: 500),
                 cadencePolicy: HLSInterlacedYADIFPolicy.cadence,
+                outputFrameRate: outputFrameRate,
                 encoder: encoder,
                 outputSink: { output.append($0) })
             guard let device = MTLCreateSystemDefaultDevice(),

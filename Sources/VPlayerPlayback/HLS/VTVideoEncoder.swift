@@ -9,6 +9,55 @@ import Foundation
 import VideoToolbox
 import VPlayerCore
 
+/// 只由完成属性设置、prepare 和硬件确认的 VT session 签发。
+/// 同一冻结合同只可绑定一个初始 writer；后继窗口通过正式 continuation 继承。
+final class WriterEncodedVideoEnvelope: @unchecked Sendable {
+    let frameDuration: ExactMediaTime
+    let declaredBitsPerSecond: UInt64
+    private let sessionID: VTCompressionSessionID
+    private let generation: MediaGeneration
+    private let inputFormat: VideoEncodingInputFormatSignature
+    private let profile: VTVideoCodecProfile
+    private let lock = NSLock()
+    private var initialBinding: FMP4WriterBinding?
+
+    fileprivate init(configuration: VTVideoEncoderConfiguration,
+                     sessionID: VTCompressionSessionID, profile: VTVideoCodecProfile) {
+        frameDuration = ExactMediaTime(value: Int64(configuration.frameRate.den),
+                                       timescale: configuration.frameRate.num)
+        declaredBitsPerSecond = configuration.bitrate.declaredBitsPerSecond
+        self.sessionID = sessionID
+        generation = configuration.generation
+        inputFormat = configuration.inputFormat
+        self.profile = profile
+    }
+
+    func claimInitialWriter(_ binding: FMP4WriterBinding) -> Bool {
+        lock.withLock {
+            guard initialBinding == nil else { return false }
+            initialBinding = binding
+            return true
+        }
+    }
+
+    func accepts(format: CMFormatDescription) -> Bool {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+        return CMFormatDescriptionGetMediaType(format) == kCMMediaType_Video
+            && CMFormatDescriptionGetMediaSubType(format) == profile.codecType
+            && dimensions.width == inputFormat.width && dimensions.height == inputFormat.height
+    }
+
+    func accepts(_ output: HLSVideoEncodedOutput) -> Bool {
+        output.writerEnvelope === self
+            && output.hardwareProof.sessionID == sessionID
+            && output.hardwareProof.generation == generation
+            && output.hardwareProof.profile == profile
+            && output.sourceIdentity.generation == generation
+            && output.inputFormatSignature == inputFormat
+            && (try? ExactMediaTime(CMSampleBufferGetDuration(output.sampleBuffer))) == frameDuration
+    }
+}
+
 struct VTCompressionSessionID: RawRepresentable, Sendable, Hashable {
     let rawValue: UInt64
 }
@@ -368,6 +417,7 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
     }
 
     let selectedProfile: VTVideoCodecProfile
+    let writerEnvelope: WriterEncodedVideoEnvelope
 
     private let configuration: VTVideoEncoderConfiguration
     private let api: any VTCompressionAPI
@@ -479,6 +529,8 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         guard let selected, let selectedProfile else { throw lastFailure }
         session = selected
         self.selectedProfile = selectedProfile
+        writerEnvelope = WriterEncodedVideoEnvelope(configuration: configuration,
+            sessionID: selected.id, profile: selectedProfile)
     }
 
     var terminal: HLSVideoEncoderTerminal? { terminalSnapshot.value }
@@ -736,7 +788,7 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
             sampleBuffer: sampleBuffer,
             presentationOrigin: pending.frame.presentationOrigin,
             inputFormatSignature: pending.frame.inputFormatSignature,
-            hardwareProof: hardwareProof
+            hardwareProof: hardwareProof, writerEnvelope: writerEnvelope
         )))
         driveIsolated()
     }
@@ -1487,7 +1539,8 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         }
         let frameRateLimit = Int64(configuration.frameRate.den)
             .multipliedReportingOverflow(by: 60)
-        guard !frameRateLimit.overflow,
+        guard configuration.frameRate.num > 0, configuration.frameRate.den > 0,
+              !frameRateLimit.overflow,
               Int64(configuration.frameRate.num) <= frameRateLimit.partialValue else {
             throw VTVideoEncoderFailure.frameRateExceeded
         }

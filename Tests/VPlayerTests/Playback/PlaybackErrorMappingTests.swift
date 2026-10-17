@@ -40,6 +40,18 @@ final class PlaybackErrorMappingTests: XCTestCase {
         }
     }
 
+    func testInterlacedAdmissionReasonSurvivesBoundedRuntimeSnapshot() {
+        let message = HLSInterlacedOutputDiagnostic.message(
+            stage: "writerAppend", error: SegmentedFMP4WriterFailure.invalidSystemConfiguration,
+            pts: CMTime(value: 32_551_200, timescale: 180_000),
+            expectedVideoStart: CMTime(value: 10, timescale: 1),
+            context: "reject=reserveBytes payload=400000 " + String(repeating: "detail ", count: 100))
+        let snapshot = PlaybackErrorDiagnostics.snapshot(PlaybackCoreError.videoSampleBuffer(message))
+        XCTAssertTrue(snapshot.summary.contains("reject=reserveBytes"), snapshot.summary)
+        XCTAssertTrue(snapshot.summary.contains("payload=400000"), snapshot.summary)
+        XCTAssertLessThanOrEqual(snapshot.summary.utf8.count - snapshot.typeName.utf8.count - 3, 256)
+    }
+
     func testInterlacedTimingKeepsExactValuesAndTimescalesThroughPrivacyRedaction() {
         let times = [
             CMTime(value: 29_786_400, timescale: 180_000),
