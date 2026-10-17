@@ -9,6 +9,8 @@ final class MacLibraryUITests: XCTestCase {
         let app = XCUIApplication()
         app.launchArguments = ["-ui-fixture", "seeded", "-ui-playback-fixture", "media-information", "-uiTestResetPlaybackSettings"]
         app.launch()
+        // 系统可能恢复上次退出时所有窗口均已关闭的状态。
+        app.typeKey("1", modifierFlags: [.command])
         XCTAssertTrue(app.textFields["channels.search"].waitForExistence(timeout: 10))
         // macOS 可能恢复上次测试的全屏窗口，先用系统菜单的实际状态统一测试起点。
         let fullscreen = app.menuItems["toggleFullScreen:"]
@@ -20,6 +22,32 @@ final class MacLibraryUITests: XCTestCase {
         }
         return app
     }
+    func testMainWindowCanBeReopenedFromWindowMenuAndShortcut() {
+        let app = launch()
+        let search = app.textFields["channels.search"]
+        let windowMenu = app.menuBars.menuBarItems["Window"].exists
+            ? app.menuBars.menuBarItems["Window"] : app.menuBars.menuBarItems["窗口"]
+
+        app.windows["VPlayer"].buttons[XCUIIdentifierCloseWindow].click()
+        XCTAssertTrue(search.waitForNonExistence(timeout: 5))
+        XCTAssertNotEqual(app.state, .notRunning)
+        windowMenu.click()
+        let reopen = app.menuItems["显示主窗口"]
+        XCTAssertTrue(reopen.waitForExistence(timeout: 3))
+        XCTAssertTrue(reopen.isEnabled)
+        reopen.click()
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["测试播放列表"].exists)
+
+        app.typeKey("1", modifierFlags: [.command])
+        XCTAssertEqual(app.windows.matching(identifier: "VPlayer").count, 1)
+        app.typeKey("w", modifierFlags: [.command])
+        XCTAssertTrue(search.waitForNonExistence(timeout: 5))
+        app.typeKey("1", modifierFlags: [.command])
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        XCTAssertEqual(app.windows.matching(identifier: "VPlayer").count, 1)
+    }
+
     func testSearchSourceManagementAndEditorValidation() {
         let app = launch()
         let search = app.textFields["channels.search"]

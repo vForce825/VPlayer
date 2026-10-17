@@ -36,8 +36,16 @@ final class MacApplicationDelegate: NSObject, NSApplicationDelegate {
 }
 
 struct MacPlayerCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
     @Bindable var state: MacApplicationState
     var body: some Commands {
+        CommandGroup(replacing: .singleWindowList) {
+            Button("显示主窗口") {
+                openWindow(id: "library")
+                NSApp.activate()
+            }
+            .keyboardShortcut("1", modifiers: .command)
+        }
         CommandGroup(after: .newItem) {
             Button("添加播放列表…") { state.showsAddSource = true }
                 .keyboardShortcut("n").disabled(state.model == nil)
