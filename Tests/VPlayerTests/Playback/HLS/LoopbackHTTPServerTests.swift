@@ -1056,12 +1056,17 @@ final class LoopbackHTTPServerTests: XCTestCase {
     }
 
     func testPausedDecodeOrderHandles256ReverseOrdinalsAndVideoHoldOverflow() throws {
-        let samples = try (0..<256).map { index in
-            SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
-                presentationRange: try .init(start: .init(value: Int64(255 - index), timescale: 100),
-                    duration: .init(value: 1, timescale: 100)), byteSpan: 8..<16,
+        var samples: [SealedDecodeSampleEntry] = []
+        samples.reserveCapacity(256)
+        for index in 0..<256 {
+            let start = ExactMediaTime(value: Int64(255 - index), timescale: 100)
+            let duration = ExactMediaTime(value: 1, timescale: 100)
+            let range = try FMP4PresentationRange(start: start, duration: duration)
+            let sample = SealedDecodeSampleEntry(decodeOrdinal: UInt16(index),
+                presentationRange: range, byteSpan: 8..<16,
                 nearestRandomAccessOrdinal: 0, isRandomAccess: index == 0,
                 containsInBandConfiguration: false)
+            samples.append(sample)
         }
         let map = try SealedDecodeCoverageMap(mediaType: .video, sealedBodyLength: 16,
             commonByteSpans: [0..<8], samples: samples)
