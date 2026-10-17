@@ -9,6 +9,55 @@ import Foundation
 import VideoToolbox
 import VPlayerCore
 
+/// 只由完成属性设置、prepare 和硬件确认的 VT session 签发。
+/// 同一冻结合同只可绑定一个初始 writer；后继窗口通过正式 continuation 继承。
+final class WriterEncodedVideoEnvelope: @unchecked Sendable {
+    let frameDuration: ExactMediaTime
+    let declaredBitsPerSecond: UInt64
+    private let sessionID: VTCompressionSessionID
+    private let generation: MediaGeneration
+    private let inputFormat: VideoEncodingInputFormatSignature
+    private let profile: VTVideoCodecProfile
+    private let lock = NSLock()
+    private var initialBinding: FMP4WriterBinding?
+
+    fileprivate init(configuration: VTVideoEncoderConfiguration,
+                     sessionID: VTCompressionSessionID, profile: VTVideoCodecProfile) {
+        frameDuration = ExactMediaTime(value: Int64(configuration.frameRate.den),
+                                       timescale: configuration.frameRate.num)
+        declaredBitsPerSecond = configuration.bitrate.declaredBitsPerSecond
+        self.sessionID = sessionID
+        generation = configuration.generation
+        inputFormat = configuration.inputFormat
+        self.profile = profile
+    }
+
+    func claimInitialWriter(_ binding: FMP4WriterBinding) -> Bool {
+        lock.withLock {
+            guard initialBinding == nil else { return false }
+            initialBinding = binding
+            return true
+        }
+    }
+
+    func accepts(format: CMFormatDescription) -> Bool {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format)
+        return CMFormatDescriptionGetMediaType(format) == kCMMediaType_Video
+            && CMFormatDescriptionGetMediaSubType(format) == profile.codecType
+            && dimensions.width == inputFormat.width && dimensions.height == inputFormat.height
+    }
+
+    func accepts(_ output: HLSVideoEncodedOutput) -> Bool {
+        output.writerEnvelope === self
+            && output.hardwareProof.sessionID == sessionID
+            && output.hardwareProof.generation == generation
+            && output.hardwareProof.profile == profile
+            && output.sourceIdentity.generation == generation
+            && output.inputFormatSignature == inputFormat
+            && (try? ExactMediaTime(CMSampleBufferGetDuration(output.sampleBuffer))) == frameDuration
+    }
+}
+
 struct VTCompressionSessionID: RawRepresentable, Sendable, Hashable {
     let rawValue: UInt64
 }
@@ -368,6 +417,7 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
     }
 
     let selectedProfile: VTVideoCodecProfile
+    let writerEnvelope: WriterEncodedVideoEnvelope
 
     private let configuration: VTVideoEncoderConfiguration
     private let api: any VTCompressionAPI
@@ -479,6 +529,8 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         guard let selected, let selectedProfile else { throw lastFailure }
         session = selected
         self.selectedProfile = selectedProfile
+        writerEnvelope = WriterEncodedVideoEnvelope(configuration: configuration,
+            sessionID: selected.id, profile: selectedProfile)
     }
 
     var terminal: HLSVideoEncoderTerminal? { terminalSnapshot.value }
@@ -736,7 +788,7 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
             sampleBuffer: sampleBuffer,
             presentationOrigin: pending.frame.presentationOrigin,
             inputFormatSignature: pending.frame.inputFormatSignature,
-            hardwareProof: hardwareProof
+            hardwareProof: hardwareProof, writerEnvelope: writerEnvelope
         )))
         driveIsolated()
     }
@@ -915,36 +967,43 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         _ pixelBuffer: CVPixelBuffer,
         expected: VideoEncodingInputFormatSignature
     ) -> Bool {
+        inputAttachmentsMatchFrozenFormat(
+            attachment: { CVBufferCopyAttachment(pixelBuffer, $0, nil) },
+            expected: expected
+        )
+    }
+
+    // 解析与 CoreVideo setter 分层：错误类型不能为测试目的送进原生 setter。
+    static func inputAttachmentsMatchFrozenFormat(
+        attachment: (CFString) -> Any?,
+        expected: VideoEncodingInputFormatSignature
+    ) -> Bool {
         exactString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil),
+            attachment(kCVImageBufferColorPrimariesKey),
             equals: expected.primaries.vtValue
         ) && transferMatches(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil),
+            attachment(kCVImageBufferTransferFunctionKey),
             expected: expected.transfer
         ) && exactString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil),
+            attachment(kCVImageBufferYCbCrMatrixKey),
             equals: expected.matrix.vtValue
         ) && optionalString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationTopFieldKey, nil),
+            attachment(kCVImageBufferChromaLocationTopFieldKey),
             equals: expected.chromaLocation.topField
         ) && optionalString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationBottomFieldKey, nil),
+            attachment(kCVImageBufferChromaLocationBottomFieldKey),
             equals: expected.chromaLocation.bottomField
         ) && optionalAspectRatio(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil),
+            attachment(kCVImageBufferPixelAspectRatioKey),
             equals: expected.sampleAspectRatio
-        ) && optionalCleanAperture(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCleanApertureKey, nil),
+        ) && optionalInputCleanAperture(
+            attachment(kCVImageBufferCleanApertureKey),
             equals: expected.cleanAperture
         ) && optionalData(
-            CVBufferCopyAttachment(
-                pixelBuffer,
-                kCVImageBufferMasteringDisplayColorVolumeKey,
-                nil
-            ),
+            attachment(kCVImageBufferMasteringDisplayColorVolumeKey),
             equals: expected.masteringDisplayColorVolume
         ) && optionalData(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil),
+            attachment(kCVImageBufferContentLightLevelInfoKey),
             equals: expected.contentLightLevelInfo
         )
     }
@@ -1401,6 +1460,45 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         return actual == expected
     }
 
+    // CoreVideo 输入合同是四个 CFNumber 标量，不能要求 CoreMedia 输出扩展的
+    // Rational 数组。额外 Rational 若存在仍须匹配，不能掩盖冲突或畸形值。
+    private static func optionalInputCleanAperture(
+        _ value: Any?,
+        equals expected: HLSCleanApertureSignature?
+    ) -> Bool {
+        guard let expected else { return value == nil }
+        guard let dictionary = strictDictionary(value) else { return false }
+        let fields: [(CFString, CFString, Int32, Int32)] = [
+            (kCVImageBufferCleanApertureWidthKey,
+             kCMFormatDescriptionKey_CleanApertureWidthRational,
+             expected.width.num, expected.width.den),
+            (kCVImageBufferCleanApertureHeightKey,
+             kCMFormatDescriptionKey_CleanApertureHeightRational,
+             expected.height.num, expected.height.den),
+            (kCVImageBufferCleanApertureHorizontalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureHorizontalOffsetRational,
+             expected.horizontalOffset.num, expected.horizontalOffset.den),
+            (kCVImageBufferCleanApertureVerticalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureVerticalOffsetRational,
+             expected.verticalOffset.num, expected.verticalOffset.den),
+        ]
+        return fields.allSatisfy { scalarKey, rationalKey, numerator, denominator in
+            guard let raw = dictionary[scalarKey as String],
+                  CFGetTypeID(raw as AnyObject) == CFNumberGetTypeID(),
+                  let number = raw as? NSNumber,
+                  number.doubleValue.isFinite,
+                  number.doubleValue == Double(numerator) / Double(denominator) else {
+                return false
+            }
+            if let rational = dictionary[rationalKey as String] {
+                guard let pair = rationalPair(rational), pair.1 > 0,
+                      Int64(pair.0) * Int64(denominator)
+                        == Int64(numerator) * Int64(pair.1) else { return false }
+            }
+            return true
+        }
+    }
+
     private static func optionalCleanAperture(
         _ value: Any?,
         equals expected: HLSCleanApertureSignature?
@@ -1487,7 +1585,8 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         }
         let frameRateLimit = Int64(configuration.frameRate.den)
             .multipliedReportingOverflow(by: 60)
-        guard !frameRateLimit.overflow,
+        guard configuration.frameRate.num > 0, configuration.frameRate.den > 0,
+              !frameRateLimit.overflow,
               Int64(configuration.frameRate.num) <= frameRateLimit.partialValue else {
             throw VTVideoEncoderFailure.frameRateExceeded
         }

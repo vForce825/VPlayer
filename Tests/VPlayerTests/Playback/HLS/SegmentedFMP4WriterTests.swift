@@ -8,6 +8,7 @@ import CoreMedia
 import CryptoKit
 import Foundation
 import UniformTypeIdentifiers
+import VideoToolbox
 import XCTest
 import VPlayerCore
 @testable import VPlayerPlayback
@@ -1573,6 +1574,190 @@ final class SegmentedFMP4WriterTests: XCTestCase {
         XCTAssertEqual(relay.usage.unpublishedLogicalSegmentCount, 8)
         for lease in leases { XCTAssertTrue(relay.releaseUnpublishedLogicalSegment(lease)) }
         XCTAssertEqual(relay.usage.unpublishedLogicalSegmentCount, 0)
+    }
+
+    func testDefaultEncodedWriterAcceptsLargeLaterIFramesWithoutMultiplyingByEveryFrame() throws {
+        let fixture = try Task17EncodedBudgetFixture()
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try fixture.makeWriter(seed: 82_000, factory: factory)
+        defer { _ = writer.cancel() }
+        try writer.start(at: .zero)
+        let native = try XCTUnwrap(factory.lastWriter)
+        native.setReleasesInputsOnFlush(true)
+        for frame in 0...210 {
+            let payload = frame == 100 ? 400_000 : (frame == 200 ? 600_000 : 128)
+            let output = try fixture.output(frame: frame, payload: payload)
+            try writer.appendVideo(output,
+                ticket: fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding))
+            XCTAssertLessThanOrEqual(writer.usage.liveInputBytes, FMP4WriterLimits.video.writerHardByteCount)
+        }
+        XCTAssertGreaterThan(202 * (400_000 + 64), FMP4WriterLimits.video.writerHardByteCount)
+        XCTAssertEqual(native.appendCount, 211)
+        XCTAssertEqual(native.calls.filter { $0 == .flush }.count, 2)
+        XCTAssertEqual(factory.configurations.count, 1)
+        XCTAssertNil(writer.usage.rolloverReason)
+        XCTAssertNil(writer.admissionFailureDiagnostic)
+    }
+
+    func testDefaultEncodedWriterByteCeilingIsExactAndSurvivesNativeRelease() throws {
+        for extra in [0, 1] {
+            let fixture = try Task17EncodedBudgetFixture()
+            let budget = try WriterVideoByteBudget(segmentInputCount: 100,
+                declaredBitsPerSecond: fixture.encoder.writerEnvelope.declaredBitsPerSecond,
+                frameDuration: fixture.encoder.writerEnvelope.frameDuration)
+            XCTAssertEqual(budget.maximumSegmentBytes, 2_366_808)
+            let factory = Task17FakeSystemWriterFactory()
+            let writer = try fixture.makeWriter(seed: UInt64(82_010 + extra), factory: factory)
+            defer { _ = writer.cancel() }
+            try writer.start(at: .zero)
+            let native = try XCTUnwrap(factory.lastWriter)
+            native.setRetainsInputs(false)
+            let firstCharge = 400_064
+            for (frame, payload) in [400_000, budget.maximumSegmentBytes - firstCharge - 64 - 128].enumerated() {
+                let output = try fixture.output(frame: frame, payload: payload)
+                try writer.appendVideo(output,
+                    ticket: fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding))
+                XCTAssertEqual(writer.usage.liveInputBytes, 0)
+            }
+            let output = try fixture.output(frame: 2, payload: 64 + extra)
+            let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+            let before = writer.usage
+            let boundaryBefore = fixture.boundary.usage
+            if extra == 0 {
+                try writer.appendVideo(output, ticket: ticket)
+                XCTAssertEqual(native.appendCount, 3)
+            } else {
+                XCTAssertThrowsError(try writer.appendVideo(output, ticket: ticket)) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+                }
+                XCTAssertTrue(writer.admissionFailureDiagnostic?.hasPrefix("segment-byte-ceiling") == true)
+                XCTAssertEqual(writer.usage, before)
+                XCTAssertEqual(fixture.boundary.usage, boundaryBefore)
+                XCTAssertNil(ticket.committedBoundary)
+                XCTAssertEqual(native.appendCount, 2)
+            }
+        }
+    }
+
+    func testDefaultEncodedWriterBudgetCannotExpandThe64MiBHardLimit() throws {
+        let fixture = try Task17EncodedBudgetFixture(boundarySeconds: 7, firstTwoSecondsByteCount: 12_500_000)
+        let budget = try WriterVideoByteBudget(segmentInputCount: 350,
+            declaredBitsPerSecond: fixture.encoder.writerEnvelope.declaredBitsPerSecond,
+            frameDuration: fixture.encoder.writerEnvelope.frameDuration)
+        XCTAssertEqual(fixture.encoder.writerEnvelope.declaredBitsPerSecond, 81_600_000)
+        XCTAssertGreaterThan(budget.maximumSegmentBytes, FMP4WriterLimits.video.writerHardByteCount)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try fixture.makeWriter(seed: 82_015, factory: factory)
+        defer { _ = writer.cancel() }
+        try writer.start(at: .zero)
+        let output = try fixture.output(frame: 0, payload: 1_000_000)
+        let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+        let before = writer.usage
+        XCTAssertThrowsError(try writer.appendVideo(output, ticket: ticket)) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .terminalOwnershipCapacityExceeded)
+        }
+        XCTAssertTrue(writer.admissionFailureDiagnostic?.hasPrefix("boundary-headroom") == true)
+        XCTAssertEqual(writer.usage, before)
+        XCTAssertNil(ticket.committedBoundary)
+        XCTAssertEqual(factory.lastWriter?.appendCount, 0)
+        XCTAssertEqual(FMP4WriterLimits.video.writerHardByteCount, 64 * 1_024 * 1_024)
+    }
+
+    func testDefaultEncodedWriterChecksActualAliasesAfterFlushBeforeRollover() async throws {
+        for releaseOnFlush in [false, true] {
+            let fixture = try Task17EncodedBudgetFixture()
+            let factory = Task17FakeSystemWriterFactory()
+            let writer = try fixture.makeWriter(seed: releaseOnFlush ? 82_017 : 82_016, factory: factory)
+            defer { _ = writer.cancel() }
+            try writer.start(at: .zero)
+            let native = try XCTUnwrap(factory.lastWriter)
+            for frame in 0..<600 {
+                let output = try fixture.output(frame: frame, payload: frame % 100 == 0 ? 400_000 : 128)
+                try writer.appendVideo(output,
+                    ticket: fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding))
+            }
+            XCTAssertEqual(writer.usage.liveInputCount, 600)
+            XCTAssertLessThan(writer.usage.liveInputBytes, FMP4WriterLimits.video.writerHardByteCount)
+            native.setReleasesInputsOnFlush(releaseOnFlush)
+            let output = try fixture.output(frame: 600, payload: 600_000)
+            let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+            if releaseOnFlush {
+                try writer.appendVideo(output, ticket: ticket)
+                XCTAssertEqual(writer.usage.liveInputCount, 1)
+                XCTAssertEqual(native.appendCount, 601)
+                XCTAssertNil(writer.usage.rolloverReason)
+            } else {
+                XCTAssertThrowsError(try writer.appendVideo(output, ticket: ticket)) {
+                    XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .rolloverRequired)
+                }
+                XCTAssertEqual(writer.usage.liveInputCount, 600)
+                XCTAssertEqual(writer.usage.segmentEvidenceCount, 0)
+                XCTAssertEqual(native.appendCount, 600)
+                let receipt = try await writer.finish()
+                XCTAssertEqual(receipt.inputCount, 600)
+                XCTAssertEqual(receipt.mediaCallbackCount, 6)
+                XCTAssertEqual(writer.usage.liveInputCount, 0)
+            }
+            XCTAssertEqual(factory.configurations.count, 1)
+        }
+    }
+
+    func testEncodedWriterEnvelopeRejectsForeignSessionCadenceAndSecondInitialWriter() throws {
+        let fixture = try Task17EncodedBudgetFixture()
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try fixture.makeWriter(seed: 82_020, factory: factory)
+        defer { _ = writer.cancel() }
+        try writer.start(at: .zero)
+        XCTAssertThrowsError(try fixture.makeWriter(seed: 82_021, factory: Task17FakeSystemWriterFactory())) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .invalidSystemConfiguration)
+        }
+        let before = writer.usage
+        for variant in 0..<3 {
+            var output = try fixture.output(frame: 0, payload: 400_000,
+                duration: variant == 0 ? CMTime(value: 1, timescale: 25) : nil)
+            if variant == 1 { output.writerEnvelope = nil }
+            if variant == 2 { output.writerEnvelope = try Task17EncodedBudgetFixture().encoder.writerEnvelope }
+            let ticket = try fixture.boundary.issueVideoAppend(for: output, writerBinding: writer.binding)
+            XCTAssertThrowsError(try writer.appendVideo(output, ticket: ticket)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+            }
+            if variant == 0 {
+                XCTAssertTrue(writer.admissionFailureDiagnostic?.hasPrefix("encoded-cadence") == true)
+            } else {
+                XCTAssertEqual(writer.admissionFailureDiagnostic, "encoded-envelope-mismatch")
+            }
+            XCTAssertEqual(writer.usage, before)
+            XCTAssertNil(ticket.committedBoundary)
+        }
+        XCTAssertEqual(factory.lastWriter?.appendCount, 0)
+        let valid = try fixture.output(frame: 0, payload: 400_000)
+        try writer.appendVideo(valid,
+            ticket: fixture.boundary.issueVideoAppend(for: valid, writerBinding: writer.binding))
+        XCTAssertNil(writer.admissionFailureDiagnostic, "成功重试不得保留上一次拒绝原因")
+    }
+
+    func testEncodedWriterEnvelopeCannotAdmitRemuxPayload() throws {
+        let remux = try Task17Fixtures.remuxFixture(codec: .h264, sampleEntry: .avc1, seed: 82_030,
+            frames: [.init(pts: 0, dts: 0, isIDR: true)], frameTimestampTimescale: 50,
+            payloadByteCounts: [400_000])
+        let fixture = try Task17EncodedBudgetFixture(format: remux.builder.formatDescription)
+        let factory = Task17FakeSystemWriterFactory()
+        let writer = try Task17Fixtures.makeWriter(seed: 82_030, kind: .video,
+            writerBinding: remux.binding, sourceFormatHint: remux.builder.formatDescription,
+            boundary: remux.boundary, encodedVideoEnvelope: fixture.encoder.writerEnvelope,
+            factory: factory, ownershipLimits: nil, releaseTransfersImmediately: true)
+        defer { _ = writer.cancel() }
+        try writer.start(at: .zero)
+        let output = try remux.builder.makeSubmission(for: remux.timed[0], admission: remux.admissions[0])
+        let ticket = try remux.boundary.issueRemuxVideoAppend(for: output, writerBinding: writer.binding)
+        let before = writer.usage
+        XCTAssertThrowsError(try writer.appendRemuxVideo(output, ticket: ticket)) {
+            XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .sourceFormatMismatch)
+        }
+        XCTAssertEqual(writer.admissionFailureDiagnostic, "encoded-envelope-remux-rejected")
+        XCTAssertEqual(writer.usage, before)
+        XCTAssertNil(ticket.committedBoundary)
+        XCTAssertEqual(factory.lastWriter?.appendCount, 0)
     }
 
     func testDefaultRemuxWriterAcceptsLargeIDRThenSmallFramesAndLargerSecondIDR() throws {
@@ -9653,6 +9838,81 @@ private final class Task17WeakSystemWriter: @unchecked Sendable {
     init(_ value: Task17FakeSystemWriter) { self.value = value }
 }
 
+/// 预算测试通过真实 encoder 初始化流程签发合同，只替换 native VT 系统接口。
+private final class Task17EncodedBudgetFixture {
+    let encoder: VTVideoEncoder
+    let boundary: SegmentBoundaryCoordinator
+    let format: CMFormatDescription
+    let input: VideoEncodingInputFormatSignature
+    let frameRate: Int32
+
+    init(format: CMFormatDescription? = nil, frameRate: Int32 = 50,
+         boundarySeconds: Int64 = 2, firstTwoSecondsByteCount: UInt64 = 0) throws {
+        self.format = try format ?? Task17Fixtures.realH264Sample().format
+        self.frameRate = frameRate
+        let dimensions = CMVideoFormatDescriptionGetDimensions(self.format)
+        input = VideoEncodingInputFormatSignature(
+            pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            width: dimensions.width, height: dimensions.height, bitDepth: 8, range: .video,
+            primaries: .bt709, transfer: .bt709, matrix: .bt709, cleanAperture: nil,
+            sampleAspectRatio: MediaRational(num: 1, den: 1),
+            chromaLocation: .init(topField: "Left", bottomField: "Left"),
+            masteringDisplayColorVolume: nil, contentLightLevelInfo: nil)
+        encoder = try VTVideoEncoder(configuration: .init(generation: .init(rawValue: 1),
+            inputFormat: input, frameRate: XCTUnwrap(MediaRational(num: frameRate, den: 1)),
+            bitrate: VTVideoBitratePolicy.freeze(firstTwoSecondsByteCount: firstTwoSecondsByteCount,
+                width: dimensions.width, height: dimensions.height, bitDepth: 8, dynamicRange: .sdr),
+            maximumPendingFrameCount: 8), api: Task17BudgetVTAPI(),
+            workQueue: DispatchQueue(label: "org.vplayer.tests.encoded-budget"))
+        boundary = try SegmentBoundaryCoordinator(mode: .audioVideo(epochStart: .zero,
+            videoMode: .passthrough, minimumPassthroughInterval: CMTime(value: boundarySeconds, timescale: 1),
+            maximumPassthroughInterval: CMTime(value: boundarySeconds, timescale: 1)))
+    }
+
+    func makeWriter(seed: UInt64, factory: Task17FakeSystemWriterFactory) throws -> SegmentedFMP4Writer {
+        try Task17Fixtures.makeWriter(seed: seed, kind: .video, sourceFormatHint: format,
+            boundary: boundary, encodedVideoEnvelope: encoder.writerEnvelope,
+            factory: factory, ownershipLimits: nil, releaseTransfersImmediately: true)
+    }
+
+    func output(frame: Int, payload: Int, duration: CMTime? = nil) throws -> HLSVideoEncodedOutput {
+        let sample = try Task17Fixtures.sampleBuffer(format: format, payload: Data(repeating: 0x65, count: payload),
+            presentationTimeStamp: CMTime(value: Int64(frame), timescale: frameRate),
+            duration: duration ?? CMTime(value: 1, timescale: frameRate))
+        try Task17Fixtures.setVideoNotSync(sample, frame % (Int(frameRate) * 2) != 0)
+        return output(sample: sample, identity: UInt64(frame + 1))
+    }
+
+    func output(sample: CMSampleBuffer, identity: UInt64) -> HLSVideoEncodedOutput {
+        let identity = VideoEncodingFrameIdentity(generation: .init(rawValue: 1),
+            accessUnitID: identity, sequenceNumber: identity)
+        return HLSVideoEncodedOutput(sourceIdentity: identity, sampleBuffer: sample,
+            presentationOrigin: .raw, inputFormatSignature: input,
+            hardwareProof: .init(sessionID: .init(rawValue: 1_001), generation: .init(rawValue: 1),
+                firstOutputIdentity: identity, profile: .h264High), writerEnvelope: encoder.writerEnvelope)
+    }
+}
+
+private final class Task17BudgetVTAPI: VTCompressionAPI, @unchecked Sendable {
+    private final class Session: VTCompressionSessionHandle, Sendable {
+        let id = VTCompressionSessionID(rawValue: 1_001)
+    }
+    func createSession(configuration: VTCompressionSessionCreationConfiguration)
+        -> (status: OSStatus, session: (any VTCompressionSessionHandle)?) { (noErr, Session()) }
+    func setProperty(_ session: any VTCompressionSessionHandle, key: String,
+                     value: VTCompressionPropertyValue) -> OSStatus { noErr }
+    func copyProperty(_ session: any VTCompressionSessionHandle, key: String) -> VTCompressionPropertyCopyResult {
+        .init(status: noErr, value: .boolean(true))
+    }
+    func prepare(_ session: any VTCompressionSessionHandle) -> OSStatus { noErr }
+    func encode(_ session: any VTCompressionSessionHandle, frame: VideoEncodingFrame, forceKeyFrame: Bool,
+                output: @escaping @Sendable (VTCompressionOutput) -> Void) -> VTCompressionSubmissionResult {
+        .init(status: kVTParameterErr, infoFlags: [])
+    }
+    func completeFrames(_ session: any VTCompressionSessionHandle) -> OSStatus { noErr }
+    func invalidate(_ session: any VTCompressionSessionHandle) {}
+}
+
 #if DEBUG
 /// Give failed notification regressions a bounded failure rather than a frozen manual-clock task.
 private func task17AwaitVideoCapacityResult<Value: Sendable>(
@@ -9718,10 +9978,13 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
             maximumPassthroughInterval: CMTime(value: 1, timescale: 1))
         var nalLength = UInt32(nativeVideo.idr.count).bigEndian
         let payload = withUnsafeBytes(of: &nalLength) { Data($0) } + nativeVideo.idr
+        let encoded = mode == .encoded
+            ? try Task17EncodedBudgetFixture(format: fixture.builder.formatDescription, frameRate: 1) : nil
         let outputs: [HLSVideoEncodedOutput] = try seconds.map { second in
             let sample = try Task17Fixtures.sampleBuffer(format: fixture.builder.formatDescription,
                 payload: payload, presentationTimeStamp: CMTime(value: Int64(second), timescale: 1),
                 duration: CMTime(value: 1, timescale: 1))
+            if let encoded { return encoded.output(sample: sample, identity: UInt64(second)) }
             return Task17Fixtures.videoOutput(fixture: .init(format: fixture.builder.formatDescription, sample: sample),
                 generation: 1, accessUnitID: UInt64(second), sequenceNumber: UInt64(second))
         }
@@ -9731,7 +9994,7 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
         let lastAliases = Task17RetainedNativeInputAliases(capacity: predecessorInputCount)
         var first: SegmentedFMP4Writer? = try Task17Fixtures.makeWriter(seed: seed, kind: .video,
             writerBinding: fixture.binding, sourceFormatHint: fixture.builder.formatDescription,
-            boundary: fixture.boundary,
+            boundary: fixture.boundary, encodedVideoEnvelope: encoded?.encoder.writerEnvelope,
             ownershipLimits: .init(rolloverThreshold: predecessorInputCount, hardCapacity: predecessorCapacity),
             releaseTransfersImmediately: true)
         let predecessor = TestWeakReference(first)
@@ -9773,6 +10036,17 @@ private final class Task17VideoCapacityHarness: @unchecked Sendable {
         XCTAssertEqual(lastAliases.count, predecessorInputCount)
         let binding = Task17Fixtures.rolloverBinding(from: fixture.binding, writerIdentity: .init(rawValue: seed + 100))
         let factory = Task17FakeSystemWriterFactory()
+        if mode == .encoded {
+            let foreign = try Task17EncodedBudgetFixture(format: fixture.builder.formatDescription, frameRate: 1)
+            XCTAssertThrowsError(try Task17Fixtures.makeWriter(seed: seed + 100, kind: .video,
+                writerBinding: binding, sourceFormatHint: fixture.builder.formatDescription,
+                boundary: fixture.boundary, encodedVideoEnvelope: foreign.encoder.writerEnvelope,
+                factory: factory, ownershipLimits: nil, writerWindowContinuation: continuation,
+                releaseTransfersImmediately: true)) {
+                XCTAssertEqual($0 as? SegmentedFMP4WriterFailure, .invalidSystemConfiguration)
+            }
+            XCTAssertTrue(factory.configurations.isEmpty)
+        }
         let writer = try Task17Fixtures.makeWriter(seed: seed + 100, kind: .video,
             writerBinding: binding, sourceFormatHint: fixture.builder.formatDescription,
             boundary: fixture.boundary, factory: factory, ownershipLimits: nil,
@@ -11009,6 +11283,7 @@ private enum Task17Fixtures {
         boundary: SegmentBoundaryCoordinator? = nil,
         compressedFormatConfiguration: CompressedAudioFormatConfiguration? = nil,
         videoCadencePolicy: SegmentedFMP4VideoCadencePolicy = .strict,
+        encodedVideoEnvelope: WriterEncodedVideoEnvelope? = nil,
         factory: (any SegmentedFMP4SystemWriterFactory)? = nil,
         collector: Task17ObjectCollector? = nil,
         limits: FMP4WriterLimits? = nil,
@@ -11117,6 +11392,7 @@ private enum Task17Fixtures {
             boundarySession: resolvedBoundary.session,
             compressedFormatConfiguration: resolvedCompressedConfiguration,
             videoCadencePolicy: videoCadencePolicy,
+            encodedVideoEnvelope: encodedVideoEnvelope,
             ownershipLimits: ownershipLimits,
             relay: relay,
             systemFactory: resolvedFactory,

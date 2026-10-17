@@ -874,6 +874,7 @@ final class WriterWindowContinuation: @unchecked Sendable {
     fileprivate let maximumObservedInputBytes: Int
     fileprivate let remuxFormatAuthorityWitness: AnyObject?
     fileprivate let remuxBitrateEnvelope: VideoBitrateEnvelope?
+    fileprivate let encodedVideoEnvelope: WriterEncodedVideoEnvelope?
     fileprivate let compressedBackingAdmission: HLSDataPlaneAdmission
     fileprivate let sourceAACBinding: SourceAACWriterTerminalBinding?
     private var state: State = .issued
@@ -888,6 +889,7 @@ final class WriterWindowContinuation: @unchecked Sendable {
         maximumObservedInputBytes: Int,
         remuxFormatAuthorityWitness: AnyObject?,
         remuxBitrateEnvelope: VideoBitrateEnvelope?,
+        encodedVideoEnvelope: WriterEncodedVideoEnvelope?,
         compressedBackingAdmission: HLSDataPlaneAdmission,
         sourceAACBinding: SourceAACWriterTerminalBinding? = nil
     ) {
@@ -896,6 +898,7 @@ final class WriterWindowContinuation: @unchecked Sendable {
         self.maximumObservedInputBytes = maximumObservedInputBytes
         self.remuxFormatAuthorityWitness = remuxFormatAuthorityWitness
         self.remuxBitrateEnvelope = remuxBitrateEnvelope
+        self.encodedVideoEnvelope = encodedVideoEnvelope
         self.compressedBackingAdmission = compressedBackingAdmission
         self.nextMovieFragmentSequenceNumber = nextMovieFragmentSequenceNumber
         self.predecessorTerminal = predecessorTerminal
@@ -2409,7 +2412,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         var flushTicket: SegmentCallbackTicket?
         var inputLifetime: WriterInputLifetime?
         let inputBytes: Int
-        let remuxByteBudget: WriterRemuxByteBudget?
+        let videoByteBudget: WriterVideoByteBudget?
         let evidence: WriterSegmentEvidence.Reservation
     }
     private enum ReadinessFailurePolicy {
@@ -2434,6 +2437,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     private var compressedCadence: CompressedCadence?
     private var remuxFormatAuthorityWitness: AnyObject?
     private var remuxBitrateEnvelope: VideoBitrateEnvelope?
+    private let encodedVideoEnvelope: WriterEncodedVideoEnvelope?
+    private var storedAdmissionFailureDiagnostic: String?
     private var cadenceIsValid = true
     private let callbackContext: SegmentedFMP4CallbackContext
     private var ownsPublicationSource = false
@@ -2480,6 +2485,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         boundarySession: SegmentBoundarySession,
         compressedFormatConfiguration: CompressedAudioFormatConfiguration?,
         videoCadencePolicy: SegmentedFMP4VideoCadencePolicy = .strict,
+        encodedVideoEnvelope: WriterEncodedVideoEnvelope? = nil,
         ownershipLimits: SegmentedFMP4WriterOwnershipLimits? = nil,
         relay: SegmentReportRelay,
         systemFactory: any SegmentedFMP4SystemWriterFactory,
@@ -2519,6 +2525,21 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
         self.frozenFormat = frozenFormat
+        let inheritedEnvelope = writerWindowContinuation?.encodedVideoEnvelope
+        guard encodedVideoEnvelope == nil || inheritedEnvelope == nil
+                || encodedVideoEnvelope === inheritedEnvelope else {
+            throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+        }
+        let resolvedEnvelope = inheritedEnvelope ?? encodedVideoEnvelope
+        if let resolvedEnvelope {
+            guard trackKind == .video, aacContinuation == nil,
+                  resolvedEnvelope.accepts(format: sourceFormatHint),
+                  writerWindowContinuation == nil || inheritedEnvelope != nil,
+                  inheritedEnvelope != nil || resolvedEnvelope.claimInitialWriter(binding) else {
+                throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
+            }
+        }
+        self.encodedVideoEnvelope = resolvedEnvelope
         self.boundarySession = boundarySession
         self.compressedFormatConfiguration = compressedFormatConfiguration
         self.ownershipLimits = ownershipLimits ?? (trackKind == .video ? .video : (trackKind == .aac ? .audio : .standard))
@@ -2691,6 +2712,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         return 2_048_000
     }
 
+    var admissionFailureDiagnostic: String? { withLane { storedAdmissionFailureDiagnostic } }
+
     var usage: SegmentedFMP4WriterUsage {
         withLane {
             SegmentedFMP4WriterUsage(
@@ -2752,9 +2775,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ output: HLSVideoEncodedOutput,
         ticket: SegmentBoundaryAppendTicket
     ) throws {
+        withLane { storedAdmissionFailureDiagnostic = nil }
         let identity = try SegmentBoundaryCoordinator.videoIdentity(output)
         do {
             try withLane {
+                try validateEncodedEnvelopeIsolated(output)
                 try appendTypedIsolated(
                     output.sampleBuffer,
                     ticket: ticket,
@@ -2772,10 +2797,12 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         _ output: HLSVideoEncodedOutput,
         ticket: SegmentBoundaryAppendTicket
     ) async throws {
+        withLane { storedAdmissionFailureDiagnostic = nil }
         do {
             try Task.checkCancellation()
             let identity = try SegmentBoundaryCoordinator.videoIdentity(output)
             let operation = try withLane {
+                try validateEncodedEnvelopeIsolated(output)
                 var admission = try preflightTypedIsolated(output.sampleBuffer,
                     ticket: ticket, sampleIdentity: identity,
                     readinessFailurePolicy: .awaiting)
@@ -3894,7 +3921,8 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                 nextMovieFragmentSequenceNumber: nextFragment, inputAdmission: inputAdmission,
                 maximumObservedInputBytes: maximumObservedInputBytes,
                 remuxFormatAuthorityWitness: remuxFormatAuthorityWitness,
-                remuxBitrateEnvelope: remuxBitrateEnvelope, compressedBackingAdmission: compressedBackingAdmission,
+                remuxBitrateEnvelope: remuxBitrateEnvelope, encodedVideoEnvelope: encodedVideoEnvelope,
+                compressedBackingAdmission: compressedBackingAdmission,
                 sourceAACBinding: sourceAACTerminalBinding)
         }
     }
@@ -4496,6 +4524,20 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
     }
 
+    private func validateEncodedEnvelopeIsolated(_ output: HLSVideoEncodedOutput) throws {
+        storedAdmissionFailureDiagnostic = nil
+        guard let encodedVideoEnvelope else { return }
+        let duration = try? ExactMediaTime(CMSampleBufferGetDuration(output.sampleBuffer))
+        guard duration == encodedVideoEnvelope.frameDuration else {
+            storedAdmissionFailureDiagnostic = "encoded-cadence duration=\(duration?.value ?? -1)@\(duration?.timescale ?? 1) expected=\(encodedVideoEnvelope.frameDuration.value)@\(encodedVideoEnvelope.frameDuration.timescale)"
+            throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+        }
+        guard encodedVideoEnvelope.accepts(output) else {
+            storedAdmissionFailureDiagnostic = "encoded-envelope-mismatch"
+            throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+        }
+    }
+
     /// remux 的所有可恢复准入必须发生在一次性 payload claim 之前。
     private func preflightRemuxAdmissionIsolated(
         _ attempt: HLSVideoRemuxWriterAttempt,
@@ -4503,6 +4545,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         sampleIdentity: SegmentBoundarySampleIdentity,
         readinessFailurePolicy: ReadinessFailurePolicy = .recoverable
     ) throws -> AppendPreflightAdmission {
+        storedAdmissionFailureDiagnostic = nil
+        guard encodedVideoEnvelope == nil else {
+            storedAdmissionFailureDiagnostic = "encoded-envelope-remux-rejected"
+            throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+        }
         guard (remuxFormatAuthorityWitness == nil
                 || remuxFormatAuthorityWitness === attempt.remuxFormatAuthorityWitness),
               remuxBitrateEnvelope == nil || remuxBitrateEnvelope == attempt.admission.bitrateEnvelope else {
@@ -4592,7 +4639,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
     }
 
     private func validateContinuationIsolated(facts: AppendPreflightFacts,
-                                              ticket: SegmentBoundaryAppendTicket) throws -> WriterRemuxByteBudget? {
+                                              ticket: SegmentBoundaryAppendTicket) throws -> WriterVideoByteBudget? {
         let rate: Int, samplesPerInput: Int
         if trackKind == .video {
             guard let duration = facts.duration, duration.value > 0,
@@ -4606,9 +4653,9 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         let seconds = CMTimeGetSeconds(boundarySession.maximumBoundaryDuration)
         guard seconds.isFinite, seconds > 0, seconds <= 60 else { throw SegmentedFMP4WriterFailure.invalidSystemConfiguration }
         let maximum = max(maximumObservedInputBytes, facts.projectedCharge)
-        // The legacy byte reserve remains unchanged for encoded video and audio.
-        // Remux keeps the same 2N+2 count reserve, with bytes calculated separately.
-        let countCharge = facts.remuxBitrateEnvelope == nil ? maximum : 1
+        // 认证的视频合同只替换字节预测，2N+2 计数和实际别名记账保持不变。
+        let hasVideoEnvelope = facts.remuxBitrateEnvelope != nil || encodedVideoEnvelope != nil
+        let countCharge = hasVideoEnvelope ? 1 : maximum
         let segment = try WriterBoundaryReserve(samplesPerSecond: rate, samplesPerAccessUnit: samplesPerInput,
             maximumBoundarySeconds: Int(ceil(seconds)), delayedPreviousInputs: 0, pendingPumpInputs: 0,
             interleavedInputs: 0, maximumInputBytes: countCharge, pendingOutputCallbacks: Self.pendingCallbackCapacity)
@@ -4616,12 +4663,19 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             maximumBoundarySeconds: Int(ceil(seconds)), delayedPreviousInputs: segment.segmentInputCount,
             pendingPumpInputs: trackKind == .aac ? 32 : 0, interleavedInputs: 2,
             maximumInputBytes: countCharge, pendingOutputCallbacks: Self.pendingCallbackCapacity)
-        let remuxByteBudget: WriterRemuxByteBudget?
+        let videoByteBudget: WriterVideoByteBudget?
         if let envelope = facts.remuxBitrateEnvelope, let duration = facts.duration {
-            remuxByteBudget = try WriterRemuxByteBudget(segmentInputCount: segment.segmentInputCount,
+            videoByteBudget = try WriterVideoByteBudget(segmentInputCount: segment.segmentInputCount,
                 declaredBitsPerSecond: envelope.declaredBitsPerSecond, frameDuration: duration)
+        } else if let envelope = encodedVideoEnvelope {
+            guard facts.duration == envelope.frameDuration else {
+                storedAdmissionFailureDiagnostic = "encoded-envelope-cadence-mismatch"
+                throw SegmentedFMP4WriterFailure.sourceFormatMismatch
+            }
+            videoByteBudget = try WriterVideoByteBudget(segmentInputCount: segment.segmentInputCount,
+                declaredBitsPerSecond: envelope.declaredBitsPerSecond, frameDuration: envelope.frameDuration)
         } else {
-            remuxByteBudget = nil
+            videoByteBudget = nil
         }
         let byteCapacity = trackKind == .video ? FMP4WriterLimits.video.writerHardByteCount : FMP4WriterLimits.audio.writerHardByteCount
         // Match private callback-authorized store limits before a one-shot claim:
@@ -4631,11 +4685,16 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         guard WriterDecodeCoveragePolicy.accepts(trackKind: trackKind,
                 samplesPerSecond: rate, samplesPerAccessUnit: samplesPerInput,
                 segmentInputCount: segment.segmentInputCount) else {
+            storedAdmissionFailureDiagnostic = "decode-coverage count=\(segment.segmentInputCount) rate=\(rate)@\(samplesPerInput)"
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
         guard reserve.fits(inputCapacity: ownershipLimits.hardCapacity, evidenceCapacity: metadataCapacity,
             inputByteCapacity: byteCapacity, outputCallbackCapacity: Self.pendingCallbackCapacity) else {
             rolloverReason = .rejectUnsupported
+            let reason = reserve.inputBytes > byteCapacity ? "reserve-bytes"
+                : (reserve.inputCount > ownershipLimits.hardCapacity ? "reserve-count"
+                    : (segment.segmentInputCount > metadataCapacity ? "reserve-evidence" : "reserve-callbacks"))
+            storedAdmissionFailureDiagnostic = "\(reason) payload=\(facts.projectedCharge - Self.sampleChargeOverhead) bytes=\(reserve.inputBytes) hardBytes=\(byteCapacity) count=\(reserve.inputCount) hardCount=\(ownershipLimits.hardCapacity) evidence=\(segment.segmentInputCount) hardEvidence=\(metadataCapacity)"
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
         maximumObservedInputBytes = maximum; boundaryReserve = reserve
@@ -4646,11 +4705,16 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             : max(1, segment.segmentInputCount - currentSegmentInputCount))
             + (trackKind == .aac ? 32 : 0) + 2
         let forwardBytes: Int
-        if let remuxByteBudget {
-            forwardBytes = try remuxByteBudget.forwardBytes(maximumInputBytes: maximum,
-                currentSegmentBytes: ticket.requiresFlushBeforeAppend ? 0 : currentSegmentProjectedBytes,
-                currentSegmentInputCount: ticket.requiresFlushBeforeAppend ? 0 : currentSegmentInputCount,
-                nextInputBytes: facts.projectedCharge)
+        if let videoByteBudget {
+            do {
+                forwardBytes = try videoByteBudget.forwardBytes(maximumInputBytes: maximum,
+                    currentSegmentBytes: ticket.requiresFlushBeforeAppend ? 0 : currentSegmentProjectedBytes,
+                    currentSegmentInputCount: ticket.requiresFlushBeforeAppend ? 0 : currentSegmentInputCount,
+                    nextInputBytes: facts.projectedCharge)
+            } catch {
+                storedAdmissionFailureDiagnostic = "segment-byte-ceiling used=\(ticket.requiresFlushBeforeAppend ? 0 : currentSegmentProjectedBytes) incoming=\(facts.projectedCharge) ceiling=\(videoByteBudget.maximumSegmentBytes)"
+                throw error
+            }
         } else {
             let bytes = remaining.multipliedReportingOverflow(by: maximum)
             guard !bytes.overflow else { throw SegmentedFMP4WriterFailure.arithmeticOverflow }
@@ -4658,7 +4722,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
         }
         let willFlushCurrentSegment = ticket.requiresFlushBeforeAppend && currentSegmentInputCount > 0
         if currentSegmentInputCount == 0, !rolloverPending,
-           !(try hasNextBoundaryHeadroomIsolated(remuxByteBudget: remuxByteBudget)) {
+           !(try hasNextBoundaryHeadroomIsolated(videoByteBudget: videoByteBudget)) {
             // Only an empty, authenticated video successor can prove all live
             // input occupancy belongs to its finished predecessor. A release can
             // repair this admission only if the same reserve/input fits at zero
@@ -4667,10 +4731,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                !live.cancelled, live.count > 0,
                inputAdmission.fitsEmptyCapacity(bytes: facts.projectedCharge,
                    sampleCount: facts.sampleCount),
-               try hasNextBoundaryHeadroomIsolated(remuxByteBudget: remuxByteBudget,
+               try hasNextBoundaryHeadroomIsolated(videoByteBudget: videoByteBudget,
                    ignoringLiveInputs: true) {
                 throw SegmentedFMP4WriterFailure.predecessorInputCapacityPending
             }
+            storedAdmissionFailureDiagnostic = "boundary-headroom liveCount=\(live.count) liveBytes=\(live.bytes) reserveCount=\(remaining) reserveBytes=\(forwardBytes) hardBytes=\(byteCapacity)"
             throw SegmentedFMP4WriterFailure.terminalOwnershipCapacityExceeded
         }
         let decision = WriterContinuationPolicy.decide(
@@ -4695,9 +4760,10 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             throw SegmentedFMP4WriterFailure.relayCapacityExceeded
         case .rejectUnsupported:
             rolloverReason = decision
+            storedAdmissionFailureDiagnostic = "continuation-rejected liveCount=\(live.count) liveBytes=\(live.bytes) reserveCount=\(remaining) reserveBytes=\(forwardBytes) hardBytes=\(byteCapacity)"
             throw SegmentedFMP4WriterFailure.invalidSystemConfiguration
         }
-        return remuxByteBudget
+        return videoByteBudget
     }
 
     private func preflightTypedIsolated(
@@ -4781,6 +4847,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             formatMatches = false
         }
         guard formatMatches else {
+            storedAdmissionFailureDiagnostic = "source-format-mismatch actualCodec=\(CMFormatDescriptionGetMediaSubType(facts.formatDescription)) expectedCodec=\(CMFormatDescriptionGetMediaSubType(sourceFormatHint))"
             throw SegmentedFMP4WriterFailure.sourceFormatMismatch
         }
         if trackKind == .video {
@@ -4812,6 +4879,7 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
                     } ?? true)
             }
             if !valid {
+                storedAdmissionFailureDiagnostic = "video-cadence-mismatch duration=\(duration.value)@\(duration.timescale) pts=\(pts.value)@\(pts.timescale) expected=\(videoCadence?.nextPTS.value ?? -1)@\(videoCadence?.nextPTS.timescale ?? 1)"
                 cadenceIsValid = false
                 // 无真实 callback context 的既有 inspection writer 永远不签 publication evidence。
                 if callbackContext.isBound {
@@ -4832,11 +4900,11 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             }
             _ = try pts.adding(duration)
         }
-        let remuxByteBudget: WriterRemuxByteBudget?
+        let videoByteBudget: WriterVideoByteBudget?
         if usesExplicitOwnershipLimits {
-            remuxByteBudget = nil
+            videoByteBudget = nil
         } else {
-            remuxByteBudget = try validateContinuationIsolated(facts: facts, ticket: ticket)
+            videoByteBudget = try validateContinuationIsolated(facts: facts, ticket: ticket)
         }
         if !ticket.requiresFlushBeforeAppend {
             guard currentSegmentInputCount < inputEvidenceCapacity else {
@@ -4916,16 +4984,16 @@ final class SegmentedFMP4Writer: SegmentedFMP4SystemCallbackSink, @unchecked Sen
             )
         }
         return AppendPreflightAdmission(flushTicket: flushTicket, inputLifetime: inputLifetime,
-            inputBytes: facts.projectedCharge, remuxByteBudget: remuxByteBudget, evidence: evidence)
+            inputBytes: facts.projectedCharge, videoByteBudget: videoByteBudget, evidence: evidence)
     }
 
     private func hasNextBoundaryHeadroomIsolated(excluding admission: AppendPreflightAdmission? = nil,
-                                                remuxByteBudget: WriterRemuxByteBudget? = nil,
+                                                videoByteBudget: WriterVideoByteBudget? = nil,
                                                 ignoringLiveInputs: Bool = false) throws -> Bool {
         guard let boundaryReserve else { throw SegmentedFMP4WriterFailure.illegalState }
         let nextCount = boundaryReserve.segmentInputCount + (trackKind == .aac ? 32 : 0) + 2
         let nextBytes: Int
-        if let budget = remuxByteBudget ?? admission?.remuxByteBudget {
+        if let budget = videoByteBudget ?? admission?.videoByteBudget {
             nextBytes = try budget.forwardBytes(maximumInputBytes: maximumObservedInputBytes)
         } else {
             let bytes = nextCount.multipliedReportingOverflow(by: maximumObservedInputBytes)

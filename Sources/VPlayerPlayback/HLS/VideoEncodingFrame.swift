@@ -175,6 +175,7 @@ struct HLSVideoEncodedOutput: @unchecked Sendable {
     let presentationOrigin: PresentationOrigin
     let inputFormatSignature: VideoEncodingInputFormatSignature
     let hardwareProof: VTHardwareEncoderProof
+    var writerEnvelope: WriterEncodedVideoEnvelope? = nil
 }
 
 struct HLSVideoEncoderFinishReceipt: Sendable, Equatable {
@@ -221,6 +222,16 @@ struct VTVideoBitratePolicy: Sendable, Hashable {
     let dataRateLimitBytesPerSecond: UInt64
     let overheadBitsPerSecond: UInt64
     let declaredBitsPerSecond: UInt64
+
+    private init(averageBitsPerSecond: UInt64, payloadBitsPerSecond: UInt64,
+                 dataRateLimitBytesPerSecond: UInt64, overheadBitsPerSecond: UInt64,
+                 declaredBitsPerSecond: UInt64) {
+        self.averageBitsPerSecond = averageBitsPerSecond
+        self.payloadBitsPerSecond = payloadBitsPerSecond
+        self.dataRateLimitBytesPerSecond = dataRateLimitBytesPerSecond
+        self.overheadBitsPerSecond = overheadBitsPerSecond
+        self.declaredBitsPerSecond = declaredBitsPerSecond
+    }
 
     static func freeze(
         firstTwoSecondsByteCount: UInt64,

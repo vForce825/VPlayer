@@ -92,10 +92,10 @@ struct WriterBoundaryReserve: Sendable, Equatable {
             && inputBytes <= inputByteCapacity && pendingOutputCallbacks <= outputCallbackCapacity
     }
 }
-/// Capacity ceiling for authenticated remux input, using the already-declared
-/// payload-plus-overhead rate. This is not a measured-media bitrate assertion.
-/// Count/evidence reserves remain independent of this byte-only calculation.
-struct WriterRemuxByteBudget: Sendable, Equatable {
+/// 已认证视频输入的累计字节上界。remux 使用冻结的源格式声明，编码路径
+/// 使用真实 VT session 签发的配置合同；计数和证据容量独立保留。
+/// 它不是实际媒体码率断言，也不扩大 writer 的硬字节上限。
+struct WriterVideoByteBudget: Sendable, Equatable {
     let segmentInputCount: Int
     let maximumSegmentBytes: Int
     private let forwardInputCount: Int
@@ -143,6 +143,9 @@ struct WriterRemuxByteBudget: Sendable, Equatable {
         return Int(min(observed, UInt128(maximumSegmentBytes - currentSegmentBytes)))
     }
 }
+
+// 保留既有 remux 算术测试入口；类型本身不授予媒体或 writer 权限。
+typealias WriterRemuxByteBudget = WriterVideoByteBudget
 
 struct WriterNativeFragmentFacts: Sendable, Equatable {
     let sequence: Int

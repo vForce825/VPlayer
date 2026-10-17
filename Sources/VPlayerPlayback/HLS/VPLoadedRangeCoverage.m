@@ -198,6 +198,8 @@ VPMallocAllocationRange VPInspectMallocAllocationContainingRange(
 #include <string.h>
 #include <stdbool.h>
 
+#if defined(__arm64__) && defined(__LP64__)
+// 这些回调仅供下方 arm64 Swift 引用计数布局检查使用。
 typedef struct { vm_address_t target; vm_size_t size; } VPAllocationLookup;
 static kern_return_t VPReadLocalAllocation(task_t task, vm_address_t address,
                                          vm_size_t size, void **memory) {
@@ -213,6 +215,8 @@ static void VPRecordLocalAllocation(task_t task, void *context, unsigned type,
         if (ranges[index].address == lookup->target) { lookup->size = ranges[index].size; }
     }
 }
+
+#endif
 
 VPPreparationWeakSideTable VPInspectPreparationWeakSideTable(const void *object) {
     VPPreparationWeakSideTable result = { .status = 2 };
