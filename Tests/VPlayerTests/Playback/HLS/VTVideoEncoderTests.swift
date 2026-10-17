@@ -1370,6 +1370,194 @@ final class VTVideoEncoderTests: XCTestCase {
         }
     }
 
+    func testFirstOutputAcceptsDeclaredPASPCLAPHDRAndChromaExtensions() throws {
+        let format = makeRichMetadataFormat()
+        let api = FakeVTCompressionAPI()
+        api.hardwareResults = [.hardware, .hardware]
+        let encoder = try makeEncoder(api: api, format: format)
+        XCTAssertEqual(encoder.selectedProfile, .hevcMain10)
+        let recorder = EncodingRecorder()
+        encoder.encode(frame: try makeFrame(id: 1, format: format)) {
+            recorder.record($0)
+        }
+        api.drain()
+
+        XCTAssertEqual(api.snapshot.encodes.count, 1, "CV 四标量 clap 必须通过输入校验")
+        XCTAssertTrue(recorder.failures.isEmpty)
+        XCTAssertNil(encoder.terminal)
+        guard api.snapshot.encodes.count == 1, recorder.failures.isEmpty else { return }
+        api.deliverFirst(.success(sampleBuffer: try makeCompressedSampleBuffer(
+            format: format,
+            profile: .hevcMain10
+        )))
+        api.drain()
+
+        XCTAssertEqual(recorder.successes.map(\.sourceIdentity.accessUnitID), [1])
+        XCTAssertTrue(recorder.failures.isEmpty)
+        XCTAssertNotNil(recorder.successes.first?.hardwareProof)
+        XCTAssertNil(encoder.terminal)
+        XCTAssertEqual(api.snapshot.hardwareCopyCount, 2)
+    }
+
+    func testInputAttachmentsRejectMalformedMetadataWithoutCoreVideoSetters() {
+        typealias Mutation = (inout [String: Any]) -> Void
+        let format = makeRichMetadataFormat()
+        let baseline = makeInputAttachmentDictionary(format: format)
+        XCTAssertTrue(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+            attachment: { baseline[$0 as String] }, expected: format
+        ))
+        // CoreVideo 可能在 setter 内抛 NSException；畸形类型只送入纯解析器。
+        let fixtures: [(String, Mutation)] = [
+            ("primaries 类型错误", { $0[kCVImageBufferColorPrimariesKey as String] = 1 }),
+            ("transfer 类型错误", { $0[kCVImageBufferTransferFunctionKey as String] =
+                NSNumber(value: 1) }),
+            ("matrix 类型错误", { $0[kCVImageBufferYCbCrMatrixKey as String] = true }),
+            ("top chroma 类型错误", { $0[kCVImageBufferChromaLocationTopFieldKey as String] = 1 }),
+            ("bottom chroma 类型错误", { $0[kCVImageBufferChromaLocationBottomFieldKey as String] =
+                Data() }),
+            ("pasp 类型错误", { $0[kCVImageBufferPixelAspectRatioKey as String] = "bad" }),
+            ("clap 类型错误", { $0[kCVImageBufferCleanApertureKey as String] = "bad" }),
+            ("MDCV 长度错误", { $0[kCVImageBufferMasteringDisplayColorVolumeKey as String] =
+                Data(repeating: 0, count: 23) }),
+            ("MDCV 类型错误", { $0[kCVImageBufferMasteringDisplayColorVolumeKey as String] =
+                "00010203" }),
+            ("CLLI 长度错误", { $0[kCVImageBufferContentLightLevelInfoKey as String] =
+                Data(repeating: 0, count: 3) }),
+            ("CLLI 类型错误", { $0[kCVImageBufferContentLightLevelInfoKey as String] =
+                "00010203" }),
+        ]
+        for (name, mutation) in fixtures {
+            var attachments = baseline
+            mutation(&attachments)
+            XCTAssertFalse(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+                attachment: { attachments[$0 as String] }, expected: format
+            ), name)
+        }
+
+        let invalidSpacing: [(String, Any)] = [
+            ("零", NSNumber(value: 0)),
+            ("负数", NSNumber(value: -1)),
+            ("非整数", NSNumber(value: 1.5)),
+            ("Bool", NSNumber(value: true)),
+            ("Int32 溢出", NSNumber(value: Int64.max)),
+            ("字符串", "3"),
+        ]
+        for key in [kCVImageBufferPixelAspectRatioHorizontalSpacingKey,
+                    kCVImageBufferPixelAspectRatioVerticalSpacingKey] {
+            for (name, value) in invalidSpacing {
+                var attachments = baseline
+                var aspect = baseline[kCVImageBufferPixelAspectRatioKey as String] as! [String: Any]
+                aspect[key as String] = value
+                attachments[kCVImageBufferPixelAspectRatioKey as String] = aspect
+                XCTAssertFalse(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+                    attachment: { attachments[$0 as String] }, expected: format
+                ), "\(key): \(name)")
+            }
+        }
+    }
+
+    func testInputCleanApertureRequiresExactFiniteScalarsAndConsistentOptionalRationals() {
+        let format = makeRichMetadataFormat()
+        let aperture = makeCleanAperture()
+        let baseline = makeInputAttachmentDictionary(format: format)
+        let scalars = makeInputCleanApertureDictionary(aperture)
+        let fields: [(CFString, CFString, Int32, Int32)] = [
+            (kCVImageBufferCleanApertureWidthKey,
+             kCMFormatDescriptionKey_CleanApertureWidthRational, 1_880, 1),
+            (kCVImageBufferCleanApertureHeightKey,
+             kCMFormatDescriptionKey_CleanApertureHeightRational, 1_060, 1),
+            (kCVImageBufferCleanApertureHorizontalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureHorizontalOffsetRational, 1, 2),
+            (kCVImageBufferCleanApertureVerticalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureVerticalOffsetRational, -1, 2),
+        ]
+        func matches(_ clap: [String: Any]) -> Bool {
+            var attachments = baseline
+            attachments[kCVImageBufferCleanApertureKey as String] = clap
+            return VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+                attachment: { attachments[$0 as String] }, expected: format
+            )
+        }
+        XCTAssertTrue(matches(scalars), "CV 合法输入不依赖 CM rational 补充键")
+        var matchingRationals = scalars
+        for (_, rationalKey, numerator, denominator) in fields {
+            matchingRationals[rationalKey as String] = [
+                NSNumber(value: numerator * 2), NSNumber(value: denominator * 2),
+            ]
+        }
+        XCTAssertTrue(matches(matchingRationals), "等值未约分 rational 也必须匹配")
+
+        for (scalarKey, rationalKey, numerator, denominator) in fields {
+            var partialRationals = scalars
+            partialRationals[rationalKey as String] = matchingRationals[rationalKey as String]
+            XCTAssertTrue(matches(partialRationals), "可只提供一个匹配的 rational 补充键")
+            let value = Double(numerator) / Double(denominator)
+            let invalidScalars: [(String, Any?)] = [
+                ("缺失", nil),
+                ("Bool", NSNumber(value: true)),
+                ("字符串", String(value)),
+                ("NaN", NSNumber(value: Double.nan)),
+                ("正无穷", NSNumber(value: Double.infinity)),
+                ("负无穷", NSNumber(value: -Double.infinity)),
+                ("一 ULP 偏差", NSNumber(value: value.nextUp)),
+            ]
+            for (name, invalid) in invalidScalars {
+                var clap = matchingRationals
+                clap[scalarKey as String] = invalid
+                XCTAssertFalse(matches(clap), "\(scalarKey): \(name)，不能退回匹配的 rational")
+            }
+            let invalidRationals: [(String, Any)] = [
+                ("数值冲突", [NSNumber(value: numerator + 1), NSNumber(value: denominator)]),
+                ("类型错误", "bad"),
+                ("截断", [NSNumber(value: numerator)]),
+                ("零分母", [NSNumber(value: numerator), NSNumber(value: 0)]),
+                ("负分母", [NSNumber(value: numerator), NSNumber(value: -denominator)]),
+                ("Bool", [NSNumber(value: true), NSNumber(value: denominator)]),
+                ("非整数", [NSNumber(value: 1.5), NSNumber(value: denominator)]),
+                ("Int32 溢出", [NSNumber(value: Int64.max), NSNumber(value: denominator)]),
+            ]
+            for (name, invalid) in invalidRationals {
+                var clap = scalars
+                clap[rationalKey as String] = invalid
+                XCTAssertFalse(matches(clap), "\(rationalKey): \(name)，不能忽略补充事实")
+            }
+        }
+
+        let noApertureFormat = makeFormat()
+        var unexpected = makeInputAttachmentDictionary(format: noApertureFormat)
+        XCTAssertTrue(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+            attachment: { unexpected[$0 as String] }, expected: noApertureFormat
+        ))
+        unexpected[kCVImageBufferCleanApertureKey as String] = scalars
+        XCTAssertFalse(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+            attachment: { unexpected[$0 as String] }, expected: noApertureFormat
+        ), "冻结格式未声明 clap 时不得接受额外附件")
+
+        // Bool 的数值即使恰好等于冻结标量，也不构成合法 CFNumber。
+        let unitAperture = HLSCleanApertureSignature(
+            width: MediaRational(num: 1, den: 1)!,
+            height: MediaRational(num: 1, den: 1)!,
+            horizontalOffset: SignedMediaRational(num: 1, den: 1)!,
+            verticalOffset: SignedMediaRational(num: 0, den: 1)!
+        )
+        let unitFormat = makeFormat(cleanAperture: unitAperture)
+        let unitAttachments = makeInputAttachmentDictionary(format: unitFormat)
+        XCTAssertTrue(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+            attachment: { unitAttachments[$0 as String] }, expected: unitFormat
+        ))
+        for (scalarKey, _, _, _) in fields {
+            var attachments = unitAttachments
+            var clap = makeInputCleanApertureDictionary(unitAperture)
+            clap[scalarKey as String] = NSNumber(
+                value: (scalarKey as String) != (kCVImageBufferCleanApertureVerticalOffsetKey as String)
+            )
+            attachments[kCVImageBufferCleanApertureKey as String] = clap
+            XCTAssertFalse(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+                attachment: { attachments[$0 as String] }, expected: unitFormat
+            ), "\(scalarKey)：不能把 Bool 当作数值相同的标量")
+        }
+    }
+
     func testInputPixelBufferAttachmentsMustMatchFrozenSignatureBeforeNativeEncode() throws {
         typealias Mutation = (CVPixelBuffer) -> Void
         let mastering = Data((0..<24).map(UInt8.init))
@@ -1386,8 +1574,9 @@ final class VTVideoEncoderTests: XCTestCase {
             ("缺少 primaries", { CVBufferRemoveAttachment(
                 $0, kCVImageBufferColorPrimariesKey
             ) }),
-            ("transfer 类型错误", { CVBufferSetAttachment(
-                $0, kCVImageBufferTransferFunctionKey, NSNumber(value: 1), .shouldPropagate
+            ("transfer 值不匹配", { CVBufferSetAttachment(
+                $0, kCVImageBufferTransferFunctionKey,
+                kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate
             ) }),
             ("matrix 不匹配", { CVBufferSetAttachment(
                 $0, kCVImageBufferYCbCrMatrixKey,
@@ -1396,21 +1585,27 @@ final class VTVideoEncoderTests: XCTestCase {
             ("缺少 bottom chroma", { CVBufferRemoveAttachment(
                 $0, kCVImageBufferChromaLocationBottomFieldKey
             ) }),
-            ("pasp 为零", { CVBufferSetAttachment(
+            ("pasp 值不匹配", { CVBufferSetAttachment(
                 $0,
                 kCVImageBufferPixelAspectRatioKey,
                 [
                     kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: 4,
-                    kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: 0,
+                    kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: 5,
                 ] as CFDictionary,
                 .shouldPropagate
             ) }),
-            ("clap 类型错误", { CVBufferSetAttachment(
-                $0, kCVImageBufferCleanApertureKey, "bad" as CFString, .shouldPropagate
+            ("clap 值不匹配", { CVBufferSetAttachment(
+                $0, kCVImageBufferCleanApertureKey,
+                [
+                    kCVImageBufferCleanApertureWidthKey as String: 1_878,
+                    kCVImageBufferCleanApertureHeightKey as String: 1_060,
+                    kCVImageBufferCleanApertureHorizontalOffsetKey as String: 0.5,
+                    kCVImageBufferCleanApertureVerticalOffsetKey as String: -0.5,
+                ] as CFDictionary, .shouldPropagate
             ) }),
-            ("MDCV 长度错误", { CVBufferSetAttachment(
+            ("MDCV 值不匹配", { CVBufferSetAttachment(
                 $0, kCVImageBufferMasteringDisplayColorVolumeKey,
-                Data(repeating: 0, count: 23) as CFData, .shouldPropagate
+                Data(repeating: 0, count: 24) as CFData, .shouldPropagate
             ) }),
             ("缺少 CLLI", { CVBufferRemoveAttachment(
                 $0, kCVImageBufferContentLightLevelInfoKey
@@ -1421,6 +1616,10 @@ final class VTVideoEncoderTests: XCTestCase {
             let api = FakeVTCompressionAPI()
             let encoder = try makeEncoder(api: api, format: format)
             let pixelBuffer = try makePixelBuffer(format: format)
+            XCTAssertTrue(VTVideoEncoder.inputAttachmentsMatchFrozenFormat(
+                attachment: { CVBufferCopyAttachment(pixelBuffer, $0, nil) },
+                expected: format
+            ), "\(name)：合法输入附件读回必须先通过校验")
             mutation(pixelBuffer)
             let recorder = EncodingRecorder()
             encoder.encode(frame: try makeFrame(
@@ -1607,6 +1806,17 @@ private extension VTVideoEncoderTests {
         )
     }
 
+    func makeRichMetadataFormat() -> VideoEncodingInputFormatSignature {
+        makeFormat(
+            pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+            transfer: .pq,
+            cleanAperture: makeCleanAperture(),
+            sampleAspectRatio: MediaRational(num: 4, den: 3),
+            masteringDisplay: Data((0..<24).map(UInt8.init)),
+            contentLightLevel: Data([0, 1, 2, 3])
+        )
+    }
+
     func makeFrame(
         id: UInt64,
         sequence: UInt64 = 1,
@@ -1786,6 +1996,10 @@ private extension VTVideoEncoderTests {
             recorder.record($0)
         }
         api.drain()
+        XCTAssertEqual(api.snapshot.encodes.count, 1, "\(name)：必须先通过输入校验")
+        XCTAssertTrue(recorder.failures.isEmpty, "\(name)：不能用输入失败代替输出负例")
+        XCTAssertNil(encoder.terminal, name)
+        guard api.snapshot.encodes.count == 1, recorder.failures.isEmpty else { return }
         api.deliverFirst(.success(sampleBuffer: try makeCompressedSampleBuffer(
             format: format,
             profile: profile,
@@ -1866,35 +2080,61 @@ private extension VTVideoEncoderTests {
         on pixelBuffer: CVPixelBuffer,
         format: VideoEncodingInputFormatSignature
     ) {
-        func set(_ key: CFString, _ value: CFTypeRef) {
-            CVBufferSetAttachment(pixelBuffer, key, value, .shouldPropagate)
+        for (key, value) in makeInputAttachmentDictionary(format: format) {
+            CVBufferSetAttachment(pixelBuffer, key as CFString, value as AnyObject, .shouldPropagate)
         }
-        set(kCVImageBufferColorPrimariesKey, colorPrimariesValue(format.primaries))
-        set(kCVImageBufferTransferFunctionKey, transferFunctionValue(format.transfer))
-        set(kCVImageBufferYCbCrMatrixKey, matrixValue(format.matrix))
+    }
+
+    func makeInputAttachmentDictionary(
+        format: VideoEncodingInputFormatSignature
+    ) -> [String: Any] {
+        var attachments: [String: Any] = [
+            kCVImageBufferColorPrimariesKey as String: colorPrimariesValue(format.primaries),
+            kCVImageBufferTransferFunctionKey as String: transferFunctionValue(format.transfer),
+            kCVImageBufferYCbCrMatrixKey as String: matrixValue(format.matrix),
+        ]
         if let top = format.chromaLocation.topField {
-            set(kCVImageBufferChromaLocationTopFieldKey, top as CFString)
+            attachments[kCVImageBufferChromaLocationTopFieldKey as String] = top
         }
         if let bottom = format.chromaLocation.bottomField {
-            set(kCVImageBufferChromaLocationBottomFieldKey, bottom as CFString)
+            attachments[kCVImageBufferChromaLocationBottomFieldKey as String] = bottom
         }
         if let aspect = format.sampleAspectRatio {
-            set(kCVImageBufferPixelAspectRatioKey, [
+            attachments[kCVImageBufferPixelAspectRatioKey as String] = [
                 kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String:
                     NSNumber(value: aspect.num),
                 kCVImageBufferPixelAspectRatioVerticalSpacingKey as String:
                     NSNumber(value: aspect.den),
-            ] as CFDictionary)
+            ]
         }
         if let aperture = format.cleanAperture {
-            set(kCVImageBufferCleanApertureKey, makeCleanApertureDictionary(aperture) as CFDictionary)
+            attachments[kCVImageBufferCleanApertureKey as String] =
+                makeInputCleanApertureDictionary(aperture)
         }
         if let mastering = format.masteringDisplayColorVolume {
-            set(kCVImageBufferMasteringDisplayColorVolumeKey, mastering as CFData)
+            attachments[kCVImageBufferMasteringDisplayColorVolumeKey as String] = mastering
         }
         if let light = format.contentLightLevelInfo {
-            set(kCVImageBufferContentLightLevelInfoKey, light as CFData)
+            attachments[kCVImageBufferContentLightLevelInfoKey as String] = light
         }
+        return attachments
+    }
+
+    func makeInputCleanApertureDictionary(
+        _ aperture: HLSCleanApertureSignature
+    ) -> [String: Any] {
+        [
+            kCVImageBufferCleanApertureWidthKey as String:
+                NSNumber(value: Double(aperture.width.num) / Double(aperture.width.den)),
+            kCVImageBufferCleanApertureHeightKey as String:
+                NSNumber(value: Double(aperture.height.num) / Double(aperture.height.den)),
+            kCVImageBufferCleanApertureHorizontalOffsetKey as String:
+                NSNumber(value: Double(aperture.horizontalOffset.num)
+                    / Double(aperture.horizontalOffset.den)),
+            kCVImageBufferCleanApertureVerticalOffsetKey as String:
+                NSNumber(value: Double(aperture.verticalOffset.num)
+                    / Double(aperture.verticalOffset.den)),
+        ]
     }
 
     func makeCleanApertureDictionary(

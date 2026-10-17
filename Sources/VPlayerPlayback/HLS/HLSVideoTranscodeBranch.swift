@@ -2588,7 +2588,17 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
             setAttachmentIfMissing(kCVImageBufferPixelAspectRatioKey, value: value, on: pixelBuffer)
         }
         if let aperture = inputFormat.cleanAperture {
-            let value = [
+            let value: [String: Any] = [
+                kCVImageBufferCleanApertureWidthKey as String:
+                    NSNumber(value: Double(aperture.width.num) / Double(aperture.width.den)),
+                kCVImageBufferCleanApertureHeightKey as String:
+                    NSNumber(value: Double(aperture.height.num) / Double(aperture.height.den)),
+                kCVImageBufferCleanApertureHorizontalOffsetKey as String:
+                    NSNumber(value: Double(aperture.horizontalOffset.num)
+                        / Double(aperture.horizontalOffset.den)),
+                kCVImageBufferCleanApertureVerticalOffsetKey as String:
+                    NSNumber(value: Double(aperture.verticalOffset.num)
+                        / Double(aperture.verticalOffset.den)),
                 kCMFormatDescriptionKey_CleanApertureWidthRational as String: [
                     NSNumber(value: aperture.width.num), NSNumber(value: aperture.width.den),
                 ],
@@ -2603,8 +2613,9 @@ final class HLSVideoTranscodeBranch: @unchecked Sendable {
                     NSNumber(value: aperture.verticalOffset.num),
                     NSNumber(value: aperture.verticalOffset.den),
                 ],
-            ] as CFDictionary
-            setAttachmentIfMissing(kCVImageBufferCleanApertureKey, value: value, on: pixelBuffer)
+            ]
+            setAttachmentIfMissing(kCVImageBufferCleanApertureKey, value: value as CFDictionary,
+                                   on: pixelBuffer)
         }
         if let mastering = inputFormat.masteringDisplayColorVolume {
             setAttachmentIfMissing(

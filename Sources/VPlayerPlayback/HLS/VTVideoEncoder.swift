@@ -967,36 +967,43 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
         _ pixelBuffer: CVPixelBuffer,
         expected: VideoEncodingInputFormatSignature
     ) -> Bool {
+        inputAttachmentsMatchFrozenFormat(
+            attachment: { CVBufferCopyAttachment(pixelBuffer, $0, nil) },
+            expected: expected
+        )
+    }
+
+    // 解析与 CoreVideo setter 分层：错误类型不能为测试目的送进原生 setter。
+    static func inputAttachmentsMatchFrozenFormat(
+        attachment: (CFString) -> Any?,
+        expected: VideoEncodingInputFormatSignature
+    ) -> Bool {
         exactString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferColorPrimariesKey, nil),
+            attachment(kCVImageBufferColorPrimariesKey),
             equals: expected.primaries.vtValue
         ) && transferMatches(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil),
+            attachment(kCVImageBufferTransferFunctionKey),
             expected: expected.transfer
         ) && exactString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil),
+            attachment(kCVImageBufferYCbCrMatrixKey),
             equals: expected.matrix.vtValue
         ) && optionalString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationTopFieldKey, nil),
+            attachment(kCVImageBufferChromaLocationTopFieldKey),
             equals: expected.chromaLocation.topField
         ) && optionalString(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferChromaLocationBottomFieldKey, nil),
+            attachment(kCVImageBufferChromaLocationBottomFieldKey),
             equals: expected.chromaLocation.bottomField
         ) && optionalAspectRatio(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil),
+            attachment(kCVImageBufferPixelAspectRatioKey),
             equals: expected.sampleAspectRatio
-        ) && optionalCleanAperture(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferCleanApertureKey, nil),
+        ) && optionalInputCleanAperture(
+            attachment(kCVImageBufferCleanApertureKey),
             equals: expected.cleanAperture
         ) && optionalData(
-            CVBufferCopyAttachment(
-                pixelBuffer,
-                kCVImageBufferMasteringDisplayColorVolumeKey,
-                nil
-            ),
+            attachment(kCVImageBufferMasteringDisplayColorVolumeKey),
             equals: expected.masteringDisplayColorVolume
         ) && optionalData(
-            CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil),
+            attachment(kCVImageBufferContentLightLevelInfoKey),
             equals: expected.contentLightLevelInfo
         )
     }
@@ -1451,6 +1458,45 @@ final class VTVideoEncoder: HLSVideoEncoding, @unchecked Sendable {
             return false
         }
         return actual == expected
+    }
+
+    // CoreVideo 输入合同是四个 CFNumber 标量，不能要求 CoreMedia 输出扩展的
+    // Rational 数组。额外 Rational 若存在仍须匹配，不能掩盖冲突或畸形值。
+    private static func optionalInputCleanAperture(
+        _ value: Any?,
+        equals expected: HLSCleanApertureSignature?
+    ) -> Bool {
+        guard let expected else { return value == nil }
+        guard let dictionary = strictDictionary(value) else { return false }
+        let fields: [(CFString, CFString, Int32, Int32)] = [
+            (kCVImageBufferCleanApertureWidthKey,
+             kCMFormatDescriptionKey_CleanApertureWidthRational,
+             expected.width.num, expected.width.den),
+            (kCVImageBufferCleanApertureHeightKey,
+             kCMFormatDescriptionKey_CleanApertureHeightRational,
+             expected.height.num, expected.height.den),
+            (kCVImageBufferCleanApertureHorizontalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureHorizontalOffsetRational,
+             expected.horizontalOffset.num, expected.horizontalOffset.den),
+            (kCVImageBufferCleanApertureVerticalOffsetKey,
+             kCMFormatDescriptionKey_CleanApertureVerticalOffsetRational,
+             expected.verticalOffset.num, expected.verticalOffset.den),
+        ]
+        return fields.allSatisfy { scalarKey, rationalKey, numerator, denominator in
+            guard let raw = dictionary[scalarKey as String],
+                  CFGetTypeID(raw as AnyObject) == CFNumberGetTypeID(),
+                  let number = raw as? NSNumber,
+                  number.doubleValue.isFinite,
+                  number.doubleValue == Double(numerator) / Double(denominator) else {
+                return false
+            }
+            if let rational = dictionary[rationalKey as String] {
+                guard let pair = rationalPair(rational), pair.1 > 0,
+                      Int64(pair.0) * Int64(denominator)
+                        == Int64(numerator) * Int64(pair.1) else { return false }
+            }
+            return true
+        }
     }
 
     private static func optionalCleanAperture(
