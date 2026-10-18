@@ -67,6 +67,45 @@ final class VideoSampleBufferBuilderTests: XCTestCase {
         XCTAssertFalse(firstDescription === CMSampleBufferGetFormatDescription(afterReset))
     }
 
+    func testSameSizeTenBitSDRHDRSwitchReplacesColorDescriptionAndClearsHDRMetadata() throws {
+        let builder = VideoImageSampleBufferBuilder()
+        // 保持尺寸和像素格式相同，确保缓存依据色彩附件失效，而不是碰巧由分辨率变化触发。
+        let pixel = try VideoTestFactories.pixelBuffer(
+            pixelFormat: kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        var previous: CMFormatDescription?
+        for transfer in [kCVImageBufferTransferFunction_ITU_R_709_2,
+                         kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+                         kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ,
+                         kCVImageBufferTransferFunction_ITU_R_709_2] {
+            let hdr = transfer != kCVImageBufferTransferFunction_ITU_R_709_2
+            let primaries = hdr ? kCVImageBufferColorPrimaries_ITU_R_2020 : kCVImageBufferColorPrimaries_ITU_R_709_2
+            let matrix = hdr ? kCVImageBufferYCbCrMatrix_ITU_R_2020 : kCVImageBufferYCbCrMatrix_ITU_R_709_2
+            CVBufferRemoveAllAttachments(pixel)
+            CVBufferSetAttachment(pixel, kCVImageBufferColorPrimariesKey, primaries, .shouldPropagate)
+            CVBufferSetAttachment(pixel, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
+            CVBufferSetAttachment(pixel, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+            if hdr {
+                CVBufferSetAttachment(pixel, kCVImageBufferContentLightLevelInfoKey,
+                    Data([0x03, 0xE8, 0x00, 0xC8]) as CFData, .shouldPropagate)
+            }
+            let sample = try builder.make(frame: makeFrame(pixelBuffer: pixel))
+            let format = try XCTUnwrap(CMSampleBufferGetFormatDescription(sample))
+            XCTAssertTrue(CMSampleBufferGetImageBuffer(sample) === pixel)
+            XCTAssertFalse(format === previous)
+            XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String, transfer as String)
+            XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_ColorPrimaries) as? String, primaries as String)
+            XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_YCbCrMatrix) as? String, matrix as String)
+            XCTAssertEqual(CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_ContentLightLevelInfo) != nil, hdr)
+            XCTAssertTrue(CMFormatDescriptionGetExtension(format,
+                extensionKey: kCMFormatDescriptionExtension_FullRangeVideo) as? Bool != true)
+            previous = format
+        }
+    }
+
     func testBuilderRejectsInvalidTimingAndNonIOSurfaceStorage() throws {
         let builder = VideoImageSampleBufferBuilder()
         XCTAssertThrowsError(try builder.make(frame: makeFrame(

@@ -20,6 +20,9 @@ final class PlaybackPresentationContextTests: XCTestCase {
         XCTAssertTrue(type(of: view.layer) == AVSampleBufferDisplayLayer.self)
         XCTAssertTrue(view.videoRenderer === view.displayLayer.sampleBufferRenderer)
         XCTAssertEqual(view.displayLayer.videoGravity, .resizeAspect)
+        // HDR 渲染不应依赖用户启用 HDMI 动态范围匹配；同一视频层也用于画中画。
+        XCTAssertEqual(view.displayLayer.preferredDynamicRange, .high)
+        XCTAssertEqual(view.displayLayer.toneMapMode, .automatic)
     }
 
     func testContextCachesExactlyOneSystemVideoViewAndRenderer() {

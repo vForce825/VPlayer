@@ -36,6 +36,40 @@ final class DisplayCriteriaControllerTests: XCTestCase {
         }
     }
 
+    func testSameCadenceSDRHDRSwitchUsesCurrentColorAndClearsOnExit() throws {
+        let manager = FakeDisplayCriteriaManager()
+        var captured: [String] = []
+        let subject = DisplayCriteriaController(
+            manager: manager, notificationCenter: NotificationCenter(),
+            criteriaFactory: { rate, format in
+                captured.append(CMFormatDescriptionGetExtension(format,
+                    extensionKey: kCMFormatDescriptionExtension_TransferFunction) as? String ?? "")
+                return AVDisplayCriteria(refreshRate: rate, formatDescription: format)
+            }, displayLink: FakeDisplayLinkControl(), readiness: FakeDisplayReadinessControl())
+        let transfers = [kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+                         kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG,
+                         kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ,
+                         kCMFormatDescriptionTransferFunction_ITU_R_709_2]
+        for transfer in transfers {
+            var format: CMFormatDescription?
+            let hdr = transfer != kCMFormatDescriptionTransferFunction_ITU_R_709_2
+            let extensions: [CFString: Any] = [
+                kCMFormatDescriptionExtension_TransferFunction: transfer,
+                kCMFormatDescriptionExtension_ColorPrimaries: hdr
+                    ? kCMFormatDescriptionColorPrimaries_ITU_R_2020 : kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+                kCMFormatDescriptionExtension_YCbCrMatrix: hdr
+                    ? kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 : kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2]
+            XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: nil, codecType: kCMVideoCodecType_HEVC,
+                width: 1920, height: 1080, extensions: extensions as CFDictionary,
+                formatDescriptionOut: &format), noErr)
+            subject.enterFullScreen(formatDescription: try XCTUnwrap(format), outputFrameRate: 50)
+            XCTAssertNotNil(manager.preferredDisplayCriteria)
+            subject.leaveFullScreen()
+            XCTAssertNil(manager.preferredDisplayCriteria)
+        }
+        XCTAssertEqual(captured, transfers.map { $0 as String })
+    }
+
     func testObserversAreInstalledBeforeCriteriaMutation() throws {
         let center = NotificationCenter()
         let manager = FakeDisplayCriteriaManager()

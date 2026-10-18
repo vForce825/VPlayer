@@ -79,6 +79,12 @@ public final class SampleBufferVideoView: UIView {
         super.init(frame: frame)
         backgroundColor = .black
         displayLayer.videoGravity = .resizeAspect
+        #if os(tvOS)
+        // 输出模式匹配与视频层的动态范围是独立设置。即使用户固定 HDR 输出，
+        // 也应允许视频层使用 HDR；默认的 standard 会把内容限制到 SDR。
+        // 保留系统自动色调映射，让系统根据当前输出能力处理 HLG/PQ/SDR。
+        displayLayer.preferredDynamicRange = .high
+        #endif
     }
 
     @available(*, unavailable)
