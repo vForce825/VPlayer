@@ -18,7 +18,7 @@ class ReleaseMarketingVersionTests(unittest.TestCase):
                                (ROOT / 'VPlayer.xcodeproj/project.pbxproj').read_text())
         self.assertEqual(len(spec), 9)
         self.assertEqual(len(generated), 18)
-        self.assertEqual(set(spec), {'2.1.1'})
+        self.assertEqual(set(spec), {'2.1.2'})
         self.assertEqual(set(generated), set(spec))
 
     def test_application_plists_resolve_build_version(self):
