@@ -150,7 +150,7 @@ final class AppModel {
                 for await generation in libraryChanges.changes(after: observedGeneration) {
                     guard !Task.isCancelled else { return }
                     guard let self else { return }
-                    let scope = libraryChanges.reloadScope(after: processedGeneration)
+                    let scope = libraryChanges.presentationReloadScope(after: processedGeneration)
                     let reloadApplied = await self.reload(scope: scope)
                     processedGeneration = generation
                     libraryChangeProcessed?(ProcessedLibraryChange(

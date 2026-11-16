@@ -97,6 +97,17 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
     }
 
     public func change(since previous: Self) -> CommittedLibraryChange? {
+        diff(since: previous, statusChangesRequireReload: true)
+    }
+
+    public func dataChange(since previous: Self) -> CommittedLibraryChange? {
+        diff(since: previous, statusChangesRequireReload: false)
+    }
+
+    private func diff(
+        since previous: Self,
+        statusChangesRequireReload: Bool
+    ) -> CommittedLibraryChange? {
         guard states == previous.states,
               mappings == previous.mappings,
               Set(profiles.keys) == Set(previous.profiles.keys) else { return .full }
@@ -105,12 +116,17 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
             guard let old = previous.profiles[id],
                   profile.configuration == old.configuration else { return .full }
             var changed: Set<RefreshResource> = []
-            if profile.playlist != old.playlist { changed.insert(.playlist) }
-            if profile.epg != old.epg { changed.insert(.epg) }
-            // Refresh status writes also update updatedAt. Treating that timestamp
-            // as a configuration edit would bypass in-flight refresh claims.
-            if changed.isEmpty, profile.updatedAt != old.updatedAt {
-                changed = [.playlist, .epg]
+            if statusChangesRequireReload {
+                if profile.playlist != old.playlist { changed.insert(.playlist) }
+                if profile.epg != old.epg { changed.insert(.epg) }
+                // Refresh status writes also update updatedAt. Treating that timestamp
+                // as a configuration edit would bypass in-flight refresh claims.
+                if changed.isEmpty, profile.updatedAt != old.updatedAt {
+                    changed = [.playlist, .epg]
+                }
+            } else {
+                if profile.playlist.snapshotID != old.playlist.snapshotID { changed.insert(.playlist) }
+                if profile.epg.snapshotID != old.epg.snapshotID { changed.insert(.epg) }
             }
             if !changed.isEmpty { resources[id] = changed }
         }

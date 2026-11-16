@@ -2982,6 +2982,149 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         )
     }
 
+    func testEPGStagingDoesNotBlockMainActorReadsConcurrentPlaylistCommitOrPurge() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let gate = EPGStagingGate()
+        let store = SwiftDataLibraryStore(
+            modelContainer: container,
+            epgStagingCheckpoint: { checkpoint in
+                guard checkpoint == .afterBatchPersist else { return }
+                gate.pauseFirstOccurrence()
+            },
+            saveFault: { _ in }
+        )
+
+        let profile = try await store.createProfile(input(name: "Concurrent"), now: date(10))
+        let epgURL = try temporaryXML(batchedXMLTV(programmeCount: 600))
+        defer { try? FileManager.default.removeItem(at: epgURL) }
+
+        let epgContext = RefreshSourceContext(
+            source: SourceURLIdentity(url: profile.epgURL),
+            attemptID: UUID()
+        )
+        let beganEPG = try await store.beginRefresh(
+            profileID: profile.id,
+            resource: .epg,
+            context: epgContext,
+            at: date(20)
+        )
+        XCTAssertTrue(beganEPG)
+
+        let playlistContext = RefreshSourceContext(
+            source: SourceURLIdentity(url: profile.m3uURL),
+            attemptID: UUID()
+        )
+        let beganPlaylist = try await store.beginRefresh(
+            profileID: profile.id,
+            resource: .playlist,
+            context: playlistContext,
+            at: date(21)
+        )
+        XCTAssertTrue(beganPlaylist)
+
+        let fetchedAt = date(25)
+        let epgTask = Task.detached {
+            try await store.commitEPGRefresh(
+                profileID: profile.id,
+                fileURL: epgURL,
+                fetchedAt: fetchedAt,
+                context: epgContext
+            )
+        }
+
+        let entered = await gate.waitUntilPaused(timeoutSeconds: 5)
+        XCTAssertTrue(entered, "EPG staging must reach first batch checkpoint")
+
+        // While EPG staging is paused, MainActor reads, playlist commit, and purge
+        // must all complete promptly without waiting on EPG staging.
+        let readTask = Task { @MainActor in
+            let profiles = try await store.profiles()
+            XCTAssertEqual(profiles.count, 1)
+            let updatedChannel = self.channel(profileID: profile.id, name: "并发频道", path: "concurrent")
+            try await store.commitPlaylistRefresh(
+                profileID: profile.id,
+                channels: [updatedChannel],
+                fetchedAt: self.date(22),
+                context: playlistContext
+            )
+            try await store.purgeUnreferencedSnapshots()
+            return try await store.channels(profileID: profile.id)
+        }
+
+        let completedWhileGated = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do {
+                    let channels = try await readTask.value
+                    return channels.map(\.displayName) == ["并发频道"]
+                } catch {
+                    return false
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(1))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        gate.release()
+
+        XCTAssertTrue(
+            completedWhileGated,
+            "MainActor reads, playlist commit, and purge must not block behind EPG staging"
+        )
+        let summary = try await epgTask.value
+        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 600))
+        let count = try await store.epgProgrammeCount(profileID: profile.id)
+        XCTAssertEqual(count, 600)
+    }
+
+    func testMainActorRunLoopRemainsResponsiveWhileAwaitingStoreOperations() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let gate = EPGStagingGate()
+        let store = SwiftDataLibraryStore(
+            modelContainer: container,
+            epgStagingCheckpoint: { checkpoint in
+                guard checkpoint == .afterBatchPersist else { return }
+                gate.pauseFirstOccurrence()
+            },
+            saveFault: { _ in }
+        )
+        let profile = try await store.createProfile(input(name: "Responsive"), now: date(10))
+        let epgURL = try temporaryXML(batchedXMLTV(programmeCount: 600))
+        defer { try? FileManager.default.removeItem(at: epgURL) }
+
+        let runLoopTicks = RunLoopTickCounter()
+        let timer = Timer(timeInterval: 0.01, repeats: true) { _ in
+            runLoopTicks.increment()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        defer { timer.invalidate() }
+
+        let ticksAtStart = runLoopTicks.value
+        let installTask = Task { @MainActor in
+            try await store.installEPG(profileID: profile.id, fileURL: epgURL, fetchedAt: date(20))
+        }
+        let entered = await gate.waitUntilPaused(timeoutSeconds: 5)
+        XCTAssertTrue(entered)
+
+        // Pump the MainActor run loop briefly while installEPG is suspended in EPGStagingWorker
+        // and verify timers continue firing even while MainActor also queries the store.
+        let profiles = try await store.profiles()
+        XCTAssertEqual(profiles.count, 1)
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertGreaterThan(
+            runLoopTicks.value,
+            ticksAtStart,
+            "Main RunLoop must keep firing while EPG staging runs"
+        )
+
+        gate.release()
+        let summary = try await installTask.value
+        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 600))
+    }
+
     private func makeStore() throws -> (ModelContainer, SwiftDataLibraryStore) {
         let container = try VPlayerModelContainer.make(inMemory: true)
         return (container, SwiftDataLibraryStore(modelContainer: container))
@@ -3386,6 +3529,50 @@ private enum InjectedSaveError: Error, Equatable, Sendable {
     case expected
     case staging
     case cleanup
+}
+
+private final class EPGStagingGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let enteredSemaphore = DispatchSemaphore(value: 0)
+    private let releaseSemaphore = DispatchSemaphore(value: 0)
+    private var didPause = false
+
+    func pauseFirstOccurrence() {
+        let shouldPause = lock.withLock {
+            guard !didPause else { return false }
+            didPause = true
+            return true
+        }
+        guard shouldPause else { return }
+        enteredSemaphore.signal()
+        _ = releaseSemaphore.wait(timeout: .now() + .seconds(3))
+    }
+
+    func waitUntilPaused(timeoutSeconds: Int) async -> Bool {
+        let sem = enteredSemaphore
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .default).async {
+                continuation.resume(returning: sem.wait(timeout: .now() + .seconds(timeoutSeconds)) == .success)
+            }
+        }
+    }
+
+    func release() {
+        releaseSemaphore.signal()
+    }
+}
+
+private final class RunLoopTickCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.withLock { count }
+    }
+
+    func increment() {
+        lock.withLock { count += 1 }
+    }
 }
 
 private enum AsyncThrowAssertionError: Error {

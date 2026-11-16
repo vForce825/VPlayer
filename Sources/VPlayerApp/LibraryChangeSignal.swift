@@ -27,6 +27,7 @@ final class LibraryChangeSignal {
         let profileID: UUID
         let resources: Set<RefreshResource>
         var pendingResources: Set<RefreshResource> = []
+        var pendingDataResources: Set<RefreshResource> = []
     }
 
     private typealias RefreshStartObserver = (UUID, RefreshResource) -> Bool
@@ -44,6 +45,9 @@ final class LibraryChangeSignal {
 
     @ObservationIgnored
     private var latestRefreshGeneration: [UUID: [RefreshResource: Int]] = [:]
+
+    @ObservationIgnored
+    private var latestDataRefreshGeneration: [UUID: [RefreshResource: Int]] = [:]
 
     @ObservationIgnored
     private var refreshCompletionClaims: [UUID: RefreshCompletionClaimState] = [:]
@@ -95,7 +99,34 @@ final class LibraryChangeSignal {
     func consumeCommittedSnapshot(_ snapshot: CommittedLibrarySnapshot) {
         if let previous = lastCommittedSnapshot {
             guard snapshot.revision > previous.revision else { return }
-            if let change = snapshot.change(since: previous) { notify(change) }
+            if let change = snapshot.change(since: previous) {
+                switch change {
+                case .full:
+                    notify()
+                case let .refreshes(resourcesByProfile):
+                    let dataByProfile: [UUID: Set<RefreshResource>]
+                    switch snapshot.dataChange(since: previous) {
+                    case .full:
+                        notify()
+                        lastCommittedSnapshot = snapshot
+                        return
+                    case let .refreshes(profiles):
+                        dataByProfile = profiles
+                    case nil:
+                        dataByProfile = [:]
+                    }
+                    for (profileID, resources) in resourcesByProfile {
+                        let dataResources = dataByProfile[profileID, default: []]
+                        for resource in resources {
+                            notify(
+                                profileID: profileID,
+                                resource: resource,
+                                includesSnapshotData: dataResources.contains(resource)
+                            )
+                        }
+                    }
+                }
+            }
         }
         lastCommittedSnapshot = snapshot
     }
@@ -141,14 +172,29 @@ final class LibraryChangeSignal {
     }
 
     func notify(profileID: UUID, resource: RefreshResource) {
+        notify(profileID: profileID, resource: resource, includesSnapshotData: true)
+    }
+
+    private func notify(
+        profileID: UUID,
+        resource: RefreshResource,
+        includesSnapshotData: Bool
+    ) {
         let key = RefreshKey(profileID: profileID, resource: resource)
         if let claimID = refreshCompletionClaimByKey[key],
            var claim = refreshCompletionClaims[claimID] {
             claim.pendingResources.insert(resource)
+            if includesSnapshotData {
+                claim.pendingDataResources.insert(resource)
+            }
             refreshCompletionClaims[claimID] = claim
             return
         }
-        recordRefreshChanges(profileID: profileID, resources: [resource])
+        recordRefreshChanges(
+            profileID: profileID,
+            resources: [resource],
+            dataResources: includesSnapshotData ? [resource] : []
+        )
     }
 
     func claimPersistedRefreshes(
@@ -198,42 +244,66 @@ final class LibraryChangeSignal {
         guard publishesPendingChanges, !state.pendingResources.isEmpty else { return }
 
         var unclaimedResources: Set<RefreshResource> = []
+        var unclaimedDataResources: Set<RefreshResource> = []
         for resource in state.pendingResources {
+            let includesSnapshotData = state.pendingDataResources.contains(resource)
             let key = RefreshKey(profileID: state.profileID, resource: resource)
             if let nextClaimID = refreshCompletionClaimByKey[key],
                var nextClaim = refreshCompletionClaims[nextClaimID] {
                 nextClaim.pendingResources.insert(resource)
+                if includesSnapshotData {
+                    nextClaim.pendingDataResources.insert(resource)
+                }
                 refreshCompletionClaims[nextClaimID] = nextClaim
             } else {
                 unclaimedResources.insert(resource)
+                if includesSnapshotData {
+                    unclaimedDataResources.insert(resource)
+                }
             }
         }
         if !unclaimedResources.isEmpty {
             recordRefreshChanges(
                 profileID: state.profileID,
-                resources: unclaimedResources
+                resources: unclaimedResources,
+                dataResources: unclaimedDataResources
             )
         }
     }
 
     private func recordRefreshChanges(
         profileID: UUID,
-        resources: Set<RefreshResource>
+        resources: Set<RefreshResource>,
+        dataResources: Set<RefreshResource>
     ) {
         guard !resources.isEmpty else { return }
         generation &+= 1
         for resource in resources {
             latestRefreshGeneration[profileID, default: [:]][resource] = generation
         }
+        for resource in dataResources {
+            latestDataRefreshGeneration[profileID, default: [:]][resource] = generation
+        }
         yieldGeneration()
     }
 
     func reloadScope(after observedGeneration: Int) -> ReloadScope {
+        reloadScope(after: observedGeneration, generationsByProfile: latestRefreshGeneration)
+    }
+
+    func presentationReloadScope(after observedGeneration: Int) -> ReloadScope {
+        reloadScope(after: observedGeneration, generationsByProfile: latestDataRefreshGeneration)
+    }
+
+    private func reloadScope(
+        after observedGeneration: Int,
+        generationsByProfile: [UUID: [RefreshResource: Int]]
+    ) -> ReloadScope {
         guard latestFullReloadGeneration <= observedGeneration else {
             return .full
         }
         var resourcesByProfile: [UUID: Set<RefreshResource>] = [:]
-        for (profileID, resourceGenerations) in latestRefreshGeneration {
+        for (profileID, resourceGenerations) in generationsByProfile {
             for (resource, resourceGeneration) in resourceGenerations
             where resourceGeneration > observedGeneration {
                 resourcesByProfile[profileID, default: []].insert(resource)

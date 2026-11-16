@@ -189,6 +189,49 @@ final class XMLTVParserTests: XCTestCase {
         }
     }
 
+    func testFastTimeParserMatchesCalendarForModernLeapAndTimezoneBoundaries() throws {
+        let parser = XMLTVTimeParser()
+        var calendar = Calendar(identifier: .gregorian)
+        let samples = [
+            "20000229235959 +0000",
+            "20240229000000 +0800",
+            "20261116091013 +0800",
+            "20261231235959 -0500",
+            "20270101000000 +1800",
+            "20270101000000 -1800",
+            "15830101000000 Z",
+            "15821015000000 Z",
+        ]
+        for raw in samples {
+            let parsed = try parser.parse(raw)
+            let parts = raw.split(separator: " ")
+            let stamp = String(parts[0])
+            let year = Int(stamp.prefix(4))!
+            let month = Int(stamp.dropFirst(4).prefix(2))!
+            let day = Int(stamp.dropFirst(6).prefix(2))!
+            let hour = Int(stamp.dropFirst(8).prefix(2))!
+            let minute = Int(stamp.dropFirst(10).prefix(2))!
+            let second = Int(stamp.dropFirst(12).prefix(2))!
+            let tzSeconds: Int
+            if parts[1] == "Z" {
+                tzSeconds = 0
+            } else {
+                let z = parts[1]
+                let sign = z.first == "-" ? -1 : 1
+                let zh = Int(z.dropFirst(1).prefix(2))!
+                let zm = Int(z.dropFirst(3).prefix(2))!
+                tzSeconds = sign * (zh * 3_600 + zm * 60)
+            }
+            let tz = TimeZone(secondsFromGMT: tzSeconds)!
+            calendar.timeZone = tz
+            let expected = calendar.date(from: DateComponents(
+                timeZone: tz, year: year, month: month, day: day,
+                hour: hour, minute: minute, second: second
+            ))!
+            XCTAssertEqual(parsed, expected, raw)
+        }
+    }
+
     func testPreservesCDATAInTitleAndDescription() throws {
         let sink = CollectingXMLTVSink()
 

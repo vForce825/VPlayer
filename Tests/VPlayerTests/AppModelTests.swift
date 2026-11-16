@@ -2834,6 +2834,66 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(changes.generation, 1)
     }
 
+    func testStatusOnlyCommittedChangeKeepsPresentationScopeProfilesOnlyUntilSnapshotUpdates() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let store = SwiftDataLibraryStore(modelContainer: container)
+        let profile = try await store.createProfile(
+            try SourceProfileInput(
+                name: "Scoped",
+                m3uURLString: "https://playlist.example/list.m3u",
+                epgURLString: "https://epg.example/epg.xml",
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            ).validated(),
+            now: now
+        )
+        let changes = LibraryChangeSignal()
+        try await changes.observeCommittedChanges(in: store)
+        let initialGen = changes.generation
+
+        let playlistContext = RefreshSourceContext(
+            source: SourceURLIdentity(url: profile.m3uURL),
+            attemptID: UUID()
+        )
+        let began = try await store.beginRefresh(
+            profileID: profile.id,
+            resource: .playlist,
+            context: playlistContext,
+            at: now.addingTimeInterval(10)
+        )
+        XCTAssertTrue(began)
+        _ = await changes.flushCommittedChanges(in: store)
+        XCTAssertGreaterThan(changes.generation, initialGen)
+        XCTAssertEqual(
+            changes.reloadScope(after: initialGen),
+            .refreshes([profile.id: [.playlist]])
+        )
+        XCTAssertEqual(
+            changes.presentationReloadScope(after: initialGen),
+            .refreshes([:])
+        )
+
+        let afterStatusGen = changes.generation
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://stream.example/live",
+            tvgID: nil,
+            order: 0
+        )
+        try await store.commitPlaylistRefresh(
+            profileID: profile.id,
+            channels: [channel],
+            fetchedAt: now.addingTimeInterval(20),
+            context: playlistContext
+        )
+        _ = await changes.flushCommittedChanges(in: store)
+        XCTAssertEqual(
+            changes.presentationReloadScope(after: afterStatusGen),
+            .refreshes([profile.id: [.playlist]])
+        )
+    }
+
     func testCreateRetryIdentityUpdatesCommittedProfileWhenInputChanges() async {
         let now = Date(timeIntervalSince1970: 2_000_000_000)
         let repository = RepositorySpy(profiles: [])

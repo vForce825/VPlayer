@@ -7,6 +7,218 @@ import Observation
 import OSLog
 import SwiftData
 
+private actor EPGStagingWorker {
+    private let executorQueue = DispatchSerialQueue(label: "com.vforce.vplayer.epg-staging")
+
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executorQueue.asUnownedSerialExecutor()
+    }
+
+    func stageEPGSnapshot(
+        modelContainer: ModelContainer,
+        snapshotID: UUID,
+        profileID: UUID,
+        fileURL: URL,
+        fetchedAt: Date,
+        epgCancellationCheck: @escaping @Sendable () throws -> Void,
+        epgStagingCheckpoint: (@Sendable (EPGStagingCheckpoint) -> Void)?,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws -> XMLTVParseSummary {
+        do {
+            try Self.persistEPGHeader(
+                modelContainer: modelContainer,
+                id: snapshotID,
+                profileID: profileID,
+                fetchedAt: fetchedAt,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
+            let sink = EPGPersistenceSink(
+                cancellationCheck: epgCancellationCheck,
+                persistBatch: { batch in
+                    try Self.persistEPGBatch(
+                        batch,
+                        modelContainer: modelContainer,
+                        snapshotID: snapshotID,
+                        saveFault: saveFault,
+                        saveContextObserver: saveContextObserver
+                    )
+                    epgStagingCheckpoint?(.afterBatchPersist)
+                },
+                batchDidPassPostPersistCancellationCheck: {
+                    epgStagingCheckpoint?(.afterBatchCancellationCheck)
+                }
+            )
+            _ = try XMLTVParser().parse(
+                fileURL: fileURL,
+                into: sink,
+                cancellationCheck: epgCancellationCheck
+            )
+            epgStagingCheckpoint?(.beforeFinalFlush)
+            try sink.finish()
+            try epgCancellationCheck()
+            let summary = sink.acceptedSummary
+            guard summary.channelCount > 0 else {
+                throw LibraryRepositoryError.epgHasNoChannels
+            }
+            try Self.finalizeEPGHeader(
+                modelContainer: modelContainer,
+                id: snapshotID,
+                channelCount: summary.channelCount,
+                programmeCount: summary.programmeCount,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
+            return summary
+        } catch {
+            let stagingError = error
+            try? Self.cleanupEPGSnapshot(
+                id: snapshotID,
+                modelContainer: modelContainer,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
+            throw stagingError
+        }
+    }
+
+    func cleanupEPGSnapshot(
+        id: UUID,
+        modelContainer: ModelContainer,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws {
+        try Self.cleanupEPGSnapshot(
+            id: id,
+            modelContainer: modelContainer,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
+    }
+
+    private static func cleanupEPGSnapshot(
+        id: UUID,
+        modelContainer: ModelContainer,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws {
+        let context = ModelContext(modelContainer)
+        do {
+            // Predicate deletes are immediate and cannot be rolled back, so
+            // injected cleanup failures must happen before the first request.
+            try saveFault?(.epgCleanup)
+            let snapshotID = id
+            try context.delete(
+                model: EPGChannelRecord.self,
+                where: #Predicate { $0.snapshotID == snapshotID }
+            )
+            try context.delete(
+                model: ProgrammeRecord.self,
+                where: #Predicate { $0.snapshotID == snapshotID }
+            )
+            try context.delete(
+                model: EPGSnapshotRecord.self,
+                where: #Predicate { $0.id == snapshotID }
+            )
+            saveContextObserver?(LibraryStoreSaveContextObservation(
+                phase: .epgCleanup,
+                context: context
+            ))
+            try context.save()
+        } catch {
+            context.rollback()
+            throw error
+        }
+    }
+
+    private static func persistEPGHeader(
+        modelContainer: ModelContainer,
+        id: UUID,
+        profileID: UUID,
+        fetchedAt: Date,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws {
+        let context = ModelContext(modelContainer)
+        context.insert(EPGSnapshotRecord(
+            id: id,
+            sourceProfileID: profileID,
+            fetchedAt: fetchedAt,
+            channelCount: 0,
+            programmeCount: 0
+        ))
+        try SwiftDataLibraryStore.save(
+            .epgHeader,
+            context: context,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
+    }
+
+    private static func persistEPGBatch(
+        _ batch: EPGPersistenceBatch,
+        modelContainer: ModelContainer,
+        snapshotID: UUID,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws {
+        let context = ModelContext(modelContainer)
+        for channel in batch.channels {
+            context.insert(EPGChannelRecord(
+                snapshotID: snapshotID,
+                xmltvID: channel.id,
+                displayNames: channel.displayNames,
+                iconURLString: channel.iconURL?.absoluteString
+            ))
+        }
+        for programme in batch.programmes {
+            context.insert(ProgrammeRecord(
+                snapshotID: snapshotID,
+                stableID: programme.id,
+                xmltvChannelID: programme.xmltvChannelID,
+                start: programme.start,
+                stop: programme.stop,
+                title: programme.title,
+                subtitle: programme.subtitle,
+                programmeDescription: programme.summary,
+                categories: programme.categories
+            ))
+        }
+        try SwiftDataLibraryStore.save(
+            .epgBatch,
+            context: context,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
+    }
+
+    private static func finalizeEPGHeader(
+        modelContainer: ModelContainer,
+        id: UUID,
+        channelCount: Int,
+        programmeCount: Int,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
+    ) throws {
+        let context = ModelContext(modelContainer)
+        let snapshotID = id
+        guard let header = try context.fetch(FetchDescriptor<EPGSnapshotRecord>(
+            predicate: #Predicate { $0.id == snapshotID }
+        )).first else {
+            throw LibraryRepositoryError.corruptPersistedField(field: "EPGSnapshotRecord.id")
+        }
+        header.channelCount = channelCount
+        header.programmeCount = programmeCount
+        try SwiftDataLibraryStore.save(
+            .epgStaging,
+            context: context,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
+    }
+}
+
 enum LibraryStoreSavePhase: Equatable, Sendable {
     case profileCreate
     case profileUpdate
@@ -54,10 +266,29 @@ typealias LibraryStoreSaveContextObserver = @Sendable (
     LibraryStoreSaveContextObservation
 ) -> Void
 
-@ModelActor
+/// Uses a dedicated background serial GCD queue rather than `@ModelActor`'s
+/// `DefaultSerialModelExecutor`, because `DefaultSerialModelExecutor` can run
+/// synchronously on or block the caller's executor (`MainActor`) during reads
+/// and actor contention.
 public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting,
     ConditionalRefreshStatusWriting, LibraryRecoveryStatusProviding {
     private static let readBatchSize = 256
+    private let executorQueue = DispatchSerialQueue(label: "com.vforce.vplayer.library-store")
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executorQueue.asUnownedSerialExecutor()
+    }
+    public nonisolated let modelContainer: ModelContainer
+    private var cachedModelContext: ModelContext?
+    private var modelContext: ModelContext {
+        if let cachedModelContext { return cachedModelContext }
+        // Lazily instantiate on the store's own serial queue so calling init from
+        // MainActor never binds the actor's ModelContext to the main queue.
+        let context = ModelContext(modelContainer)
+        cachedModelContext = context
+        return context
+    }
+    private let epgStagingWorker = EPGStagingWorker()
+    private var activeStagingEPGSnapshotIDs: Set<UUID> = []
     private var saveFault: LibraryStoreSaveFault?
     private var epgCancellationCheck: @Sendable () throws -> Void = {
         try Task.checkCancellation()
@@ -217,6 +448,10 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         observedSnapshot = nil
     }
 
+    public init(modelContainer: ModelContainer) {
+        self.modelContainer = modelContainer
+    }
+
     /// Mirrors source configuration and manual mappings on every user edit, so
     /// `synchronizeProfileMirror()` can rebuild those choices after the system
     /// deletes the store. Only the production store needs this.
@@ -224,8 +459,6 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         modelContainer: ModelContainer,
         profileMirror: SourceProfileMirror
     ) {
-        let modelContext = ModelContext(modelContainer)
-        self.modelExecutor = DefaultSerialModelExecutor(modelContext: modelContext)
         self.modelContainer = modelContainer
         self.profileMirror = profileMirror
     }
@@ -240,8 +473,6 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileMirror: SourceProfileMirror? = nil,
         saveFault: @escaping LibraryStoreSaveFault
     ) {
-        let modelContext = ModelContext(modelContainer)
-        self.modelExecutor = DefaultSerialModelExecutor(modelContext: modelContext)
         self.modelContainer = modelContainer
         self.epgCancellationCheck = epgCancellationCheck
         self.epgStagingCheckpoint = epgStagingCheckpoint
@@ -292,7 +523,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         id: UUID,
         input: ValidatedSourceProfileInput,
         now: Date
-    ) throws {
+    ) async throws {
         let m3uURLIdentity = SourceURLIdentity(url: input.m3uURL)
         let epgURLIdentity = SourceURLIdentity(url: input.epgURL)
         var oldPlaylistSnapshotID: UUID?
@@ -328,7 +559,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             try? cleanupPlaylistSnapshot(id: oldPlaylistSnapshotID)
         }
         if let oldEPGSnapshotID {
-            try? cleanupEPGSnapshot(id: oldEPGSnapshotID)
+            try? await epgStagingWorker.cleanupEPGSnapshot(
+                id: oldEPGSnapshotID,
+                modelContainer: modelContainer,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
         }
     }
 
@@ -714,8 +950,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileID: UUID,
         fileURL: URL,
         fetchedAt: Date
-    ) throws -> XMLTVParseSummary {
-        try installEPGSnapshot(
+    ) async throws -> XMLTVParseSummary {
+        try await installEPGSnapshot(
             profileID: profileID,
             fileURL: fileURL,
             fetchedAt: fetchedAt,
@@ -729,8 +965,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         fileURL: URL,
         fetchedAt: Date,
         context: RefreshSourceContext
-    ) throws -> XMLTVParseSummary {
-        try installEPGSnapshot(
+    ) async throws -> XMLTVParseSummary {
+        try await installEPGSnapshot(
             profileID: profileID,
             fileURL: fileURL,
             fetchedAt: fetchedAt,
@@ -745,50 +981,29 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         fetchedAt: Date,
         recordsSuccess: Bool,
         refreshContext: RefreshSourceContext?
-    ) throws -> XMLTVParseSummary {
+    ) async throws -> XMLTVParseSummary {
         try Task.checkCancellation()
         _ = try profileRecord(id: profileID)
         let snapshotID = UUID()
-        let summary: XMLTVParseSummary
-        do {
-            try persistEPGHeader(
-                id: snapshotID,
-                profileID: profileID,
-                fetchedAt: fetchedAt
-            )
-            let cancellationCheck = epgCancellationCheck
-            let sink = EPGPersistenceSink(
-                cancellationCheck: cancellationCheck,
-                persistBatch: { batch in
-                    try self.persistEPGBatch(batch, snapshotID: snapshotID)
-                    self.epgStagingCheckpoint?(.afterBatchPersist)
-                },
-                batchDidPassPostPersistCancellationCheck: {
-                    self.epgStagingCheckpoint?(.afterBatchCancellationCheck)
-                }
-            )
-            _ = try XMLTVParser().parse(
-                fileURL: fileURL,
-                into: sink,
-                cancellationCheck: cancellationCheck
-            )
-            epgStagingCheckpoint?(.beforeFinalFlush)
-            try sink.finish()
-            try cancellationCheck()
-            summary = sink.acceptedSummary
-            guard summary.channelCount > 0 else {
-                throw LibraryRepositoryError.epgHasNoChannels
-            }
-            try finalizeEPGHeader(
-                id: snapshotID,
-                channelCount: summary.channelCount,
-                programmeCount: summary.programmeCount
-            )
-        } catch {
-            let stagingError = error
-            try? cleanupEPGSnapshot(id: snapshotID)
-            throw stagingError
-        }
+        activeStagingEPGSnapshotIDs.insert(snapshotID)
+        defer { activeStagingEPGSnapshotIDs.remove(snapshotID) }
+
+        let modelContainer = modelContainer
+        let epgCancellationCheck = epgCancellationCheck
+        let epgStagingCheckpoint = epgStagingCheckpoint
+        let saveFault = saveFault
+        let saveContextObserver = saveContextObserver
+        let summary = try await epgStagingWorker.stageEPGSnapshot(
+            modelContainer: modelContainer,
+            snapshotID: snapshotID,
+            profileID: profileID,
+            fileURL: fileURL,
+            fetchedAt: fetchedAt,
+            epgCancellationCheck: epgCancellationCheck,
+            epgStagingCheckpoint: epgStagingCheckpoint,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
 
         let oldSnapshotID: UUID?
         do {
@@ -821,12 +1036,22 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             oldSnapshotID = previousSnapshotID
         } catch {
             let pointerError = error
-            try? cleanupEPGSnapshot(id: snapshotID)
+            try? await epgStagingWorker.cleanupEPGSnapshot(
+                id: snapshotID,
+                modelContainer: modelContainer,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
             throw pointerError
         }
 
         if let oldSnapshotID, oldSnapshotID != snapshotID {
-            try? cleanupEPGSnapshot(id: oldSnapshotID)
+            try? await epgStagingWorker.cleanupEPGSnapshot(
+                id: oldSnapshotID,
+                modelContainer: modelContainer,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
         }
         return summary
     }
@@ -962,7 +1187,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         try commit(.purge) {
             let profiles = try modelContext.fetch(FetchDescriptor<SourceProfileRecord>())
             let playlistIDs = profiles.compactMap(\.playlistSnapshotID)
-            let epgIDs = profiles.compactMap(\.epgSnapshotID)
+            let epgIDs = profiles.compactMap(\.epgSnapshotID) + Array(activeStagingEPGSnapshotIDs)
 
             // Predicate-based batch deletes push the work to the store instead of
             // loading every unreferenced row into memory to delete one at a time.
@@ -1073,105 +1298,6 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         }
     }
 
-    private func cleanupEPGSnapshot(id: UUID) throws {
-        let context = ModelContext(modelContainer)
-        do {
-            // Predicate deletes are immediate and cannot be rolled back, so
-            // injected cleanup failures must happen before the first request.
-            try saveFault?(.epgCleanup)
-            try batchDeleteEPGSnapshotForCleanup(id: id, context: context)
-            saveContextObserver?(LibraryStoreSaveContextObservation(
-                phase: .epgCleanup,
-                context: context
-            ))
-            try context.save()
-        } catch {
-            context.rollback()
-            throw error
-        }
-    }
-
-    private func batchDeleteEPGSnapshotForCleanup(
-        id: UUID,
-        context: ModelContext
-    ) throws {
-        let snapshotID = id
-        try context.delete(
-            model: EPGChannelRecord.self,
-            where: #Predicate { $0.snapshotID == snapshotID }
-        )
-        try context.delete(
-            model: ProgrammeRecord.self,
-            where: #Predicate { $0.snapshotID == snapshotID }
-        )
-        try context.delete(
-            model: EPGSnapshotRecord.self,
-            where: #Predicate { $0.id == snapshotID }
-        )
-    }
-
-    private func persistEPGHeader(
-        id: UUID,
-        profileID: UUID,
-        fetchedAt: Date
-    ) throws {
-        let context = ModelContext(modelContainer)
-        context.insert(EPGSnapshotRecord(
-            id: id,
-            sourceProfileID: profileID,
-            fetchedAt: fetchedAt,
-            channelCount: 0,
-            programmeCount: 0
-        ))
-        try save(.epgHeader, context: context)
-    }
-
-    private func persistEPGBatch(
-        _ batch: EPGPersistenceBatch,
-        snapshotID: UUID
-    ) throws {
-        let context = ModelContext(modelContainer)
-        for channel in batch.channels {
-            context.insert(EPGChannelRecord(
-                snapshotID: snapshotID,
-                xmltvID: channel.id,
-                displayNames: channel.displayNames,
-                iconURLString: channel.iconURL?.absoluteString
-            ))
-        }
-        for programme in batch.programmes {
-            context.insert(ProgrammeRecord(
-                snapshotID: snapshotID,
-                stableID: programme.id,
-                xmltvChannelID: programme.xmltvChannelID,
-                start: programme.start,
-                stop: programme.stop,
-                title: programme.title,
-                subtitle: programme.subtitle,
-                programmeDescription: programme.summary,
-                categories: programme.categories
-            ))
-        }
-        try save(.epgBatch, context: context)
-    }
-
-    private func finalizeEPGHeader(
-        id: UUID,
-        channelCount: Int,
-        programmeCount: Int
-    ) throws {
-        let context = ModelContext(modelContainer)
-        let snapshotID = id
-        guard let header = try context.fetch(FetchDescriptor<EPGSnapshotRecord>(
-            predicate: #Predicate { $0.id == snapshotID }
-        )).first else {
-            throw LibraryRepositoryError.corruptPersistedField(field: "EPGSnapshotRecord.id")
-        }
-        header.channelCount = channelCount
-        header.programmeCount = programmeCount
-        try save(.epgStaging, context: context)
-    }
-
     /// Admit user-choice edits against the recovery budget before committing.
     /// Failed edits leave both SwiftData and the previous mirror untouched.
     /// Legacy shrink/delete operations can commit while still oversized; their
@@ -1263,12 +1389,19 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
 
     private func save(_ phase: LibraryStoreSavePhase) throws {
-        try save(phase, context: modelContext)
+        try Self.save(
+            phase,
+            context: modelContext,
+            saveFault: saveFault,
+            saveContextObserver: saveContextObserver
+        )
     }
 
-    private func save(
+    fileprivate nonisolated static func save(
         _ phase: LibraryStoreSavePhase,
-        context: ModelContext
+        context: ModelContext,
+        saveFault: LibraryStoreSaveFault?,
+        saveContextObserver: LibraryStoreSaveContextObserver?
     ) throws {
         do {
             saveContextObserver?(LibraryStoreSaveContextObservation(

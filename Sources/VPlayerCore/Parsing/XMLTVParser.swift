@@ -226,7 +226,7 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
         guard firstError == nil else { return }
 
         if let textElement, textElement.name == elementName, textElement.depth == depth {
-            acceptText(text.trimmingCharacters(in: .whitespacesAndNewlines), for: elementName)
+            acceptText(Self.trimmedWhitespaceAndNewlines(text), for: elementName)
             self.textElement = nil
             text = ""
             textByteCount = 0
@@ -405,10 +405,18 @@ private final class XMLTVDelegate: NSObject, XMLParserDelegate {
     }
 
     private func nonEmpty(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
+        guard let value else { return nil }
+        let trimmed = Self.trimmedWhitespaceAndNewlines(value)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func trimmedWhitespaceAndNewlines(_ value: String) -> String {
+        let utf8 = value.utf8
+        guard let first = utf8.first, let last = utf8.last else { return value }
+        if (0x21...0x7E).contains(first), (0x21...0x7E).contains(last) {
+            return value
         }
-        return value
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func checkCancellation(parser: XMLParser) -> Bool {
