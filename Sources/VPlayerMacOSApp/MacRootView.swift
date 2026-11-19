@@ -258,6 +258,14 @@ private struct MacSidebarBrowserView: View {
 
     @FocusState private var sidebarFocus: SidebarFocus?
     @State private var cache: BrowserCache
+    @State private var programmeClockDate = Date()
+
+    private var programmeClockKey: ProgrammeClockKey {
+        ProgrammeClockKey(
+            active: !model.programmesByChannelID.isEmpty,
+            intervalSeconds: prefersReducedResourceUsage ? 120 : 30
+        )
+    }
 
     init(
         model: AppModel,
@@ -335,7 +343,7 @@ private struct MacSidebarBrowserView: View {
             } else if displayedChannels.isEmpty {
                 emptyFilterState
             } else {
-                channelListWithSharedClock(channels: displayedChannels)
+                channelList(channels: displayedChannels, referenceDate: programmeClockDate)
             }
             Spacer(minLength: 0)
             Divider()
@@ -351,6 +359,11 @@ private struct MacSidebarBrowserView: View {
         .onChange(of: searchText) { _, _ in recomputeCache() }
         .onChange(of: browsingSettings.grouping) { _, _ in recomputeCache() }
         .onChange(of: selectedGroup) { _, _ in recomputeCache() }
+        .task(id: programmeClockKey) {
+            await ProgrammeClockTicker.run(for: programmeClockKey) { date in
+                programmeClockDate = date
+            }
+        }
     }
 
     @ViewBuilder
@@ -418,22 +431,6 @@ private struct MacSidebarBrowserView: View {
             .padding(.bottom, 16)
         } else {
             ContentUnavailableView.search(text: searchText)
-        }
-    }
-
-    @ViewBuilder
-    private func channelListWithSharedClock(channels: [Channel]) -> some View {
-        if model.programmesByChannelID.isEmpty {
-            channelList(channels: channels, referenceDate: .now)
-        } else {
-            TimelineView(
-                .periodic(
-                    from: Date(timeIntervalSinceReferenceDate: 0),
-                    by: prefersReducedResourceUsage ? 120 : 30
-                )
-            ) { context in
-                channelList(channels: channels, referenceDate: context.date)
-            }
         }
     }
 

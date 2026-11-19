@@ -118,6 +118,28 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCTAssertTrue(waitForValue(visibility, equals: "hidden", timeout: 5))
         XCTAssertFalse(playPause.isHittable)
 
+        // Verify hidden controls render no frosted white focus plate over the
+        // black fixture canvas, and that Select wakes controls without exiting.
+        let hiddenScreenshot = XCUIScreen.main.screenshot()
+        if let cgImage = hiddenScreenshot.image.cgImage {
+            let brightness = centerPixelLuminance(in: cgImage)
+            XCTAssertLessThan(
+                brightness,
+                0.08,
+                "Expected hidden controls to leave the video unobstructed without a focus plate (luminance=\(brightness))"
+            )
+        }
+        let wakeButton = app.buttons["player-controls-wake"]
+        XCTAssertTrue(wakeButton.waitForExistence(timeout: 2))
+        XCTAssertLessThanOrEqual(wakeButton.frame.width, 10)
+        XCTAssertLessThanOrEqual(wakeButton.frame.height, 10)
+
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
+        XCTAssertTrue(app.otherElements["player-full-screen"].exists)
+        XCTAssertTrue(playPause.wait(for: \.isHittable, toEqual: true, timeout: 2))
+
+        XCTAssertTrue(waitForValue(visibility, equals: "hidden", timeout: 5))
         XCUIRemote.shared.press(.right)
         XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
         XCTAssertTrue(playPause.wait(for: \.isHittable, toEqual: true, timeout: 2))
@@ -126,6 +148,35 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCUIRemote.shared.press(.playPause)
         XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
         XCTAssertTrue(playPause.wait(for: \.isHittable, toEqual: true, timeout: 2))
+    }
+
+    @MainActor
+    func testSelectingNonFirstChannelPreservesBrowserFocusAfterPlaybackDismissal() {
+        let app = launchFixture()
+        XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 5))
+        selectTab(named: "频道", in: app)
+        XCTAssertTrue(app.buttons["channel.http"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
+
+        // Navigate down to a channel in a later section (not the first channel).
+        let targetChannel = app.buttons["channel.grouped"]
+        for _ in 0..<4 where !targetChannel.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(
+            targetChannel.wait(for: \.hasFocus, toEqual: true, timeout: 2),
+            "Expected focus to reach channel.grouped before opening playback"
+        )
+
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(app.otherElements["player-full-screen"].waitForExistence(timeout: 3))
+
+        XCUIRemote.shared.press(.menu)
+        XCTAssertTrue(targetChannel.waitForExistence(timeout: 3))
+        XCTAssertTrue(
+            targetChannel.wait(for: \.hasFocus, toEqual: true, timeout: 2),
+            "Expected focus to stay on channel.grouped instead of resetting to the first channel"
+        )
+        XCTAssertFalse(app.buttons["channel.http"].hasFocus)
     }
 
     @MainActor
@@ -270,5 +321,28 @@ final class FullScreenPlayerUITests: XCTestCase {
         }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func centerPixelLuminance(in image: CGImage) -> Double {
+        var pixel: [UInt8] = [0, 0, 0, 0]
+        guard let context = CGContext(
+            data: &pixel,
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return 1.0
+        }
+        let sampleRect = CGRect(x: image.width / 2, y: image.height / 2, width: 1, height: 1)
+        if let cropped = image.cropping(to: sampleRect) {
+            context.draw(cropped, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        }
+        let r = Double(pixel[0]) / 255.0
+        let g = Double(pixel[1]) / 255.0
+        let b = Double(pixel[2]) / 255.0
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 }

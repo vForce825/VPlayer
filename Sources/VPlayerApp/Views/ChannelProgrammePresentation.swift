@@ -21,3 +21,37 @@ struct ChannelProgrammePresentation: Equatable {
         return Self(current: current, next: next, progress: progress)
     }
 }
+
+struct ProgrammeClockKey: Equatable, Sendable {
+    let active: Bool
+    let intervalSeconds: Int
+}
+
+enum ProgrammeClockTicker {
+    static func nextTickDelay(after date: Date = Date(), intervalSeconds: Int) -> Duration {
+        let interval = max(1, intervalSeconds)
+        let remainder = date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: Double(interval))
+        let normalizedRemainder = remainder < 0 ? remainder + Double(interval) : remainder
+        let remaining = max(0.25, Double(interval) - normalizedRemainder)
+        return .milliseconds(Int((remaining * 1_000).rounded(.up)))
+    }
+
+    @MainActor
+    static func run(
+        for key: ProgrammeClockKey,
+        onTick: @MainActor (Date) -> Void
+    ) async {
+        guard key.active else { return }
+        onTick(Date())
+        while !Task.isCancelled {
+            let delay = nextTickDelay(after: Date(), intervalSeconds: key.intervalSeconds)
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            onTick(Date())
+        }
+    }
+}

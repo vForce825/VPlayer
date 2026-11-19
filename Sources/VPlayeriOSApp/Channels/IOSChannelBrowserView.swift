@@ -21,6 +21,14 @@ struct IOSChannelBrowserView: View {
     @State private var informationChannel: Channel?
     @State private var cachedInput: ChannelBrowserPresentationInput
     @State private var cachedPresentation: ChannelBrowserPresentation
+    @State private var programmeClockDate = Date()
+
+    private var programmeClockKey: ProgrammeClockKey {
+        ProgrammeClockKey(
+            active: !model.programmesByChannelID.isEmpty,
+            intervalSeconds: reducedResourceUsage ? 120 : 30
+        )
+    }
 
     init(model: AppModel, browsingSettings: ChannelBrowsingSettingsStore) {
         self.model = model
@@ -147,7 +155,7 @@ struct IOSChannelBrowserView: View {
                 if presentation.sections.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
-                    channelListWithSharedClock(presentation: presentation)
+                    channelListContent(presentation: presentation, referenceDate: programmeClockDate)
                         .scrollEdgeEffectStyle(.hard, for: .top)
                         .toolbar {
                             if presentation.showsGroupRail {
@@ -174,22 +182,11 @@ struct IOSChannelBrowserView: View {
                         }
                 }
             }
-        }
-    }
-
-    @ViewBuilder
-    private func channelListWithSharedClock(presentation: ChannelBrowserPresentation) -> some View {
-        if !model.programmesByChannelID.isEmpty {
-            TimelineView(
-                .periodic(
-                    from: Date(timeIntervalSinceReferenceDate: 0),
-                    by: reducedResourceUsage ? 120 : 30
-                )
-            ) { tick in
-                channelListContent(presentation: presentation, referenceDate: tick.date)
+            .task(id: programmeClockKey) {
+                await ProgrammeClockTicker.run(for: programmeClockKey) { date in
+                    programmeClockDate = date
+                }
             }
-        } else {
-            channelListContent(presentation: presentation, referenceDate: .now)
         }
     }
 
@@ -263,6 +260,14 @@ struct IOSPlayerChannelPickerView: View {
     @State private var detent: PresentationDetent = .large
     @State private var cachedInput: ChannelBrowserPresentationInput
     @State private var cachedPresentation: ChannelBrowserPresentation
+    @State private var programmeClockDate = Date()
+
+    private var programmeClockKey: ProgrammeClockKey {
+        ProgrammeClockKey(
+            active: !model.programmesByChannelID.isEmpty,
+            intervalSeconds: reducedResourceUsage ? 120 : 30
+        )
+    }
 
     init(model: AppModel, grouping: ChannelGrouping, onSelect: @escaping (Channel) -> Void) {
         self.model = model
@@ -293,7 +298,7 @@ struct IOSPlayerChannelPickerView: View {
         NavigationStack {
             let presentation = cachedPresentation
             ScrollViewReader { proxy in
-                pickerListWithSharedClock(presentation: presentation)
+                pickerListContent(presentation: presentation, referenceDate: programmeClockDate)
                     .safeAreaInset(edge: .top, spacing: 0) {
                         if let selectionMessage {
                             HStack(alignment: .top, spacing: 10) {
@@ -368,21 +373,10 @@ struct IOSPlayerChannelPickerView: View {
         }
         .presentationDetents([.medium, .large], selection: $detent)
         .presentationDragIndicator(.visible)
-    }
-
-    @ViewBuilder
-    private func pickerListWithSharedClock(presentation: ChannelBrowserPresentation) -> some View {
-        if !model.programmesByChannelID.isEmpty {
-            TimelineView(
-                .periodic(
-                    from: Date(timeIntervalSinceReferenceDate: 0),
-                    by: reducedResourceUsage ? 120 : 30
-                )
-            ) { tick in
-                pickerListContent(presentation: presentation, referenceDate: tick.date)
+        .task(id: programmeClockKey) {
+            await ProgrammeClockTicker.run(for: programmeClockKey) { date in
+                programmeClockDate = date
             }
-        } else {
-            pickerListContent(presentation: presentation, referenceDate: .now)
         }
     }
 

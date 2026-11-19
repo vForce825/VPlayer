@@ -43,11 +43,10 @@ struct ChannelBrowserView: View {
                 ChannelBrowserGridView(
                     model: model,
                     presentation: presentation,
-                    searchText: searchText,
+                    searchText: $searchText,
                     focusPolicy: focusPolicy,
                     mappingChannel: $mappingChannel
                 )
-                .searchable(text: $searchText, prompt: "搜索频道")
             }
         }
         .onChange(of: model.activeProfile?.id) { _, _ in
@@ -73,11 +72,19 @@ private struct ChannelBrowserGridView: View {
     @ScaledMetric(relativeTo: .subheadline) private var maximumTileWidth: CGFloat = 420
     @Bindable var model: AppModel
     let presentation: ChannelBrowserPresentation
-    let searchText: String
+    @Binding var searchText: String
     let focusPolicy: AcceptanceFocusPolicy
     @Binding var mappingChannel: Channel?
     @State private var pendingGroupFocusID: String?
+    @State private var programmeClockDate = Date()
     @FocusState private var focusedElement: ChannelBrowserFocus?
+
+    private var programmeClockKey: ProgrammeClockKey {
+        ProgrammeClockKey(
+            active: !model.programmesByChannelID.isEmpty && model.presentedPlaybackRequest == nil,
+            intervalSeconds: prefersReducedResourceUsage ? 120 : 30
+        )
+    }
 
     /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
     /// columns on a 1080p screen and still degrades gracefully under larger
@@ -96,11 +103,17 @@ private struct ChannelBrowserGridView: View {
             sections: presentation.sections,
             showsGroupRail: presentation.showsGroupRail
         )
+        .searchable(text: $searchText, prompt: "搜索频道")
         .defaultFocus($focusedElement, defaultFocusElement)
         .onChange(of: focusedElement) { _, newFocus in
             guard let pendingID = pendingGroupFocusID else { return }
             if newFocus == .channel(pendingID) || newFocus != nil {
                 pendingGroupFocusID = nil
+            }
+        }
+        .task(id: programmeClockKey) {
+            await ProgrammeClockTicker.run(for: programmeClockKey) { date in
+                programmeClockDate = date
             }
         }
     }
@@ -148,26 +161,10 @@ private struct ChannelBrowserGridView: View {
                         staleEPGBanner(coverageEnd: staleCoverageEnd)
                             .padding(.top, 16)
                     }
-                    channelCardsWithSharedClock(sections: sections)
+                    channelCardsGrid(sections: sections, referenceDate: programmeClockDate)
                 }
             }
             .scrollClipDisabled()
-        }
-    }
-
-    @ViewBuilder
-    private func channelCardsWithSharedClock(sections: [ChannelSection]) -> some View {
-        if !model.programmesByChannelID.isEmpty && model.presentedPlaybackRequest == nil {
-            TimelineView(
-                .periodic(
-                    from: Date(timeIntervalSinceReferenceDate: 0),
-                    by: prefersReducedResourceUsage ? 120 : 30
-                )
-            ) { context in
-                channelCardsGrid(sections: sections, referenceDate: context.date)
-            }
-        } else {
-            channelCardsGrid(sections: sections, referenceDate: .now)
         }
     }
 

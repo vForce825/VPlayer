@@ -30,6 +30,12 @@ final class FullScreenPlayerDismissCleanup {
     }
 }
 
+private struct InvisibleWakeButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        Color.clear
+    }
+}
+
 struct FullScreenPlayerView: View {
     private enum FailureControl: Hashable {
         case retry
@@ -170,14 +176,16 @@ struct FullScreenPlayerView: View {
                 .allowsHitTesting(controlsAreVisible)
                 .transition(.opacity)
             } else if shouldMountTransportOverlays {
-                // Keep a dedicated invisible focus target while controls are
-                // hidden so Select wakes the HUD instead of blindly activating
-                // a hidden Back button.
+                // Keep a dedicated invisible 1x1 focus target while controls
+                // are hidden so Select wakes the HUD instead of blindly
+                // activating a hidden Back button — without rendering tvOS's
+                // frosted `.plain` button focus plate over the video.
                 Button(action: wakeControls) {
                     Color.clear
                 }
-                .buttonStyle(.plain)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .buttonStyle(InvisibleWakeButtonStyle())
+                .focusEffectDisabled()
+                .frame(width: 1, height: 1)
                 .accessibilityIdentifier("player-controls-wake")
                 .accessibilityLabel("显示播放控制")
                 .focused($isWakeSurfaceFocused)
