@@ -20,14 +20,17 @@ final class EPGPersistenceSink: XMLTVEventSink {
     private let persistBatch: (EPGPersistenceBatch) throws -> Void
     private let batchDidPassPostPersistCancellationCheck: (() -> Void)?
     private var channelIDs: Set<String> = []
-    private var programmeIDs: Set<String> = []
+    private var programmeDigestKeys: Set<ProgrammeDigestKey> = []
+    private var nonDigestProgrammeIDs: Set<String> = []
+    private(set) var maxProgrammeStop: Date?
     private var channels: [EPGChannel] = []
     private var programmes: [Programme] = []
 
     var acceptedSummary: XMLTVParseSummary {
         XMLTVParseSummary(
             channelCount: channelIDs.count,
-            programmeCount: programmeIDs.count
+            programmeCount: programmeDigestKeys.count + nonDigestProgrammeIDs.count,
+            coverageEnd: maxProgrammeStop
         )
     }
 
@@ -52,9 +55,23 @@ final class EPGPersistenceSink: XMLTVEventSink {
 
     func accept(programme: Programme) throws {
         try cancellationCheck()
-        guard programmeIDs.insert(programme.id).inserted else { return }
+        guard insertProgrammeID(programme.id) else { return }
+        if let currentMax = maxProgrammeStop {
+            if programme.stop > currentMax {
+                maxProgrammeStop = programme.stop
+            }
+        } else {
+            maxProgrammeStop = programme.stop
+        }
         programmes.append(programme)
         try flushIfNeeded()
+    }
+
+    private func insertProgrammeID(_ id: String) -> Bool {
+        if let digestKey = ProgrammeDigestKey(hexString: id) {
+            return programmeDigestKeys.insert(digestKey).inserted
+        }
+        return nonDigestProgrammeIDs.insert(id).inserted
     }
 
     func finish() throws {

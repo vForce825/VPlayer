@@ -594,20 +594,20 @@ final class ProjectConfigurationTests: XCTestCase {
         XCTAssertTrue(root.contains("TabView(selection: $selectedTab)"))
         XCTAssertTrue(root.contains("focusPolicy.initialRootTab"))
         XCTAssertTrue(profiles.contains(
-            "@FocusState private var focusedControl: AcceptanceFocusPolicy.SourceControl?"
+            "@FocusState private var focusedControl: FocusTarget?"
         ))
         XCTAssertTrue(profiles.contains(".focused($focusedControl, equals: .add)"))
-        XCTAssertTrue(profiles.contains("focusTarget: .playlistRefresh"))
-        XCTAssertTrue(profiles.contains("focusTarget: .epgRefresh"))
+        XCTAssertTrue(profiles.contains("focusTarget: .playlistRefresh(profile.id)"))
+        XCTAssertTrue(profiles.contains("focusTarget: .epgRefresh(profile.id)"))
         XCTAssertTrue(profiles.contains(".focused($focusedControl, equals: focusTarget)"))
-        XCTAssertTrue(profiles.contains("if let initialControl = focusPolicy.initialSourceControl"))
+        XCTAssertTrue(profiles.contains("if let initialControl = initialFocusTarget"))
         XCTAssertTrue(profiles.contains(".defaultFocus($focusedControl, initialControl)"))
         XCTAssertEqual(
             profiles.components(separatedBy: "await Task.yield()").count - 1,
             1
         )
         XCTAssertTrue(profiles.contains("guard !model.profiles.isEmpty else { return }"))
-        XCTAssertTrue(profiles.contains("focusedControl = target"))
+        XCTAssertTrue(profiles.contains("focusedControl = focusTarget(for: target)"))
         XCTAssertFalse(profiles.contains("@Environment(\\.resetFocus)"))
         XCTAssertFalse(profiles.contains("@Namespace private var sourceFocus"))
         XCTAssertFalse(profiles.contains(".prefersDefaultFocus("))

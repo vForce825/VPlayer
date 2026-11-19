@@ -83,6 +83,67 @@ final class MacPictureInPictureWindowTests: XCTestCase {
         harness.target.continuation = nil
     }
 
+    func testFailureWhilePictureInPictureActiveRestoresMainWindowAndClearsMessage() {
+        let harness = Harness()
+        defer { harness.close() }
+        var restoreCalls = 0
+        harness.coordinator.onRestore = { completion in
+            restoreCalls += 1
+            harness.window.makeKeyAndOrderFront(nil)
+            completion(true)
+        }
+        harness.coordinator.start()
+        XCTAssertTrue(harness.coordinator.isActive)
+
+        let failure = PlaybackFailure(code: "test.failed", userMessage: "测试信号中断", retryDisposition: .retrySameRequest)
+        harness.coordinator.update(state: .failed(failure), paused: false)
+
+        XCTAssertEqual(restoreCalls, 1)
+        XCTAssertFalse(harness.coordinator.isActive)
+        XCTAssertNil(harness.coordinator.message)
+        XCTAssertTrue(harness.surface.superview === harness.container)
+    }
+
+    func testFailureWhenRestorationFailsDisplaysErrorInFloatingWindowAndAutoDismissesToast() async throws {
+        let harness = Harness(messageDuration: .milliseconds(40))
+        defer { harness.close() }
+        harness.coordinator.onRestore = { completion in
+            completion(false)
+        }
+        harness.coordinator.start()
+        let failure = PlaybackFailure(code: "test.failed", userMessage: "频道连接已断开", retryDisposition: .retrySameRequest)
+        harness.coordinator.update(state: .failed(failure), paused: false)
+
+        XCTAssertTrue(harness.coordinator.isActive)
+        XCTAssertNotNil(harness.coordinator.message)
+        XCTAssertEqual(harness.coordinator.displayedFloatingMessageForTesting, "频道连接已断开")
+        XCTAssertFalse(harness.coordinator.controlsHiddenForTesting)
+
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(harness.coordinator.message)
+        XCTAssertEqual(harness.coordinator.displayedFloatingMessageForTesting, "频道连接已断开")
+
+        harness.coordinator.close()
+        XCTAssertNil(harness.coordinator.message)
+    }
+
+    func testMouseExitedHidesControlsWhenPlayingButKeepsControlsVisibleWhenPaused() {
+        let harness = Harness()
+        defer { harness.close() }
+        harness.coordinator.start()
+        XCTAssertFalse(harness.coordinator.controlsHiddenForTesting)
+
+        harness.coordinator.simulateMouseExitedForTesting()
+        XCTAssertTrue(harness.coordinator.controlsHiddenForTesting)
+
+        let req = PlaybackRequest(sourceProfileID: UUID(), channelID: "浮窗验收",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "浮窗验收")
+        harness.coordinator.update(state: .paused(req), paused: true)
+        XCTAssertFalse(harness.coordinator.controlsHiddenForTesting)
+        harness.coordinator.simulateMouseExitedForTesting()
+        XCTAssertFalse(harness.coordinator.controlsHiddenForTesting)
+    }
+
     private final class Target: NowPlayingPlaybackTarget {
         var requests: [Bool] = []
         var continuation: CheckedContinuation<Void, Never>?
@@ -100,13 +161,17 @@ final class MacPictureInPictureWindowTests: XCTestCase {
         let container = NSView(frame: .init(x: 0, y: 0, width: 1000, height: 700))
         let surface = SampleBufferVideoView(frame: .init(x: 0, y: 0, width: 1000, height: 700))
         let identity = Harness.identity(1)
-        init() {
+        init(messageDuration: Duration = .seconds(4)) {
             _ = NSApplication.shared
             window = NSWindow(contentRect: container.bounds, styleMask: [.titled], backing: .buffered, defer: false)
             window.contentView = container
             container.addSubview(surface)
             surface.autoresizingMask = [.width, .height]
-            coordinator = MacPictureInPictureCoordinator(target: target, persistsWindowFrame: false)
+            coordinator = MacPictureInPictureCoordinator(
+                target: target,
+                persistsWindowFrame: false,
+                messageDuration: messageDuration
+            )
             coordinator.install(videoView: surface, identity: identity)
             coordinator.update(state: .playing(.init(sourceProfileID: UUID(), channelID: "浮窗验收",
                 streamURL: URL(string: "https://example.invalid/live")!, title: "浮窗验收")), paused: false)

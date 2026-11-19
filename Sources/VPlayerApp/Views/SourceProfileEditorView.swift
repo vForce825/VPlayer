@@ -87,6 +87,7 @@ struct SourceProfileEditorView: View {
                 editor
             }
         }
+        .interactiveDismissDisabled(isSaving)
         .onDisappear {
             guard profile == nil else { return }
             model.cancelCreateAttempt(createAttemptID)
@@ -173,6 +174,7 @@ struct SourceProfileEditorView: View {
             Section {
                 saveButton
                 Button("取消") { cancel() }
+                    .disabled(isSaving)
                     .accessibilityIdentifier("source.editor.cancel")
             }
         }
@@ -246,16 +248,23 @@ struct SourceProfileEditorView: View {
         isSaving = true
         let input = input
         Task {
+            var failure: String?
             let succeeded: Bool
             if let profile {
-                succeeded = await model.update(profileID: profile.id, input: input)
+                succeeded = await model.update(profileID: profile.id, input: input) {
+                    failure = $0
+                }
             } else {
-                succeeded = await model.create(input: input, attemptID: createAttemptID)
+                succeeded = await model.create(input: input, attemptID: createAttemptID) {
+                    failure = $0
+                }
             }
             guard !Task.isCancelled else { return }
             isSaving = false
             if succeeded {
                 dismiss()
+            } else {
+                validationMessage = failure ?? "未能完成保存，请重试。"
             }
         }
     }

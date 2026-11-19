@@ -30,16 +30,36 @@ struct MacSourceManagerView: View {
                                     Button("删除", role: .destructive) { deleting = profile }
                                 }
                                 Text(RedactedURL.string(profile.m3uURL)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                HStack {
+                                let m3uRefreshing = profile.m3uStatus.state == .refreshing
+                                let epgRefreshing = profile.epgStatus.state == .refreshing
+                                HStack(alignment: .top) {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text("频道：\(ResourceRefreshStatusPresentation.text(for: profile.m3uStatus))")
+                                            .foregroundStyle(profile.m3uStatus.state == .failed ? .red : .secondary)
+                                        if let error = profile.m3uStatus.errorSummary, !error.isEmpty {
+                                            Text(error)
+                                                .foregroundStyle(.red)
+                                                .lineLimit(2)
+                                        }
                                         Text("节目单：\(ResourceRefreshStatusPresentation.text(for: profile.epgStatus))")
-                                    }.font(.caption).foregroundStyle(.secondary)
+                                            .foregroundStyle(profile.epgStatus.state == .failed ? .red : .secondary)
+                                        if let error = profile.epgStatus.errorSummary, !error.isEmpty {
+                                            Text(error)
+                                                .foregroundStyle(.red)
+                                                .lineLimit(2)
+                                        }
+                                    }.font(.caption)
                                     Spacer()
-                                    Menu("刷新") {
-                                        Button("刷新频道") { Task { await model.refresh(profileID: profile.id, resource: .playlist) } }
-                                        Button("刷新节目单") { Task { await model.refresh(profileID: profile.id, resource: .epg) } }
-                                    }.disabled(model.isLoading)
+                                    Menu(m3uRefreshing || epgRefreshing ? "刷新中…" : "刷新") {
+                                        Button(m3uRefreshing ? "正在刷新频道…" : "刷新频道") {
+                                            guard !m3uRefreshing else { return }
+                                            Task { await model.refresh(profileID: profile.id, resource: .playlist) }
+                                        }.disabled(m3uRefreshing || model.isLoading)
+                                        Button(epgRefreshing ? "正在刷新节目单…" : "刷新节目单") {
+                                            guard !epgRefreshing else { return }
+                                            Task { await model.refresh(profileID: profile.id, resource: .epg) }
+                                        }.disabled(epgRefreshing || model.isLoading)
+                                    }.disabled(model.isLoading || (m3uRefreshing && epgRefreshing))
                                 }
                             }.padding(.vertical, 10)
                         }
@@ -65,7 +85,7 @@ struct MacSourceManagerView: View {
                 }
             }
         } message: { Text("该播放列表的频道和节目单会从本机资料库移除。") }
-        .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil },
+        .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil && editing == nil && !adding },
             set: { if !$0 { model.dismissAlert() } })) {
             Button("知道了") { model.dismissAlert() }
         } message: { Text(model.alertMessage ?? "") }

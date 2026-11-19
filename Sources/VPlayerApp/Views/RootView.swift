@@ -20,6 +20,7 @@ struct RootView: View {
     @State private var selectedTab: AcceptanceFocusPolicy.RootTab
     @State private var initialLibraryState = InitialLibraryState.loading
     @State private var initialLibraryAttempt = 0
+    @State private var playerDismissCleanup = FullScreenPlayerDismissCleanup()
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -102,7 +103,10 @@ struct RootView: View {
         } message: {
             Text(model.alertMessage ?? "")
         }
-        .fullScreenCover(item: $model.presentedPlaybackRequest) { request in
+        .fullScreenCover(
+            item: $model.presentedPlaybackRequest,
+            onDismiss: { playerDismissCleanup.runAndClear() }
+        ) { request in
             FullScreenPlayerView(
                 channelPresentation: playerChannelPresentation(for: request),
                 engine: dependencies.playbackEngine,
@@ -113,7 +117,8 @@ struct RootView: View {
                 acceptanceMetricsEnabled: dependencies.exposesAcceptanceMetrics,
                 acceptanceStateEnabled: dependencies.exposesAcceptanceState,
                 settings: dependencies.playbackSettings,
-                nowPlaying: dependencies.nowPlaying
+                nowPlaying: dependencies.nowPlaying,
+                dismissCleanup: playerDismissCleanup
             ) {
                 model.dismissPlayback()
             }

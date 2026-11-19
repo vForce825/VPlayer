@@ -82,6 +82,51 @@ final class HLSProxyBackpressureTests: XCTestCase {
         XCTAssertNil(end)
     }
 
+    func testBytePipeChunkPublishHandlesWrapAroundAndPartialCapacity() async throws {
+        let budget = try HLSProxyBudget()
+        let transfer = try budget.admitTransfer()
+        let pipe = HLSProxyBudget.BytePipe(envelope: try transfer.reserveBodyEnvelope())
+        let capacity = pipe.window.capacity
+
+        // Fill near the end of the ring so the next chunk wraps across offset 0.
+        let initialCount = capacity - 64
+        let initial = Data((0..<initialCount).map { UInt8(truncatingIfNeeded: $0) })
+        let writtenInitial = try pipe.publish(contentsOf: initial, at: 0)
+        XCTAssertEqual(writtenInitial, initialCount)
+        let firstSpanRaw = try await pipe.nextSpan(at: 0)
+        let firstSpan = try XCTUnwrap(firstSpanRaw)
+        XCTAssertEqual(firstSpan.offset, 0)
+        XCTAssertEqual(firstSpan.count, initialCount)
+        pipe.releaseThrough(UInt64(initialCount))
+
+        // Write a 256-byte chunk that wraps around the ring boundary (64 bytes tail + 192 bytes head).
+        let wrapped = Data((0..<256).map { UInt8(truncatingIfNeeded: $0 &+ 17) })
+        let writtenWrapped = try pipe.publish(contentsOf: wrapped, at: UInt64(initialCount))
+        XCTAssertEqual(writtenWrapped, 256)
+
+        // Attempt to publish a chunk larger than remaining capacity: must copy only available space.
+        let oversized = Data(repeating: 0x5A, count: capacity)
+        let expectedSpace = capacity - 256
+        let partialWritten = try pipe.publish(contentsOf: oversized, at: UInt64(initialCount + 256))
+        XCTAssertEqual(partialWritten, expectedSpace)
+        XCTAssertTrue(pipe.isFull(at: UInt64(initialCount + 256 + partialWritten)))
+
+        // Read back the wrapped 256 bytes and verify byte-exact contents across both spans.
+        var reconstructed = Data()
+        var cursor = UInt64(initialCount)
+        while reconstructed.count < 256 {
+            let spanRaw = try await pipe.nextSpan(at: cursor)
+            let span = try XCTUnwrap(spanRaw)
+            let take = min(span.count, 256 - reconstructed.count)
+            let borrow = pipe.window.borrow(offset: span.offset, count: take)
+            reconstructed.append(borrow.makeData())
+            await borrow.waitForRelease()
+            cursor += UInt64(take)
+            pipe.releaseThrough(cursor)
+        }
+        XCTAssertEqual(reconstructed, wrapped)
+    }
+
     func testRingAbortWakesBothDirectionsWithoutTreatingBufferedBytesAsSuccess() async throws {
         let budget = try HLSProxyBudget()
         let transfer = try budget.admitTransfer()

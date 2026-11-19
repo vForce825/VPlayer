@@ -19,6 +19,54 @@ public enum PlaybackPresentationRoute: UInt8, Sendable, Equatable {
 }
 
 public enum PlaybackPresentationCadencePolicy {
+    private static let standardBroadcastFrameRates: [Double] = [
+        24_000.0 / 1_001.0,
+        24.0,
+        25.0,
+        30_000.0 / 1_001.0,
+        30.0,
+        48.0,
+        50.0,
+        60_000.0 / 1_001.0,
+        60.0,
+        100.0,
+        120_000.0 / 1_001.0,
+        120.0,
+    ]
+
+    /// Snap raw computed frame rates (e.g. 90 kHz MPEG-TS 1501/1502-tick
+    /// alternating 59.94p durations) to canonical broadcast frame rates within
+    /// tight tolerance so display criteria and media metadata stay stable.
+    static func canonicalFrameRate(_ rawRate: Double) -> Double {
+        guard rawRate.isFinite, rawRate > 0 else { return rawRate }
+        let clamped = min(rawRate, 120.0)
+        var bestMatch: (rate: Double, distance: Double)?
+        for candidate in standardBroadcastFrameRates {
+            let tolerance = max(0.08, candidate * 0.002)
+            let distance = abs(clamped - candidate)
+            if distance <= tolerance {
+                if let current = bestMatch {
+                    if distance < current.distance {
+                        bestMatch = (candidate, distance)
+                    }
+                } else {
+                    bestMatch = (candidate, distance)
+                }
+            }
+        }
+        return bestMatch?.rate ?? clamped
+    }
+
+    /// Compare two canonicalized display frame rates with a tight tolerance
+    /// (< 0.04%, strictly smaller than the 0.1% NTSC 1000/1001 ratio between
+    /// 23.976/24, 29.97/30, and 59.94/60) so minor jitter never churns display
+    /// criteria while real NTSC/integer cadence switches still apply.
+    static func areEquivalentDisplayFrameRates(_ lhs: Float, _ rhs: Float) -> Bool {
+        if lhs == rhs { return true }
+        let scale = max(abs(lhs), abs(rhs))
+        return abs(lhs - rhs) <= max(0.005, scale * 0.0004)
+    }
+
     public static func outputFrameRate(
         for frame: VideoPresentationFrame,
         route: PlaybackPresentationRoute
@@ -28,9 +76,9 @@ public enum PlaybackPresentationCadencePolicy {
               duration.epoch == 0,
               duration.value > 0,
               duration.timescale > 0 else { return nil }
-        let rate = Float(duration.timescale) / Float(duration.value)
+        let rate = Double(duration.timescale) / Double(duration.value)
         guard rate.isFinite, rate > 0 else { return nil }
-        return min(rate, 120)
+        return Float(canonicalFrameRate(rate))
     }
 }
 
@@ -194,20 +242,26 @@ public final class PlaybackPresentationContext: @unchecked Sendable {
         outputFrameRate: Float
     ) {
         guard !terminal, outputFrameRate.isFinite, outputFrameRate > 0 else { return }
+        let normalizedRate = Float(
+            PlaybackPresentationCadencePolicy.canonicalFrameRate(Double(outputFrameRate))
+        )
         let request = CriteriaRequest(
             formatIdentity: ObjectIdentifier(formatDescription as AnyObject),
             formatDescription: formatDescription,
-            outputFrameRate: outputFrameRate
+            outputFrameRate: normalizedRate
         )
         if let pendingCriteria,
            pendingCriteria.formatIdentity == request.formatIdentity,
-           pendingCriteria.outputFrameRate == request.outputFrameRate {
+           PlaybackPresentationCadencePolicy.areEquivalentDisplayFrameRates(
+               pendingCriteria.outputFrameRate,
+               request.outputFrameRate
+           ) {
             return
         }
         pendingCriteria = request
         criteriaController?.enterFullScreen(
             formatDescription: formatDescription,
-            outputFrameRate: outputFrameRate
+            outputFrameRate: normalizedRate
         )
     }
 

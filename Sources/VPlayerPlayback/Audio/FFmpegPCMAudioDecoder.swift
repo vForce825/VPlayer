@@ -483,6 +483,7 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
     private var handle: (any FFmpegAudioDecoderHandle)?
     private var nextToken: Int64? = 1
     private var pending: [Int64: PendingToken] = [:]
+    private var lastEmittedTokenState: (token: Int64, state: PendingToken)?
     private let nativeCondition = NSCondition()
     private var nativeLaneOwner: Thread?
     private var nativeAccessClosed = false
@@ -551,7 +552,8 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         var outputs: [CMSampleBuffer] = []
         var emittedTokens = Set<Int64>()
         for callback in callbacks.frames {
-            guard var state = pending[callback.token] else {
+            let lookupFromLast = pending[callback.token] == nil && lastEmittedTokenState?.token == callback.token
+            guard var state = pending[callback.token] ?? (lookupFromLast ? lastEmittedTokenState?.state : nil) else {
                 throw PlaybackCoreError.audioFallbackDecode(Self.invalidCallbackErrorCode)
             }
             let pts = state.emittedDuration == .zero
@@ -579,12 +581,15 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
                 pcmLease: callback.retainedLease
             ))
             state.emittedDuration = accumulated
-            pending[callback.token] = state
+            if !lookupFromLast {
+                pending[callback.token] = state
+            }
+            if lastEmittedTokenState == nil || callback.token >= lastEmittedTokenState!.token {
+                lastEmittedTokenState = (token: callback.token, state: state)
+            }
             emittedTokens.insert(callback.token)
         }
-        for emittedToken in emittedTokens { pending.removeValue(forKey: emittedToken) }
-        // receive callback 不能证明 token 已终结：解码器可在后续 packet 或 EOF
-        // 继续为同一 opaque token 输出帧。仅 flush/destroy/真实 EOF 清理。
+        pruneEmittedAndStalePendingTokens(emittedTokens)
         return outputs
     }
 
@@ -610,11 +615,17 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         pending[token] = PendingToken(presentationTimeStamp: sample.presentationTimeStamp, emittedDuration: .zero)
         var emittedTokens = Set<Int64>()
         collector.beginStreaming { [self] callback in
-            guard var state = pending[callback.token] else {
+            let lookupFromLast = pending[callback.token] == nil && lastEmittedTokenState?.token == callback.token
+            guard var state = pending[callback.token] ?? (lookupFromLast ? lastEmittedTokenState?.state : nil) else {
                 throw PlaybackCoreError.audioFallbackDecode(Self.invalidCallbackErrorCode)
             }
             let output = try makeOutput(callback, state: &state)
-            pending[callback.token] = state
+            if !lookupFromLast {
+                pending[callback.token] = state
+            }
+            if lastEmittedTokenState == nil || callback.token >= lastEmittedTokenState!.token {
+                lastEmittedTokenState = (token: callback.token, state: state)
+            }
             emittedTokens.insert(callback.token)
             try consumer(output)
         }
@@ -627,8 +638,17 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
             pending.removeValue(forKey: token)
             throw PlaybackCoreError.audioFallbackDecode(result)
         }
-        for emittedToken in emittedTokens { pending.removeValue(forKey: emittedToken) }
+        pruneEmittedAndStalePendingTokens(emittedTokens)
         return
+    }
+
+    private func pruneEmittedAndStalePendingTokens(_ emittedTokens: Set<Int64>) {
+        guard let maxEmittedToken = emittedTokens.max() else { return }
+        // 一旦更新的 token 已产出帧，早于它的 0-output 占位 token 已不可能再被回调；
+        // 同时 lastEmittedTokenState 保留最新已产出 token 的累计时长，供后续尾帧或 EOF drain 使用。
+        for key in pending.keys where emittedTokens.contains(key) || key < maxEmittedToken {
+            pending.removeValue(forKey: key)
+        }
     }
 
     func drainForNaturalEOF() throws -> [CMSampleBuffer] {
@@ -641,7 +661,8 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         guard result == -541_478_725 else { throw PlaybackCoreError.audioFallbackDecode(result) }
         var outputs: [CMSampleBuffer] = []
         for callback in callbacks.frames {
-            guard var state = pending[callback.token] else {
+            let lookupFromLast = pending[callback.token] == nil && lastEmittedTokenState?.token == callback.token
+            guard var state = pending[callback.token] ?? (lookupFromLast ? lastEmittedTokenState?.state : nil) else {
                 throw PlaybackCoreError.audioFallbackDecode(Self.invalidCallbackErrorCode)
             }
             let pts = CMTimeAdd(state.presentationTimeStamp, state.emittedDuration)
@@ -654,9 +675,14 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
                 channelLayoutMask: callback.channelLayoutMask, presentationTimeStamp: pts,
                 hlsCopyOwnership: hlsCopyOwnership, pcmLease: callback.retainedLease))
             state.emittedDuration = CMTimeAdd(state.emittedDuration, duration)
-            pending[callback.token] = state
+            if lookupFromLast {
+                lastEmittedTokenState = (token: callback.token, state: state)
+            } else {
+                pending[callback.token] = state
+            }
         }
         pending.removeAll(keepingCapacity: false)
+        lastEmittedTokenState = nil
         return outputs
     }
 
@@ -665,6 +691,7 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         defer { endNativeCall() }
         handle?.flush()
         pending.removeAll(keepingCapacity: false)
+        lastEmittedTokenState = nil
         _ = collector.take()
     }
 
@@ -679,6 +706,7 @@ final class FFmpegPCMAudioDecoder: PCMAudioDecoding, @unchecked Sendable {
         handle.destroy()
         drainObservation?.nativeDestroyed()
         pending.removeAll(keepingCapacity: false)
+        lastEmittedTokenState = nil
         _ = collector.take()
     }
 

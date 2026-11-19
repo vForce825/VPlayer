@@ -67,6 +67,7 @@ private actor EPGStagingWorker {
                 id: snapshotID,
                 channelCount: summary.channelCount,
                 programmeCount: summary.programmeCount,
+                coverageEnd: summary.coverageEnd,
                 saveFault: saveFault,
                 saveContextObserver: saveContextObserver
             )
@@ -198,6 +199,7 @@ private actor EPGStagingWorker {
         id: UUID,
         channelCount: Int,
         programmeCount: Int,
+        coverageEnd: Date?,
         saveFault: LibraryStoreSaveFault?,
         saveContextObserver: LibraryStoreSaveContextObserver?
     ) throws {
@@ -210,6 +212,7 @@ private actor EPGStagingWorker {
         }
         header.channelCount = channelCount
         header.programmeCount = programmeCount
+        header.coverageEnd = coverageEnd
         try SwiftDataLibraryStore.save(
             .epgStaging,
             context: context,
@@ -289,6 +292,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
     }
     private let epgStagingWorker = EPGStagingWorker()
     private var activeStagingEPGSnapshotIDs: Set<UUID> = []
+    private var pendingCleanupTasks: [UUID: Task<Void, Never>] = [:]
     private var saveFault: LibraryStoreSaveFault?
     private var epgCancellationCheck: @Sendable () throws -> Void = {
         try Task.checkCancellation()
@@ -538,6 +542,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 record.m3uStateRaw = RefreshState.never.rawValue
                 record.m3uErrorSummary = nil
                 record.m3uAttemptID = nil
+                record.m3uFailureCount = nil
             }
             if record.epgURLString != epgURLIdentity.rawValue {
                 oldEPGSnapshotID = record.epgSnapshotID
@@ -547,6 +552,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 record.epgStateRaw = RefreshState.never.rawValue
                 record.epgErrorSummary = nil
                 record.epgAttemptID = nil
+                record.epgFailureCount = nil
             }
             record.name = input.name
             record.m3uURLString = m3uURLIdentity.rawValue
@@ -559,24 +565,17 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             try? cleanupPlaylistSnapshot(id: oldPlaylistSnapshotID)
         }
         if let oldEPGSnapshotID {
-            try? await epgStagingWorker.cleanupEPGSnapshot(
-                id: oldEPGSnapshotID,
-                modelContainer: modelContainer,
-                saveFault: saveFault,
-                saveContextObserver: saveContextObserver
-            )
+            scheduleEPGSnapshotCleanup(id: oldEPGSnapshotID)
         }
     }
 
-    public func deleteProfile(id: UUID) throws {
+    public func deleteProfile(id: UUID) async throws {
+        var oldPlaylistSnapshotID: UUID?
+        var oldEPGSnapshotID: UUID?
         try commitRecoveryChange(.profileDelete) {
             let record = try profileRecord(id: id)
-            if let snapshotID = record.playlistSnapshotID {
-                try deletePlaylistSnapshot(id: snapshotID)
-            }
-            if let snapshotID = record.epgSnapshotID {
-                try deleteEPGSnapshot(id: snapshotID)
-            }
+            oldPlaylistSnapshotID = record.playlistSnapshotID
+            oldEPGSnapshotID = record.epgSnapshotID
             let profileID = id
             for mapping in try modelContext.fetch(FetchDescriptor<ManualEPGMappingRecord>(
                 predicate: #Predicate { $0.sourceProfileID == profileID }
@@ -592,6 +591,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                     .sorted(by: Self.profileOrder)
                 state.activeProfileID = remaining.first?.id
             }
+        }
+        if let oldPlaylistSnapshotID {
+            try? cleanupPlaylistSnapshot(id: oldPlaylistSnapshotID)
+        }
+        if let oldEPGSnapshotID {
+            scheduleEPGSnapshotCleanup(id: oldEPGSnapshotID)
         }
     }
 
@@ -660,8 +665,9 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             ]
         )
         var result: [Channel] = []
+        let decoder = JSONDecoder()
         try modelContext.enumerate(descriptor, batchSize: Self.readBatchSize) { record in
-            result.append(try Self.channel(from: record))
+            result.append(try Self.channel(from: record, decoder: decoder))
         }
         return result
     }
@@ -688,6 +694,15 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
 
     public func epgCoverageEnd(profileID: UUID) throws -> Date? {
         guard let snapshotID = try profileRecord(id: profileID).epgSnapshotID else { return nil }
+        guard let snapshot = try modelContext.fetch(FetchDescriptor<EPGSnapshotRecord>(
+            predicate: #Predicate { $0.id == snapshotID }
+        )).first else {
+            return nil
+        }
+        if let coverageEnd = snapshot.coverageEnd {
+            return coverageEnd
+        }
+        guard snapshot.programmeCount > 0 else { return nil }
         var descriptor = FetchDescriptor<ProgrammeRecord>(
             predicate: #Predicate { $0.snapshotID == snapshotID },
             sortBy: [SortDescriptor(\.stop, order: .reverse)]
@@ -1046,12 +1061,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         }
 
         if let oldSnapshotID, oldSnapshotID != snapshotID {
-            try? await epgStagingWorker.cleanupEPGSnapshot(
-                id: oldSnapshotID,
-                modelContainer: modelContainer,
-                saveFault: saveFault,
-                saveContextObserver: saveContextObserver
-            )
+            scheduleEPGSnapshotCleanup(id: oldSnapshotID)
         }
         return summary
     }
@@ -1108,10 +1118,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 profile.m3uStateRaw = RefreshState.failed.rawValue
                 profile.m3uErrorSummary = truncatedSummary
                 profile.m3uAttemptID = context.attemptID
+                profile.m3uFailureCount = max(0, profile.m3uFailureCount ?? 0) + 1
             case .epg:
                 profile.epgStateRaw = RefreshState.failed.rawValue
                 profile.epgErrorSummary = truncatedSummary
                 profile.epgAttemptID = context.attemptID
+                profile.epgFailureCount = max(0, profile.epgFailureCount ?? 0) + 1
             }
             profile.updatedAt = at
             return true
@@ -1174,10 +1186,12 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 profile.m3uStateRaw = RefreshState.failed.rawValue
                 profile.m3uErrorSummary = truncatedSummary
                 profile.m3uAttemptID = attemptID
+                profile.m3uFailureCount = max(0, profile.m3uFailureCount ?? 0) + 1
             case .epg:
                 profile.epgStateRaw = RefreshState.failed.rawValue
                 profile.epgErrorSummary = truncatedSummary
                 profile.epgAttemptID = attemptID
+                profile.epgFailureCount = max(0, profile.epgFailureCount ?? 0) + 1
             }
             profile.updatedAt = at
         }
@@ -1283,18 +1297,70 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             profile.m3uStateRaw = RefreshState.succeeded.rawValue
             profile.m3uErrorSummary = nil
             profile.m3uAttemptID = attemptID
+            profile.m3uFailureCount = nil
         case .epg:
             profile.epgLastSuccessAt = at
             profile.epgStateRaw = RefreshState.succeeded.rawValue
             profile.epgErrorSummary = nil
             profile.epgAttemptID = attemptID
+            profile.epgFailureCount = nil
         }
         profile.updatedAt = at
     }
 
     private func cleanupPlaylistSnapshot(id: UUID) throws {
-        try commit(.playlistCleanup) {
-            try deletePlaylistSnapshot(id: id)
+        do {
+            // Predicate deletes are immediate and cannot be rolled back, so
+            // injected cleanup failures must happen before the first request.
+            try saveFault?(.playlistCleanup)
+            let snapshotID = id
+            try modelContext.delete(
+                model: ChannelRecord.self,
+                where: #Predicate { $0.snapshotID == snapshotID }
+            )
+            try modelContext.delete(
+                model: PlaylistSnapshotRecord.self,
+                where: #Predicate { $0.id == snapshotID }
+            )
+            saveContextObserver?(LibraryStoreSaveContextObservation(
+                phase: .playlistCleanup,
+                context: modelContext
+            ))
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
+            throw error
+        }
+    }
+
+    private func scheduleEPGSnapshotCleanup(id: UUID) {
+        let taskID = UUID()
+        let worker = epgStagingWorker
+        let modelContainer = modelContainer
+        let saveFault = saveFault
+        let saveContextObserver = saveContextObserver
+        let task = Task(priority: .utility) { [weak self] in
+            try? await worker.cleanupEPGSnapshot(
+                id: id,
+                modelContainer: modelContainer,
+                saveFault: saveFault,
+                saveContextObserver: saveContextObserver
+            )
+            await self?.finishBackgroundCleanup(taskID: taskID)
+        }
+        pendingCleanupTasks[taskID] = task
+    }
+
+    private func finishBackgroundCleanup(taskID: UUID) {
+        pendingCleanupTasks.removeValue(forKey: taskID)
+    }
+
+    func waitForPendingBackgroundCleanup() async {
+        while !pendingCleanupTasks.isEmpty {
+            let tasks = Array(pendingCleanupTasks.values)
+            for task in tasks {
+                await task.value
+            }
         }
     }
 
@@ -1416,46 +1482,6 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         }
     }
 
-    private func deletePlaylistSnapshot(id: UUID) throws {
-        let snapshotID = id
-        for row in try modelContext.fetch(FetchDescriptor<ChannelRecord>(
-            predicate: #Predicate { $0.snapshotID == snapshotID }
-        )) {
-            modelContext.delete(row)
-        }
-        for header in try modelContext.fetch(FetchDescriptor<PlaylistSnapshotRecord>(
-            predicate: #Predicate { $0.id == snapshotID }
-        )) {
-            modelContext.delete(header)
-        }
-    }
-
-    private func deleteEPGSnapshot(id: UUID) throws {
-        try deleteEPGSnapshot(id: id, context: modelContext)
-    }
-
-    private func deleteEPGSnapshot(
-        id: UUID,
-        context: ModelContext
-    ) throws {
-        let snapshotID = id
-        for row in try context.fetch(FetchDescriptor<EPGChannelRecord>(
-            predicate: #Predicate { $0.snapshotID == snapshotID }
-        )) {
-            context.delete(row)
-        }
-        for row in try context.fetch(FetchDescriptor<ProgrammeRecord>(
-            predicate: #Predicate { $0.snapshotID == snapshotID }
-        )) {
-            context.delete(row)
-        }
-        for header in try context.fetch(FetchDescriptor<EPGSnapshotRecord>(
-            predicate: #Predicate { $0.id == snapshotID }
-        )) {
-            context.delete(header)
-        }
-    }
-
     private static func profileOrder(_ lhs: SourceProfileRecord, _ rhs: SourceProfileRecord) -> Bool {
         if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
         return lhs.id.uuidString < rhs.id.uuidString
@@ -1492,27 +1518,32 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
                 lastSuccessAt: record.m3uLastSuccessAt,
                 state: m3uState,
                 errorSummary: record.m3uErrorSummary,
-                attemptID: record.m3uAttemptID
+                attemptID: record.m3uAttemptID,
+                consecutiveFailureCount: max(0, record.m3uFailureCount ?? 0)
             ),
             epgStatus: ResourceRefreshStatus(
                 lastAttemptAt: record.epgLastAttemptAt,
                 lastSuccessAt: record.epgLastSuccessAt,
                 state: epgState,
                 errorSummary: record.epgErrorSummary,
-                attemptID: record.epgAttemptID
+                attemptID: record.epgAttemptID,
+                consecutiveFailureCount: max(0, record.epgFailureCount ?? 0)
             ),
             createdAt: record.createdAt,
             updatedAt: record.updatedAt
         )
     }
 
-    private static func channel(from record: ChannelRecord) throws -> Channel {
+    private static func channel(
+        from record: ChannelRecord,
+        decoder: JSONDecoder
+    ) throws -> Channel {
         guard let streamURL = URL(string: record.streamURLString) else {
             throw LibraryRepositoryError.corruptPersistedField(field: "ChannelRecord.streamURLString")
         }
         let attributes: [String: String]
         do {
-            attributes = try JSONDecoder().decode([String: String].self, from: record.attributesJSON)
+            attributes = try decoder.decode([String: String].self, from: record.attributesJSON)
         } catch {
             throw LibraryRepositoryError.persistedValueDecodingFailed(
                 field: "ChannelRecord.attributesJSON",
@@ -1520,6 +1551,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             )
         }
         return Channel(
+            id: record.stableID,
             sourceProfileID: record.sourceProfileID,
             displayName: record.displayName,
             streamURL: streamURL,

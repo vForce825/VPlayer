@@ -6,23 +6,11 @@ import SwiftUI
 import VPlayerCore
 
 struct ChannelBrowserView: View {
-    @ScaledMetric(relativeTo: .subheadline) private var minimumTileWidth: CGFloat = 300
-    @ScaledMetric(relativeTo: .subheadline) private var maximumTileWidth: CGFloat = 420
     @Bindable var model: AppModel
     @Bindable var browsingSettings: ChannelBrowsingSettingsStore
     @State private var mappingChannel: Channel?
     @State private var searchText = ""
-    @State private var pendingGroupFocusID: String?
-    @FocusState private var focusedElement: ChannelBrowserFocus?
     private let focusPolicy = AcceptanceFocusPolicy.current()
-
-    /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
-    /// columns on a 1080p screen and still degrades gracefully under larger
-    /// dynamic type.
-    private var gridColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: min(minimumTileWidth, 780),
-                            maximum: max(minimumTileWidth, maximumTileWidth)), spacing: 40)]
-    }
 
     var body: some View {
         Group {
@@ -44,28 +32,76 @@ struct ChannelBrowserView: View {
                 )
             case .channels:
                 // Search is only reachable alongside an actual channel list;
-                // the loading and empty states above stay chrome-free. Default
-                // focus is pinned to the first channel so entering the tab
-                // lands on content rather than the search keyboard.
+                // the loading and empty states above stay chrome-free.
+                // Computing presentation in this focus-free parent isolates
+                // O(N) grouping/filtering from D-pad focus updates in the grid.
                 let presentation = ChannelBrowserPresentation(
                     channels: model.channels,
                     searchText: searchText,
                     grouping: browsingSettings.grouping
                 )
-                let defaultFocusElement = defaultFocusElement(
-                    for: presentation.sections,
-                    defaultFocusChannelID: presentation.defaultFocusChannelID
+                ChannelBrowserGridView(
+                    model: model,
+                    presentation: presentation,
+                    searchText: searchText,
+                    focusPolicy: focusPolicy,
+                    mappingChannel: $mappingChannel
                 )
-                channelGrid(
-                    sections: presentation.sections,
-                    showsGroupRail: presentation.showsGroupRail
-                )
-                    .searchable(text: $searchText, prompt: "搜索频道")
-                    .defaultFocus($focusedElement, defaultFocusElement)
+                .searchable(text: $searchText, prompt: "搜索频道")
             }
+        }
+        .onChange(of: model.activeProfile?.id) { _, _ in
+            searchText = ""
         }
         .sheet(item: $mappingChannel) { channel in
             ChannelEPGMappingView(model: model, channel: channel)
+        }
+    }
+
+    private var contentState: ChannelBrowserContentState {
+        ChannelBrowserContentState.resolve(
+            isLoading: model.isLoading,
+            hasActiveProfile: model.activeProfile != nil,
+            hasChannels: !model.channels.isEmpty
+        )
+    }
+}
+
+private struct ChannelBrowserGridView: View {
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
+    @ScaledMetric(relativeTo: .subheadline) private var minimumTileWidth: CGFloat = 300
+    @ScaledMetric(relativeTo: .subheadline) private var maximumTileWidth: CGFloat = 420
+    @Bindable var model: AppModel
+    let presentation: ChannelBrowserPresentation
+    let searchText: String
+    let focusPolicy: AcceptanceFocusPolicy
+    @Binding var mappingChannel: Channel?
+    @State private var pendingGroupFocusID: String?
+    @FocusState private var focusedElement: ChannelBrowserFocus?
+
+    /// Tiles fill the whole canvas: adaptive sizing yields five logo-led
+    /// columns on a 1080p screen and still degrades gracefully under larger
+    /// dynamic type.
+    private var gridColumns: [GridItem] {
+        [GridItem(.adaptive(minimum: min(minimumTileWidth, 780),
+                            maximum: max(minimumTileWidth, maximumTileWidth)), spacing: 40)]
+    }
+
+    var body: some View {
+        let defaultFocusElement = defaultFocusElement(
+            for: presentation.sections,
+            defaultFocusChannelID: presentation.defaultFocusChannelID
+        )
+        channelGrid(
+            sections: presentation.sections,
+            showsGroupRail: presentation.showsGroupRail
+        )
+        .defaultFocus($focusedElement, defaultFocusElement)
+        .onChange(of: focusedElement) { _, newFocus in
+            guard let pendingID = pendingGroupFocusID else { return }
+            if newFocus == .channel(pendingID) || newFocus != nil {
+                pendingGroupFocusID = nil
+            }
         }
     }
 
@@ -81,14 +117,6 @@ struct ChannelBrowserView: View {
             return nil
         }
         return .channel(firstChannelID)
-    }
-
-    private var contentState: ChannelBrowserContentState {
-        ChannelBrowserContentState.resolve(
-            isLoading: model.isLoading,
-            hasActiveProfile: model.activeProfile != nil,
-            hasChannels: !model.channels.isEmpty
-        )
     }
 
     @ViewBuilder
@@ -120,22 +148,45 @@ struct ChannelBrowserView: View {
                         staleEPGBanner(coverageEnd: staleCoverageEnd)
                             .padding(.top, 16)
                     }
-                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 40) {
-                        ForEach(sections) { section in
-                            Section {
-                                ForEach(section.channels) { channel in
-                                    channelCard(for: channel)
-                                }
-                            } header: {
-                                sectionHeader(for: section)
-                            }
-                        }
-                    }
-                    .padding(.vertical, 24)
+                    channelCardsWithSharedClock(sections: sections)
                 }
             }
             .scrollClipDisabled()
         }
+    }
+
+    @ViewBuilder
+    private func channelCardsWithSharedClock(sections: [ChannelSection]) -> some View {
+        if !model.programmesByChannelID.isEmpty && model.presentedPlaybackRequest == nil {
+            TimelineView(
+                .periodic(
+                    from: Date(timeIntervalSinceReferenceDate: 0),
+                    by: prefersReducedResourceUsage ? 120 : 30
+                )
+            ) { context in
+                channelCardsGrid(sections: sections, referenceDate: context.date)
+            }
+        } else {
+            channelCardsGrid(sections: sections, referenceDate: .now)
+        }
+    }
+
+    private func channelCardsGrid(
+        sections: [ChannelSection],
+        referenceDate: Date
+    ) -> some View {
+        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 40) {
+            ForEach(sections) { section in
+                Section {
+                    ForEach(section.channels) { channel in
+                        channelCard(for: channel, referenceDate: referenceDate)
+                    }
+                } header: {
+                    sectionHeader(for: section)
+                }
+            }
+        }
+        .padding(.vertical, 24)
     }
 
     /// Group jumps for playlists too long to reach by scrolling. Selecting a
@@ -154,14 +205,14 @@ struct ChannelBrowserView: View {
                         pendingGroupFocusID = channelID
                         focusedElement = nil
                         proxy.scrollTo(sectionScrollID(for: section), anchor: .top)
-                        // A distant lazy section is realized by `scrollTo` on
-                        // the following layout pass. Move focus after that pass
-                        // and ignore stale jumps if another chip is selected.
+                        // Try focusing after the immediate layout pass if the
+                        // row is already materialized; otherwise keep
+                        // `pendingGroupFocusID` armed so `channelCard.onAppear`
+                        // claims focus once `LazyVGrid` finishes realizing it.
                         Task { @MainActor in
                             await Task.yield()
                             guard pendingGroupFocusID == channelID else { return }
                             focusedElement = .channel(channelID)
-                            pendingGroupFocusID = nil
                         }
                     }
                     .buttonStyle(.bordered)
@@ -179,18 +230,24 @@ struct ChannelBrowserView: View {
         .focusSection()
     }
 
-    private func channelCard(for channel: Channel) -> some View {
+    private func channelCard(for channel: Channel, referenceDate: Date) -> some View {
         Button {
             model.select(channel: channel)
         } label: {
             ChannelCard(
                 channel: channel,
-                programmes: model.programmesByChannelID[channel.id, default: []]
+                programmes: model.programmesByChannelID[channel.id, default: []],
+                referenceDate: referenceDate
             )
         }
         .buttonStyle(.card)
         .accessibilityIdentifier(channelIdentifier(channel))
         .focused($focusedElement, equals: .channel(channel.id))
+        .onAppear {
+            if pendingGroupFocusID == channel.id {
+                focusedElement = .channel(channel.id)
+            }
+        }
         .contextMenu {
             Button("设置 EPG") {
                 mappingChannel = channel

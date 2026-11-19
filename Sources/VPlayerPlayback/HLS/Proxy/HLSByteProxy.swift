@@ -48,6 +48,7 @@ final class HLSProxySession: @unchecked Sendable {
     private let listener: NWListener
     private let queue = DispatchQueue(label: "org.vplayer.byte-proxy")
     private let lock = NSLock()
+    private let upstreamSession = HLSProxyUpstreamSession()
     private let authority: HLSOwnedProxyManifestAuthority?
     private let transport: any HLSResourceTransport
     private let validator: (@Sendable (URL, HLSManifestGraph.Document) async throws -> Void)?
@@ -199,7 +200,8 @@ final class HLSProxySession: @unchecked Sendable {
                 withExtendedLifetime((resource, body)) {}
             } else {
                 let operation = HLSProxyUpstream(resource: resource, method: request.method,
-                    range: try HLSProxyHTTP.validatedRange(request.values(forHeader: "Range").first), connection: connection, transfer: transfer)
+                    range: try HLSProxyHTTP.validatedRange(request.values(forHeader: "Range").first),
+                    connection: connection, transfer: transfer, sharedSession: upstreamSession)
                 connection.installUpstream(operation)
                 try await operation.run()
                 connection.installUpstream(nil)
@@ -223,6 +225,7 @@ final class HLSProxySession: @unchecked Sendable {
                 listener.cancel()
                 for worker in current { worker.cancel() }
                 for worker in current { await worker.joinWork() }
+                await upstreamSession.invalidate()
                 await withCheckedContinuation { continuation in
                     let finished = lock.withLock { () -> Bool in
                         if listenerCancelled { return true }; listenerStopped = continuation; return false

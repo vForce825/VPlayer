@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreGraphics
 import CryptoKit
 import Foundation
 import OSLog
@@ -17,11 +18,26 @@ import VPlayerPlayback
 final class ChannelLogoCache {
     static let shared = ChannelLogoCache()
 
+    private struct NegativeCacheEntry {
+        let recordedAt: Date
+        let expiresAt: Date
+    }
+
+    private enum LoadResult {
+        case loaded(DecodedChannelLogo)
+        case failed(ChannelLogoLoadFailureKind)
+    }
+
     private let memoryCache = NSCache<NSURL, ChannelLogoImage>()
     private let dataLoader: any ChannelLogoDataLoading
     private let imageDecoder: any ChannelLogoImageDecoding
     private let diskCache: ChannelLogoDiskCache?
     private let maximumResponseBytes: Int
+    private let transientNegativeTTL: TimeInterval
+    private let permanentNegativeTTL: TimeInterval
+    private let maximumNegativeCacheEntries: Int
+    private let now: @Sendable () -> Date
+    private var negativeCache: [URL: NegativeCacheEntry] = [:]
     private struct LogoRequest {
         let identifier: UUID
         var waiters: [UUID: CheckedContinuation<ChannelLogoImage?, Never>]
@@ -31,20 +47,25 @@ final class ChannelLogoCache {
     private var inFlight: [URL: LogoRequest] = [:]
 
     init(
-        dataLoader: any ChannelLogoDataLoading = LiveChannelLogoDataLoader(
-            downloader: URLSessionBoundedDownloader(),
-            fileManager: .default
-        ),
+        dataLoader: any ChannelLogoDataLoading = LiveChannelLogoDataLoader.makeFastFail(),
         imageDecoder: any ChannelLogoImageDecoding = ChannelLogoImageDecoder(),
         fileManager: FileManager = .default,
         cacheDirectory: URL? = nil,
         memoryCostLimit: Int = 64 * 1_024 * 1_024,
         diskCapacity: Int = 128 * 1_024 * 1_024,
-        maximumResponseBytes: Int = 8 * 1_024 * 1_024
+        maximumResponseBytes: Int = 8 * 1_024 * 1_024,
+        transientNegativeTTL: TimeInterval = 60,
+        permanentNegativeTTL: TimeInterval = 600,
+        maximumNegativeCacheEntries: Int = 2_048,
+        now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.dataLoader = dataLoader
         self.imageDecoder = imageDecoder
         self.maximumResponseBytes = maximumResponseBytes
+        self.transientNegativeTTL = transientNegativeTTL
+        self.permanentNegativeTTL = permanentNegativeTTL
+        self.maximumNegativeCacheEntries = maximumNegativeCacheEntries
+        self.now = now
         memoryCache.totalCostLimit = memoryCostLimit
         memoryCache.countLimit = 256
 
@@ -67,6 +88,9 @@ final class ChannelLogoCache {
         if let image = memoryCache.object(forKey: url as NSURL) {
             return image
         }
+        if isNegativelyCached(url) {
+            return nil
+        }
         let waiter = UUID()
         let image: ChannelLogoImage? = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -81,8 +105,8 @@ final class ChannelLogoCache {
                     let identifier = UUID()
                     let task = Task { [weak self] in
                         guard let self else { return }
-                        let loaded = await self.loadLogo(for: url)
-                        self.completeLogoRequest(for: url, identifier: identifier, loaded: loaded)
+                        let result = await self.loadLogo(for: url)
+                        self.completeLogoRequest(for: url, identifier: identifier, result: result)
                     }
                     inFlight[url] = LogoRequest(
                         identifier: identifier, waiters: [waiter: continuation], task: task
@@ -110,20 +134,56 @@ final class ChannelLogoCache {
     }
 
     private func completeLogoRequest(
-        for url: URL, identifier: UUID, loaded: DecodedChannelLogo?
+        for url: URL, identifier: UUID, result: LoadResult
     ) {
         guard let request = inFlight[url], request.identifier == identifier else { return }
         inFlight.removeValue(forKey: url)
-        if let loaded {
+        let image: ChannelLogoImage?
+        switch result {
+        case let .loaded(loaded):
+            negativeCache.removeValue(forKey: url)
             memoryCache.setObject(loaded.image, forKey: url as NSURL, cost: loaded.cost)
+            image = loaded.image
+        case let .failed(kind):
+            recordNegativeCache(for: url, kind: kind)
+            image = nil
         }
         for continuation in request.waiters.values {
-            continuation.resume(returning: loaded?.image)
+            continuation.resume(returning: image)
         }
     }
 
     func memoryCachedImage(for url: URL) -> ChannelLogoImage? {
         memoryCache.object(forKey: url as NSURL)
+    }
+
+    /// Reads an already cached logo from memory or disk without issuing any
+    /// network request. Used by Now Playing artwork loading.
+    func diskCachedImage(for url: URL) async -> ChannelLogoImage? {
+        if let image = memoryCache.object(forKey: url as NSURL) {
+            return image
+        }
+        guard !Task.isCancelled, let diskCache else { return nil }
+        let diskKey = Self.diskKey(for: url)
+        guard let data = await diskCache.data(
+            forKey: diskKey,
+            maximumByteCount: maximumResponseBytes
+        ), !Task.isCancelled else {
+            return nil
+        }
+        guard let decoded = await decode(data) else {
+            if !Task.isCancelled {
+                await diskCache.removeData(forKey: diskKey)
+            }
+            return nil
+        }
+        guard !Task.isCancelled else { return nil }
+        memoryCache.setObject(decoded.image, forKey: url as NSURL, cost: decoded.cost)
+        return decoded.image
+    }
+
+    func cachedCGImage(for url: URL) async -> CGImage? {
+        await diskCachedImage(for: url)?.logoCGImage
     }
 
     static func defaultCacheDirectory(
@@ -140,32 +200,79 @@ final class ChannelLogoCache {
             .appendingPathComponent("ChannelLogos", isDirectory: true)
     }
 
-    private func loadLogo(for url: URL) async -> DecodedChannelLogo? {
-        guard !Task.isCancelled else { return nil }
+    private func isNegativelyCached(_ url: URL) -> Bool {
+        guard let entry = negativeCache[url] else { return false }
+        if entry.expiresAt > now() {
+            return true
+        }
+        negativeCache.removeValue(forKey: url)
+        return false
+    }
+
+    private func recordNegativeCache(for url: URL, kind: ChannelLogoLoadFailureKind) {
+        let ttl: TimeInterval
+        switch kind {
+        case .cancelled:
+            return
+        case .transient:
+            ttl = transientNegativeTTL
+        case .permanent:
+            ttl = permanentNegativeTTL
+        }
+        guard ttl > 0, maximumNegativeCacheEntries > 0 else { return }
+        let currentDate = now()
+        if negativeCache[url] == nil, negativeCache.count >= maximumNegativeCacheEntries {
+            negativeCache = negativeCache.filter { $0.value.expiresAt > currentDate }
+            if negativeCache.count >= maximumNegativeCacheEntries {
+                let overflowCount = negativeCache.count - maximumNegativeCacheEntries + 1
+                let keysToEvict = negativeCache
+                    .sorted { $0.value.recordedAt < $1.value.recordedAt }
+                    .prefix(overflowCount)
+                    .map(\.key)
+                for key in keysToEvict {
+                    negativeCache.removeValue(forKey: key)
+                }
+            }
+        }
+        negativeCache[url] = NegativeCacheEntry(
+            recordedAt: currentDate,
+            expiresAt: currentDate.addingTimeInterval(ttl)
+        )
+    }
+
+    private func loadLogo(for url: URL) async -> LoadResult {
+        guard !Task.isCancelled else { return .failed(.cancelled) }
         let diskKey = Self.diskKey(for: url)
         if let diskCache,
            let data = await diskCache.data(
             forKey: diskKey,
             maximumByteCount: maximumResponseBytes
         ) {
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled else { return .failed(.cancelled) }
             if let decoded = await decode(data) {
-                return Task.isCancelled ? nil : decoded
+                return Task.isCancelled ? .failed(.cancelled) : .loaded(decoded)
             }
-            guard !Task.isCancelled else { return nil }
+            guard !Task.isCancelled else { return .failed(.cancelled) }
             await diskCache.removeData(forKey: diskKey)
         }
 
-        guard !Task.isCancelled,
-              let data = await dataLoader.data(
+        guard !Task.isCancelled else { return .failed(.cancelled) }
+        let dataResult = await dataLoader.loadData(
             for: url,
             maximumByteCount: maximumResponseBytes
-        ),
-              !Task.isCancelled,
-              let decoded = await decode(data),
-              !Task.isCancelled else {
-            return nil
+        )
+        guard !Task.isCancelled else { return .failed(.cancelled) }
+        let data: Data
+        switch dataResult {
+        case let .data(loadedData):
+            data = loadedData
+        case let .failed(kind):
+            return .failed(kind)
         }
+        guard let decoded = await decode(data) else {
+            return Task.isCancelled ? .failed(.cancelled) : .failed(.permanent)
+        }
+        guard !Task.isCancelled else { return .failed(.cancelled) }
         if let diskCache {
             await diskCache.store(
                 data,
@@ -173,7 +280,7 @@ final class ChannelLogoCache {
                 maximumByteCount: maximumResponseBytes
             )
         }
-        return Task.isCancelled ? nil : decoded
+        return Task.isCancelled ? .failed(.cancelled) : .loaded(decoded)
     }
 
     private func decode(_ data: Data) async -> DecodedChannelLogo? {
@@ -370,6 +477,7 @@ private func makeProductionLibraryRuntime(
             try await repository.recoverInterruptedRefreshes()
         },
         maintenance: {
+            URLSessionBoundedDownloader.purgeOrphanedDownloads()
             try await repository.purgeUnreferencedSnapshots()
         }
     )
@@ -391,7 +499,8 @@ final class LiveAppBootstrap {
             await MainActor.run {
                 libraryChanges?.notify(
                     profileID: profileID,
-                    resource: outcome.resource
+                    resource: outcome.resource,
+                    includesSnapshotData: outcome.succeeded
                 )
             }
         }
@@ -613,7 +722,8 @@ struct AppDependencies {
                     await MainActor.run {
                         libraryChanges?.notify(
                             profileID: profileID,
-                            resource: outcome.resource
+                            resource: outcome.resource,
+                            includesSnapshotData: outcome.succeeded
                         )
                     }
                 },
@@ -685,7 +795,8 @@ struct AppDependencies {
                     await MainActor.run {
                         libraryChanges?.notify(
                             profileID: profileID,
-                            resource: outcome.resource
+                            resource: outcome.resource,
+                            includesSnapshotData: outcome.succeeded
                         )
                     }
                 },
@@ -943,7 +1054,8 @@ struct AppDependencies {
                 await MainActor.run {
                     libraryChanges.notify(
                         profileID: profileID,
-                        resource: resource
+                        resource: resource,
+                        includesSnapshotData: outcome.succeeded
                     )
                 }
             }

@@ -236,6 +236,40 @@ final class NowPlayingIntegrationTests: XCTestCase {
         coordinator.end(owner: secondToken)
     }
 
+    func testArtworkProviderResolvesCachedLogoLazilyWithoutMainActorEncoding() async throws {
+        let logoURL = try XCTUnwrap(URL(string: "https://example.invalid/logo.png"))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: 4,
+            height: 4,
+            bitsPerComponent: 8,
+            bytesPerRow: 16,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        let cgImage = try XCTUnwrap(context.makeImage())
+        let resolvedCount = NowPlayingArtworkCallCounter()
+        let target = TestNowPlayingTarget()
+        let model = PlaybackNowPlayingModel(
+            owner: target,
+            presentation: .init(request: request("Channel"), logoURL: logoURL, programmes: []),
+            cachedLogoProvider: { requestedURL in
+                XCTAssertEqual(requestedURL, logoURL)
+                resolvedCount.increment()
+                return cgImage
+            }
+        )
+
+        let content = try XCTUnwrap(model.content as? GenericContent)
+        XCTAssertNotNil(content.artwork)
+        XCTAssertEqual(
+            resolvedCount.value,
+            0,
+            "Artwork provider must not eagerly decode or encode on MainActor during init"
+        )
+    }
+
     private func eventually(_ predicate: @escaping @MainActor () -> Bool) async throws {
         for _ in 0..<200 {
             if predicate() { return }
@@ -333,4 +367,12 @@ private actor TestNowPlayingEngine: PlaybackEngine {
         if let request { emit(paused ? .paused(request) : .playing(request)) }
     }
     func stop() async { stopCount += 1; emit(.stopped) }
+}
+
+private final class NowPlayingArtworkCallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = 0
+
+    var value: Int { lock.withLock { storage } }
+    func increment() { lock.withLock { storage += 1 } }
 }

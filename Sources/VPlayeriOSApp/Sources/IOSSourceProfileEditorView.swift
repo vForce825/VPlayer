@@ -54,7 +54,9 @@ struct IOSSourceProfileEditorView: View {
                     Button("取消") {
                         if profile == nil { model.cancelCreateAttempt(attempt) }
                         dismiss()
-                    }.accessibilityIdentifier("source.editor.cancel")
+                    }
+                    .disabled(isSaving)
+                    .accessibilityIdentifier("source.editor.cancel")
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(isSaving ? "保存中…" : "保存", action: save)
@@ -62,6 +64,7 @@ struct IOSSourceProfileEditorView: View {
                 }
             }
         }
+        .interactiveDismissDisabled(isSaving)
         .onDisappear { if profile == nil { model.cancelCreateAttempt(attempt) } }
     }
 

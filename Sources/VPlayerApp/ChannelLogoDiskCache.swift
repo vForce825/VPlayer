@@ -14,6 +14,8 @@ actor ChannelLogoDiskCache {
     private let directory: URL
     private let capacity: Int
     private let fileManager: FileManager
+    private let modificationDateRefreshInterval: TimeInterval
+    private let now: @Sendable () -> Date
     private var knownTotalSize: Int?
     private var storesSinceScan = 0
     private let reconciliationInterval = 32
@@ -21,11 +23,15 @@ actor ChannelLogoDiskCache {
     init(
         directory: URL,
         capacity: Int,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        modificationDateRefreshInterval: TimeInterval = 3_600,
+        now: @escaping @Sendable () -> Date = Date.init
     ) throws {
         self.directory = directory
         self.capacity = capacity
         self.fileManager = fileManager
+        self.modificationDateRefreshInterval = modificationDateRefreshInterval
+        self.now = now
         try fileManager.createDirectory(
             at: directory,
             withIntermediateDirectories: true
@@ -33,28 +39,76 @@ actor ChannelLogoDiskCache {
     }
 
     func data(forKey key: String, maximumByteCount: Int) -> Data? {
+        guard maximumByteCount >= 0 else { return nil }
         let fileURL = fileURL(forKey: key)
-        let keys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey]
-        guard maximumByteCount >= 0,
-              let values = try? fileURL.resourceValues(forKeys: keys),
-              values.isRegularFile == true,
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .fileSizeKey,
+            .contentModificationDateKey,
+        ]
+        let values: URLResourceValues
+        do {
+            values = try fileURL.resourceValues(forKeys: keys)
+        } catch {
+            if Self.isNoSuchFileError(error) {
+                return nil
+            }
+            removeData(forKey: key)
+            return nil
+        }
+        guard values.isRegularFile == true,
               let fileSize = values.fileSize,
               fileSize >= 0,
               fileSize <= maximumByteCount else {
             removeData(forKey: key)
             return nil
         }
-        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe),
-              data.count == fileSize,
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+        } catch {
+            if Self.isNoSuchFileError(error) {
+                return nil
+            }
+            removeData(forKey: key)
+            return nil
+        }
+        guard data.count == fileSize,
               data.count <= maximumByteCount else {
             removeData(forKey: key)
             return nil
         }
-        try? fileManager.setAttributes(
-            [.modificationDate: Date()],
-            ofItemAtPath: fileURL.path
-        )
+        let currentDate = now()
+        let shouldTouchModificationDate: Bool
+        if let modificationDate = values.contentModificationDate {
+            shouldTouchModificationDate =
+                currentDate.timeIntervalSince(modificationDate) >= modificationDateRefreshInterval
+        } else {
+            shouldTouchModificationDate = true
+        }
+        if shouldTouchModificationDate {
+            try? fileManager.setAttributes(
+                [.modificationDate: currentDate],
+                ofItemAtPath: fileURL.path
+            )
+        }
         return data
+    }
+
+    private static func isNoSuchFileError(_ error: any Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain,
+           nsError.code == NSFileReadNoSuchFileError || nsError.code == NSFileNoSuchFileError {
+            return true
+        }
+        if nsError.domain == NSPOSIXErrorDomain,
+           nsError.code == Int(POSIXErrorCode.ENOENT.rawValue) {
+            return true
+        }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+            return isNoSuchFileError(underlying)
+        }
+        return false
     }
 
     func store(_ data: Data, forKey key: String, maximumByteCount: Int) {

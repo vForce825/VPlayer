@@ -265,22 +265,23 @@ final class EPGMatcherTests: XCTestCase {
                 path: "cancel/\(index)"
             )
         }
+        let epgChannels = [EPGChannel(id: "other", displayNames: ["Other"], iconURL: nil)]
         var cancellationCheckCount = 0
 
         XCTAssertThrowsError(try EPGMatcher.matches(
             channels: channels,
-            epgChannels: [],
+            epgChannels: epgChannels,
             manualMappingsByChannelID: [:],
             cancellationCheck: {
                 cancellationCheckCount += 1
-                if cancellationCheckCount == 3 {
+                if cancellationCheckCount == 12 {
                     throw ExpectedCancellation.cancelled
                 }
             }
         )) { error in
             XCTAssertTrue(error is ExpectedCancellation)
         }
-        XCTAssertEqual(cancellationCheckCount, 3)
+        XCTAssertEqual(cancellationCheckCount, 12)
     }
 
     func testFuzzyMatchingBoundsNormalizedUTF8WorkWithoutTruncatingExactNames() {
@@ -333,30 +334,82 @@ final class EPGMatcherTests: XCTestCase {
     func testCancellationCanInterruptSignaturesWithinOneEPGName() {
         var checks = 0
         XCTAssertThrowsError(try EPGMatcher.matches(
-            channels: [],
+            channels: [makeChannel(tvgID: nil, tvgName: "Unmatched Channel")],
             epgChannels: [EPGChannel(
                 id: "one", displayNames: [String(repeating: "a", count: 128)], iconURL: nil
             )],
             manualMappingsByChannelID: [:],
             cancellationCheck: {
                 checks += 1
-                if checks == 20 { throw CancellationError() }
+                if checks == 30 { throw CancellationError() }
             }
         )) { XCTAssertTrue($0 is CancellationError) }
-        XCTAssertEqual(checks, 20)
+        XCTAssertEqual(checks, 30)
     }
 
     func testCancellationCanInterruptSignaturesWithinOnePlaylistName() {
         var checks = 0
         XCTAssertThrowsError(try EPGMatcher.matches(
             channels: [makeChannel(tvgID: nil, tvgName: String(repeating: "a", count: 128))],
-            epgChannels: [], manualMappingsByChannelID: [:],
+            epgChannels: [EPGChannel(id: "other", displayNames: ["Other"], iconURL: nil)],
+            manualMappingsByChannelID: [:],
             cancellationCheck: {
                 checks += 1
-                if checks == 20 { throw CancellationError() }
+                if checks == 35 { throw CancellationError() }
             }
         )) { XCTAssertTrue($0 is CancellationError) }
-        XCTAssertEqual(checks, 20)
+        XCTAssertEqual(checks, 35)
+    }
+
+    func testBatchMatcherEarlyReturnsEmptyWhenChannelsOrEPGChannelsAreEmpty() {
+        var checks = 0
+        let emptyEPG = EPGMatcher.matches(
+            channels: [makeChannel(tvgID: "one", tvgName: "One")],
+            epgChannels: [],
+            manualMappingsByChannelID: [:],
+            cancellationCheck: { checks += 1 }
+        )
+        XCTAssertTrue(emptyEPG.isEmpty)
+        XCTAssertEqual(checks, 1)
+
+        checks = 0
+        let emptyChannels = EPGMatcher.matches(
+            channels: [],
+            epgChannels: [EPGChannel(id: "one", displayNames: [String(repeating: "a", count: 128)], iconURL: nil)],
+            manualMappingsByChannelID: [:],
+            cancellationCheck: { checks += 1 }
+        )
+        XCTAssertTrue(emptyChannels.isEmpty)
+        XCTAssertEqual(checks, 1)
+    }
+
+    func testBatchMatcherSkipsFuzzyIndexBuildWhenAllChannelsMatchDirectly() {
+        let epgChannels = (0..<20).map { index in
+            EPGChannel(
+                id: "guide-\(index)",
+                displayNames: [String(repeating: "a", count: 100) + "\(index)"],
+                iconURL: nil
+            )
+        }
+        let channels = [
+            makeChannel(tvgID: "guide-0", tvgName: nil, path: "id-hit"),
+            makeChannel(
+                tvgID: nil,
+                tvgName: String(repeating: "a", count: 100) + "1",
+                path: "name-hit"
+            )
+        ]
+        var checks = 0
+        let results = EPGMatcher.matches(
+            channels: channels,
+            epgChannels: epgChannels,
+            manualMappingsByChannelID: [:],
+            cancellationCheck: { checks += 1 }
+        )
+        XCTAssertEqual(results[channels[0].id], .matched(xmltvChannelID: "guide-0", method: .exactID))
+        XCTAssertEqual(results[channels[1].id], .matched(xmltvChannelID: "guide-1", method: .exactName))
+        // 若预先构建 20 个 101 字符名称的模糊删除索引，会产生 >2,000 次取消检查。
+        XCTAssertLessThan(checks, 200)
     }
 
     func testNormalizerPrecomposesAndRemovesFormattingCharacters() {

@@ -5147,6 +5147,230 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(model.alertTitle, "操作失败")
     }
 
+    func testManualRefreshDoesNotTriggerRedundantSecondReload() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: "ch1",
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [channel]]
+        )
+        let changes = LibraryChangeSignal()
+        let model = AppModel(
+            repository: repository,
+            refresh: { profileID, resources, _ in
+                var outcomes: [RefreshOutcome] = []
+                for resource in resources {
+                    let attemptID = UUID()
+                    try? await repository.recordSuccess(
+                        profileID: profileID,
+                        resource: resource,
+                        at: now,
+                        attemptID: attemptID
+                    )
+                    let outcome = RefreshOutcome(
+                        resource: resource,
+                        succeeded: true,
+                        message: nil,
+                        attemptID: attemptID
+                    )
+                    outcomes.append(outcome)
+                    await MainActor.run {
+                        changes.notify(
+                            profileID: profileID,
+                            resource: resource,
+                            includesSnapshotData: outcome.succeeded
+                        )
+                    }
+                }
+                return outcomes
+            },
+            libraryChanges: changes,
+            now: { now }
+        )
+
+        await model.reload()
+        let baseline = await repository.snapshot()
+        XCTAssertEqual(baseline.profileLookupCount, 1)
+        XCTAssertEqual(baseline.channelLookupCount, 1)
+
+        await model.refresh(profileID: profile.id, resource: .epg)
+        for _ in 0..<20 { await Task.yield() }
+        let afterEPG = await repository.snapshot()
+        XCTAssertEqual(
+            afterEPG.profileLookupCount,
+            baseline.profileLookupCount + 1,
+            "Manual EPG refresh must perform only one scoped reload"
+        )
+        XCTAssertEqual(
+            afterEPG.channelLookupCount,
+            baseline.channelLookupCount,
+            "Manual EPG refresh must not re-read channels"
+        )
+
+        await model.refresh(profileID: profile.id, resource: .playlist)
+        for _ in 0..<20 { await Task.yield() }
+        let afterPlaylist = await repository.snapshot()
+        XCTAssertEqual(
+            afterPlaylist.profileLookupCount,
+            afterEPG.profileLookupCount + 1,
+            "Manual playlist refresh must perform only one reload without a redundant follow-up"
+        )
+        XCTAssertEqual(
+            afterPlaylist.channelLookupCount,
+            afterEPG.channelLookupCount + 1
+        )
+    }
+
+    func testFailedRefreshNotificationOnlyReloadsProfilesWithoutRereadingChannels() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Source",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: "ch1",
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [channel]]
+        )
+        let changes = LibraryChangeSignal()
+        let (processedChanges, processedContinuation) = AsyncStream.makeStream(
+            of: AppModel.ProcessedLibraryChange.self
+        )
+        defer { processedContinuation.finish() }
+        var processedIterator = processedChanges.makeAsyncIterator()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, resources, _ in
+                resources.map {
+                    RefreshOutcome(resource: $0, succeeded: false, message: "连接失败")
+                }
+            },
+            libraryChanges: changes,
+            libraryChangeProcessed: { processed in
+                processedContinuation.yield(processed)
+            },
+            now: { now }
+        )
+
+        await model.reload()
+        let baseline = await repository.snapshot()
+
+        try? await repository.recordFailure(
+            profileID: profile.id,
+            resource: .playlist,
+            summary: "连接失败",
+            at: now,
+            attemptID: UUID()
+        )
+        changes.notify(profileID: profile.id, resource: .playlist, includesSnapshotData: false)
+        _ = await processedIterator.next()
+
+        let afterFailure = await repository.snapshot()
+        XCTAssertEqual(afterFailure.profileLookupCount, baseline.profileLookupCount + 1)
+        XCTAssertEqual(
+            afterFailure.channelLookupCount,
+            baseline.channelLookupCount,
+            "Failed refresh status notification must not reload channels"
+        )
+        XCTAssertEqual(model.activeProfile?.m3uStatus.state, .failed)
+    }
+
+    func testDeleteProfileCancelsAutomaticRefreshAndClearsManualRefreshState() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let repository = RepositorySpy(profiles: [])
+        let changes = LibraryChangeSignal()
+        let refreshGate = AppModelPersistedOutcomeGate()
+        let model = AppModel(
+            repository: repository,
+            refresh: { _, resources, _ in
+                await refreshGate.suspend()
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            libraryChanges: changes,
+            now: { now }
+        )
+
+        await model.reload()
+        let created = await model.create(
+            input: SourceProfileInput(
+                name: "Transient",
+                m3uURLString: "https://example.test/list.m3u",
+                epgURLString: "https://example.test/epg.xml",
+                m3uRefreshInterval: .manual,
+                epgRefreshInterval: .manual
+            ),
+            attemptID: UUID()
+        )
+        XCTAssertTrue(created)
+        let profileID = try XCTUnwrap(model.profiles.first?.id)
+        await refreshGate.waitUntilSuspended()
+
+        let deleted = await model.delete(profileID: profileID)
+        XCTAssertTrue(deleted)
+        XCTAssertTrue(model.profiles.isEmpty)
+
+        await refreshGate.release()
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertTrue(model.profiles.isEmpty)
+        XCTAssertNil(model.activeProfile)
+    }
+
+    func testActivatingAlreadyActiveHealthyProfileIsNoOpAndPreservesPlayback() async {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        let profile = makeProfile(
+            id: "00000000-0000-0000-0000-000000000001",
+            name: "Active",
+            now: now
+        )
+        let channel = makeChannel(
+            profileID: profile.id,
+            url: "https://example.test/live",
+            tvgID: nil,
+            order: 0
+        )
+        let repository = RepositorySpy(
+            profiles: [profile],
+            activeProfileID: profile.id,
+            channels: [profile.id: [channel]]
+        )
+        let model = AppModel(repository: repository, refresh: { _, _, _ in [] }, now: { now })
+
+        await model.reload()
+        model.select(channel: channel)
+        let playbackRequest = model.presentedPlaybackRequest
+        XCTAssertNotNil(playbackRequest)
+        let baseline = await repository.snapshot()
+
+        let activated = await model.activate(profileID: profile.id)
+        XCTAssertTrue(activated)
+        XCTAssertEqual(model.channels, [channel])
+        XCTAssertEqual(model.presentedPlaybackRequest, playbackRequest)
+        let after = await repository.snapshot()
+        XCTAssertEqual(after.profileLookupCount, baseline.profileLookupCount)
+        XCTAssertEqual(after.channelLookupCount, baseline.channelLookupCount)
+        XCTAssertTrue(after.operationEvents.isEmpty)
+    }
+
     private func eventually(
         _ condition: @escaping @MainActor () -> Bool,
         file: StaticString = #filePath,

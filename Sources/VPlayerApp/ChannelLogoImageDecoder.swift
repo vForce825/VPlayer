@@ -12,10 +12,19 @@ extension NSImage {
         guard let tiffRepresentation, let bitmap = NSBitmapImageRep(data: tiffRepresentation) else { return nil }
         return bitmap.representation(using: .png, properties: [:])
     }
+
+    var logoCGImage: CGImage? {
+        cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
 }
 #else
 import UIKit
 typealias ChannelLogoImage = UIImage
+extension UIImage {
+    var logoCGImage: CGImage? {
+        cgImage
+    }
+}
 #endif
 
 struct DecodedChannelLogo: @unchecked Sendable {
@@ -68,6 +77,7 @@ struct ChannelLogoImageDecoder: ChannelLogoImageDecoding {
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: thumbnailMaxPixelSize,
+            kCGImageSourceShouldCacheImmediately: true,
         ] as CFDictionary
         guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(
             source,

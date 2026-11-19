@@ -77,6 +77,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var pauseTask: Task<Void, Never>?
     @ObservationIgnored private var pauseWorkerTask: Task<Void, Never>?
     @ObservationIgnored private var pauseWorkerID: UUID?
+    @ObservationIgnored private var playbackControlMessageDismissTask: Task<Void, Never>?
+    private let playbackControlMessageDuration: Duration
     private var stopTask: Task<Void, Never>?
     private var lifecycleGeneration: UInt64 = 0
     private var playbackGeneration: UInt64 = 0
@@ -89,6 +91,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     private var awaitingAuthoritativePause: Bool?
     private var acceptsAuthoritativePauseState = false
     private var receivedRequestState = false
+    private var hasDispatchedPlay = false
     private var hasEstablishedPlayback = false
     private var started = false
     private var stopped = false
@@ -138,7 +141,8 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         settings: PlaybackSettingsStore,
         initialPresentationConsumerGeneration: UInt64 = 0,
         nowPlaying: PlaybackNowPlayingCoordinator? = nil,
-        channelPresentation: PlayerChannelPresentation? = nil
+        channelPresentation: PlayerChannelPresentation? = nil,
+        playbackControlMessageDuration: Duration = .seconds(4)
     ) {
         self.request = request
         self.engine = engine
@@ -150,11 +154,13 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         self.settings = settings
         self.nowPlaying = nowPlaying
         self.channelPresentation = channelPresentation ?? .init(request: request, logoURL: nil, programmes: [])
+        self.playbackControlMessageDuration = playbackControlMessageDuration
         presentationConsumerGeneration = initialPresentationConsumerGeneration
     }
 
     deinit {
         pauseWorkerTask?.cancel()
+        playbackControlMessageDismissTask?.cancel()
         if let nowPlayingOwnerID {
             let nowPlaying = nowPlaying
             Task { @MainActor [weak nowPlaying] in
@@ -199,6 +205,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         resetMediaInformation()
         resetPauseIntent()
         receivedRequestState = false
+        hasDispatchedPlay = false
         started = true
         nowPlayingOwnerID = nowPlaying?.begin(owner: self, presentation: channelPresentation)
         playbackGeneration &+= 1
@@ -209,17 +216,26 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             let states = await engine.events()
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             stateTask = Task { [weak self] in
+                var awaitingInitialEvent = true
                 for await state in states {
+                    let isInitialEvent = awaitingInitialEvent
+                    awaitingInitialEvent = false
                     guard let self,
                           !Task.isCancelled,
                           isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-                    self.apply(state)
+                    self.apply(state, isInitialEvent: isInitialEvent)
                 }
             }
             await playWithMediaInformation(lifecycle: lifecycle, playback: playback)
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             await beginPresentationLookup(lifecycle: lifecycle, playback: playback)
         }
+    }
+
+    func clearPlaybackControlMessage() {
+        playbackControlMessageDismissTask?.cancel()
+        playbackControlMessageDismissTask = nil
+        playbackControlMessage = nil
     }
 
     func togglePause() {
@@ -259,7 +275,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
     }
 
     private func enqueuePause(_ paused: Bool) {
-        playbackControlMessage = nil
+        clearPlaybackControlMessage()
         desiredPaused = paused
         let command = PendingPauseCommand(id: UUID(), target: paused)
         if pauseWorkerTask != nil, pauseTask == nil {
@@ -336,6 +352,11 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         playbackGeneration &+= 1
         resetPauseIntent()
         receivedRequestState = false
+        hasDispatchedPlay = false
+        state = .preparing(request)
+        if let nowPlayingOwnerID {
+            nowPlaying?.update(.preparing(request), owner: nowPlayingOwnerID)
+        }
         let lifecycle = lifecycleGeneration
         let playback = playbackGeneration
         let predecessor = playbackTask
@@ -348,11 +369,14 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
             stateTask?.cancel()
             stateTask = Task { [weak self] in
+                var awaitingInitialEvent = true
                 for await state in states {
+                    let isInitialEvent = awaitingInitialEvent
+                    awaitingInitialEvent = false
                     guard let self,
                           !Task.isCancelled,
                           isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-                    self.apply(state)
+                    self.apply(state, isInitialEvent: isInitialEvent)
                 }
             }
             await playWithMediaInformation(lifecycle: lifecycle, playback: playback)
@@ -395,6 +419,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         mediaInformationProviderTask = nil
         mediaInformationTask = nil
         mediaInformationPreparationBegan = false
+        hasDispatchedPlay = false
         resetPauseIntent()
         stateTask = nil
         self.mediaInformation = nil
@@ -725,9 +750,15 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
                 await self?.beginMediaInformationSubscription(lifecycle: lifecycle, playback: playback,
                                                               afterPreparationReset: true)
             }
+            if isCurrent(lifecycle: lifecycle, playback: playback) {
+                hasDispatchedPlay = true
+            }
         } else {
             // Compatibility engines do not expose their clear boundary.
             await engine.play(request)
+            if isCurrent(lifecycle: lifecycle, playback: playback) {
+                hasDispatchedPlay = true
+            }
             beginMediaInformationSubscription(lifecycle: lifecycle, playback: playback)
         }
     }
@@ -738,7 +769,10 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         afterPreparationReset: Bool = false
     ) {
         guard isCurrent(lifecycle: lifecycle, playback: playback) else { return }
-        if afterPreparationReset { mediaInformationPreparationBegan = true }
+        if afterPreparationReset {
+            mediaInformationPreparationBegan = true
+            hasDispatchedPlay = true
+        }
         let provider = mediaInformationProvider
         mediaInformationProviderTask = Task { [weak self] in
             let mediaStream = await provider()
@@ -763,7 +797,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         return playback.map { playbackGeneration == $0 } ?? true
     }
 
-    private func apply(_ newState: PlaybackState) {
+    private func apply(_ newState: PlaybackState, isInitialEvent: Bool = false) {
         switch newState {
         case let .preparing(eventRequest), let .buffering(eventRequest), let .recovering(eventRequest),
              let .playing(eventRequest), let .paused(eventRequest):
@@ -775,7 +809,13 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             if mediaInformationPreparationBegan, mediaInformationProviderTask == nil, mediaInformationTask == nil {
                 beginMediaInformationSubscription(lifecycle: lifecycleGeneration, playback: playbackGeneration)
             }
-        case .idle, .stopped, .failed: break
+        case .failed:
+            // Ignore a shared engine's initial replayed terminal failure from a
+            // previous request before this request has started or dispatched play.
+            if isInitialEvent && !hasDispatchedPlay && !receivedRequestState {
+                return
+            }
+        case .idle, .stopped: break
         }
         state = newState
         if let nowPlayingOwnerID {
@@ -793,7 +833,7 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
             acceptsAuthoritativePauseState = true
             if pendingPauseCommands.isEmpty, awaitingAuthoritativePause == nil { desiredPaused = false }
         case .playing:
-            playbackControlMessage = nil
+            clearPlaybackControlMessage()
             hasEstablishedPlayback = true
             applyAuthoritativePauseState(false)
         case .paused:
@@ -852,9 +892,9 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
                 switch result {
                 case .rejected(.audioInterruption):
                     // 恢复中的暂停按钮仍用于取消自动恢复；拒绝播放不能反转它的动作。
-                    playbackControlMessage = "上次播放被系统音频中断阻止，请在中断结束后重试。"
+                    setPlaybackControlMessage("上次播放被系统音频中断阻止，请在中断结束后重试。")
                 case .rejected(.unavailable):
-                    playbackControlMessage = "上次操作未能完成，请重试。"
+                    setPlaybackControlMessage("上次操作未能完成，请重试。")
                 case .superseded, .accepted: break
                 }
             }
@@ -888,12 +928,28 @@ final class FullScreenPlayerViewModel: NowPlayingPlaybackTarget {
         pauseTask?.cancel()
         pauseTask = nil
         desiredPaused = false
-        playbackControlMessage = nil
+        clearPlaybackControlMessage()
         hasEstablishedPlayback = false
         pendingPauseCommands.removeAll()
         dispatchedPauseCommandID = nil
         awaitingAuthoritativePause = nil
         acceptsAuthoritativePauseState = false
+    }
+
+    private func setPlaybackControlMessage(_ message: String) {
+        playbackControlMessageDismissTask?.cancel()
+        playbackControlMessage = message
+        let duration = playbackControlMessageDuration
+        playbackControlMessageDismissTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: duration)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled, self.playbackControlMessage == message else { return }
+            self.playbackControlMessage = nil
+            self.playbackControlMessageDismissTask = nil
+        }
     }
 
     private func resetMediaInformation(preservingPreparationBoundary: Bool = false) {

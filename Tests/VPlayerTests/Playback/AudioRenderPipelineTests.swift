@@ -2050,6 +2050,47 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
         )])
     }
 
+    func testPreFloorUnsentReplayEntriesCanBeEvictedDuringClosedRecovery() throws {
+        let limits = try CompressedAudioRetentionLimits(
+            maximumCount: 10,
+            maximumOwnedBytes: 9,
+            latestTailHorizon: CMTime(value: 12, timescale: 1)
+        )
+        let harness = try makeHarness(
+            replayRetentionLimits: limits,
+            replayHardCount: 10
+        )
+        let renderer = try XCTUnwrap(harness.renderers.snapshot.first)
+        renderer.configureReadiness(ready: false)
+
+        try perform(on: harness.executor) {
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 1,
+                pts: CMTime(value: 0, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1),
+                payloadBytes: 4
+            ))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 2,
+                pts: CMTime(value: 1, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1),
+                payloadBytes: 4
+            ))
+            // Advance recovery floor past sample 1 ([0..1]); sample 1 can never be
+            // played after reopening readiness and must be evicted to make room for sample 3.
+            harness.pipeline.updateRecoveryFloor(CMTime(value: 3, timescale: 2))
+            try harness.pipeline.enqueue(try self.makeSample(
+                id: 3,
+                pts: CMTime(value: 2, timescale: 1),
+                duration: CMTime(value: 1, timescale: 1),
+                payloadBytes: 4
+            ))
+            XCTAssertEqual(harness.pipeline.retainedReplaySampleIDs, [2, 3])
+            XCTAssertEqual(harness.pipeline.retainedReplayPayloadBytes, 8)
+        }
+        XCTAssertTrue(harness.failures.snapshot.isEmpty)
+    }
+
     func testReplaySoftCountAllowsMandatoryWorkOnlyUntilInjectedHardCount() throws {
         let limits = try CompressedAudioRetentionLimits(
             maximumCount: 2,
@@ -6043,6 +6084,60 @@ final class AudioRenderPipelineTests: XCTestCase, @unchecked Sendable {
             )
             XCTAssertEqual(try decoder.push(makeSample(id: 1)).count, 1)
         }
+    }
+
+    func testFFmpegPCMDecoderPrunesStaleZeroOutputTokensAcrossLongStream() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        // 150 packets: every 5th packet emits 1 PCM frame, the other 4 emit 0 frames.
+        // Without pruning stale 0-output tokens < maxEmittedToken, pending would hit 96 and fail.
+        for index in 0..<150 {
+            native.outputScripts.append(index.isMultiple(of: 5) ? [.stereo(frames: 1_024)] : [])
+        }
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native
+        )
+        var emittedCount = 0
+        for index in 0..<150 {
+            let outputs = try decoder.push(makeSample(
+                id: UInt64(index + 1),
+                pts: CMTime(value: Int64(index * 1_024), timescale: 48_000)
+            ))
+            emittedCount += outputs.count
+        }
+        XCTAssertEqual(emittedCount, 30)
+        decoder.destroy()
+    }
+
+    func testFFmpegPCMDecoderDrainForNaturalEOFAcceptsLastEmittedTokenTailCallback() throws {
+        let native = FakeFFmpegAudioDecoderAPI()
+        native.outputScripts = [[.stereo(frames: 1_024)]]
+        native.drainOutputScripts = [[.stereo(frames: 512)]]
+        let decoder = try FFmpegPCMAudioDecoder(
+            codec: .aac,
+            extradata: Data([0x12, 0x10]),
+            api: native
+        )
+        let pushed = try decoder.push(makeSample(
+            id: 1,
+            pts: CMTime(value: 0, timescale: 48_000)
+        ))
+        XCTAssertEqual(pushed.count, 1)
+        XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(pushed[0]), CMTime(value: 0, timescale: 48_000))
+
+        // Token 1 already emitted in push(); drainForNaturalEOF() replays tail samples
+        // under owned->last_token and must advance PTS continuously by emittedDuration.
+        let drained = try decoder.drainForNaturalEOF()
+        XCTAssertEqual(drained.count, 1)
+        XCTAssertEqual(
+            CMTimeCompare(
+                CMSampleBufferGetPresentationTimeStamp(drained[0]),
+                CMTime(value: 1_024, timescale: 48_000)
+            ),
+            0
+        )
+        decoder.destroy()
     }
 
     func testFallbackPushFailureEmitsOneExactDecodeError() throws {

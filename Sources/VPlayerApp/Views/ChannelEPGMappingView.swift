@@ -25,6 +25,7 @@ struct ChannelEPGMappingView: View {
     }
 
     var body: some View {
+        let filteredChannels = filteredEPGChannels
         NavigationStack {
             List {
                 if let errorMessage {
@@ -34,10 +35,15 @@ struct ChannelEPGMappingView: View {
                 }
                 if model.manualEPGChannelID(for: channel) != nil {
                     Button {
+                        #if os(tvOS)
+                        save(selection: .some(nil))
+                        #else
                         selection = nil
+                        #endif
                     } label: {
                         mappingLabel(title: "清除手动映射", selected: selection == nil)
                     }
+                    .disabled(isSaving)
                     .accessibilityIdentifier("mapping.clear")
                 }
 
@@ -48,7 +54,7 @@ struct ChannelEPGMappingView: View {
                         description: Text("请先刷新当前播放列表的 EPG。")
                     )
                     .accessibilityIdentifier("mapping.empty")
-                } else if filteredEPGChannels.isEmpty {
+                } else if filteredChannels.isEmpty {
                     ContentUnavailableView(
                         "没有匹配的频道",
                         systemImage: "magnifyingglass",
@@ -56,9 +62,13 @@ struct ChannelEPGMappingView: View {
                     )
                     .accessibilityIdentifier("mapping.no-results")
                 } else {
-                    ForEach(filteredEPGChannels) { epgChannel in
+                    ForEach(filteredChannels) { epgChannel in
                         Button {
+                            #if os(tvOS)
+                            save(selection: .some(epgChannel.id))
+                            #else
                             selection = epgChannel.id
+                            #endif
                         } label: {
                             mappingLabel(
                                 title: epgChannel.displayNames.first ?? epgChannel.id,
@@ -66,16 +76,20 @@ struct ChannelEPGMappingView: View {
                                 selected: selection == epgChannel.id
                             )
                         }
+                        .disabled(isSaving)
                         .accessibilityIdentifier("mapping.\(epgChannel.id)")
                     }
                 }
             }
             .searchable(text: $searchText, prompt: "搜索 EPG 频道")
             .navigationTitle("为“\(channel.displayName)”设置 EPG")
+            .interactiveDismissDisabled(isSaving)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") { dismiss() }
+                        .disabled(isSaving)
                 }
+                #if !os(tvOS)
                 ToolbarItem(placement: .confirmationAction) {
                     Button("保存") {
                         save()
@@ -83,6 +97,7 @@ struct ChannelEPGMappingView: View {
                     .disabled(isSaving)
                     .accessibilityIdentifier("mapping.save")
                 }
+                #endif
             }
         }
     }
@@ -128,14 +143,19 @@ struct ChannelEPGMappingView: View {
         }
     }
 
-    private func save() {
+    private func save(selection overrideSelection: String?? = nil) {
+        guard !isSaving else { return }
+        if let overrideSelection {
+            selection = overrideSelection
+        }
+        let targetSelection = selection
         errorMessage = nil
         isSaving = true
         Task {
             var failure: String?
             let succeeded = await model.saveMapping(
                 channel: channel,
-                xmltvChannelID: selection
+                xmltvChannelID: targetSelection
             ) { failure = $0 }
             guard !Task.isCancelled else { return }
             isSaving = false

@@ -6,6 +6,8 @@ import CryptoKit
 import Foundation
 
 public enum ChannelIdentity {
+    private static let hexDigits = Array("0123456789abcdef".utf8)
+
     public static func make(profileID: UUID, streamURL: URL) -> String {
         var components = URLComponents(url: streamURL, resolvingAgainstBaseURL: false)
         if let scheme = components?.scheme {
@@ -21,7 +23,13 @@ public enum ChannelIdentity {
         components?.fragment = nil
         let normalized = components?.string ?? streamURL.absoluteString
         let digest = SHA256.hash(data: Data("\(profileID.uuidString)|\(normalized)".utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        var hex = [UInt8]()
+        hex.reserveCapacity(64)
+        for byte in digest {
+            hex.append(hexDigits[Int(byte >> 4)])
+            hex.append(hexDigits[Int(byte & 0x0F)])
+        }
+        return String(decoding: hex, as: UTF8.self)
     }
 }
 
@@ -38,6 +46,7 @@ public struct Channel: Identifiable, Equatable, Hashable, Sendable {
     public let order: Int
 
     public init(
+        id: String,
         sourceProfileID: UUID,
         displayName: String,
         streamURL: URL,
@@ -48,7 +57,7 @@ public struct Channel: Identifiable, Equatable, Hashable, Sendable {
         attributes: [String: String],
         order: Int
     ) {
-        self.id = ChannelIdentity.make(profileID: sourceProfileID, streamURL: streamURL)
+        self.id = id
         self.sourceProfileID = sourceProfileID
         self.displayName = displayName
         self.streamURL = streamURL
@@ -58,5 +67,30 @@ public struct Channel: Identifiable, Equatable, Hashable, Sendable {
         self.groupTitle = groupTitle
         self.attributes = attributes
         self.order = order
+    }
+
+    public init(
+        sourceProfileID: UUID,
+        displayName: String,
+        streamURL: URL,
+        tvgID: String?,
+        tvgName: String?,
+        logoURL: URL?,
+        groupTitle: String?,
+        attributes: [String: String],
+        order: Int
+    ) {
+        self.init(
+            id: ChannelIdentity.make(profileID: sourceProfileID, streamURL: streamURL),
+            sourceProfileID: sourceProfileID,
+            displayName: displayName,
+            streamURL: streamURL,
+            tvgID: tvgID,
+            tvgName: tvgName,
+            logoURL: logoURL,
+            groupTitle: groupTitle,
+            attributes: attributes,
+            order: order
+        )
     }
 }

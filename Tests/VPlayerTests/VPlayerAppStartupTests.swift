@@ -519,6 +519,85 @@ final class VPlayerAppStartupTests: XCTestCase {
         )
     }
 
+    func testChannelLogoCacheNegativeCacheRespectsTTLAndNeverCachesCancellation() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let clock = StartupLogoClock(Date(timeIntervalSince1970: 2_000_000_000))
+        let loader = ClassifyingChannelLogoDataLoader()
+        let cache = ChannelLogoCache(
+            dataLoader: loader,
+            cacheDirectory: cacheDirectory,
+            transientNegativeTTL: 60,
+            permanentNegativeTTL: 600,
+            maximumNegativeCacheEntries: 2,
+            now: { clock.date }
+        )
+
+        let transientURL = URL(string: "https://images.example/transient.png")!
+        await loader.setResult(.failed(.transient), for: transientURL)
+        _ = await cache.image(for: transientURL)
+        _ = await cache.image(for: transientURL)
+        let transientCallsBeforeExpiry = await loader.callCount(for: transientURL)
+        XCTAssertEqual(transientCallsBeforeExpiry, 1, "Transient failure must be negative-cached")
+
+        clock.advance(61)
+        _ = await cache.image(for: transientURL)
+        let transientCallsAfterExpiry = await loader.callCount(for: transientURL)
+        XCTAssertEqual(transientCallsAfterExpiry, 2, "Transient negative entry must expire after TTL")
+
+        let permanentURL = URL(string: "https://images.example/404.png")!
+        await loader.setResult(.failed(.permanent), for: permanentURL)
+        _ = await cache.image(for: permanentURL)
+        clock.advance(120)
+        _ = await cache.image(for: permanentURL)
+        let permanentCallsWithinTTL = await loader.callCount(for: permanentURL)
+        XCTAssertEqual(permanentCallsWithinTTL, 1, "Permanent failure must stay cached past transient TTL")
+
+        let cancelledURL = URL(string: "https://images.example/cancelled.png")!
+        await loader.setResult(.failed(.cancelled), for: cancelledURL)
+        _ = await cache.image(for: cancelledURL)
+        _ = await cache.image(for: cancelledURL)
+        let cancelledCalls = await loader.callCount(for: cancelledURL)
+        XCTAssertEqual(cancelledCalls, 2, "Cancellation must never be negative-cached")
+
+        // Verify bounded cap evicts oldest entry when exceeding maximumNegativeCacheEntries (2).
+        let thirdURL = URL(string: "https://images.example/third-404.png")!
+        await loader.setResult(.failed(.permanent), for: thirdURL)
+        clock.advance(1)
+        _ = await cache.image(for: thirdURL)
+        let fourthURL = URL(string: "https://images.example/fourth-404.png")!
+        await loader.setResult(.failed(.permanent), for: fourthURL)
+        clock.advance(1)
+        _ = await cache.image(for: fourthURL)
+        // permanentURL was oldest and should now be evicted so it retries.
+        _ = await cache.image(for: permanentURL)
+        let permanentCallsAfterEviction = await loader.callCount(for: permanentURL)
+        XCTAssertEqual(permanentCallsAfterEviction, 2)
+    }
+
+    func testChannelLogoCacheDiskCachedImageAvoidsNetwork() async throws {
+        let cacheDirectory = temporaryLogoCacheDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        let logoURL = try XCTUnwrap(URL(string: "https://images.example/disk-only.png"))
+        let writerCache = ChannelLogoCache(
+            dataLoader: FixedChannelLogoDataLoader(data: Self.onePixelPNG),
+            cacheDirectory: cacheDirectory
+        )
+        let stored = await writerCache.image(for: logoURL)
+        XCTAssertNotNil(stored)
+
+        let loader = CountingImmediateChannelLogoDataLoader(data: Self.onePixelPNG)
+        let readerCache = ChannelLogoCache(dataLoader: loader, cacheDirectory: cacheDirectory)
+        let fromDisk = await readerCache.diskCachedImage(for: logoURL)
+        XCTAssertNotNil(fromDisk)
+        let missing = await readerCache.diskCachedImage(
+            for: URL(string: "https://images.example/not-on-disk.png")!
+        )
+        XCTAssertNil(missing)
+        let networkCalls = await loader.requestCount
+        XCTAssertEqual(networkCalls, 0, "diskCachedImage must never touch the network")
+    }
+
     func testSeededFixtureLaunchFlagIsHonoredOnlyInDebugBuilds() {
         #if DEBUG
         let expectedSeededMode: AppLaunchMode = .seededFixture
@@ -1549,5 +1628,42 @@ private actor CountingImmediateChannelLogoDataLoader: ChannelLogoDataLoading {
     func data(for url: URL, maximumByteCount: Int) async -> Data? {
         requestCount += 1
         return data
+    }
+}
+
+private final class StartupLogoClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(_ initial: Date) { self.current = initial }
+    var date: Date { lock.withLock { current } }
+    func advance(_ seconds: TimeInterval) {
+        lock.withLock { current = current.addingTimeInterval(seconds) }
+    }
+}
+
+private actor ClassifyingChannelLogoDataLoader: ChannelLogoDataLoading {
+    private var results: [URL: ChannelLogoDataLoadResult] = [:]
+    private var counts: [URL: Int] = [:]
+
+    func setResult(_ result: ChannelLogoDataLoadResult, for url: URL) {
+        results[url] = result
+    }
+
+    func callCount(for url: URL) -> Int {
+        counts[url, default: 0]
+    }
+
+    func data(for url: URL, maximumByteCount: Int) async -> Data? {
+        switch await loadData(for: url, maximumByteCount: maximumByteCount) {
+        case let .data(data): return data
+        case .failed: return nil
+        }
+    }
+
+    func loadData(for url: URL, maximumByteCount: Int) async -> ChannelLogoDataLoadResult {
+        _ = maximumByteCount
+        counts[url, default: 0] += 1
+        return results[url] ?? .failed(.transient)
     }
 }

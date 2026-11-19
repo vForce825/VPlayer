@@ -9,7 +9,7 @@ import Observation
 final class MacSidebarPreferences {
     static let widthKey = "mac.sidebar.width"
     static let defaultWidth = 260.0
-    private let defaults: UserDefaults
+    @ObservationIgnored private let defaults: UserDefaults
     private(set) var width: Double
 
     init(defaults: UserDefaults = .standard) {
@@ -18,8 +18,13 @@ final class MacSidebarPreferences {
     }
 
     func resize(to width: Double) {
-        self.width = Self.clamped(width)
-        defaults.set(self.width, forKey: Self.widthKey)
+        let clamped = Self.clamped(width)
+        guard clamped != self.width else { return }
+        self.width = clamped
+    }
+
+    func commitWidth() {
+        defaults.set(width, forKey: Self.widthKey)
     }
 
     private static func clamped(_ width: Double) -> Double {

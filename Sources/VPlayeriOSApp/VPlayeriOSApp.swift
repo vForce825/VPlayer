@@ -31,6 +31,9 @@ struct VPlayeriOSApp: App {
         #else
         initialDependencies = nil
         #endif
+        // BGTaskScheduler requires launch handlers to be registered before
+        // application launch finishes. Register the active dependency set once.
+        (initialDependencies?.backgroundRefreshRegistrar ?? bootstrap.backgroundRefreshRegistrar).register()
     }
     var body: some Scene {
         WindowGroup {

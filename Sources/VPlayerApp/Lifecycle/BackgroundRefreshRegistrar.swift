@@ -144,11 +144,18 @@ final class BackgroundRefreshRegistrar {
                 }
 
                 let refreshDate = now()
+                var ranAnyRefresh = false
                 for planned in planner.dueRefreshes(for: profiles, now: refreshDate) {
                     try Task.checkCancellation()
                     if self.prefersReducedResourceUsage { break }
+                    ranAnyRefresh = true
                     let outcomes = await refresh(planned.profileID, planned.resources, .background)
                     succeeded = succeeded && outcomes.allSatisfy(\.succeeded)
+                }
+                if ranAnyRefresh, !Task.isCancelled,
+                   let updatedProfiles = try? await loadProfiles(),
+                   !Task.isCancelled {
+                    try? await self.submitNext(profiles: updatedProfiles, revision: revision)
                 }
                 return succeeded
             } catch is CancellationError {

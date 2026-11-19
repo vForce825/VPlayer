@@ -75,10 +75,117 @@ final class MacPlaybackSessionTests: XCTestCase {
         let library = NSWindow(contentRect: .init(x: 0, y: 0, width: 900, height: 600),
             styleMask: [.titled], backing: .buffered, defer: false)
         state.registerLibraryWindow(library)
+        XCTAssertTrue(state.isLibraryWindowVisible)
         state.registerLibraryWindow(nil)
         XCTAssertTrue(state.libraryWindow === library)
+        state.libraryWindowWillClose(library)
+        XCTAssertFalse(state.isLibraryWindowVisible)
         library.orderOut(nil)
         #endif
+    }
+
+    func testModelObserversSyncPlaybackAndProgrammeUpdatesWithoutRootView() async throws {
+        let dependencies = AppDependencies.uiTesting(playbackFixture: nil)
+        let state = MacApplicationState(dependenciesForTesting: dependencies)
+        let model = try XCTUnwrap(state.model)
+        let opened = await dependencies.openInitialLibrary(using: model)
+        XCTAssertTrue(opened)
+        let channel = try XCTUnwrap(model.channels.first)
+
+        model.select(channel: channel)
+        try await wait {
+            state.session?.model.request.channelID == channel.id
+                && state.session?.model.state == .playing(state.session!.model.request)
+        }
+
+        let updatedProgramme = Programme(
+            id: "pip-sync-programme",
+            xmltvChannelID: channel.tvgID ?? channel.id,
+            start: Date().addingTimeInterval(-60),
+            stop: Date().addingTimeInterval(3600),
+            title: "后台画中画同步节目",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        )
+        model.programmesByChannelID[channel.id] = [updatedProgramme]
+        try await wait {
+            state.session?.presentation.programmes.first?.title == "后台画中画同步节目"
+        }
+
+        await state.shutdown()
+    }
+
+    func testChannelSwitchKeepsSessionNonNilAndCarriesOverOverlayPreferences() async throws {
+        let state = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: nil))
+        let first = request("频道一")
+        state.replaceSession(for: first)
+        try await wait { state.session?.model.state == .playing(first) }
+        let firstSession = try XCTUnwrap(state.session)
+        firstSession.overlay.toggleInformation(paused: false)
+        firstSession.overlay.toggleSidebar(paused: false)
+        XCTAssertFalse(firstSession.overlay.informationEnabled)
+        XCTAssertTrue(firstSession.overlay.sidebarVisible)
+
+        let second = request("频道二")
+        state.replaceSession(for: second)
+        XCTAssertNotNil(state.session)
+        try await wait {
+            state.session?.model.request.id == second.id
+                && state.session?.model.state == .playing(second)
+        }
+        let secondSession = try XCTUnwrap(state.session)
+        XCTAssertFalse(secondSession.overlay.informationEnabled)
+        XCTAssertFalse(secondSession.overlay.informationVisible)
+        XCTAssertTrue(secondSession.overlay.sidebarVisible)
+
+        await state.shutdown()
+    }
+
+    func testShutdownSerializesBehindInFlightStopPlayback() async throws {
+        let state = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: nil))
+        let req = request("停止序列化")
+        state.replaceSession(for: req)
+        try await wait { state.session?.model.state == .playing(req) }
+        let previous = try XCTUnwrap(state.session)
+
+        let stopTask = Task { await state.stopPlayback(requestID: req.id) }
+        await state.shutdown()
+        await stopTask.value
+
+        XCTAssertNil(state.session)
+        XCTAssertTrue(previous.isClosing)
+        XCTAssertEqual(previous.model.state, .stopped)
+        XCTAssertFalse(state.hasInFlightReplacementForTesting)
+    }
+
+    func testPlaybackSessionHoldsDisplaySleepAssertionDuringBufferingAndReleasesOnPauseOrFailure() async throws {
+        let bufferingState = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: "buffering"))
+        let bufferingReq = request("缓冲保活")
+        bufferingState.replaceSession(for: bufferingReq)
+        try await wait { bufferingState.session?.model.state == .buffering(bufferingReq) }
+        XCTAssertEqual(bufferingState.session?.holdsActivityForTesting, true)
+        await bufferingState.shutdown()
+
+        let playingState = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: nil))
+        let playingReq = request("暂停释放")
+        playingState.replaceSession(for: playingReq)
+        try await wait { playingState.session?.model.state == .playing(playingReq) }
+        XCTAssertEqual(playingState.session?.holdsActivityForTesting, true)
+        playingState.session?.model.togglePause()
+        try await wait { playingState.session?.model.isPaused == true }
+        try await wait { playingState.session?.holdsActivityForTesting == false }
+        await playingState.shutdown()
+
+        let failedState = MacApplicationState(dependenciesForTesting: .uiTesting(playbackFixture: "failed"))
+        let failedReq = request("失败释放")
+        failedState.replaceSession(for: failedReq)
+        try await wait {
+            if case .failed = failedState.session?.model.state { return true }
+            return false
+        }
+        XCTAssertEqual(failedState.session?.holdsActivityForTesting, false)
+        await failedState.shutdown()
     }
     private func wait(_ condition: @MainActor () -> Bool) async throws {
         for _ in 0..<200 {

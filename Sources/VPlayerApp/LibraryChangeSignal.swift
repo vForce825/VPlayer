@@ -171,14 +171,10 @@ final class LibraryChangeSignal {
         yieldGeneration()
     }
 
-    func notify(profileID: UUID, resource: RefreshResource) {
-        notify(profileID: profileID, resource: resource, includesSnapshotData: true)
-    }
-
-    private func notify(
+    func notify(
         profileID: UUID,
         resource: RefreshResource,
-        includesSnapshotData: Bool
+        includesSnapshotData: Bool = true
     ) {
         let key = RefreshKey(profileID: profileID, resource: resource)
         if let claimID = refreshCompletionClaimByKey[key],
@@ -235,6 +231,10 @@ final class LibraryChangeSignal {
                 refreshCompletionClaimByKey[key] = nil
             }
         }
+    }
+
+    func claimedDataResources(for claim: RefreshCompletionClaim) -> Set<RefreshResource> {
+        refreshCompletionClaims[claim.id]?.pendingDataResources ?? []
     }
 
     private func publishPendingRefreshChanges(

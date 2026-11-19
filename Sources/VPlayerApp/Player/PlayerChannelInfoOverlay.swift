@@ -140,12 +140,20 @@ struct PlayerChannelInfoOverlay: View {
             minimumWidth: minimumCardWidth,
             maximumWidth: min(maximumCardWidth, 900)
         ) {
-            TimelineView(.periodic(from: .now, by: prefersReducedResourceUsage ? 120 : 30)) { context in
-                let programmePresentation = ChannelProgrammePresentation.resolve(
-                    programmes: presentation.programmes,
-                    at: context.date
-                )
-                card(programmePresentation: programmePresentation)
+            if presentation.programmes.isEmpty {
+                card(programmePresentation: ChannelProgrammePresentation(
+                    current: nil,
+                    next: nil,
+                    progress: nil
+                ))
+            } else {
+                TimelineView(.periodic(from: .now, by: prefersReducedResourceUsage ? 120 : 30)) { context in
+                    let programmePresentation = ChannelProgrammePresentation.resolve(
+                        programmes: presentation.programmes,
+                        at: context.date
+                    )
+                    card(programmePresentation: programmePresentation)
+                }
             }
         }
         .allowsHitTesting(false)

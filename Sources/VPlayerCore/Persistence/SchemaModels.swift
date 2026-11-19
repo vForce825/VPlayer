@@ -30,11 +30,13 @@ import SwiftData
     var m3uStateRaw: String
     var m3uErrorSummary: String?
     var m3uAttemptID: UUID?
+    var m3uFailureCount: Int?
     var epgLastAttemptAt: Date?
     var epgLastSuccessAt: Date?
     var epgStateRaw: String
     var epgErrorSummary: String?
     var epgAttemptID: UUID?
+    var epgFailureCount: Int?
     var createdAt: Date
     var updatedAt: Date
 
@@ -52,11 +54,13 @@ import SwiftData
         m3uStateRaw: String = RefreshState.never.rawValue,
         m3uErrorSummary: String? = nil,
         m3uAttemptID: UUID? = nil,
+        m3uFailureCount: Int? = nil,
         epgLastAttemptAt: Date? = nil,
         epgLastSuccessAt: Date? = nil,
         epgStateRaw: String = RefreshState.never.rawValue,
         epgErrorSummary: String? = nil,
         epgAttemptID: UUID? = nil,
+        epgFailureCount: Int? = nil,
         createdAt: Date,
         updatedAt: Date
     ) {
@@ -73,11 +77,13 @@ import SwiftData
         self.m3uStateRaw = m3uStateRaw
         self.m3uErrorSummary = m3uErrorSummary
         self.m3uAttemptID = m3uAttemptID
+        self.m3uFailureCount = m3uFailureCount
         self.epgLastAttemptAt = epgLastAttemptAt
         self.epgLastSuccessAt = epgLastSuccessAt
         self.epgStateRaw = epgStateRaw
         self.epgErrorSummary = epgErrorSummary
         self.epgAttemptID = epgAttemptID
+        self.epgFailureCount = epgFailureCount
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -147,19 +153,22 @@ import SwiftData
     var fetchedAt: Date
     var channelCount: Int
     var programmeCount: Int
+    var coverageEnd: Date?
 
     init(
         id: UUID,
         sourceProfileID: UUID,
         fetchedAt: Date,
         channelCount: Int,
-        programmeCount: Int
+        programmeCount: Int,
+        coverageEnd: Date? = nil
     ) {
         self.id = id
         self.sourceProfileID = sourceProfileID
         self.fetchedAt = fetchedAt
         self.channelCount = channelCount
         self.programmeCount = programmeCount
+        self.coverageEnd = coverageEnd
     }
 }
 

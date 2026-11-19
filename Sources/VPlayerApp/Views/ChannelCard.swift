@@ -12,43 +12,41 @@ import VPlayerCore
 /// tiles in a grid row keep the same height.
 struct ChannelCard: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     let channel: Channel
     let programmes: [Programme]
+    var referenceDate: Date = .now
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: prefersReducedResourceUsage ? 120 : 30)) { context in
-            let presentation = ChannelProgrammePresentation.resolve(
-                programmes: programmes,
-                at: context.date
-            )
-            VStack(alignment: .leading, spacing: 12) {
-                logo
+        let presentation = ChannelProgrammePresentation.resolve(
+            programmes: programmes,
+            at: referenceDate
+        )
+        VStack(alignment: .leading, spacing: 12) {
+            logo
 
-                Text(channel.displayName)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+            Text(channel.displayName)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
                 .fixedSize(horizontal: false, vertical: true)
 
-                epgFooter(presentation: presentation)
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            #if DEBUG
-            // Diagnostic-only, layout-neutral fiducial. Measuring its screenshot
-            // pixels observes CardButtonStyle's actual transform, not AX bounds.
-            .overlay(alignment: .top) {
-                if channel.attributes["ui-card-focus-probe"] == "true" {
-                    Rectangle()
-                        .fill(Color(red: 1, green: 0, blue: 1))
-                        .frame(height: 6)
-                        .padding(.horizontal, 20)
-                        .allowsHitTesting(false)
-                        .accessibilityHidden(true)
-                }
-            }
-            #endif
+            epgFooter(presentation: presentation)
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        #if DEBUG
+        // Diagnostic-only, layout-neutral fiducial. Measuring its screenshot
+        // pixels observes CardButtonStyle's actual transform, not AX bounds.
+        .overlay(alignment: .top) {
+            if channel.attributes["ui-card-focus-probe"] == "true" {
+                Rectangle()
+                    .fill(Color(red: 1, green: 0, blue: 1))
+                    .frame(height: 6)
+                    .padding(.horizontal, 20)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
+        #endif
     }
 
     private func epgFooter(presentation: ChannelProgrammePresentation) -> some View {

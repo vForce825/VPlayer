@@ -21,11 +21,20 @@ final class IOSPlaybackSession {
     var isFullScreenPresented = true
     @ObservationIgnored private var hasStarted = false
     @ObservationIgnored private var restoreTask: Task<Void, Never>?
+    @ObservationIgnored private var restoreGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var hostMountGeneration: UInt64 = 0
+    @ObservationIgnored private(set) var isHostMounted = false
+    @ObservationIgnored var onPrepareForFullScreenRestore: (@MainActor () -> Void)?
+    @ObservationIgnored private let restorePollInterval: Duration
+    @ObservationIgnored private let restoreMaxAttempts: Int
     private(set) var isClosing = false
     var id: UUID { presentation.request.id }
 
-    init(presentation: PlayerChannelPresentation, dependencies: AppDependencies) {
+    init(presentation: PlayerChannelPresentation, dependencies: AppDependencies,
+         restorePollInterval: Duration = .milliseconds(20), restoreMaxAttempts: Int = 100) {
         self.presentation = presentation
+        self.restorePollInterval = restorePollInterval
+        self.restoreMaxAttempts = restoreMaxAttempts
         settings = dependencies.playbackSettings
         let mount = PlaybackPresentationHostMount()
         self.mount = mount
@@ -76,24 +85,72 @@ final class IOSPlaybackSession {
             Task { @MainActor [weak self] in self?.observePlaybackState() }
         }
     }
+    func noteHostMounted(in container: IOSPlaybackHostContainerController) -> UInt64 {
+        hostMountGeneration &+= 1
+        isHostMounted = true
+        return hostMountGeneration
+    }
+
+    func noteHostUnmounted(generation: UInt64) {
+        guard hostMountGeneration == generation else { return }
+        isHostMounted = false
+    }
+
+    var isHostActivelyPresented: Bool {
+        guard isHostMounted, host.isViewLoaded,
+              let view = host.view,
+              let window = view.window,
+              !window.isHidden, !view.isHidden else { return false }
+        var current: UIViewController? = host
+        while let controller = current {
+            if controller.isBeingDismissed || controller.isMovingFromParent { return false }
+            current = controller.parent
+        }
+        return true
+    }
+
     func showFullScreen() {
         guard !isClosing else { return }
+        restoreTask?.cancel()
+        restoreTask = nil
+        restoreGeneration &+= 1
+        onPrepareForFullScreenRestore?()
         isFullScreenPresented = true
         pictureInPicture.stopForRestoration()
     }
-    private func restoreFullScreen(completion: @escaping @MainActor (Bool) -> Void) {
+    func restoreFullScreen(completion: @escaping @MainActor (Bool) -> Void) {
         restoreTask?.cancel()
+        restoreGeneration &+= 1
+        let generation = restoreGeneration
+        let wasPresented = isFullScreenPresented
+        let baselineMountGeneration = hostMountGeneration
+        onPrepareForFullScreenRestore?()
         isFullScreenPresented = true
+        let pollInterval = restorePollInterval
+        let maxAttempts = restoreMaxAttempts
         restoreTask = Task { @MainActor [weak self] in
-            for _ in 0..<100 {
-                guard !Task.isCancelled, let self, !self.isClosing else { completion(false); return }
-                if self.host.isViewLoaded, let window = self.host.view.window,
-                   !window.isHidden, !self.host.view.isHidden {
+            for _ in 0..<maxAttempts {
+                guard !Task.isCancelled, let self, !self.isClosing,
+                      self.restoreGeneration == generation else {
+                    completion(false)
+                    return
+                }
+                let hasExpectedMount = wasPresented || self.hostMountGeneration > baselineMountGeneration
+                if hasExpectedMount, self.isHostActivelyPresented {
                     completion(true)
                     return
                 }
-                do { try await Task.sleep(for: .milliseconds(20)) }
-                catch { completion(false); return }
+                do { try await Task.sleep(for: pollInterval) }
+                catch {
+                    if !self.isClosing, self.restoreGeneration == generation {
+                        self.isFullScreenPresented = false
+                    }
+                    completion(false)
+                    return
+                }
+            }
+            if let self, !self.isClosing, self.restoreGeneration == generation {
+                self.isFullScreenPresented = false
             }
             completion(false)
         }
@@ -104,6 +161,7 @@ final class IOSPlaybackSession {
         IOSPlaybackRouteDiagnostics.record("session-close:stopped=\(model.hasStoppedCurrentRequest)")
         #endif
         isClosing = true
+        restoreGeneration &+= 1
         restoreTask?.cancel()
         restoreTask = nil
         pictureInPicture.close()

@@ -542,7 +542,14 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             fileURL: validURL,
             fetchedAt: date(20)
         )
-        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1))
+        XCTAssertEqual(
+            summary,
+            XMLTVParseSummary(
+                channelCount: 1,
+                programmeCount: 1,
+                coverageEnd: ISO8601DateFormatter().date(from: "2026-07-18T16:00:00Z")
+            )
+        )
         let initialProgrammeCount = try await store.epgProgrammeCount(profileID: profile.id)
         XCTAssertEqual(initialProgrammeCount, 1)
 
@@ -662,6 +669,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             fileURL: duplicateURL,
             fetchedAt: date(30)
         )
+        await store.waitForPendingBackgroundCleanup()
 
         let activeChannels = try await store.epgChannels(profileID: profile.id)
         let activeProgrammes = try await store.programmes(
@@ -673,7 +681,14 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         let currentProfile = try XCTUnwrap(profiles.first)
         let snapshotHeaders = try ModelContext(container).fetch(FetchDescriptor<EPGSnapshotRecord>())
         let inventory = try snapshotInventory(container)
-        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1))
+        XCTAssertEqual(
+            summary,
+            XMLTVParseSummary(
+                channelCount: 1,
+                programmeCount: 1,
+                coverageEnd: ISO8601DateFormatter().date(from: "2026-07-18T16:00:00Z")
+            )
+        )
         XCTAssertEqual(activeChannels.map(\.id), ["replacement"])
         XCTAssertEqual(activeProgrammes.map(\.title), ["Duplicated Show"])
         XCTAssertEqual(activeProgrammes.map(\.subtitle), ["First metadata"])
@@ -846,6 +861,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             input: try editedInput(before, epgURL: replacementURL),
             now: date(60)
         )
+        await fixture.store.waitForPendingBackgroundCleanup()
 
         let profilesAfterUpdate = try await fixture.store.profiles()
         let updated = try XCTUnwrap(profilesAfterUpdate.first)
@@ -1144,8 +1160,11 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             fileURL: replacementURL,
             fetchedAt: date(30)
         )
+        await store.waitForPendingBackgroundCleanup()
 
-        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 1_001))
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.programmeCount, 1_001)
+        XCTAssertNotNil(summary.coverageEnd)
         XCTAssertEqual(saveProbe.occurrence(of: .epgHeader), 1)
         XCTAssertEqual(saveProbe.occurrence(of: .epgBatch), 3)
         XCTAssertEqual(saveProbe.occurrence(of: .epgStaging), 1)
@@ -1589,6 +1608,7 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             fileURL: replacementURL,
             fetchedAt: date(30)
         )
+        await failingStore.waitForPendingBackgroundCleanup()
 
         let installedChannels = try await failingStore.epgChannels(profileID: profile.id)
         XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 0))
@@ -3075,7 +3095,9 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
             "MainActor reads, playlist commit, and purge must not block behind EPG staging"
         )
         let summary = try await epgTask.value
-        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 600))
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.programmeCount, 600)
+        XCTAssertNotNil(summary.coverageEnd)
         let count = try await store.epgProgrammeCount(profileID: profile.id)
         XCTAssertEqual(count, 600)
     }
@@ -3122,7 +3144,329 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
 
         gate.release()
         let summary = try await installTask.value
-        XCTAssertEqual(summary, XMLTVParseSummary(channelCount: 1, programmeCount: 600))
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.programmeCount, 600)
+        XCTAssertNotNil(summary.coverageEnd)
+    }
+
+    func testDeleteProfileUsesPostCommitBatchDeletesForPlaylistAndEPGSnapshots() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let contextProbe = SaveContextObservationProbe()
+        let store = SwiftDataLibraryStore(
+            modelContainer: container,
+            saveContextObserver: { contextProbe.record($0) }
+        ) { _ in }
+
+        let deleted = try await store.createProfile(input(name: "Deleted"), now: date(10))
+        let kept = try await store.createProfile(input(name: "Kept"), now: date(20))
+
+        let deletedChannels = (0..<12).map {
+            channel(profileID: deleted.id, name: "Deleted \($0)", path: "deleted-\($0)")
+        }
+        let keptChannel = channel(profileID: kept.id, name: "Kept", path: "kept")
+        try await store.installPlaylist(profileID: deleted.id, channels: deletedChannels, fetchedAt: date(30))
+        try await store.installPlaylist(profileID: kept.id, channels: [keptChannel], fetchedAt: date(31))
+
+        let deletedEPGURL = try temporaryXML(batchedXMLTV(programmeCount: 25))
+        let keptEPGURL = try temporaryXML(singleProgrammeXMLTV(channelID: "kept-guide", title: "Kept Show"))
+        defer {
+            try? FileManager.default.removeItem(at: deletedEPGURL)
+            try? FileManager.default.removeItem(at: keptEPGURL)
+        }
+        _ = try await store.installEPG(profileID: deleted.id, fileURL: deletedEPGURL, fetchedAt: date(40))
+        _ = try await store.installEPG(profileID: kept.id, fileURL: keptEPGURL, fetchedAt: date(41))
+        try await store.setManualMapping(profileID: deleted.id, channelID: deletedChannels[0].id, xmltvChannelID: "guide")
+        try await store.setManualMapping(profileID: kept.id, channelID: keptChannel.id, xmltvChannelID: "kept-guide")
+
+        let keptPointers = try snapshotPointers(container, profileID: kept.id)
+        try await store.deleteProfile(id: deleted.id)
+        await store.waitForPendingBackgroundCleanup()
+
+        let remainingProfiles = try await store.profiles()
+        XCTAssertEqual(remainingProfiles.map(\.id), [kept.id])
+        let inventory = try snapshotInventory(container)
+        XCTAssertEqual(inventory.playlistHeaderIDs, [try XCTUnwrap(keptPointers.playlist)])
+        XCTAssertEqual(inventory.channels.map(\.valueID), [keptChannel.id])
+        XCTAssertEqual(inventory.epgHeaderIDs, [try XCTUnwrap(keptPointers.epg)])
+        XCTAssertEqual(inventory.epgChannels.map(\.valueID), ["kept-guide"])
+        XCTAssertEqual(inventory.programmes.count, 1)
+        let keptMapping = try await store.manualMapping(profileID: kept.id, channelID: keptChannel.id)
+        XCTAssertEqual(keptMapping?.xmltvChannelID, "kept-guide")
+        XCTAssertEqual(
+            try ModelContext(container).fetch(FetchDescriptor<ManualEPGMappingRecord>()).count,
+            1
+        )
+
+        let deletePhases = contextProbe.recorded.filter {
+            $0.phase == .profileDelete || $0.phase == .playlistCleanup || $0.phase == .epgCleanup
+        }
+        XCTAssertEqual(
+            deletePhases.map(\.phase),
+            [.profileDelete, .playlistCleanup, .epgCleanup]
+        )
+        let profileDeleteObservation = try XCTUnwrap(deletePhases.first { $0.phase == .profileDelete })
+        XCTAssertEqual(
+            profileDeleteObservation.deletedModelCount,
+            2,
+            "profileDelete 事务只删除配置与手动映射，不应逐行加载频道与节目单"
+        )
+        let playlistCleanupObservation = try XCTUnwrap(deletePhases.first { $0.phase == .playlistCleanup })
+        let epgCleanupObservation = try XCTUnwrap(deletePhases.first { $0.phase == .epgCleanup })
+        XCTAssertEqual(playlistCleanupObservation.deletedModelCount, 0)
+        XCTAssertEqual(epgCleanupObservation.deletedModelCount, 0)
+    }
+
+    func testFailureCountIncrementsAndResetsOnSuccessAndURLRetarget() async throws {
+        let (_, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Retry"), now: date(10))
+        let playlistSource = SourceURLIdentity(url: profile.m3uURL)
+
+        let firstAttempt = RefreshSourceContext(source: playlistSource, attemptID: UUID())
+        let beganFirst = try await store.beginRefresh(
+            profileID: profile.id, resource: .playlist, context: firstAttempt, at: date(20)
+        )
+        XCTAssertTrue(beganFirst)
+        let recordedFirst = try await store.recordRefreshFailure(
+            profileID: profile.id, resource: .playlist, context: firstAttempt, summary: "err 1", at: date(21)
+        )
+        XCTAssertTrue(recordedFirst)
+        var profiles = try await store.profiles()
+        var current = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(current.m3uStatus.consecutiveFailureCount, 1)
+
+        let secondAttempt = RefreshSourceContext(source: playlistSource, attemptID: UUID())
+        let beganSecond = try await store.beginRefresh(
+            profileID: profile.id, resource: .playlist, context: secondAttempt, at: date(30)
+        )
+        XCTAssertTrue(beganSecond)
+        let recordedSecond = try await store.recordRefreshFailure(
+            profileID: profile.id, resource: .playlist, context: secondAttempt, summary: "err 2", at: date(31)
+        )
+        XCTAssertTrue(recordedSecond)
+        profiles = try await store.profiles()
+        current = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(current.m3uStatus.consecutiveFailureCount, 2)
+
+        try await store.recordSuccess(
+            profileID: profile.id, resource: .playlist, at: date(40), attemptID: secondAttempt.attemptID
+        )
+        profiles = try await store.profiles()
+        current = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(current.m3uStatus.consecutiveFailureCount, 0)
+
+        try await store.recordFailure(
+            profileID: profile.id, resource: .epg, summary: "epg err", at: date(50)
+        )
+        profiles = try await store.profiles()
+        current = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(current.epgStatus.consecutiveFailureCount, 1)
+
+        try await store.updateProfile(
+            id: profile.id,
+            input: try editedInput(current, epgURL: URL(string: "https://epg.example/new.xml")!),
+            now: date(60)
+        )
+        profiles = try await store.profiles()
+        current = try XCTUnwrap(profiles.first)
+        XCTAssertEqual(current.epgStatus.consecutiveFailureCount, 0)
+    }
+
+    func testEPGCoverageEndReadsPersistedHeaderDirectlyAndFallsBackForLegacySnapshots() async throws {
+        let (container, store) = try makeStore()
+        let profile = try await store.createProfile(input(name: "Coverage"), now: date(10))
+        let scheduleURL = try temporaryXML(
+            """
+            <tv>
+              <channel id="news"><display-name>News</display-name></channel>
+              <programme channel="news" start="20260718150000 Z" stop="20260718183000 Z">
+                <title>Feature</title>
+              </programme>
+            </tv>
+            """
+        )
+        defer { try? FileManager.default.removeItem(at: scheduleURL) }
+
+        let expectedEnd = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-18T18:30:00Z"))
+        let summary = try await store.installEPG(
+            profileID: profile.id,
+            fileURL: scheduleURL,
+            fetchedAt: date(20)
+        )
+        XCTAssertEqual(summary.coverageEnd, expectedEnd)
+
+        let snapshotID = try XCTUnwrap(try snapshotPointers(container, profileID: profile.id).epg)
+        let context = ModelContext(container)
+        let header = try XCTUnwrap(try context.fetch(FetchDescriptor<EPGSnapshotRecord>(
+            predicate: #Predicate { $0.id == snapshotID }
+        )).first)
+        XCTAssertEqual(header.coverageEnd, expectedEnd)
+
+        // 删除所有 ProgrammeRecord 后仍能从快照头 O(1) 返回 coverageEnd，证明不再扫描节目表。
+        try context.delete(model: ProgrammeRecord.self, where: #Predicate { $0.snapshotID == snapshotID })
+        try context.save()
+        let readerAfterRowDeletion = SwiftDataLibraryStore(modelContainer: container)
+        let fastCoverageEnd = try await readerAfterRowDeletion.epgCoverageEnd(profileID: profile.id)
+        XCTAssertEqual(fastCoverageEnd, expectedEnd)
+
+        // 模拟旧版本遗留快照（coverageEnd == nil 但 programmeCount > 0）回退扫描 ProgrammeRecord。
+        let legacyStop = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-19T22:00:00Z"))
+        header.coverageEnd = nil
+        header.programmeCount = 1
+        context.insert(ProgrammeRecord(
+            snapshotID: snapshotID,
+            stableID: "legacy-programme",
+            xmltvChannelID: "news",
+            start: expectedEnd,
+            stop: legacyStop,
+            title: "Legacy",
+            subtitle: nil,
+            programmeDescription: nil,
+            categories: []
+        ))
+        try context.save()
+        let legacyReader = SwiftDataLibraryStore(modelContainer: container)
+        let legacyCoverageEnd = try await legacyReader.epgCoverageEnd(profileID: profile.id)
+        XCTAssertEqual(legacyCoverageEnd, legacyStop)
+    }
+
+    func testEPGSinkDeduplicatesSHA256HexIDsAndTracksMaxStop() throws {
+        let batches = EPGBatchRecorder()
+        let sink = EPGPersistenceSink(
+            cancellationCheck: {},
+            persistBatch: { batches.persist($0) }
+        )
+        try sink.accept(channel: EPGChannel(id: "news", displayNames: ["News"], iconURL: nil))
+
+        let id1 = ProgrammeStableID.make(
+            channelID: "news",
+            startEpochSeconds: 1_784_000_000,
+            stopEpochSeconds: 1_784_003_600,
+            title: "Show A"
+        )
+        let id2 = ProgrammeStableID.make(
+            channelID: "news",
+            startEpochSeconds: 1_784_003_600,
+            stopEpochSeconds: 1_784_010_800,
+            title: "Show B"
+        )
+        try sink.accept(programme: Programme(
+            id: id1,
+            xmltvChannelID: "news",
+            start: date(1_784_000_000),
+            stop: date(1_784_003_600),
+            title: "Show A",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        ))
+        try sink.accept(programme: Programme(
+            id: id2,
+            xmltvChannelID: "news",
+            start: date(1_784_003_600),
+            stop: date(1_784_010_800),
+            title: "Show B",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        ))
+        // 重复的 SHA-256 ID 即使 stop 更晚也必须被忽略。
+        try sink.accept(programme: Programme(
+            id: id1,
+            xmltvChannelID: "news",
+            start: date(1_784_000_000),
+            stop: date(1_784_099_999),
+            title: "Show A duplicate",
+            subtitle: nil,
+            summary: nil,
+            categories: []
+        ))
+        try sink.finish()
+
+        XCTAssertEqual(sink.acceptedSummary.channelCount, 1)
+        XCTAssertEqual(sink.acceptedSummary.programmeCount, 2)
+        XCTAssertEqual(sink.acceptedSummary.coverageEnd, date(1_784_010_800))
+        XCTAssertEqual(batches.recorded.flatMap(\.programmes).map(\.id), [id1, id2])
+    }
+
+    func testUpdateProfileDoesNotStallBehindActiveEPGStagingTask() async throws {
+        let container = try VPlayerModelContainer.make(inMemory: true)
+        let gate = EPGStagingGate()
+        let store = SwiftDataLibraryStore(
+            modelContainer: container,
+            epgStagingCheckpoint: { checkpoint in
+                guard checkpoint == .afterBatchPersist else { return }
+                gate.pauseFirstOccurrence()
+            },
+            saveFault: { _ in }
+        )
+
+        let stagingProfile = try await store.createProfile(input(name: "Staging"), now: date(10))
+        let editedProfile = try await store.createProfile(
+            input(name: "Edited"),
+            now: date(20)
+        )
+        let oldEditedEPGURL = try temporaryXML(singleProgrammeXMLTV(channelID: "old-edited", title: "Old"))
+        let stagingEPGURL = try temporaryXML(batchedXMLTV(programmeCount: 600))
+        defer {
+            try? FileManager.default.removeItem(at: oldEditedEPGURL)
+            try? FileManager.default.removeItem(at: stagingEPGURL)
+        }
+        _ = try await store.installEPG(
+            profileID: editedProfile.id,
+            fileURL: oldEditedEPGURL,
+            fetchedAt: date(25)
+        )
+        let oldEditedSnapshotID = try XCTUnwrap(
+            try snapshotPointers(container, profileID: editedProfile.id).epg
+        )
+
+        let fetchedAt = date(30)
+        let stagingTask = Task.detached {
+            try await store.installEPG(
+                profileID: stagingProfile.id,
+                fileURL: stagingEPGURL,
+                fetchedAt: fetchedAt
+            )
+        }
+        let entered = await gate.waitUntilPaused(timeoutSeconds: 5)
+        XCTAssertTrue(entered)
+
+        // 当 stagingProfile 正在占用 EPGStagingWorker 时，修改 editedProfile 的 EPG URL
+        // 必须立即提交并返回，不能阻塞在旧 EPG 快照清理上。
+        let replacementURL = URL(string: "https://epg.example/retargeted.xml")!
+        let updateInput = try editedInput(editedProfile, epgURL: replacementURL)
+        let updatedAt = date(40)
+        let updatedWhileGated = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                do {
+                    try await store.updateProfile(
+                        id: editedProfile.id,
+                        input: updateInput,
+                        now: updatedAt
+                    )
+                    return true
+                } catch {
+                    return false
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(1))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        gate.release()
+
+        XCTAssertTrue(updatedWhileGated, "updateProfile 不应阻塞在正在运行的 EPGStagingWorker 上")
+        _ = try await stagingTask.value
+        await store.waitForPendingBackgroundCleanup()
+
+        let inventory = try snapshotInventory(container)
+        XCTAssertFalse(inventory.epgHeaderIDs.contains(oldEditedSnapshotID))
+        XCTAssertFalse(inventory.epgChannels.contains { $0.snapshotID == oldEditedSnapshotID })
+        XCTAssertFalse(inventory.programmes.contains { $0.snapshotID == oldEditedSnapshotID })
     }
 
     private func makeStore() throws -> (ModelContainer, SwiftDataLibraryStore) {
@@ -3533,26 +3877,43 @@ private enum InjectedSaveError: Error, Equatable, Sendable {
 
 private final class EPGStagingGate: @unchecked Sendable {
     private let lock = NSLock()
-    private let enteredSemaphore = DispatchSemaphore(value: 0)
     private let releaseSemaphore = DispatchSemaphore(value: 0)
     private var didPause = false
+    private var pauseContinuation: CheckedContinuation<Bool, Never>?
 
     func pauseFirstOccurrence() {
-        let shouldPause = lock.withLock {
-            guard !didPause else { return false }
+        let state: (shouldPause: Bool, continuation: CheckedContinuation<Bool, Never>?) = lock.withLock {
+            guard !didPause else { return (false, nil) }
             didPause = true
-            return true
+            let waiting = pauseContinuation
+            pauseContinuation = nil
+            return (true, waiting)
         }
-        guard shouldPause else { return }
-        enteredSemaphore.signal()
+        guard state.shouldPause else { return }
+        state.continuation?.resume(returning: true)
         _ = releaseSemaphore.wait(timeout: .now() + .seconds(3))
     }
 
     func waitUntilPaused(timeoutSeconds: Int) async -> Bool {
-        let sem = enteredSemaphore
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .default).async {
-                continuation.resume(returning: sem.wait(timeout: .now() + .seconds(timeoutSeconds)) == .success)
+        await withCheckedContinuation { continuation in
+            let alreadyPaused = lock.withLock { () -> Bool in
+                if didPause { return true }
+                pauseContinuation = continuation
+                return false
+            }
+            if alreadyPaused {
+                continuation.resume(returning: true)
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(
+                deadline: .now() + .seconds(timeoutSeconds)
+            ) { [self] in
+                let timedOut = lock.withLock { () -> CheckedContinuation<Bool, Never>? in
+                    let waiting = pauseContinuation
+                    pauseContinuation = nil
+                    return waiting
+                }
+                timedOut?.resume(returning: false)
             }
         }
     }

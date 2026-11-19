@@ -474,6 +474,80 @@ extension HLSCompatibilityProbeTests {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testMultiVariantMasterDoesNotShareCumulativeEightMiBCap() async throws {
+        // 3 variants * 3 MiB = 9 MiB cumulative (> 8 MiB), but each variant stays
+        // well within the 8 MiB per-variant working-memory cap.
+        let context = try sourceContext()
+        let variantSize = 3 * 1_024 * 1_024
+        let names = ["v0", "v1", "v2"]
+        let masterText = "#EXTM3U\n" + names.enumerated().map { idx, name in
+            "#EXT-X-STREAM-INF:BANDWIDTH=\((idx + 1) * 1_000_000)\n\(name).m3u8\n"
+        }.joined()
+        let master = try HLSManifestGraph.parse(data: Data(masterText.utf8), responseURL: context.entryURL)
+        var documents = master.documents
+        var responses: [URL: HLSResourceResponse] = [:]
+        for name in names {
+            let playlistURL = URL(string: "https://example.test/\(name).m3u8")!
+            let segmentURL = URL(string: "https://example.test/\(name).ts")!
+            let media = try HLSManifestGraph.parse(
+                data: Data("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\n\(name).ts\n".utf8),
+                responseURL: playlistURL
+            )
+            documents.merge(media.documents) { old, _ in old }
+            responses[segmentURL] = HLSResourceResponse(
+                responseURL: segmentURL,
+                data: Data(repeating: 0x47, count: variantSize),
+                completeness: .complete
+            )
+        }
+        let source = ResolvedPlaybackSource(
+            context: context,
+            responseURL: context.entryURL,
+            generation: 1,
+            topology: .hls(HLSManifestGraph(rootURL: context.entryURL, documents: documents, aliases: [:]))
+        )
+        let facts = try await HLSCompatibilityProbe(
+            transport: SourceTestTransport(responses: responses),
+            inspector: SourceFactInspector()
+        ).inspect(source)
+        XCTAssertEqual(facts.media.count, 3)
+        XCTAssertEqual(facts.inspectedBytes, variantSize)
+        XCTAssertLessThanOrEqual(facts.inspectedBytes, HLSCompatibilityProbe.maximumBytes)
+    }
+
+    func testFMP4InitPlusSampleAndAES128DoNotDoubleCountBytes() async throws {
+        // fMP4 init + sample totaling 5 MiB (> 4 MiB half-cap) must not fail from double-accounting.
+        let context = try sourceContext(url: URL(string: "https://example.test/fmp4.m3u8")!)
+        let initURL = URL(string: "https://example.test/init.mp4")!
+        let sampleURL = URL(string: "https://example.test/seg0.m4s")!
+        let fmp4Playlist = "#EXTM3U\n#EXT-X-MAP:URI=\"\(initURL.absoluteString)\"\n#EXTINF:4,\n\(sampleURL.absoluteString)\n"
+        let fmp4Graph = try HLSManifestGraph.parse(data: Data(fmp4Playlist.utf8), responseURL: context.entryURL)
+        let fmp4Source = ResolvedPlaybackSource(context: context, responseURL: context.entryURL, generation: 1, topology: .hls(fmp4Graph))
+        let fmp4Transport = SourceTestTransport(responses: [
+            initURL: HLSResourceResponse(responseURL: initURL, data: Data(repeating: 0x11, count: 64 * 1_024)),
+            sampleURL: HLSResourceResponse(responseURL: sampleURL, data: Data(repeating: 0x22, count: 5 * 1_024 * 1_024)),
+        ])
+        let fmp4Facts = try await HLSCompatibilityProbe(transport: fmp4Transport, inspector: SourceFactInspector()).inspect(fmp4Source)
+        XCTAssertEqual(fmp4Facts.media.count, 1)
+        XCTAssertEqual(fmp4Facts.inspectedBytes, 64 * 1_024 + 5 * 1_024 * 1_024)
+
+        // AES-128 encrypted 5 MiB segment (> 4 MiB half-cap) must not fail from double-accounting.
+        let encContext = try sourceContext(url: URL(string: "https://example.test/enc.m3u8")!)
+        let keyURL = URL(string: "https://example.test/key.bin")!
+        let encSegURL = URL(string: "https://example.test/enc0.ts")!
+        let encPlaylist = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"\(keyURL.absoluteString)\",IV=0x00000000000000000000000000000000\n#EXTINF:4,\n\(encSegURL.absoluteString)\n"
+        let encGraph = try HLSManifestGraph.parse(data: Data(encPlaylist.utf8), responseURL: encContext.entryURL)
+        let encSource = ResolvedPlaybackSource(context: encContext, responseURL: encContext.entryURL, generation: 2, topology: .hls(encGraph))
+        let ciphertext = try encryptInitialization(Data(repeating: 0x47, count: 5 * 1_024 * 1_024))
+        let encTransport = SourceTestTransport(responses: [
+            keyURL: HLSResourceResponse(responseURL: keyURL, data: Data(0..<16)),
+            encSegURL: HLSResourceResponse(responseURL: encSegURL, data: ciphertext),
+        ])
+        let encFacts = try await HLSCompatibilityProbe(transport: encTransport, inspector: SourceFactInspector()).inspect(encSource)
+        XCTAssertEqual(encFacts.media.count, 1)
+        XCTAssertLessThanOrEqual(encFacts.inspectedBytes, HLSCompatibilityProbe.maximumBytes)
+    }
+
     private func initializationCase(fragmented: Bool, ranged: Bool = false, laterMap: Bool = false, encryptedMap: Bool = false) throws ->
         (source: ResolvedPlaybackSource, transport: SourceTestTransport, mediaURL: URL, map: HLSManifestGraph.Resource,
          encryption: HLSManifestGraph.Encryption, header: Data, sample: Data) {

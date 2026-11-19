@@ -115,4 +115,47 @@ final class M3UParserTests: XCTestCase {
         XCTAssertEqual(try decoder.decode(Data([0xD6, 0xD0, 0xCE, 0xC4])), "中文")
         XCTAssertEqual(try decoder.decode(Data([0x63, 0x61, 0x66, 0xE9])), "café")
     }
+
+    func testInvalidStreamURLClearsPendingMetadataWithoutLeakingToBareURL() throws {
+        let playlist = """
+            #EXTM3U
+            #EXTINF:-1 tvg-id="bad",Bad Entry
+            http://[invalid
+            https://example.test/orphan-bare.ts
+            #EXTINF:-1 tvg-id="good",Good Entry
+            #EXTVLCOPT:http-user-agent=VPlayerTest
+            https://example.test/good.ts
+            """
+
+        let channels = try M3UParser().parse(
+            data: Data(playlist.utf8),
+            sourceURL: sourceURL,
+            profileID: profileID
+        )
+
+        XCTAssertEqual(channels.map(\.displayName), ["Good Entry"])
+        XCTAssertEqual(channels.map(\.tvgID), ["good"])
+        XCTAssertEqual(channels.map(\.streamURL.absoluteString), ["https://example.test/good.ts"])
+    }
+
+    func testScanAttributesSkipsStrayEqualsAndPreservesAttributesAfterValuelessToken() throws {
+        let playlist = """
+            #EXTM3U
+            #EXTINF:-1 = tvg-id="id-1" group-title="Group One",Channel One
+            https://example.test/one
+            #EXTINF:-1 =stray valueless-flag tvg-id="id-2" group-title="Group Two",Channel Two
+            https://example.test/two
+            #EXTINF:-1 malformed-token tvg-id="id-3",Channel Three
+            https://example.test/three
+            """
+
+        let channels = try M3UParser().parse(
+            data: Data(playlist.utf8),
+            sourceURL: sourceURL,
+            profileID: profileID
+        )
+
+        XCTAssertEqual(channels.map(\.tvgID), ["id-1", "id-2", "id-3"])
+        XCTAssertEqual(channels.map(\.groupTitle), ["Group One", "Group Two", nil])
+    }
 }

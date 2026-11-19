@@ -229,6 +229,28 @@ enum PlaybackPipelineEventStorage {
         }
         tag.pointee = emptyTag
     }
+
+    static func replaceIfSameMediaInformationGeneration(
+        _ event: PlaybackPipelineEvent,
+        at slot: UnsafeMutableRawPointer,
+        tag: UnsafeMutablePointer<UInt16>
+    ) -> Bool {
+        guard case let .mediaInformation(information, generation: generation) = event else {
+            return false
+        }
+        switch (kind(tag), generation) {
+        case (.mediaWithoutGeneration, nil):
+            slot.assumingMemoryBound(to: PlaybackMediaInformation?.self).pointee = information
+            return true
+        case let (.mediaWithGeneration, target?):
+            let pointer = slot.assumingMemoryBound(to: MediaPayload.self)
+            guard pointer.pointee.1 == target else { return false }
+            pointer.pointee = (information, target)
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 final class PlaybackSessionEventRelay: @unchecked Sendable {
@@ -362,7 +384,26 @@ final class PlaybackSessionEventRelay: @unchecked Sendable {
     func send(_ event: PlaybackPipelineEvent) {
         let executor = lock.withLock { _ -> PlaybackControlExecutor? in
             guard let ownedExecutor, isActive, !overflowed else { return nil }
-            if pendingCount >= Self.maximumCapacity - (isDraining ? 1 : 0) {
+            let atCapacity = pendingCount >= Self.maximumCapacity - (isDraining ? 1 : 0)
+            if case .mediaInformation = event, pendingCount > 0 {
+                // Always coalesce consecutive same-generation media-info updates at the tail,
+                // and scan backwards across the ring before allowing an overflow.
+                let lowerOffset = atCapacity ? 0 : pendingCount - 1
+                for offset in stride(from: pendingCount - 1, through: lowerOffset, by: -1) {
+                    let slotIndex = (pendingIndex + offset) % Self.maximumCapacity
+                    if PlaybackPipelineEventStorage.replaceIfSameMediaInformationGeneration(
+                        event,
+                        at: pendingSlot(at: slotIndex),
+                        tag: pendingTags.advanced(by: slotIndex)
+                    ) {
+                        guard !isDraining else { return nil }
+                        isDraining = true
+                        ownedDrainRequested = true
+                        return ownedExecutor
+                    }
+                }
+            }
+            if atCapacity {
                 // 不可折叠溢出成为一次终态；用原槽保存，不另排队或继续接纳。
                 overflowed = true
                 clearPending()

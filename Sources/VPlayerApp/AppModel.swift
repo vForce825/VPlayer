@@ -80,6 +80,7 @@ final class AppModel {
     private let now: @Sendable () -> Date
     private var matchByChannelID: [String: EPGMatchResult] = [:]
     private var manualMappingByChannelID: [String: String] = [:]
+    @ObservationIgnored private var rawEPGCoverageEnd: Date?
     @ObservationIgnored private var programmeWindowDate: Date?
     private var reloadID: UUID?
     // 未成功应用的较大范围更新不能被后来的增量读取覆盖。
@@ -91,7 +92,7 @@ final class AppModel {
     private var activeCreationAttemptIDs: Set<UUID> = []
     private var cancelledCreationAttemptIDs: Set<UUID> = []
     private var terminalRefreshOverlays: [RefreshKey: TerminalRefreshOverlay] = [:]
-    private var manualRefreshAttempts: [RefreshKey: ManualRefreshAttempt] = [:]
+    @ObservationIgnored private var manualRefreshAttempts: [RefreshKey: ManualRefreshAttempt] = [:]
     @ObservationIgnored private var activeReloadIDs: Set<UUID> = []
     /// Distinguishes a successfully loaded, legitimately empty library from the
     /// default empty presentation state left behind by a failed first read.
@@ -178,6 +179,11 @@ final class AppModel {
                 completionClaims.insert(completionClaim)
             }
         }
+        for attempt in manualRefreshAttempts.values {
+            if let completionClaim = attempt.completionClaim {
+                completionClaims.insert(completionClaim)
+            }
+        }
         if !completionClaims.isEmpty, let libraryChanges {
             Task { @MainActor in
                 for completionClaim in completionClaims {
@@ -226,8 +232,8 @@ final class AppModel {
         if let programmeWindowDate,
            date >= programmeWindowDate,
            date.timeIntervalSince(programmeWindowDate) < 3_600 { return false }
-        return await reloadEPGOutcome(
-            activeProfileID: activeProfileID, reportsFailure: false
+        return await reloadProgrammeWindowOutcome(
+            activeProfileID: activeProfileID
         ) == .applied
     }
 
@@ -511,6 +517,68 @@ final class AppModel {
         }
     }
 
+    private func reloadProgrammeWindowOutcome(activeProfileID: UUID) async -> ReloadOutcome {
+        if requiresFullReload {
+            return await reloadOutcome(onError: { _ in })
+        }
+        if requiresEPGReload {
+            return await reloadEPGOutcome(activeProfileID: activeProfileID, reportsFailure: false)
+        }
+        let currentReloadID = UUID()
+        activeReloadIDs.insert(currentReloadID)
+        defer { completeReload(currentReloadID) }
+        let loadedChannels = channels
+        let cachedMatches = matchByChannelID
+        let cachedCoverageEnd = rawEPGCoverageEnd
+        let cachedProgrammeCount = epgProgrammeCount
+        activeTransition = nil
+        reloadID = currentReloadID
+        lastReloadFailure = nil
+
+        do {
+            let windowDate = now()
+            let windowStart = windowDate.addingTimeInterval(-3_600)
+            let windowEnd = windowStart.addingTimeInterval(25 * 3_600)
+            let matchedXMLTVChannelIDs = Set(cachedMatches.values.compactMap(\.xmltvChannelID))
+            let programmesByXMLTVChannelID = try await repository.programmes(
+                profileID: activeProfileID,
+                xmltvChannelIDs: matchedXMLTVChannelIDs,
+                overlapping: windowStart..<windowEnd
+            )
+            try Task.checkCancellation()
+
+            let presentation = try await Self.makeLibraryPresentationSnapshot(
+                channels: loadedChannels,
+                matches: cachedMatches,
+                programmesByXMLTVChannelID: programmesByXMLTVChannelID,
+                sortsChannels: false,
+                indexesPlaybackChannels: false
+            )
+            try Task.checkCancellation()
+
+            guard reloadID == currentReloadID,
+                  activeProfile?.id == activeProfileID else {
+                return .superseded
+            }
+            self.programmesByChannelID = presentation.programmesByChannelID
+            self.staleEPGCoverageEnd = EPGCoverageNotice.staleCoverageEnd(
+                coverageEnd: cachedCoverageEnd,
+                programmeCount: cachedProgrammeCount,
+                now: now()
+            )
+            self.programmeWindowDate = windowDate
+            appliedReloadID = currentReloadID
+            finishLoading(reloadID: currentReloadID)
+            return .applied
+        } catch is CancellationError {
+            return reloadID == currentReloadID ? .failedWhileCurrent : .superseded
+        } catch {
+            guard reloadID == currentReloadID else { return .superseded }
+            lastReloadFailure = ErrorDiagnosticSnapshot(error)
+            return .failedWhileCurrent
+        }
+    }
+
     private nonisolated static func makeEPGMatchingSnapshot(
         channels: [Channel],
         epgChannels: [EPGChannel],
@@ -724,6 +792,7 @@ final class AppModel {
         let activeTransition = deletedActiveProfile ? beginActiveTransition(to: nil) : nil
         do {
             try await repository.deleteProfile(id: profileID)
+            cancelAndClearRefreshState(for: profileID)
             clearPendingCreation(profileID: profileID)
             profiles.removeAll { $0.id == profileID }
             if deletedActiveProfile {
@@ -773,6 +842,10 @@ final class AppModel {
             mutationLaneEvent?(.cancelled(mutationLease.operation))
             return false
         }
+        if activeProfile?.id == profileID, lastReloadFailure == nil {
+            clearOperationAlert()
+            return true
+        }
         clearOperationAlert()
         let activeTransition = beginActiveTransition(
             to: profiles.first { $0.id == profileID }
@@ -806,9 +879,22 @@ final class AppModel {
 
     func refresh(profileID: UUID, resource: RefreshResource) async {
         let key = RefreshKey(profileID: profileID, resource: resource)
+        let libraryChanges = libraryChanges
+        let previousClaim = manualRefreshAttempts[key]?.completionClaim
+        let completionClaim = libraryChanges?.claimPersistedRefreshes(
+            profileID: profileID,
+            resources: [resource]
+        )
+        if let previousClaim {
+            libraryChanges?.releasePersistedRefreshes(
+                previousClaim,
+                publishesPendingChanges: true
+            )
+        }
         let attempt = ManualRefreshAttempt(
             id: UUID(),
-            startedAt: now()
+            startedAt: now(),
+            completionClaim: completionClaim
         )
         manualRefreshAttempts[key] = attempt
         markRefreshing(
@@ -817,7 +903,15 @@ final class AppModel {
             startedAt: attempt.startedAt
         )
         let outcomes = await refreshResources(profileID, [resource], .manual)
-        guard manualRefreshAttempts[key]?.id == attempt.id else { return }
+        guard manualRefreshAttempts[key]?.id == attempt.id else {
+            if let completionClaim {
+                libraryChanges?.releasePersistedRefreshes(
+                    completionClaim,
+                    publishesPendingChanges: true
+                )
+            }
+            return
+        }
         let outcome = outcomes.first { $0.resource == resource } ?? RefreshOutcome(
             resource: resource,
             succeeded: false,
@@ -839,14 +933,45 @@ final class AppModel {
         )
         let overlayID = terminalRefreshOverlays[key]?.id
         manualRefreshAttempts[key] = nil
-        let reconciliationTask: Task<Void, Never>?
-        if let overlayID, outcome.attemptID != nil || !Task.isCancelled {
-            reconciliationTask = scheduleRefreshReconciliation(key: key, overlayID: overlayID)
-        } else {
-            reconciliationTask = nil
+        if Task.isCancelled {
+            if let completionClaim {
+                libraryChanges?.releasePersistedRefreshes(
+                    completionClaim,
+                    publishesPendingChanges: true
+                )
+            }
+            if let overlayID, outcome.attemptID != nil {
+                _ = scheduleRefreshReconciliation(key: key, overlayID: overlayID)
+            }
+            return
         }
-        guard !Task.isCancelled else { return }
-        await reconciliationTask?.value
+        if let completionClaim {
+            await libraryChanges?.flushCommittedChanges()
+            libraryChanges?.stopClaimingPersistedRefreshes(completionClaim)
+        }
+        let dataResources: Set<RefreshResource>
+        if outcome.succeeded {
+            dataResources = [resource]
+        } else if let completionClaim, let libraryChanges {
+            dataResources = libraryChanges.claimedDataResources(for: completionClaim)
+        } else {
+            dataResources = []
+        }
+        let scope: LibraryChangeSignal.ReloadScope = dataResources.isEmpty
+            ? .refreshes([:])
+            : .refreshes([profileID: dataResources])
+        let reloadApplied: Bool
+        if let overlayID, terminalRefreshOverlays[key]?.id == overlayID {
+            reloadApplied = await reload(scope: scope)
+        } else {
+            reloadApplied = false
+        }
+        if let completionClaim {
+            libraryChanges?.releasePersistedRefreshes(
+                completionClaim,
+                publishesPendingChanges: !reloadApplied
+            )
+        }
     }
 
     /// Fetches resources the user has just pointed somewhere new. A freshly
@@ -880,9 +1005,13 @@ final class AppModel {
         let automaticRefreshID = UUID()
         let startedAt = now()
         var attempts: [RefreshKey: ManualRefreshAttempt] = [:]
+        var replacedManualClaims: [LibraryChangeSignal.RefreshCompletionClaim] = []
         for resource in batchedResources {
             let key = RefreshKey(profileID: profileID, resource: resource)
-            let attempt = ManualRefreshAttempt(id: UUID(), startedAt: startedAt)
+            if let existingClaim = manualRefreshAttempts[key]?.completionClaim {
+                replacedManualClaims.append(existingClaim)
+            }
+            let attempt = ManualRefreshAttempt(id: UUID(), startedAt: startedAt, completionClaim: nil)
             attempts[key] = attempt
             manualRefreshAttempts[key] = attempt
             markRefreshing(
@@ -897,6 +1026,12 @@ final class AppModel {
             profileID: profileID,
             resources: batchedResources
         )
+        for replacedClaim in replacedManualClaims {
+            libraryChanges?.releasePersistedRefreshes(
+                replacedClaim,
+                publishesPendingChanges: true
+            )
+        }
         for batch in overlappingBatchesByID.values {
             if let oldClaim = batch.completionClaim {
                 libraryChanges?.releasePersistedRefreshes(
@@ -933,7 +1068,8 @@ final class AppModel {
                 profileID: profileID,
                 resources: batchedResources,
                 attempts: attempts,
-                outcomes: outcomes
+                outcomes: outcomes,
+                completionClaim: completionClaim
             )
             if let completionClaim {
                 libraryChanges?.releasePersistedRefreshes(
@@ -966,10 +1102,12 @@ final class AppModel {
         profileID: UUID,
         resources: Set<RefreshResource>,
         attempts: [RefreshKey: ManualRefreshAttempt],
-        outcomes: [RefreshOutcome]
+        outcomes: [RefreshOutcome],
+        completionClaim: LibraryChangeSignal.RefreshCompletionClaim?
     ) async -> Bool {
         let completedAt = now()
         var reconciledResources: Set<RefreshResource> = []
+        var snapshotResources: Set<RefreshResource> = []
 
         for resource in resources {
             let key = RefreshKey(profileID: profileID, resource: resource)
@@ -998,10 +1136,54 @@ final class AppModel {
             )
             manualRefreshAttempts[key] = nil
             reconciledResources.insert(resource)
+            if outcome.succeeded {
+                snapshotResources.insert(resource)
+            }
         }
 
         guard !reconciledResources.isEmpty else { return false }
-        return await reload(scope: .refreshes([profileID: reconciledResources]))
+        if let completionClaim, let libraryChanges {
+            snapshotResources.formUnion(
+                libraryChanges.claimedDataResources(for: completionClaim)
+                    .intersection(reconciledResources)
+            )
+        }
+        let scope: LibraryChangeSignal.ReloadScope = snapshotResources.isEmpty
+            ? .refreshes([:])
+            : .refreshes([profileID: snapshotResources])
+        return await reload(scope: scope)
+    }
+
+    private func cancelAndClearRefreshState(for profileID: UUID) {
+        var cancelledBatchIDs: Set<UUID> = []
+        var claimsToRelease: Set<LibraryChangeSignal.RefreshCompletionClaim> = []
+        for key in Array(automaticRefreshTasks.keys) where key.profileID == profileID {
+            if let batch = automaticRefreshTasks.removeValue(forKey: key),
+               cancelledBatchIDs.insert(batch.id).inserted {
+                batch.task.cancel()
+                if let claim = batch.completionClaim {
+                    claimsToRelease.insert(claim)
+                }
+            }
+        }
+        for key in Array(refreshReconciliationTasks.keys) where key.profileID == profileID {
+            refreshReconciliationTasks.removeValue(forKey: key)?.task.cancel()
+        }
+        for key in Array(manualRefreshAttempts.keys) where key.profileID == profileID {
+            if let attempt = manualRefreshAttempts.removeValue(forKey: key),
+               let claim = attempt.completionClaim {
+                claimsToRelease.insert(claim)
+            }
+        }
+        for key in Array(terminalRefreshOverlays.keys) where key.profileID == profileID {
+            terminalRefreshOverlays[key] = nil
+        }
+        for claim in claimsToRelease {
+            libraryChanges?.releasePersistedRefreshes(
+                claim,
+                publishesPendingChanges: false
+            )
+        }
     }
 
     private func finishAutomaticRefresh(
@@ -1041,7 +1223,9 @@ final class AppModel {
         guard !resources.isEmpty else { return }
         for resource in resources {
             let key = RefreshKey(profileID: profileID, resource: resource)
-            manualRefreshAttempts[key] = nil
+            if let claim = manualRefreshAttempts.removeValue(forKey: key)?.completionClaim {
+                libraryChanges?.releasePersistedRefreshes(claim, publishesPendingChanges: false)
+            }
             terminalRefreshOverlays[key] = nil
             cancelRefreshReconciliation(for: key)
         }
@@ -1065,6 +1249,7 @@ final class AppModel {
                 guard isActiveProfile else { continue }
                 epgChannels = []
                 epgProgrammeCount = 0
+                rawEPGCoverageEnd = nil
                 staleEPGCoverageEnd = nil
                 matchByChannelID = [:]
                 programmesByChannelID = [:]
@@ -1201,6 +1386,7 @@ final class AppModel {
         )
         self.epgChannels = epgChannels
         self.epgProgrammeCount = epgProgrammeCount
+        self.rawEPGCoverageEnd = epgCoverageEnd
         self.staleEPGCoverageEnd = EPGCoverageNotice.staleCoverageEnd(
             coverageEnd: epgCoverageEnd,
             programmeCount: epgProgrammeCount,
@@ -1242,6 +1428,7 @@ final class AppModel {
         self.channels = channels
         self.epgChannels = epgChannels
         self.epgProgrammeCount = epgProgrammeCount
+        self.rawEPGCoverageEnd = epgCoverageEnd
         self.staleEPGCoverageEnd = EPGCoverageNotice.staleCoverageEnd(
             coverageEnd: epgCoverageEnd,
             programmeCount: epgProgrammeCount,
@@ -1367,6 +1554,7 @@ final class AppModel {
             channels: channels,
             epgChannels: epgChannels,
             epgProgrammeCount: epgProgrammeCount,
+            rawEPGCoverageEnd: rawEPGCoverageEnd,
             staleEPGCoverageEnd: staleEPGCoverageEnd,
             matchByChannelID: matchByChannelID,
             manualMappingByChannelID: manualMappingByChannelID,
@@ -1386,6 +1574,7 @@ final class AppModel {
         channels = transition.previousState.channels
         epgChannels = transition.previousState.epgChannels
         epgProgrammeCount = transition.previousState.epgProgrammeCount
+        rawEPGCoverageEnd = transition.previousState.rawEPGCoverageEnd
         staleEPGCoverageEnd = transition.previousState.staleEPGCoverageEnd
         matchByChannelID = transition.previousState.matchByChannelID
         manualMappingByChannelID = transition.previousState.manualMappingByChannelID
@@ -1405,6 +1594,7 @@ final class AppModel {
         channels = []
         epgChannels = []
         epgProgrammeCount = 0
+        rawEPGCoverageEnd = nil
         staleEPGCoverageEnd = nil
         matchByChannelID = [:]
         manualMappingByChannelID = [:]
@@ -1589,7 +1779,9 @@ final class AppModel {
         let loadedProfileIDs = Set(profiles.map(\.id))
         for key in Array(manualRefreshAttempts.keys)
         where !loadedProfileIDs.contains(key.profileID) {
-            manualRefreshAttempts[key] = nil
+            if let claim = manualRefreshAttempts.removeValue(forKey: key)?.completionClaim {
+                libraryChanges?.releasePersistedRefreshes(claim, publishesPendingChanges: false)
+            }
         }
     }
 
@@ -1634,7 +1826,7 @@ final class AppModel {
             finishRefreshReconciliation(key: key, id: reconciliationID)
             return
         }
-        _ = await reload()
+        _ = await reload(scope: .refreshes([key.profileID: [key.resource]]))
         finishRefreshReconciliation(key: key, id: reconciliationID)
     }
 
@@ -1844,6 +2036,7 @@ fileprivate extension AppModel {
         let channels: [Channel]
         let epgChannels: [EPGChannel]
         let epgProgrammeCount: Int
+        let rawEPGCoverageEnd: Date?
         let staleEPGCoverageEnd: Date?
         let matchByChannelID: [String: EPGMatchResult]
         let manualMappingByChannelID: [String: String]
@@ -1859,6 +2052,7 @@ fileprivate extension AppModel {
     struct ManualRefreshAttempt {
         let id: UUID
         let startedAt: Date
+        let completionClaim: LibraryChangeSignal.RefreshCompletionClaim?
     }
 
     struct TerminalRefreshOverlay {

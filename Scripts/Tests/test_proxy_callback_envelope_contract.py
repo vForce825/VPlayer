@@ -19,13 +19,11 @@ class ProxyReadWindowContract(unittest.TestCase):
         self.assertIn('static let maximumConnections = 16', budget)
         self.assertIn('try reserve(bytes: 512 * 1_024, kind: 1)', budget)
         self.assertIn('budget.reserve(bytes: 2 * maximum)', budget)
-        self.assertLess(source.index('reserveBodyEnvelope()'), source.index('session.bytes(for:'))
-        self.assertNotIn('didReceive data:', source)
-        self.assertNotIn('URLSessionDataDelegate', source)
+        self.assertLess(source.index('reserveBodyEnvelope()'), source.index('session.makeDataTask('))
         self.assertNotIn('AsyncStream', source)
         self.assertNotIn('append(byte)', source)
-        self.assertIn('pipe.publish(byte, at: position)', source)
-        self.assertIn('written.store(position + 1, ordering: .sequentiallyConsistent)', budget)
+        self.assertIn('pipe.publish(contentsOf:', source)
+        self.assertIn('written.store(position + UInt64(count), ordering: .sequentiallyConsistent)', budget)
         self.assertIn('readerWaiting.store(true, ordering: .sequentiallyConsistent)', budget)
 
     def test_reuse_waits_for_actual_backing_release_and_send_tail(self):
@@ -40,9 +38,9 @@ class ProxyReadWindowContract(unittest.TestCase):
 
     def test_reader_diagnostic_spans_the_real_reader_task(self):
         source = (PROXY / 'HLSProxyUpstream.swift').read_text()
-        reader = source[source.index('private func read('):source.index('private func request(')]
+        reader = source[source.index('private func drainChunks('):source.index('private func request(')]
         self.assertIn('connection.io.beginUpstreamReader()', reader)
-        self.assertIn('defer { connection.io.endUpstreamReader() }', reader)
+        self.assertIn('connection.io.endUpstreamReader()', reader)
         self.assertNotIn('position == 0', reader)
 
     def test_wire_framing_uses_the_bounded_raw_socket_oracle(self):
@@ -56,12 +54,14 @@ class ProxyReadWindowContract(unittest.TestCase):
         source = (PROXY / 'HLSProxyUpstream.swift').read_text()
         self.assertIn('try await consumer.value', source)
         self.assertIn('finishTasksAndInvalidate()', source)
-        self.assertIn('await waitForInvalidation()', source)
+        self.assertIn('await invalidation.wait()', source)
         self.assertNotIn('invalidateAndCancel()', source)
         self.assertIn('pending.0?.cancel()', source)
         self.assertIn('pending.1?.cancel()', source)
         self.assertIn('await reader.value', source)
-        self.assertIn('pipe.abort(error); reader.cancel(); upstream.cancel()', source)
+        self.assertIn('pipe.abort(error)', source)
+        self.assertIn('reader.cancel()', source)
+        self.assertIn('upstream.cancel()', source)
 
 
 if __name__ == '__main__':

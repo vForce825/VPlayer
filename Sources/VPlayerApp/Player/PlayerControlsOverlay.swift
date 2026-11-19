@@ -18,6 +18,7 @@ struct PlayerControlsOverlay: View {
     let onPlayPause: () -> Void
     let onSettings: () -> Void
     let onInteraction: () -> Void
+    @State private var hasManualFocusMove = false
     @FocusState private var focusedControl: Control?
     private let focusPolicy = AcceptanceFocusPolicy.current()
 
@@ -58,11 +59,26 @@ struct PlayerControlsOverlay: View {
         }
         .padding(56)
         .defaultFocus($focusedControl, initialControl)
-        .onMoveCommand { _ in onInteraction() }
-        .onChange(of: focusedControl) { _, _ in onInteraction() }
+        .onMoveCommand { _ in
+            hasManualFocusMove = true
+            onInteraction()
+        }
+        .onChange(of: focusedControl) { oldValue, newValue in
+            if oldValue != nil, newValue != nil, oldValue != newValue, newValue == .settings {
+                hasManualFocusMove = true
+            }
+            onInteraction()
+        }
         .onChange(of: isPaused) { _, _ in onInteraction() }
-        .onChange(of: canControlPlayback) { _, allowed in
-            if !allowed, focusedControl == .playPause { focusedControl = .back }
+        .onChange(of: canControlPlayback) { wasAllowed, allowed in
+            if !allowed, focusedControl == .playPause {
+                focusedControl = .back
+            } else if !wasAllowed, allowed,
+                      !hasManualFocusMove,
+                      focusPolicy.initialPlayerControl == .playPause,
+                      focusedControl == .back || focusedControl == nil {
+                focusedControl = .playPause
+            }
         }
         .task {
             await Task.yield()

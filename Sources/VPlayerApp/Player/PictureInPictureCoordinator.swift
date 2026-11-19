@@ -299,12 +299,17 @@ final class PictureInPictureCoordinator: NSObject,
     }
     private var currentID: ObjectIdentifier? { controller.map { ObjectIdentifier($0.callbackObject) } }
     private var retiringID: ObjectIdentifier? { retiring.map { ObjectIdentifier($0.callbackObject) } }
+    func clearMessage() {
+        message = nil
+    }
+
     func start() {
         guard supportsPictureInPicture() else {
             message = "当前设备不支持画中画。后台音频仍由系统播放策略管理。"
             return
         }
-        guard !closed, !starting, let controller, isPossible else {
+        guard !starting else { return }
+        guard !closed, let controller, isPossible else {
             message = "画中画尚未就绪，请在画面开始播放后重试。"
             return
         }
@@ -354,6 +359,7 @@ final class PictureInPictureCoordinator: NSObject,
         }
         controller = nil; retiring = nil; presentationIdentity = nil
         isActive = false; isPossible = false; starting = false
+        message = nil
         updateSnapshot()
         setPictureInPicture(false)
     }
@@ -370,6 +376,7 @@ final class PictureInPictureCoordinator: NSObject,
         }
         resumingAfterReplacement = false
         starting = false; isActive = true; restoring = false
+        message = nil
         setPictureInPicture(true)
         onStarted?()
     }
@@ -387,6 +394,7 @@ final class PictureInPictureCoordinator: NSObject,
         guard currentID == identity else { return }
         resumingAfterReplacement = false
         starting = false; isActive = false
+        message = nil
         setPictureInPicture(false)
         let restored = snapshot.consumeRestoreIntent(identity)
         if !restoring && !restored { onStopped?() }

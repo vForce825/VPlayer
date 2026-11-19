@@ -670,6 +670,109 @@ final class IOSPlaybackSessionTests: XCTestCase {
         XCTAssertFalse(session.isFullScreenPresented)
         session.close()
     }
+
+    func testRestoreFullScreenTimeoutResetsFullScreenPresentedBeforeCompletion() async {
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "restore-timeout",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "Timeout")
+        let session = IOSPlaybackSession(presentation: PlayerChannelPresentation(request: request,
+            logoURL: nil, programmes: []), dependencies: .uiTesting(playbackFixture: nil),
+            restorePollInterval: .milliseconds(5), restoreMaxAttempts: 4)
+        defer { session.close() }
+        var prepareCalls = 0
+        session.onPrepareForFullScreenRestore = { prepareCalls += 1 }
+        session.isFullScreenPresented = false
+
+        var presentedDuringCompletion: Bool?
+        let restored: Bool = await withCheckedContinuation { continuation in
+            session.restoreFullScreen { success in
+                presentedDuringCompletion = session.isFullScreenPresented
+                continuation.resume(returning: success)
+            }
+        }
+        XCTAssertEqual(prepareCalls, 1)
+        XCTAssertFalse(restored, "Blocked cover presentation must time out cleanly")
+        XCTAssertEqual(presentedDuringCompletion, false,
+            "isFullScreenPresented must be reset to false before completion(false) so the mini-bar reappears")
+        XCTAssertFalse(session.isFullScreenPresented)
+    }
+
+    func testRestoreFullScreenRejectsStaleCoverAndWaitsForFreshContainerMount() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        let window = UIWindow(windowScene: scene)
+        window.frame = CGRect(x: 0, y: 0, width: 390, height: 844)
+        let root = UIViewController()
+        window.rootViewController = root
+        window.isHidden = false
+        defer {
+            window.isHidden = true
+            window.rootViewController = nil
+        }
+
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "restore-race",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "Race")
+        let session = IOSPlaybackSession(presentation: PlayerChannelPresentation(request: request,
+            logoURL: nil, programmes: []), dependencies: .uiTesting(playbackFixture: nil),
+            restorePollInterval: .milliseconds(5), restoreMaxAttempts: 80)
+        defer { session.close() }
+
+        let oldContainer = IOSPlaybackHostContainerController()
+        root.addChild(oldContainer)
+        oldContainer.view.frame = root.view.bounds
+        root.view.addSubview(oldContainer.view)
+        oldContainer.didMove(toParent: root)
+        oldContainer.attach(session: session)
+        XCTAssertTrue(session.isHostActivelyPresented)
+
+        // Simulate PiP having minimized full-screen while the old cover is still mounted/dismissing.
+        session.isFullScreenPresented = false
+
+        var completedResult: Bool?
+        session.restoreFullScreen { success in
+            completedResult = success
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertNil(completedResult, "restoreFullScreen must not pass prematurely against the still-mounted old cover")
+
+        // Mount a fresh cover container and verify reparenting + late old dismantle cannot strip host.
+        let newContainer = IOSPlaybackHostContainerController()
+        root.addChild(newContainer)
+        newContainer.view.frame = root.view.bounds
+        root.view.addSubview(newContainer.view)
+        newContainer.didMove(toParent: root)
+        newContainer.attach(session: session)
+        oldContainer.detachIfOwned()
+        XCTAssertTrue(session.host.parent === newContainer)
+        XCTAssertTrue(session.host.view.superview === newContainer.view)
+        XCTAssertTrue(session.isHostMounted)
+
+        for _ in 0..<40 {
+            if completedResult != nil { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(completedResult, true, "restoreFullScreen must complete once the fresh container mounts")
+
+        newContainer.detachIfOwned()
+        XCTAssertNil(session.host.parent)
+        XCTAssertFalse(session.isHostMounted)
+    }
+
+    func testClearingPiPMessageRestoresControlsAutoHideEligibility() {
+        let target = PiPTestTarget()
+        let coordinator = IOSPictureInPictureCoordinator(target: target, supportsPictureInPicture: { false })
+        defer { coordinator.close() }
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "pip-msg",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "PiP Message")
+        coordinator.start()
+        XCTAssertNotNil(coordinator.message)
+        XCTAssertFalse(IOSPlayerControlsVisibility.allowsAutoHide(state: .playing(request),
+            isPresentingSettings: false, isVoiceOverRunning: false, isSceneActive: true,
+            hasPlaybackMessage: coordinator.message != nil))
+        coordinator.clearMessage()
+        XCTAssertNil(coordinator.message)
+        XCTAssertTrue(IOSPlayerControlsVisibility.allowsAutoHide(state: .playing(request),
+            isPresentingSettings: false, isVoiceOverRunning: false, isSceneActive: true,
+            hasPlaybackMessage: coordinator.message != nil))
+    }
 }
 
 @MainActor

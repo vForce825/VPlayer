@@ -142,6 +142,8 @@ public struct HLSProbeByteCache: Sendable, CustomStringConvertible, CustomReflec
 
 public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
     public static let maximumBytes = 8 * 1_024 * 1_024
+    private static let tsInitialAcquisitionBytes = 1 * 1_024 * 1_024
+    private static let maximumConcurrentVariants = 3
     private let transport: any HLSResourceTransport
     private let inspector: any HLSContainerInspecting
     private let cache: HLSProbeByteCache?
@@ -160,22 +162,28 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
         return try await inspect(source, factsCharge: charge)
     }
 
+    private struct VariantProbeOutcome: Sendable {
+        let index: Int
+        let fact: HLSMediaFacts
+        let inspectedBytes: Int
+        let initializationReceipt: InitializationReceipt?
+    }
+
     private func inspect(_ source: ResolvedPlaybackSource, factsCharge: HLSApplicationLifetimeCharge?) async throws -> HLSCompatibilityFacts {
         try Task.checkCancellation()
         guard let owner = source.context.owner else { throw HLSSourceError.unboundOwner }
         if let cache { guard cache.owner == owner, cache.generation == source.generation else { throw HLSSourceError.staleResolution } }
         let deadline = HLSMonotonicClock.deadline(seconds: 10)
-        var bytes = 0
+        var peakInspectedBytes = 0
         var media: [HLSMediaFacts] = []
         var retainedConfigurationBytes = 0
-        var loaded: [HLSManifestGraph.Resource: Data] = [:]
         // At most 128 fixed digest/scalar records (<64 KiB of conservative retained
         // metadata allowance) share the already reserved 4 MiB facts lifetime.
         var initializationRecords: [InitializationReceipt] = []
         switch source.topology {
         case let .media(data):
             guard !data.isEmpty, data.count <= Self.maximumBytes else { throw HLSSourceError.byteLimit }
-            bytes = data.count
+            peakInspectedBytes = data.count
             let fact = try await inspector.inspect(data: data, url: source.responseURL, deadline: deadline, completeness: source.mediaCompleteness)
             try admitFacts(fact, configurationBytes: &retainedConfigurationBytes)
             media = [fact]
@@ -187,38 +195,64 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
             let documents = graph.orderedDocuments.filter { $0.kind == .media }
             guard !documents.isEmpty else { throw HLSSourceError.incompleteEvidence }
             guard documents.count <= HLSInitializationReceipts.maximumCount else { throw HLSSourceError.graphLimit }
-            for document in documents {
-                try Task.checkCancellation()
-                guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
-                guard let segment = document.segments.first else { throw HLSSourceError.incompleteEvidence }
-                let sample = try await inspectedResource(segment.resource, encryption: segment.encryption, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded)
-                let input: Data
-                var initializationIdentity: (SHA256.Digest, Int)?
-                if let initialization = segment.initialization {
-                    let header = try await inspectedResource(initialization, encryption: segment.initializationEncryption, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded)
-                    if factsCharge != nil, inspector is FFmpegHLSContainerInspector {
-                        initializationIdentity = (SHA256.hash(data: header), header.count)
+
+            let outcomes: [VariantProbeOutcome]
+            if documents.count == 1 {
+                outcomes = [try await inspectVariant(
+                    document: documents[0],
+                    index: 0,
+                    source: source,
+                    deadline: deadline,
+                    recordInitializationReceipt: factsCharge != nil && inspector is FFmpegHLSContainerInspector
+                )]
+            } else {
+                let recordReceipt = factsCharge != nil && inspector is FFmpegHLSContainerInspector
+                outcomes = try await withThrowingTaskGroup(of: VariantProbeOutcome.self) { group in
+                    var collected: [VariantProbeOutcome] = []
+                    collected.reserveCapacity(documents.count)
+                    var nextIndex = 0
+                    let initialBatch = min(Self.maximumConcurrentVariants, documents.count)
+                    for _ in 0..<initialBatch {
+                        let idx = nextIndex
+                        let document = documents[idx]
+                        nextIndex += 1
+                        group.addTask {
+                            try await self.inspectVariant(
+                                document: document,
+                                index: idx,
+                                source: source,
+                                deadline: deadline,
+                                recordInitializationReceipt: recordReceipt
+                            )
+                        }
                     }
-                    guard header.count <= Self.maximumBytes - sample.count else { throw HLSSourceError.byteLimit }
-                    try reserve(header.count + sample.count, bytes: &bytes)
-                    var combined = Data(capacity: header.count + sample.count)
-                    combined.append(header); combined.append(sample)
-                    input = combined
-                } else { input = sample }
-                let fact: HLSMediaFacts
-                if HLSWebVTTInspector.accepts(input) {
-                    fact = HLSMediaFacts(url: document.responseURL, container: .webVTT, video: nil, audio: [], hasUnsupportedTracks: false)
-                } else {
-                    fact = try await inspector.inspect(data: input, url: document.responseURL, deadline: deadline)
+                    while let outcome = try await group.next() {
+                        collected.append(outcome)
+                        if nextIndex < documents.count {
+                            let idx = nextIndex
+                            let document = documents[idx]
+                            nextIndex += 1
+                            group.addTask {
+                                try await self.inspectVariant(
+                                    document: document,
+                                    index: idx,
+                                    source: source,
+                                    deadline: deadline,
+                                    recordInitializationReceipt: recordReceipt
+                                )
+                            }
+                        }
+                    }
+                    return collected.sorted { $0.index < $1.index }
                 }
-                try admitFacts(fact, configurationBytes: &retainedConfigurationBytes)
-                media.append(fact)
-                if let identity = initializationIdentity, let initialization = segment.initialization,
-                   fact.container == .fragmentedMP4 || fact.container == .mpegTS,
-                   let binding = InitializationReceipt.binding(source: source, mediaURL: document.responseURL,
-                        resource: initialization, encryption: segment.initializationEncryption) {
-                    initializationRecords.append(InitializationReceipt(bindingDigest: binding, plaintextDigest: identity.0,
-                        byteCount: identity.1, range: initialization.range, encrypted: segment.initializationEncryption != .none))
+            }
+
+            for outcome in outcomes {
+                try admitFacts(outcome.fact, configurationBytes: &retainedConfigurationBytes)
+                media.append(outcome.fact)
+                peakInspectedBytes = max(peakInspectedBytes, outcome.inspectedBytes)
+                if let receipt = outcome.initializationReceipt {
+                    initializationRecords.append(receipt)
                 }
             }
         }
@@ -226,7 +260,74 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
         let receipts: HLSInitializationReceipts = initializationRecords.isEmpty ? .empty :
             .init(owner: owner, generation: source.generation, charge: factsCharge, records: initializationRecords)
-        return HLSCompatibilityFacts(source: source, media: media, complete: true, inspectedBytes: bytes, initializationReceipts: receipts)
+        return HLSCompatibilityFacts(source: source, media: media, complete: true, inspectedBytes: peakInspectedBytes, initializationReceipts: receipts)
+    }
+
+    private func inspectVariant(
+        document: HLSManifestGraph.Document,
+        index: Int,
+        source: ResolvedPlaybackSource,
+        deadline: UInt64,
+        recordInitializationReceipt: Bool
+    ) async throws -> VariantProbeOutcome {
+        try Task.checkCancellation()
+        guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
+        guard let segment = document.segments.first else { throw HLSSourceError.incompleteEvidence }
+        // 工作内存与字节限额按变体独立作用域核算，单变体探测完成后即释放分片缓冲。
+        var variantBytes = 0
+        var loaded: [HLSManifestGraph.Resource: Data] = [:]
+        let allowTSPrefix = segment.encryption == .none && segment.resource.range == nil && segment.initialization == nil
+        let (sample, sampleCompleteness) = try await inspectedResource(
+            segment.resource,
+            encryption: segment.encryption,
+            source: source,
+            deadline: deadline,
+            bytes: &variantBytes,
+            loaded: &loaded,
+            allowTSPrefix: allowTSPrefix
+        )
+        let input: Data
+        let inputCompleteness: HLSMediaCompleteness
+        var initializationIdentity: (SHA256.Digest, Int)?
+        if let initialization = segment.initialization {
+            let (header, _) = try await inspectedResource(
+                initialization,
+                encryption: segment.initializationEncryption,
+                source: source,
+                deadline: deadline,
+                bytes: &variantBytes,
+                loaded: &loaded,
+                allowTSPrefix: false
+            )
+            if recordInitializationReceipt {
+                initializationIdentity = (SHA256.hash(data: header), header.count)
+            }
+            // header 与 sample 已在各自 fetch 时计入 variantBytes，这里只校验合并上限，不再重复扣减。
+            guard header.count <= Self.maximumBytes - sample.count else { throw HLSSourceError.byteLimit }
+            var combined = Data(capacity: header.count + sample.count)
+            combined.append(header)
+            combined.append(sample)
+            input = combined
+            inputCompleteness = .complete
+        } else {
+            input = sample
+            inputCompleteness = sampleCompleteness
+        }
+        let fact: HLSMediaFacts
+        if inputCompleteness == .complete, HLSWebVTTInspector.accepts(input) {
+            fact = HLSMediaFacts(url: document.responseURL, container: .webVTT, video: nil, audio: [], hasUnsupportedTracks: false)
+        } else {
+            fact = try await inspector.inspect(data: input, url: document.responseURL, deadline: deadline, completeness: inputCompleteness)
+        }
+        var receipt: InitializationReceipt?
+        if let identity = initializationIdentity, let initialization = segment.initialization,
+           fact.container == .fragmentedMP4 || fact.container == .mpegTS,
+           let binding = InitializationReceipt.binding(source: source, mediaURL: document.responseURL,
+                resource: initialization, encryption: segment.initializationEncryption) {
+            receipt = InitializationReceipt(bindingDigest: binding, plaintextDigest: identity.0,
+                byteCount: identity.1, range: initialization.range, encrypted: segment.initializationEncryption != .none)
+        }
+        return VariantProbeOutcome(index: index, fact: fact, inspectedBytes: variantBytes, initializationReceipt: receipt)
     }
 
     private func admitFacts(_ fact: HLSMediaFacts, configurationBytes: inout Int) throws {
@@ -237,56 +338,104 @@ public struct HLSCompatibilityProbe: HLSPaidCompatibilityProbing {
         }
     }
 
-    private func reserve(_ count: Int, bytes: inout Int) throws {
-        guard count >= 0, count <= Self.maximumBytes - bytes else { throw HLSSourceError.byteLimit }
-        bytes += count
-    }
-
     private func inspectedResource(_ resource: HLSManifestGraph.Resource, encryption: HLSManifestGraph.Encryption,
                                    source: ResolvedPlaybackSource, deadline: UInt64, bytes: inout Int,
-                                   loaded: inout [HLSManifestGraph.Resource: Data]) async throws -> Data {
-        let data = try await fetch(resource, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded)
-        guard case let .aes128(keyURL, iv) = encryption else { return data }
+                                   loaded: inout [HLSManifestGraph.Resource: Data],
+                                   allowTSPrefix: Bool) async throws -> (Data, HLSMediaCompleteness) {
+        let (data, completeness) = try await fetch(
+            resource,
+            source: source,
+            deadline: deadline,
+            bytes: &bytes,
+            loaded: &loaded,
+            allowTSPrefix: allowTSPrefix
+        )
+        guard case let .aes128(keyURL, iv) = encryption else { return (data, completeness) }
         guard resource.range == nil else {
             HLSPreparationDiagnostics.current?.reject(.encryptedRange)
             throw HLSSourceError.unsupportedMedia
         }
         let keyResource = HLSManifestGraph.Resource(url: keyURL, range: nil)
-        let key = try await fetch(keyResource, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded, resourceLimit: 16)
+        let (key, _) = try await fetch(keyResource, source: source, deadline: deadline, bytes: &bytes, loaded: &loaded, resourceLimit: 16, allowTSPrefix: false)
         guard key.count == 16 else {
             HLSPreparationDiagnostics.current?.reject(.keyLength)
             throw HLSSourceError.unsupportedMedia
         }
-        try reserve(data.count + HLSAES128Preflight.workspaceBytes, bytes: &bytes)
+        // data 已在 fetch 时计入 bytes；仅检查解密工作区不越界，避免将同一负载重复扣减两次。
+        guard data.count <= Self.maximumBytes - HLSAES128Preflight.workspaceBytes else { throw HLSSourceError.byteLimit }
         try Task.checkCancellation()
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
         let plaintext = try HLSAES128Preflight.decrypt(data, key: key, iv: iv)
         try Task.checkCancellation()
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
-        return plaintext
+        return (plaintext, .complete)
     }
 
     private func fetch(_ resource: HLSManifestGraph.Resource, source: ResolvedPlaybackSource, deadline: UInt64,
-                       bytes: inout Int, loaded: inout [HLSManifestGraph.Resource: Data], resourceLimit: Int = HLSCompatibilityProbe.maximumBytes) async throws -> Data {
+                       bytes: inout Int, loaded: inout [HLSManifestGraph.Resource: Data],
+                       resourceLimit: Int = HLSCompatibilityProbe.maximumBytes,
+                       allowTSPrefix: Bool) async throws -> (Data, HLSMediaCompleteness) {
         if let value = loaded[resource] {
             guard value.count <= resourceLimit else { throw HLSSourceError.byteLimit }
-            return value
+            return (value, .complete)
         }
         let remaining = Self.maximumBytes - bytes
         guard remaining > 0 else { throw HLSSourceError.byteLimit }
+        let budgetLimit = min(remaining, resourceLimit)
         let value: Data
-        if let cached = cache?.resources[resource] { value = cached } else {
+        let completeness: HLSMediaCompleteness
+        if let cached = cache?.resources[resource] {
+            value = cached
+            completeness = .complete
+        } else if allowTSPrefix, resource.range == nil {
+            let initialMaximum = min(Self.tsInitialAcquisitionBytes, budgetLimit)
+            let continuation = budgetLimit > initialMaximum ? budgetLimit : nil
+            let response = try await transport.fetch(.init(
+                url: resource.url,
+                headers: source.context.headers,
+                range: nil,
+                maximumBytes: initialMaximum,
+                deadline: deadline,
+                mode: .classify,
+                maximumTSContinuationBytes: continuation
+            ))
+            if response.completeness == .complete {
+                value = response.data
+                completeness = .complete
+            } else if response.completeness == .prefix, response.data.first == 0x47 {
+                value = response.data
+                completeness = .prefix
+            } else if response.completeness == .prefix, budgetLimit > initialMaximum {
+                // 非 TS 资源在 1 MiB 截断时回退到完整拉取（受剩余 per-variant 上限约束）。
+                let fullResponse = try await transport.fetch(.init(
+                    url: resource.url,
+                    headers: source.context.headers,
+                    range: nil,
+                    maximumBytes: budgetLimit,
+                    deadline: deadline,
+                    mode: .complete
+                ))
+                guard fullResponse.completeness == .complete else { throw HLSSourceError.incompleteEvidence }
+                value = fullResponse.data
+                completeness = .complete
+            } else {
+                throw HLSSourceError.incompleteEvidence
+            }
+        } else {
             let response = try await transport.fetch(.init(url: resource.url, headers: source.context.headers,
-                range: resource.range, maximumBytes: min(remaining, resourceLimit), deadline: deadline))
+                range: resource.range, maximumBytes: budgetLimit, deadline: deadline))
             guard response.completeness == .complete || (resource.range != nil && response.completeness == .byteRange) else { throw HLSSourceError.incompleteEvidence }
             value = response.data
+            completeness = .complete
         }
         try Task.checkCancellation()
         guard HLSMonotonicClock.now < deadline else { throw HLSSourceError.deadline }
         guard !value.isEmpty, value.count <= remaining, value.count <= resourceLimit,
               resource.range == nil || Int64(value.count) == resource.range?.length else { throw HLSSourceError.byteLimit }
         bytes += value.count
-        loaded[resource] = value
-        return value
+        if completeness == .complete {
+            loaded[resource] = value
+        }
+        return (value, completeness)
     }
 }

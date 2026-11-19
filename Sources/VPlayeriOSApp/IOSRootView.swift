@@ -12,10 +12,15 @@ struct IOSRootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var model: AppModel
-    @State private var session: IOSPlaybackSession?
+    @State private var sessionBox = IOSActivePlaybackSessionBox()
     @State private var libraryReady = false
     @State private var libraryFailure: String?
     @State private var loadAttempt = 0
+    private var session: IOSPlaybackSession? { sessionBox.session }
+    private var miniBarSession: IOSPlaybackSession? {
+        guard let active = session, !active.isClosing, !active.isFullScreenPresented else { return nil }
+        return active
+    }
 
     init(dependencies: AppDependencies) {
         self.dependencies = dependencies
@@ -33,6 +38,14 @@ struct IOSRootView: View {
                     IOSSettingsView(playback: dependencies.playbackSettings,
                                     channelBrowsing: dependencies.channelBrowsingSettings)
                         .tabItem { Label("设置", systemImage: "gearshape") }
+                }
+                .tabViewBottomAccessory(isEnabled: miniBarSession != nil) {
+                    if let active = miniBarSession {
+                        IOSMiniPlayerBar(session: active) {
+                            active.close()
+                            model.dismissPlayback()
+                        }
+                    }
                 }
             } else if let libraryFailure {
                 VStack(spacing: 20) {
@@ -55,11 +68,20 @@ struct IOSRootView: View {
             await model.maintainProgrammeWindow()
         }
         .onChange(of: scenePhase, initial: true) { _, phase in
-            if phase == .active { dependencies.foregroundRefreshDriver.activate() }
-            else { dependencies.foregroundRefreshDriver.deactivate() }
+            switch phase {
+            case .active:
+                dependencies.foregroundRefreshDriver.activate()
+            case .inactive, .background:
+                dependencies.foregroundRefreshDriver.deactivate()
+                dependencies.backgroundRefreshRegistrar.scheduleNext()
+            @unknown default:
+                dependencies.foregroundRefreshDriver.deactivate()
+                dependencies.backgroundRefreshRegistrar.scheduleNext()
+            }
         }
         .onChange(of: reducedResourceUsage, initial: true) { _, value in
             dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(value)
+            dependencies.backgroundRefreshRegistrar.setPrefersReducedResourceUsage(value)
         }
         .onChange(of: currentPlayerPresentation) { _, presentation in
             if let presentation { session?.updatePresentation(presentation) }
@@ -68,42 +90,29 @@ struct IOSRootView: View {
         .onChange(of: session?.isClosing) { _, closing in
             if closing == true { model.dismissPlayback() }
         }
-        .safeAreaInset(edge: .bottom) {
-            if let active = session, !active.isClosing, !active.isFullScreenPresented {
-                HStack(spacing: 14) {
-                    Button { active.showFullScreen() } label: {
-                        Label(active.presentation.request.title, systemImage: "play.rectangle")
-                            .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    #if DEBUG
-                    .accessibilityIdentifier("player-mini-resume")
-                    #endif
-                    Button { active.model.togglePause() } label: {
-                        Image(systemName: active.model.isPaused ? "play.fill" : "pause.fill")
-                    }.accessibilityLabel(active.model.isPaused ? "播放" : "暂停")
-                    Button { active.close(); model.dismissPlayback() } label: { Image(systemName: "xmark") }
-                        .accessibilityLabel("关闭播放")
-                }
-                .padding().background(.regularMaterial)
-            }
-        }
         .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil },
             set: { if !$0 { model.dismissAlert() } })) {
             Button("知道了") { model.dismissAlert() }
         } message: { Text(model.alertMessage ?? "") }
         .fullScreenCover(isPresented: fullScreenBinding) {
-            if let active = session {
-                IOSFullScreenPlayerView(session: active, library: model,
-                    browsingSettings: dependencies.channelBrowsingSettings) {
-                        guard model.presentedPlaybackRequest?.id == active.id else { return }
-                        model.dismissPlayback()
-                    }
-                    .id(active.id)
-                    .interactiveDismissDisabled()
-                    #if DEBUG
-                    .overlay(alignment: .topLeading) { routeProbe(identifier: "ios.playback.route.presented") }
-                    #endif
+            Group {
+                if let active = session {
+                    IOSFullScreenPlayerView(session: active, library: model,
+                        browsingSettings: dependencies.channelBrowsingSettings) {
+                            guard model.presentedPlaybackRequest?.id == active.id else { return }
+                            model.dismissPlayback()
+                        }
+                        .id(active.id)
+                }
             }
+            .overlay(alignment: .topLeading) {
+                IOSPlaybackOrientationPreference(playback: dependencies.playbackSettings, sessionBox: sessionBox)
+                    .frame(width: 1, height: 1).allowsHitTesting(false).accessibilityHidden(true)
+            }
+            .interactiveDismissDisabled()
+            #if DEBUG
+            .overlay(alignment: .topLeading) { routeProbe(identifier: "ios.playback.route.presented") }
+            #endif
         }
         #if DEBUG
         .overlay(alignment: .topLeading) { routeProbe() }
@@ -154,15 +163,128 @@ struct IOSRootView: View {
         let previous = session
         if let request {
             let channel = model.channels.first { $0.id == request.channelID }
-            session = IOSPlaybackSession(presentation: PlayerChannelPresentation(request: request,
+            let next = IOSPlaybackSession(presentation: PlayerChannelPresentation(request: request,
                 logoURL: channel?.logoURL,
                 programmes: model.programmesByChannelID[request.channelID, default: []]),
                 dependencies: dependencies)
-        } else { session = nil }
+            let appModel = model
+            next.onPrepareForFullScreenRestore = { [weak appModel] in
+                appModel?.dismissAlert()
+            }
+            sessionBox.session = next
+        } else { sessionBox.session = nil }
         #if DEBUG
         IOSPlaybackRouteDiagnostics.replaceSession(id: session?.id)
         #endif
         previous?.close()
+    }
+}
+
+enum IOSMiniPlayerAction: Equatable {
+    case playPause(isPaused: Bool)
+    case retry
+    case loading
+    case none
+
+    static func resolve(
+        state: PlaybackState,
+        isPaused: Bool,
+        canControlPlayback: Bool
+    ) -> Self {
+        if case let .failed(failure) = state {
+            return PlayerFailureActionPolicy.showsRetry(for: failure) ? .retry : .none
+        }
+        if canControlPlayback {
+            return .playPause(isPaused: isPaused)
+        }
+        switch state {
+        case .idle, .preparing, .buffering, .recovering:
+            return .loading
+        case .playing, .paused, .stopped, .failed:
+            return .none
+        }
+    }
+}
+
+private struct IOSMiniPlayerBar: View {
+    let session: IOSPlaybackSession
+    let onClose: () -> Void
+
+    private var isFailed: Bool {
+        if case .failed = session.model.state { return true }
+        return false
+    }
+
+    private var action: IOSMiniPlayerAction {
+        IOSMiniPlayerAction.resolve(
+            state: session.model.state,
+            isPaused: session.model.isPaused,
+            canControlPlayback: session.model.canControlPlayback
+        )
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button { session.showFullScreen() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isFailed ? "exclamationmark.triangle.fill" : "play.rectangle")
+                        .foregroundStyle(isFailed ? .orange : .primary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(session.presentation.request.title)
+                            .font(.subheadline.weight(.medium))
+                            .lineLimit(1)
+                        if isFailed {
+                            Text("播放失败")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            #if DEBUG
+            .accessibilityIdentifier("player-mini-resume")
+            #endif
+
+            switch action {
+            case let .playPause(isPaused):
+                Button { session.model.togglePause() } label: {
+                    Image(systemName: isPaused ? "play.fill" : "pause.fill")
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isPaused ? "播放" : "暂停")
+            case .retry:
+                Button { session.model.retry() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .frame(minWidth: 44, minHeight: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("重试")
+                .accessibilityIdentifier("player-mini-retry")
+            case .loading:
+                ProgressView()
+                    .frame(minWidth: 44, minHeight: 44)
+                    .accessibilityLabel("正在加载播放")
+            case .none:
+                EmptyView()
+            }
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("关闭播放")
+            .accessibilityIdentifier("player-mini-close")
+        }
+        .padding(.horizontal, 12)
     }
 }
 

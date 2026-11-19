@@ -73,6 +73,64 @@ final class IOSPlatformBoundaryTests: XCTestCase {
         XCTAssertEqual(url, expected)
         XCTAssertEqual(VPlayerCore.deploymentTarget, "iOS 27.0")
     }
+
+    func testPhoneBundleDeclaresBackgroundRefreshIdentifierAndFetchMode() throws {
+        let info = try XCTUnwrap(Bundle.main.infoDictionary)
+        let modes = try XCTUnwrap(info["UIBackgroundModes"] as? [String])
+        XCTAssertTrue(modes.contains("audio"))
+        XCTAssertTrue(modes.contains("fetch"))
+        let identifiers = try XCTUnwrap(info["BGTaskSchedulerPermittedIdentifiers"] as? [String])
+        XCTAssertTrue(identifiers.contains(BackgroundRefreshRegistrar.identifier))
+    }
+
+    func testRestoredOrientationPrefersPriorInterfaceOrientation() {
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: .portrait), .portrait)
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: .portraitUpsideDown), .portrait)
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: .unknown), .portrait)
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: nil), .portrait)
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: .landscapeLeft), .landscapeLeft)
+        XCTAssertEqual(IOSWindowSceneDelegate.restoredOrientationMask(for: .landscapeRight), .landscapeRight)
+    }
+
+    func testMiniPlayerActionResolvesFailureRetryLoadingAndPlayPauseStates() {
+        let request = PlaybackRequest(sourceProfileID: UUID(), channelID: "mini-fixture",
+            streamURL: URL(string: "https://example.invalid/live")!, title: "Mini")
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .playing(request), isPaused: false, canControlPlayback: true),
+            .playPause(isPaused: false)
+        )
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .paused(request), isPaused: true, canControlPlayback: true),
+            .playPause(isPaused: true)
+        )
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .preparing(request), isPaused: false, canControlPlayback: false),
+            .loading
+        )
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .buffering(request), isPaused: false, canControlPlayback: true),
+            .playPause(isPaused: false)
+        )
+        let retryable = PlaybackFailure(code: "net", userMessage: "网络错误", retryDisposition: .retrySameRequest)
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .failed(retryable), isPaused: false, canControlPlayback: false),
+            .retry
+        )
+        let terminal = PlaybackFailure(code: "unsupported", userMessage: "不支持", retryDisposition: .doNotRetry)
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .failed(terminal), isPaused: false, canControlPlayback: false),
+            .none
+        )
+        let switchChannel = PlaybackFailure(code: "gone", userMessage: "频道不可用", retryDisposition: .chooseAnotherChannel)
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .failed(switchChannel), isPaused: false, canControlPlayback: false),
+            .none
+        )
+        XCTAssertEqual(
+            IOSMiniPlayerAction.resolve(state: .stopped, isPaused: false, canControlPlayback: false),
+            .none
+        )
+    }
 }
 
 @MainActor

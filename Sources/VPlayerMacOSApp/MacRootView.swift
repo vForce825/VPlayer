@@ -6,15 +6,15 @@ import SwiftUI
 import VPlayerCore
 
 struct MacRootView: View {
-    private enum SidebarFocus: Hashable { case search, channels, group, profile }
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
-    @FocusState private var sidebarFocus: SidebarFocus?
+    @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     @Bindable var state: MacApplicationState
     @State private var searchText = ""
     @State private var selectedGroup: String?
     @State private var mappingChannel: Channel?
     @State private var selectedChannelID: String?
+    @State private var sidebarHasKeyboardFocus = false
     var body: some View {
         Group {
             if let model = state.model, let dependencies = state.dependencies {
@@ -40,11 +40,10 @@ struct MacRootView: View {
         }
         .navigationTitle(state.session.map { "VPlayer - \($0.presentation.request.title)" } ?? "VPlayer")
         .toolbarVisibility(.visible, for: .windowToolbar)
-        .background(MacLibraryWindowReader(update: { state.registerLibraryWindow($0) }, hidePlaybackControls: {
-            guard let session = state.session else { return false }
-            session.overlay.hide(pointerLocation: NSEvent.mouseLocation)
-            return true
-        }))
+        .background(MacLibraryWindowReader(
+            update: { state.registerLibraryWindow($0) },
+            handleKeyShortcut: { handleWindowKeyShortcut($0) }
+        ))
         .onAppear { state.openLibraryWindow = { openWindow(id: "library") } }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { notification in
             if notification.object as? NSWindow === state.libraryWindow { state.isTheaterMode = true }
@@ -56,12 +55,41 @@ struct MacRootView: View {
             if let window = notification.object as? NSWindow { state.libraryWindowWillClose(window) }
         }
     }
+    private func handleWindowKeyShortcut(_ shortcut: MacPlayerKeyShortcut) -> Bool {
+        guard let session = state.session else { return false }
+        switch shortcut {
+        case .escape:
+            guard session.overlay.hasVisibleOverlay else { return false }
+            session.overlay.hide(pointerLocation: NSEvent.mouseLocation)
+            session.model.clearPlaybackControlMessage()
+            return true
+        case .togglePause:
+            session.model.togglePause()
+            session.overlay.interact(paused: session.model.isPaused)
+            return true
+        case .toggleInformation:
+            session.overlay.toggleInformation(paused: session.model.isPaused)
+            return true
+        case .showProgrammes:
+            state.showsProgrammes = true
+            return true
+        case .toggleSidebar:
+            session.overlay.toggleSidebar(paused: session.model.isPaused)
+            return true
+        }
+    }
     private func libraryView(model: AppModel, dependencies: AppDependencies) -> some View {
-        ZStack(alignment: .leading) {
+        let hasActiveRootSheet = state.showsSourceManager || state.showsAddSource || mappingChannel != nil
+        return ZStack(alignment: .leading) {
             Group {
                 if let session = state.session {
-                    MacPlayerView(session: session, state: state, settings: dependencies.playbackSettings)
-                        .id(session.model.request.id)
+                    MacPlayerView(
+                        session: session,
+                        state: state,
+                        settings: dependencies.playbackSettings,
+                        hasActiveRootSheet: hasActiveRootSheet
+                    )
+                    .id(session.model.request.id)
                 } else {
                     ContentUnavailableView("选择一个频道开始播放", systemImage: "play.rectangle",
                         description: Text(model.channels.isEmpty ? "添加 M3U 播放列表，即可浏览频道与节目单。" : "双击频道或按回车播放，直播将在右侧显示。"))
@@ -72,8 +100,23 @@ struct MacRootView: View {
                 .padding(.leading, state.session == nil ? state.sidebar.width + 8 : 0)
             if state.session == nil || state.session?.overlay.sidebarVisible == true {
                 HStack(spacing: 0) {
-                    browser(model: model, dependencies: dependencies)
-                        .frame(width: state.sidebar.width)
+                    MacSidebarBrowserView(
+                        model: model,
+                        browsingSettings: dependencies.channelBrowsingSettings,
+                        playingChannelID: state.session?.model.request.channelID,
+                        prefersReducedResourceUsage: prefersReducedResourceUsage,
+                        searchText: $searchText,
+                        selectedGroup: $selectedGroup,
+                        selectedChannelID: $selectedChannelID,
+                        onAddSource: { state.showsAddSource = true },
+                        onManageSources: { state.showsSourceManager = true },
+                        onMapEPG: { mappingChannel = $0 },
+                        onFocusChanged: { focused in
+                            sidebarHasKeyboardFocus = focused
+                            updateSidebarFocus()
+                        }
+                    )
+                    .frame(width: state.sidebar.width)
                     MacSidebarResizeHandle(preferences: state.sidebar)
                         .frame(width: 8)
                 }
@@ -81,7 +124,7 @@ struct MacRootView: View {
                 .shadow(color: .black.opacity(state.session == nil ? 0 : 0.25), radius: 12, x: 5)
                 .onHover { hovering in
                     guard let session = state.session else { return }
-                    session.overlay.holdsSidebarOpen = hovering
+                    session.overlay.holdsSidebarOpen = hovering && session.overlay.sidebarVisible
                     if hovering, session.overlay.sidebarVisible {
                         session.overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
                     } else { session.overlay.scheduleAutoHide(paused: session.model.isPaused) }
@@ -90,6 +133,13 @@ struct MacRootView: View {
                     if case .active = phase, let session = state.session, session.overlay.sidebarVisible {
                         session.overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
                     }
+                }
+                .onDisappear {
+                    sidebarHasKeyboardFocus = false
+                    guard let session = state.session else { return }
+                    session.overlay.holdsSidebarOpen = false
+                    session.overlay.sidebarHasFocus = voiceOverEnabled
+                    session.overlay.scheduleAutoHide(paused: session.model.isPaused)
                 }
                 .transition(.move(edge: .leading).combined(with: .opacity))
             } else if let session = state.session {
@@ -103,25 +153,29 @@ struct MacRootView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: state.session?.overlay.sidebarVisible)
-        .onChange(of: model.presentedPlaybackRequest) { _, request in state.replaceSession(for: request) }
-        .onChange(of: sidebarFocus) { _, _ in updateSidebarFocus() }
+        .onChange(of: prefersReducedResourceUsage, initial: true) { _, preferred in
+            dependencies.foregroundRefreshDriver.setPrefersReducedResourceUsage(preferred)
+        }
         .onChange(of: voiceOverEnabled) { _, _ in updateSidebarFocus() }
         .onChange(of: state.session?.model.request.id) { _, _ in updateSidebarFocus() }
-        .onChange(of: model.programmesByChannelID) { _, _ in state.refreshPresentation() }
+        .onChange(of: model.activeProfile?.id) { _, _ in
+            searchText = ""
+            selectedGroup = nil
+        }
         .onChange(of: model.channels) { _, _ in
-            state.refreshPresentation()
             if let selectedGroup, !model.channels.contains(where: { ChannelSectionBuilder.resolvedGroupTitle(for: $0) == selectedGroup }) {
                 self.selectedGroup = nil
             }
         }
-        .task {
-            while !Task.isCancelled {
-                await model.maintainProgrammeWindow()
-                do { try await Task.sleep(for: .seconds(30)) } catch { return }
-            }
-        }
-        .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil },
-            set: { if !$0 { model.dismissAlert() } })) {
+        .alert(model.alertTitle, isPresented: Binding(
+            get: {
+                model.alertMessage != nil
+                    && !state.showsSourceManager
+                    && !state.showsAddSource
+                    && mappingChannel == nil
+            },
+            set: { if !$0 { model.dismissAlert() } }
+        )) {
             Button("知道了") { model.dismissAlert() }
         } message: { Text(model.alertMessage ?? "") }
         .sheet(isPresented: $state.showsSourceManager) { MacSourceManagerView(model: model) }
@@ -130,20 +184,128 @@ struct MacRootView: View {
             ChannelEPGMappingView(model: model, channel: channel).frame(width: 600, height: 560)
         }
     }
-    private func browser(model: AppModel, dependencies: AppDependencies) -> some View {
-        let grouped = dependencies.channelBrowsingSettings.grouping == .playlistGroups
-        let presentation = ChannelBrowserPresentation(channels: model.channels, searchText: searchText,
-            grouping: dependencies.channelBrowsingSettings.grouping)
-        let channels = presentation.filteredChannels.filter { !grouped || selectedGroup == nil || ChannelSectionBuilder.resolvedGroupTitle(for: $0) == selectedGroup }
+
+    private func updateSidebarFocus() {
+        guard let session = state.session else { return }
+        let sidebarMounted = session.overlay.sidebarVisible
+        session.overlay.sidebarHasFocus = (sidebarHasKeyboardFocus && sidebarMounted) || voiceOverEnabled
+        if sidebarHasKeyboardFocus, sidebarMounted {
+            session.overlay.interact(paused: session.model.isPaused, revealSidebar: true)
+        } else {
+            session.overlay.scheduleAutoHide(paused: session.model.isPaused)
+        }
+    }
+}
+
+private struct MacSidebarBrowserView: View {
+    private enum SidebarFocus: Hashable { case search, channels, group, profile }
+
+    private struct BrowserCache: Equatable {
+        let channels: [Channel]
+        let searchText: String
+        let grouping: ChannelGrouping
+        let selectedGroup: String?
+        let presentation: ChannelBrowserPresentation
+        let allGroupSections: [ChannelSection]
+        let displayedChannels: [Channel]
+
+        static func build(
+            channels: [Channel],
+            searchText: String,
+            grouping: ChannelGrouping,
+            selectedGroup: String?
+        ) -> BrowserCache {
+            let presentation = ChannelBrowserPresentation(
+                channels: channels,
+                searchText: searchText,
+                grouping: grouping
+            )
+            let grouped = grouping == .playlistGroups
+            let allGroupSections = grouped
+                ? ChannelSectionBuilder.sections(channels: channels, grouping: .playlistGroups)
+                : []
+            let displayedChannels: [Channel]
+            if grouped, let selectedGroup {
+                displayedChannels = presentation.filteredChannels.filter {
+                    ChannelSectionBuilder.resolvedGroupTitle(for: $0) == selectedGroup
+                }
+            } else {
+                displayedChannels = presentation.filteredChannels
+            }
+            return BrowserCache(
+                channels: channels,
+                searchText: searchText,
+                grouping: grouping,
+                selectedGroup: selectedGroup,
+                presentation: presentation,
+                allGroupSections: allGroupSections,
+                displayedChannels: displayedChannels
+            )
+        }
+    }
+
+    let model: AppModel
+    let browsingSettings: ChannelBrowsingSettingsStore
+    let playingChannelID: String?
+    let prefersReducedResourceUsage: Bool
+    @Binding var searchText: String
+    @Binding var selectedGroup: String?
+    @Binding var selectedChannelID: String?
+    let onAddSource: () -> Void
+    let onManageSources: () -> Void
+    let onMapEPG: (Channel) -> Void
+    let onFocusChanged: (Bool) -> Void
+
+    @FocusState private var sidebarFocus: SidebarFocus?
+    @State private var cache: BrowserCache
+
+    init(
+        model: AppModel,
+        browsingSettings: ChannelBrowsingSettingsStore,
+        playingChannelID: String?,
+        prefersReducedResourceUsage: Bool,
+        searchText: Binding<String>,
+        selectedGroup: Binding<String?>,
+        selectedChannelID: Binding<String?>,
+        onAddSource: @escaping () -> Void,
+        onManageSources: @escaping () -> Void,
+        onMapEPG: @escaping (Channel) -> Void,
+        onFocusChanged: @escaping (Bool) -> Void
+    ) {
+        self.model = model
+        self.browsingSettings = browsingSettings
+        self.playingChannelID = playingChannelID
+        self.prefersReducedResourceUsage = prefersReducedResourceUsage
+        _searchText = searchText
+        _selectedGroup = selectedGroup
+        _selectedChannelID = selectedChannelID
+        self.onAddSource = onAddSource
+        self.onManageSources = onManageSources
+        self.onMapEPG = onMapEPG
+        self.onFocusChanged = onFocusChanged
+        _cache = State(initialValue: BrowserCache.build(
+            channels: model.channels,
+            searchText: searchText.wrappedValue,
+            grouping: browsingSettings.grouping,
+            selectedGroup: selectedGroup.wrappedValue
+        ))
+    }
+
+    var body: some View {
+        let grouped = browsingSettings.grouping == .playlistGroups
+        let displayedChannels = cache.displayedChannels
         return VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 Text(model.activeProfile?.name ?? "频道资料库").font(.headline).lineLimit(1)
                 Spacer()
-                Text("\(channels.count)").foregroundStyle(.secondary).monospacedDigit()
+                refreshStatusIndicator
+                Text("\(displayedChannels.count)").foregroundStyle(.secondary).monospacedDigit()
             }.padding(16)
             if model.profiles.count > 1 {
                 Picker("播放列表", selection: Binding(get: { model.activeProfile?.id }, set: { id in
-                    guard let id else { return }; selectedGroup = nil
+                    guard let id, id != model.activeProfile?.id else { return }
+                    selectedGroup = nil
+                    searchText = ""
                     Task { _ = await model.activate(profileID: id) }
                 })) {
                     ForEach(model.profiles) { profile in Text(profile.name).tag(Optional(profile.id)) }
@@ -154,11 +316,12 @@ struct MacRootView: View {
                 .focused($sidebarFocus, equals: .search)
                 .textFieldStyle(.roundedBorder).padding(.horizontal, 16).padding(.bottom, 12)
                 .accessibilityIdentifier("channels.search")
-            if grouped, presentation.sections.count > 1 {
+            if grouped, cache.allGroupSections.count > 1 {
                 Picker("频道分组", selection: $selectedGroup) {
                     Text("全部分组").tag(Optional<String>.none)
-                    ForEach(presentation.sections) { section in
-                        Text(section.title ?? "其他").tag(Optional(section.title ?? "其他"))
+                    ForEach(cache.allGroupSections) { section in
+                        let title = section.title ?? ChannelSectionBuilder.ungroupedTitle
+                        Text(title).tag(Optional(title))
                     }
                 }.focused($sidebarFocus, equals: .group)
                     .padding(.horizontal, 16).padding(.bottom, 12)
@@ -168,30 +331,11 @@ struct MacRootView: View {
             if model.channels.isEmpty {
                 ContentUnavailableView("暂无频道", systemImage: "tv",
                     description: Text("添加或刷新播放列表后，频道会出现在这里。"))
-                Button("添加播放列表") { state.showsAddSource = true }.padding(.bottom, 24)
-            } else if channels.isEmpty {
-                ContentUnavailableView.search(text: searchText)
+                Button("添加播放列表", action: onAddSource).padding(.bottom, 24)
+            } else if displayedChannels.isEmpty {
+                emptyFilterState
             } else {
-                List(selection: $selectedChannelID) {
-                    ForEach(channels) { channel in
-                        MacChannelRow(channel: channel, programmes: model.programmesByChannelID[channel.id] ?? [],
-                            playing: state.session?.model.request.channelID == channel.id)
-                            .tag(channel.id)
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) { model.select(channel: channel) }
-                            .contextMenu {
-                                Button("播放频道") { model.select(channel: channel) }
-                                Button("设置 EPG 映射…") { mappingChannel = channel }
-                            }
-                            .accessibilityIdentifier("channel.\(channel.id)")
-                    }
-                }.listStyle(.inset)
-                .focused($sidebarFocus, equals: .channels)
-                .onKeyPress(.return) {
-                    guard let selectedChannelID, let channel = channels.first(where: { $0.id == selectedChannelID }) else { return .ignored }
-                    model.select(channel: channel)
-                    return .handled
-                }
+                channelListWithSharedClock(channels: displayedChannels)
             }
             Spacer(minLength: 0)
             Divider()
@@ -200,16 +344,136 @@ struct MacRootView: View {
                 Spacer()
                 if model.staleEPGCoverageEnd != nil { Label("节目单待更新", systemImage: "clock.badge.exclamationmark") }
             }.font(.caption).foregroundStyle(.secondary).padding(12)
-        }.background(.background)
+        }
+        .background(.background)
+        .onChange(of: sidebarFocus) { _, next in onFocusChanged(next != nil) }
+        .onChange(of: model.channels) { _, _ in recomputeCache() }
+        .onChange(of: searchText) { _, _ in recomputeCache() }
+        .onChange(of: browsingSettings.grouping) { _, _ in recomputeCache() }
+        .onChange(of: selectedGroup) { _, _ in recomputeCache() }
     }
 
-    private func updateSidebarFocus() {
-        guard let session = state.session else { return }
-        session.overlay.sidebarHasFocus = sidebarFocus != nil || voiceOverEnabled
-        if sidebarFocus != nil {
-            session.overlay.interact(paused: session.model.isPaused, revealSidebar: true)
+    @ViewBuilder
+    private var refreshStatusIndicator: some View {
+        if let profile = model.activeProfile {
+            if profile.m3uStatus.state == .refreshing || profile.epgStatus.state == .refreshing {
+                ProgressView()
+                    .controlSize(.mini)
+                    .help("正在刷新当前播放列表")
+                    .accessibilityLabel("正在刷新")
+                    .accessibilityIdentifier("channels.refreshing")
+            } else if profile.m3uStatus.state == .failed || profile.epgStatus.state == .failed {
+                Button(action: onManageSources) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .help(refreshFailureSummary(for: profile))
+                .accessibilityLabel("刷新失败，查看播放列表状态")
+                .accessibilityIdentifier("channels.refresh-failed")
+            }
+        }
+    }
+
+    private func refreshFailureSummary(for profile: SourceProfile) -> String {
+        var parts: [String] = []
+        if profile.m3uStatus.state == .failed {
+            parts.append("频道刷新失败：\(profile.m3uStatus.errorSummary ?? "请重试")")
+        }
+        if profile.epgStatus.state == .failed {
+            parts.append("节目单刷新失败：\(profile.epgStatus.errorSummary ?? "请重试")")
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    @ViewBuilder
+    private var emptyFilterState: some View {
+        let trimmedQuery = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let otherGroupMatches = cache.presentation.filteredChannels.count
+        if let selectedGroup, !trimmedQuery.isEmpty, otherGroupMatches > 0 {
+            VStack(spacing: 12) {
+                ContentUnavailableView(
+                    "“\(selectedGroup)”分组中无匹配频道",
+                    systemImage: "magnifyingglass",
+                    description: Text("其他分组中有 \(otherGroupMatches) 个匹配频道。")
+                )
+                Button("显示全部分组") { self.selectedGroup = nil }
+                    .accessibilityIdentifier("channels.clear-group-filter")
+            }
+            .padding(.bottom, 16)
+        } else if let selectedGroup {
+            VStack(spacing: 12) {
+                if trimmedQuery.isEmpty {
+                    ContentUnavailableView(
+                        "“\(selectedGroup)”分组暂无频道",
+                        systemImage: "tv"
+                    )
+                } else {
+                    ContentUnavailableView.search(text: searchText)
+                }
+                Button("显示全部分组") { self.selectedGroup = nil }
+                    .accessibilityIdentifier("channels.clear-group-filter")
+            }
+            .padding(.bottom, 16)
         } else {
-            session.overlay.scheduleAutoHide(paused: session.model.isPaused)
+            ContentUnavailableView.search(text: searchText)
+        }
+    }
+
+    @ViewBuilder
+    private func channelListWithSharedClock(channels: [Channel]) -> some View {
+        if model.programmesByChannelID.isEmpty {
+            channelList(channels: channels, referenceDate: .now)
+        } else {
+            TimelineView(
+                .periodic(
+                    from: Date(timeIntervalSinceReferenceDate: 0),
+                    by: prefersReducedResourceUsage ? 120 : 30
+                )
+            ) { context in
+                channelList(channels: channels, referenceDate: context.date)
+            }
+        }
+    }
+
+    private func channelList(channels: [Channel], referenceDate: Date) -> some View {
+        List(selection: $selectedChannelID) {
+            ForEach(channels) { channel in
+                MacChannelRow(
+                    channel: channel,
+                    programmes: model.programmesByChannelID[channel.id] ?? [],
+                    playing: playingChannelID == channel.id,
+                    referenceDate: referenceDate
+                )
+                .tag(channel.id)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { model.select(channel: channel) }
+                .contextMenu {
+                    Button("播放频道") { model.select(channel: channel) }
+                    Button("设置 EPG 映射…") { onMapEPG(channel) }
+                }
+                .accessibilityIdentifier("channel.\(channel.id)")
+            }
+        }
+        .listStyle(.inset)
+        .focused($sidebarFocus, equals: .channels)
+        .onKeyPress(.return) {
+            guard let selectedChannelID, let channel = channels.first(where: { $0.id == selectedChannelID }) else { return .ignored }
+            model.select(channel: channel)
+            return .handled
+        }
+    }
+
+    private func recomputeCache() {
+        let next = BrowserCache.build(
+            channels: model.channels,
+            searchText: searchText,
+            grouping: browsingSettings.grouping,
+            selectedGroup: selectedGroup
+        )
+        if next != cache {
+            cache = next
         }
     }
 }
@@ -247,13 +511,19 @@ private struct MacSidebarResizeHandle: NSViewRepresentable {
             guard let dragStart else { return }
             preferences.resize(to: dragStart.width + event.locationInWindow.x - dragStart.x)
         }
-        override func mouseUp(with event: NSEvent) { dragStart = nil }
+        override func mouseUp(with event: NSEvent) {
+            guard dragStart != nil else { return }
+            dragStart = nil
+            preferences.commitWidth()
+        }
         override func accessibilityPerformIncrement() -> Bool {
             preferences.resize(to: preferences.width + 20)
+            preferences.commitWidth()
             return true
         }
         override func accessibilityPerformDecrement() -> Bool {
             preferences.resize(to: preferences.width - 20)
+            preferences.commitWidth()
             return true
         }
     }
@@ -263,41 +533,73 @@ private struct MacChannelRow: View {
     let channel: Channel
     let programmes: [Programme]
     let playing: Bool
+    let referenceDate: Date
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
-            let programme = ChannelProgrammePresentation.resolve(programmes: programmes, at: context.date)
-            HStack(spacing: 12) {
-                ChannelLogoView(url: channel.logoURL, imagePadding: 3, placeholderVerticalPadding: 8)
-                    .frame(width: 42, height: 36)
-                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(channel.displayName).fontWeight(playing ? .semibold : .regular).lineLimit(1)
-                    Text(programme.current?.title ?? "暂无当前节目").font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer(minLength: 0)
-                if playing { Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption) }
-            }.padding(.vertical, 5)
+        let programme = ChannelProgrammePresentation.resolve(programmes: programmes, at: referenceDate)
+        return HStack(spacing: 12) {
+            ChannelLogoView(url: channel.logoURL, imagePadding: 3, placeholderVerticalPadding: 8)
+                .frame(width: 42, height: 36)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(channel.displayName).fontWeight(playing ? .semibold : .regular).lineLimit(1)
+                Text(programme.current?.title ?? "暂无当前节目").font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if playing { Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint).font(.caption) }
+        }.padding(.vertical, 5)
+    }
+}
+
+enum MacPlayerKeyShortcut: Equatable {
+    case escape
+    case togglePause
+    case toggleInformation
+    case showProgrammes
+    case toggleSidebar
+
+    static func resolve(
+        keyCode: UInt16,
+        charactersIgnoringModifiers: String?,
+        modifierFlags: NSEvent.ModifierFlags,
+        isRepeat: Bool,
+        isEditingText: Bool
+    ) -> MacPlayerKeyShortcut? {
+        guard modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else {
+            return nil
+        }
+        if keyCode == 53 {
+            return .escape
+        }
+        guard !isEditingText, !isRepeat else { return nil }
+        if keyCode == 49 {
+            return .togglePause
+        }
+        switch charactersIgnoringModifiers?.lowercased() {
+        case "i": return .toggleInformation
+        case "e": return .showProgrammes
+        case "l": return .toggleSidebar
+        default: return nil
         }
     }
 }
 
 private struct MacLibraryWindowReader: NSViewRepresentable {
     let update: @MainActor (NSWindow?) -> Void
-    let hidePlaybackControls: @MainActor () -> Bool
+    let handleKeyShortcut: @MainActor (MacPlayerKeyShortcut) -> Bool
     func makeNSView(context: Context) -> WindowView {
         let view = WindowView()
         view.update = update
-        view.hidePlaybackControls = hidePlaybackControls
+        view.handleKeyShortcut = handleKeyShortcut
         return view
     }
     func updateNSView(_ view: WindowView, context: Context) {
         view.update = update
-        view.hidePlaybackControls = hidePlaybackControls
+        view.handleKeyShortcut = handleKeyShortcut
     }
     static func dismantleNSView(_ view: WindowView, coordinator: ()) { view.stopMonitoring() }
     final class WindowView: NSView {
         var update: (@MainActor (NSWindow?) -> Void)?
-        var hidePlaybackControls: (@MainActor () -> Bool)?
+        var handleKeyShortcut: (@MainActor (MacPlayerKeyShortcut) -> Bool)?
         private var keyMonitor: Any?
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
@@ -306,11 +608,18 @@ private struct MacLibraryWindowReader: NSViewRepresentable {
             guard window != nil else { return }
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 let handled = MainActor.assumeIsolated {
-                    guard event.keyCode == 53,
-                          event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-                          let window = self?.window, event.window === window,
+                    guard let window = self?.window,
+                          event.window === window,
                           window.attachedSheet == nil else { return false }
-                    return self?.hidePlaybackControls?() == true
+                    let isEditingText = (window.firstResponder is NSTextView) || (window.firstResponder is NSTextField)
+                    guard let shortcut = MacPlayerKeyShortcut.resolve(
+                        keyCode: event.keyCode,
+                        charactersIgnoringModifiers: event.charactersIgnoringModifiers,
+                        modifierFlags: event.modifierFlags,
+                        isRepeat: event.isARepeat,
+                        isEditingText: isEditingText
+                    ) else { return false }
+                    return self?.handleKeyShortcut?(shortcut) == true
                 }
                 return handled ? nil : event
             }

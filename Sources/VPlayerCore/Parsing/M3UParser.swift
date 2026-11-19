@@ -32,13 +32,15 @@ public struct M3UParser: Sendable {
                 pending = parseEXTINF(line)
                 continue
             }
-            guard !line.hasPrefix("#"), let metadata = pending,
-                  let streamURL = URL(string: line, relativeTo: sourceURL)?.absoluteURL else { continue }
+            guard !line.hasPrefix("#") else { continue }
+            guard let metadata = pending else { continue }
             pending = nil
+            guard let streamURL = URL(string: line, relativeTo: sourceURL)?.absoluteURL else { continue }
             let identity = ChannelIdentity.make(profileID: profileID, streamURL: streamURL)
             guard seen.insert(identity).inserted else { continue }
             let attributes = metadata.attributes
             channels.append(Channel(
+                id: identity,
                 sourceProfileID: profileID,
                 displayName: metadata.name,
                 streamURL: streamURL,
@@ -80,15 +82,18 @@ public struct M3UParser: Sendable {
         var index = value.startIndex
         while index < value.endIndex {
             while index < value.endIndex && value[index].isWhitespace { index = value.index(after: index) }
+            guard index < value.endIndex else { break }
+            if value[index] == "=" {
+                index = value.index(after: index)
+                continue
+            }
             let keyStart = index
             while index < value.endIndex && value[index] != "=" && !value[index].isWhitespace {
                 index = value.index(after: index)
             }
-            guard keyStart < index else { break }
             let key = String(value[keyStart..<index]).lowercased()
             while index < value.endIndex && value[index].isWhitespace { index = value.index(after: index) }
             guard index < value.endIndex, value[index] == "=" else {
-                while index < value.endIndex && !value[index].isWhitespace { index = value.index(after: index) }
                 continue
             }
             index = value.index(after: index)

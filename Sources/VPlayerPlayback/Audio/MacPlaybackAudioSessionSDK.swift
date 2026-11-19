@@ -101,6 +101,11 @@ final class MacAudioRouteSnapshot: AudioSessionRouteSnapshot, @unchecked Sendabl
 
 /// 使用固定监听集合，设备切换时重绑设备属性；突发回调由现有安全入口合并。
 final class MacAudioDeviceObserver: @unchecked Sendable {
+    enum ChangeDecision: Equatable {
+        case ignore
+        case notify(rebind: Bool, topologyChangeHint: Bool)
+    }
+
     private struct Listener {
         let object: AudioObjectID
         var address: AudioObjectPropertyAddress
@@ -113,12 +118,12 @@ final class MacAudioDeviceObserver: @unchecked Sendable {
     }
     private let queue = DispatchQueue(label: "com.vplayer.macos.audio-device")
     private let queueKey = DispatchSpecificKey<Bool>()
-    private let changed: @Sendable () -> Void
+    private let changed: @Sendable (Bool) -> Void
     private var listeners: [Listener] = []
     private var stopped = false
     private var device: AudioObjectID = kAudioObjectUnknown
 
-    init(changed: @escaping @Sendable () -> Void) {
+    init(changed: @escaping @Sendable (Bool) -> Void) {
         self.changed = changed
         listeners.reserveCapacity(8)
         queue.setSpecific(key: queueKey, value: true)
@@ -129,6 +134,26 @@ final class MacAudioDeviceObserver: @unchecked Sendable {
         if DispatchQueue.getSpecific(key: queueKey) == true { remove(); stopped = true }
         else { queue.sync { remove(); stopped = true } }
     }
+
+    static func changeDecision(
+        for selector: AudioObjectPropertySelector,
+        observedDevice: AudioObjectID,
+        currentDefaultOutput: AudioObjectID
+    ) -> ChangeDecision {
+        let defaultChanged = currentDefaultOutput != observedDevice
+        switch selector {
+        case kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultOutputDevice:
+            // 插入/移除无关音频设备（麦克风、摄像头、Continuity Camera 等）时
+            // 默认输出设备并未变化，忽略以避免无意义的重采与短暂断音。
+            guard defaultChanged else { return .ignore }
+            return .notify(rebind: true, topologyChangeHint: true)
+        case kAudioDevicePropertyDeviceIsAlive, kAudioDevicePropertyStreamConfiguration:
+            return .notify(rebind: defaultChanged, topologyChangeHint: true)
+        default:
+            return .notify(rebind: defaultChanged, topologyChangeHint: defaultChanged)
+        }
+    }
+
     private func remove() {
         for var listener in listeners {
             AudioObjectRemovePropertyListenerBlock(listener.object, &listener.address, queue, listener.block)
@@ -153,8 +178,18 @@ final class MacAudioDeviceObserver: @unchecked Sendable {
         var address = MacAudioDeviceProperties.address(selector, scope: scope)
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             guard let self, !self.stopped else { return }
-            if self.device != MacAudioDeviceProperties.defaultOutput { self.bind() }
-            self.changed()
+            let decision = Self.changeDecision(
+                for: selector,
+                observedDevice: self.device,
+                currentDefaultOutput: MacAudioDeviceProperties.defaultOutput
+            )
+            switch decision {
+            case .ignore:
+                return
+            case let .notify(rebind, topologyChangeHint):
+                if rebind { self.bind() }
+                self.changed(topologyChangeHint)
+            }
         }
         if AudioObjectAddPropertyListenerBlock(object, &address, queue, block) == noErr {
             listeners.append(.init(object: object, address: address, block: block))

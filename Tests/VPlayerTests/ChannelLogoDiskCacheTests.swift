@@ -398,6 +398,82 @@ final class ChannelLogoDiskCacheTests: XCTestCase {
         }
     }
 
+    func testDiskCacheMissDoesNotAttemptFileRemoval() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let counter = FileOperationCounter()
+        let cache = try ChannelLogoDiskCache(
+            directory: directory,
+            capacity: 1024,
+            fileManager: OperationCountingFileManager(counter: counter)
+        )
+
+        let data = await cache.data(forKey: "missing-key", maximumByteCount: 1024)
+        XCTAssertNil(data)
+        XCTAssertEqual(counter.removeCount, 0, "Cache miss must not invoke removeItem")
+    }
+
+    func testDiskCacheThrottlesModificationDateUpdatesWithinOneHour() async throws {
+        let directory = temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let clock = LogoDiskCacheClock(Date(timeIntervalSince1970: 2_000_000_000))
+        let counter = FileOperationCounter()
+        let cache = try ChannelLogoDiskCache(
+            directory: directory,
+            capacity: 1024,
+            fileManager: OperationCountingFileManager(counter: counter),
+            modificationDateRefreshInterval: 3_600,
+            now: { clock.date }
+        )
+        await cache.store(Data("logo".utf8), forKey: "hit", maximumByteCount: 1024)
+        try FileManager.default.setAttributes(
+            [.modificationDate: clock.date],
+            ofItemAtPath: directory.appendingPathComponent("hit").path
+        )
+
+        clock.advance(60)
+        _ = await cache.data(forKey: "hit", maximumByteCount: 1024)
+        XCTAssertEqual(counter.setAttributesCount, 0, "Hit within 1 hour must not rewrite mtime")
+
+        clock.advance(3_600)
+        _ = await cache.data(forKey: "hit", maximumByteCount: 1024)
+        XCTAssertEqual(counter.setAttributesCount, 1, "Hit after 1 hour must refresh mtime")
+    }
+
+    func testFastFailInMemoryLoaderClassifiesSuccessClientErrorServerErrorAndOversized() async throws {
+        StubURLProtocol.reset()
+        defer { StubURLProtocol.reset() }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [StubURLProtocol.self]
+        let loader = LiveChannelLogoDataLoader.makeFastFail(configuration: configuration)
+
+        let okURL = URL(string: "https://images.example/fast-ok.png")!
+        StubURLProtocol.enqueue(.init(
+            response: .http(statusCode: 200),
+            chunks: [Data("png".utf8)]
+        ))
+        let okResult = await loader.loadData(for: okURL, maximumByteCount: 16)
+        XCTAssertEqual(okResult, .data(Data("png".utf8)))
+
+        let notFoundURL = URL(string: "https://images.example/fast-404.png")!
+        StubURLProtocol.enqueue(.init(response: .http(statusCode: 404)))
+        let notFoundResult = await loader.loadData(for: notFoundURL, maximumByteCount: 16)
+        XCTAssertEqual(notFoundResult, .failed(.permanent))
+
+        let serverErrorURL = URL(string: "https://images.example/fast-503.png")!
+        StubURLProtocol.enqueue(.init(response: .http(statusCode: 503)))
+        let serverErrorResult = await loader.loadData(for: serverErrorURL, maximumByteCount: 16)
+        XCTAssertEqual(serverErrorResult, .failed(.transient))
+
+        let oversizedURL = URL(string: "https://images.example/fast-oversized.png")!
+        StubURLProtocol.enqueue(.init(
+            response: .http(statusCode: 200),
+            chunks: [Data(repeating: 0x41, count: 32)]
+        ))
+        let oversizedResult = await loader.loadData(for: oversizedURL, maximumByteCount: 16)
+        XCTAssertEqual(oversizedResult, .failed(.permanent))
+    }
+
     private func temporaryDirectory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent(
             "ChannelLogoDiskCacheTests-\(UUID().uuidString)",
@@ -531,6 +607,51 @@ private struct FixedDownloadedResourceChannelLogoDownloader: BoundedHTTPDownload
 
 private enum UnexpectedChannelLogoDownloaderError: Error {
     case called
+}
+
+private final class FileOperationCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var removes = 0
+    private var setAttributesCalls = 0
+
+    var removeCount: Int { lock.withLock { removes } }
+    var setAttributesCount: Int { lock.withLock { setAttributesCalls } }
+
+    func recordRemove() { lock.withLock { removes += 1 } }
+    func recordSetAttributes() { lock.withLock { setAttributesCalls += 1 } }
+}
+
+private final class OperationCountingFileManager: FileManager {
+    private let counter: FileOperationCounter
+
+    init(counter: FileOperationCounter) {
+        self.counter = counter
+        super.init()
+    }
+
+    override func removeItem(at URL: URL) throws {
+        counter.recordRemove()
+        try super.removeItem(at: URL)
+    }
+
+    override func setAttributes(
+        _ attributes: [FileAttributeKey: Any],
+        ofItemAtPath path: String
+    ) throws {
+        counter.recordSetAttributes()
+        try super.setAttributes(attributes, ofItemAtPath: path)
+    }
+}
+
+private final class LogoDiskCacheClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Date
+
+    init(_ initial: Date) { self.current = initial }
+    var date: Date { lock.withLock { current } }
+    func advance(_ seconds: TimeInterval) {
+        lock.withLock { current = current.addingTimeInterval(seconds) }
+    }
 }
 
 // Test-only actor-isolated observations establish admission without scheduling

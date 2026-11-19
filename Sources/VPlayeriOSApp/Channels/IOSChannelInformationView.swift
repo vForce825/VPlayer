@@ -21,10 +21,19 @@ struct IOSChannelInformationView: View {
         var id: Self { self }
     }
 
+    private var liveChannel: Channel? {
+        model.channels.first(where: { $0.id == channel.id && $0.sourceProfileID == channel.sourceProfileID })
+    }
+
+    private var resolvedChannel: Channel {
+        liveChannel ?? channel
+    }
+
     var body: some View {
+        let currentChannel = resolvedChannel
         NavigationStack {
             VStack(spacing: 0) {
-                channelHeading
+                channelHeading(for: currentChannel)
                 Picker("频道信息内容", selection: $selectedTab) {
                     ForEach(InformationTab.allCases) { tab in
                         Text(tab.rawValue).tag(tab)
@@ -34,17 +43,38 @@ struct IOSChannelInformationView: View {
                 .accessibilityIdentifier("channel.info.tabs")
                 .padding(.horizontal, 20)
                 .padding(.bottom, 8)
-                TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
-                    let programmes = model.programmesByChannelID[channel.id, default: []]
+                TimelineView(.periodic(from: Date(timeIntervalSinceReferenceDate: 0), by: reducedResourceUsage ? 120 : 30)) { tick in
+                    let programmes = model.programmesByChannelID[currentChannel.id, default: []]
                     let guide = IOSProgrammeGuidePresentation(programmes: programmes, at: tick.date)
                     List {
                         switch selectedTab {
                         case .overview:
+                            if liveChannel == nil {
+                                Section {
+                                    Text("该频道已从当前播放列表中移除，以下显示打开时的频道信息。")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                        .accessibilityIdentifier("channel.info.removed-notice")
+                                }
+                            }
+                            if let end = model.staleEPGCoverageEnd {
+                                Section {
+                                    Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                        .accessibilityIdentifier("channel.info.stale-epg")
+                                }
+                            }
                             currentProgrammeSummary(guide: guide)
-                            streamInformation
-                            matchedProgrammeInformation
-                            originalSourceFields
+                            streamInformation(for: currentChannel)
+                            matchedProgrammeInformation(for: currentChannel)
+                            originalSourceFields(for: currentChannel)
                         case .programmes:
+                            if let end = model.staleEPGCoverageEnd {
+                                Section {
+                                    Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                        .accessibilityIdentifier("channel.info.stale-epg")
+                                }
+                            }
                             if guide.days.isEmpty {
                                 ContentUnavailableView("暂无节目单", systemImage: "list.bullet.rectangle",
                                     description: Text("请在“概览”中检查节目单匹配，或在“播放列表”中刷新节目单。"))
@@ -74,12 +104,15 @@ struct IOSChannelInformationView: View {
             }
         }
         .presentationDetents([.large])
+        .onChange(of: currentChannel.streamURL) { _, _ in
+            copiedStreamURL = false
+        }
         .sheet(isPresented: $showsMapping) {
-            ChannelEPGMappingView(model: model, channel: channel)
+            ChannelEPGMappingView(model: model, channel: currentChannel)
         }
     }
 
-    private var channelHeading: some View {
+    private func channelHeading(for channel: Channel) -> some View {
         HStack(spacing: 12) {
             ChannelLogoView(url: channel.logoURL, imagePadding: 4, placeholderVerticalPadding: 8)
                 .frame(width: 48, height: 44)
@@ -146,7 +179,7 @@ struct IOSChannelInformationView: View {
             .accessibilityIdentifier("channel.info.current.time")
     }
 
-    private var streamInformation: some View {
+    private func streamInformation(for channel: Channel) -> some View {
         Section("播放链接") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 12) {
@@ -174,7 +207,7 @@ struct IOSChannelInformationView: View {
         }
     }
 
-    private var matchedProgrammeInformation: some View {
+    private func matchedProgrammeInformation(for channel: Channel) -> some View {
         Section("节目单匹配结果") {
             if let id = model.matchedEPGChannelID(for: channel) {
                 let name = model.epgChannels.first(where: { $0.id == id })?.displayNames
@@ -192,7 +225,7 @@ struct IOSChannelInformationView: View {
         }
     }
 
-    private var originalSourceFields: some View {
+    private func originalSourceFields(for channel: Channel) -> some View {
         Section("播放源原始字段") {
             informationField("EPG ID", value: originalValue(channel.tvgID) ?? "未提供",
                 identifier: "channel.info.source.epg-id")
@@ -217,13 +250,16 @@ struct IOSChannelInformationView: View {
 
 struct IOSProgrammeGuideView: View {
     let presentation: PlayerChannelPresentation
+    var staleEPGCoverageEnd: Date? = nil
     @Environment(\.dismiss) private var dismiss
     @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var detent: PresentationDetent = .large
 
     var body: some View {
         NavigationStack {
-            TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
+            TimelineView(.periodic(from: Date(timeIntervalSinceReferenceDate: 0), by: reducedResourceUsage ? 120 : 30)) { tick in
+                let guide = IOSProgrammeGuidePresentation(
+                    programmes: presentation.programmes, at: tick.date)
                 List {
                     Section {
                         Text(presentation.request.title).font(.title3.weight(.semibold))
@@ -231,13 +267,25 @@ struct IOSProgrammeGuideView: View {
                             .listRowBackground(Color.clear)
                             .listRowInsets(EdgeInsets(top: 4, leading: 4, bottom: 0, trailing: 4))
                     }
-                    IOSProgrammeSections(guide: IOSProgrammeGuidePresentation(
-                        programmes: presentation.programmes, at: tick.date))
-                    if presentation.programmes.isEmpty {
+                    if let end = staleEPGCoverageEnd {
                         Section {
-                            Text("暂时没有可用的节目单，可在“播放列表”中刷新节目单。")
-                                .font(.footnote).foregroundStyle(.secondary)
+                            Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                                .font(.caption).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("programme.guide.stale-epg")
                         }
+                    }
+                    if guide.days.isEmpty {
+                        Section {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text("暂无当前节目")
+                                    .foregroundStyle(.secondary)
+                                Text("暂时没有可用的节目单，可在“播放列表”中刷新节目单。")
+                                    .font(.footnote).foregroundStyle(.secondary)
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    } else {
+                        IOSProgrammeSections(guide: guide)
                     }
                 }
                 .listSectionSpacing(.compact)

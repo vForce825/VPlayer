@@ -5184,13 +5184,16 @@ final class ControlTaskRegistry: @unchecked Sendable {
         backend?.startPipeline(readinessCycle: readinessCycle, initiallyPaused: initiallyPaused)
     }
 
-    func updatePreparedSampleBufferPause(contextNonce: UInt64, paused: Bool, readinessCycle: UInt64) {
+    @discardableResult
+    func updatePreparedSampleBufferPause(contextNonce: UInt64, paused: Bool, readinessCycle: UInt64) -> Bool {
         let backend: SampleBufferPlaybackBackend? = try? transaction { _ in
             guard let context = authority.outputContext, context.contextNonce == contextNonce,
                   context.prepared, context.owner == nil else { return nil }
             return authority.ownedBackendResources?.object as? SampleBufferPlaybackBackend
         }
-        backend?.pipeline?.setPaused(paused, readinessCycle: readinessCycle)
+        guard let pipeline = backend?.pipeline else { return false }
+        pipeline.setPaused(paused, readinessCycle: readinessCycle)
+        return true
     }
 
     func updateInstalledSampleBufferTuning(_ tuning: PlaybackTuning) {

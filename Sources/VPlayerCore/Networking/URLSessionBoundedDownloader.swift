@@ -224,6 +224,45 @@ public actor URLSessionBoundedDownloader:
         }
     }
     
+    static let launchDirectoryName = UUID().uuidString
+
+    private static func defaultRootDownloadsDirectory(fileManager: FileManager = .default) -> URL {
+        fileManager.temporaryDirectory
+            .appendingPathComponent("VPlayerDownloads", isDirectory: true)
+    }
+
+    static func defaultDownloadsDirectory(fileManager: FileManager = .default) -> URL {
+        defaultRootDownloadsDirectory(fileManager: fileManager)
+            .appendingPathComponent(launchDirectoryName, isDirectory: true)
+    }
+
+    /// 清理历史进程遗留在 `tmp/VPlayerDownloads/` 下的孤立下载子目录和临时文件，
+    /// 保留当前进程本次启动对应的子目录，因此可在启动维护阶段与活跃下载并发执行。
+    public static func purgeOrphanedDownloads() {
+        purgeOrphanedDownloads(
+            in: defaultRootDownloadsDirectory(),
+            keepingDirectoryNamed: launchDirectoryName,
+            fileManager: .default
+        )
+    }
+
+    static func purgeOrphanedDownloads(
+        in rootDirectory: URL,
+        keepingDirectoryNamed activeDirectoryName: String,
+        fileManager: FileManager = .default
+    ) {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: rootDirectory,
+            includingPropertiesForKeys: nil,
+            options: []
+        ) else {
+            return
+        }
+        for entry in entries where entry.lastPathComponent != activeDirectoryName {
+            try? fileManager.removeItem(at: entry)
+        }
+    }
+
     private let sessionDelegate: SharedSessionDelegate
     private let session: URLSession
     private let fileManager: FileManager
@@ -240,8 +279,7 @@ public actor URLSessionBoundedDownloader:
         sessionDelegate = delegate
         session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: nil)
         fileManager = .default
-        downloadsDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("VPlayerDownloads", isDirectory: true)
+        downloadsDirectory = Self.defaultDownloadsDirectory(fileManager: .default)
     }
     
     init(

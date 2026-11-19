@@ -225,6 +225,15 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         let formatIdentity: ObjectIdentifier
         let route: DeinterlaceRoute
         let outputFrameRate: Float
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.formatIdentity == rhs.formatIdentity
+                && lhs.route == rhs.route
+                && PlaybackPresentationCadencePolicy.areEquivalentDisplayFrameRates(
+                    lhs.outputFrameRate,
+                    rhs.outputFrameRate
+                )
+        }
     }
 
     private struct PreparedAnchor {
@@ -495,8 +504,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
     private var pendingVideoDecode = CompressedVideoReservoir(
         limits: PlaybackPipeline.pendingDecodeVideoRetentionLimits
     )
+    private static let interlacedStartupMaximumPrerollDuration = CMTime(value: 8, timescale: 1)
+    private static let interlacedStartupPendingDecodeCeiling = pendingVideoDecodeCapacity * 3 / 4
     private var interlacedStartupPrerollGeneration: MediaGeneration?
     private var interlacedStartupRandomAccessCount = 0
+    private var interlacedStartupFirstPTS: CMTime?
+    private var interlacedStartupOverallLatestEndPTS: CMTime?
     private var interlacedStartupSecondRandomAccessPTS: CMTime?
     private var interlacedStartupLatestEndPTS: CMTime?
     private var pendingVideoDrainScheduled = false
@@ -1053,8 +1066,12 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             }
             return
         }
-        // 首次建立时间线前仍需读取到视频关键帧；开始播放后的积压由音频队列背压约束。
-        if case let .packet(packet) = event, hasOpenedReadinessForCurrentMedia, audio.isInputBackpressured {
+        // 首次建立时间线前或就绪门关闭（恢复/重锚定）期间仍需继续读取视频帧以重新打开就绪门；
+        // 仅在就绪门打开且正常播放时由音频队列背压约束解复用积压。
+        if case let .packet(packet) = event,
+           hasOpenedReadinessForCurrentMedia,
+           readiness?.isOpen == true,
+           audio.isInputBackpressured {
             pendingPacketAdmission = PendingPacketAdmission(packet: packet, acknowledgement: acknowledgement)
             let token = UUID()
             readAheadAdmissionToken = token
@@ -1069,7 +1086,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         executor.submit(after: .milliseconds(20)) { [weak self] in
             guard let self, readAheadAdmissionToken == token,
                   let admission = pendingPacketAdmission, !terminal, !paused else { return }
-            if hasOpenedReadinessForCurrentMedia, audio.isInputBackpressured {
+            if hasOpenedReadinessForCurrentMedia,
+               readiness?.isOpen == true,
+               audio.isInputBackpressured {
                 scheduleReadAheadAdmissionIsolated(token: token)
                 return
             }
@@ -1712,6 +1731,20 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
 
     private func hasInterlacedStartupPrerollIsolated() -> Bool {
         assertIsolated()
+        if pendingVideoDecode.count >= Self.interlacedStartupPendingDecodeCeiling {
+            return true
+        }
+        if audio.isInputBackpressured {
+            return true
+        }
+        if let firstPTS = interlacedStartupFirstPTS,
+           let overallLatestEnd = interlacedStartupOverallLatestEndPTS {
+            let totalSpan = CMTimeSubtract(overallLatestEnd, firstPTS)
+            if totalSpan.isNumeric,
+               CMTimeCompare(totalSpan, Self.interlacedStartupMaximumPrerollDuration) >= 0 {
+                return true
+            }
+        }
         guard let start = interlacedStartupSecondRandomAccessPTS,
               let latestEnd = interlacedStartupLatestEndPTS else { return false }
         let duration = CMTimeSubtract(latestEnd, start)
@@ -1729,27 +1762,40 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         if interlacedStartupPrerollGeneration != accessUnit.generation {
             resetInterlacedStartupPrerollIsolated()
         }
+        let isH264 = tracks?.video?.codec == .h264
+            && (videoFormat.map { CMFormatDescriptionGetMediaSubType($0) == kCMVideoCodecType_H264 } ?? true)
         if interlacedStartupPrerollGeneration == nil {
-            guard accessUnit.parserMetadata.isInterlaced == true else { return }
+            // 仅当 VideoPipelineCoordinator 实际跳过首个隔行 H.264 GOP 时启用起播预缓冲，
+            // 避免无谓延迟 HEVC 等不跳过首 GOP 的隔行流。
+            guard isH264, accessUnit.parserMetadata.isInterlaced == true else { return }
             interlacedStartupPrerollGeneration = accessUnit.generation
+        }
+
+        let pts = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
+        let duration = CMSampleBufferGetDuration(accessUnit.sampleBuffer)
+        let end = pts.isNumeric
+            ? (duration.isNumeric && CMTimeCompare(duration, .zero) > 0 ? CMTimeAdd(pts, duration) : pts)
+            : .invalid
+        if pts.isNumeric {
+            if interlacedStartupFirstPTS == nil || CMTimeCompare(pts, interlacedStartupFirstPTS!) < 0 {
+                interlacedStartupFirstPTS = pts
+            }
+            if end.isNumeric,
+               interlacedStartupOverallLatestEndPTS.map({ CMTimeCompare(end, $0) > 0 }) ?? true {
+                interlacedStartupOverallLatestEndPTS = end
+            }
         }
 
         if accessUnit.isRandomAccess, interlacedStartupRandomAccessCount < 2 {
             interlacedStartupRandomAccessCount += 1
             if interlacedStartupRandomAccessCount == 2 {
-                let pts = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
                 guard pts.isNumeric else { return }
                 interlacedStartupSecondRandomAccessPTS = pts
                 interlacedStartupLatestEndPTS = pts
             }
         }
         guard let start = interlacedStartupSecondRandomAccessPTS else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(accessUnit.sampleBuffer)
         guard pts.isNumeric, CMTimeCompare(pts, start) >= 0 else { return }
-        let duration = CMSampleBufferGetDuration(accessUnit.sampleBuffer)
-        let end = duration.isNumeric && CMTimeCompare(duration, .zero) > 0
-            ? CMTimeAdd(pts, duration)
-            : pts
         if end.isNumeric,
            interlacedStartupLatestEndPTS.map({ CMTimeCompare(end, $0) > 0 }) ?? true {
             interlacedStartupLatestEndPTS = end
@@ -1760,6 +1806,8 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         interlacedStartupPrerollGeneration = nil
         interlacedStartupRandomAccessCount = 0
+        interlacedStartupFirstPTS = nil
+        interlacedStartupOverallLatestEndPTS = nil
         interlacedStartupSecondRandomAccessPTS = nil
         interlacedStartupLatestEndPTS = nil
     }
@@ -3102,6 +3150,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
               videoCoordinator.isClassificationResolved else { return }
         let generation = generationController.current
         let information = makeMediaInformationIsolated()
+        guard mediaInformationGeneration != generation || mediaInformation != information else { return }
         mediaInformation = information
         mediaInformationGeneration = generation
         eventSink(.mediaInformation(information, generation: generation))
@@ -3162,7 +3211,7 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
             guard seconds.isFinite, seconds > 0 else { return nil }
             let rate = 1 / seconds
             guard rate.isFinite, rate > 0, rate <= 120 else { return nil }
-            return rate
+            return PlaybackPresentationCadencePolicy.canonicalFrameRate(rate)
         }.sorted()
         guard !durations.isEmpty else { return nil }
         return durations[durations.count / 2]
@@ -3824,6 +3873,9 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         assertIsolated()
         guard !terminal else { return }
         refreshExternalMetricsDiagnostics()
+        permittedOutputRate = 0
+        outputRateInvocation = nil
+        audioSupplyHold = nil
         finishModeSwitchSignpostIsolated()
         terminal = true
         cancelPendingVideoFormatCommitIsolated()
@@ -3833,11 +3885,18 @@ final class PlaybackPipeline: PlaybackPipelineProtocol, SampleBufferPlaybackRate
         cancelPendingVideoDrainIsolated()
         demuxer.cancel()
         releasePendingAdmissionIsolated()
+        clock.pause()
+        videoCoordinator.stop(emergency: true)
+        let generation = generationController.current
+        renderer.flush(to: generation)
+        audio.flush(to: generation)
+        readiness?.closeForTimelineReset(.flush)
+        clearRetainedVideoIsolated(keepingCapacity: false)
+        deferredPackets.removeAll(keepingCapacity: false)
         pendingTrackVideo.removeAll(keepingCapacity: false)
         clearPendingTrackAudioIsolated(keepingCapacity: false)
         pendingVideoDecode.removeAll(keepingCapacity: false)
         videoDecodeBufferHorizon = nil
-        videoCoordinator.stop(emergency: true)
         display.pauseSubmission()
         Task { [self] in
             async let videoStop: Void = renderer.stopAwaitingRendererRemoval()

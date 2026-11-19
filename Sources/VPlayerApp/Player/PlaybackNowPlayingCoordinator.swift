@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
+import CoreGraphics
 import Foundation
 import NowPlaying
 import Observation
@@ -40,6 +41,8 @@ private final class SystemNowPlayingSession: NowPlayingSessionPublishing {
 @MainActor
 @Observable
 final class PlaybackNowPlayingModel: MediaSessionRepresentable {
+    typealias CachedLogoProvider = @Sendable (URL) async -> CGImage?
+
     let id = UUID().uuidString
     private var presentation: PlayerChannelPresentation
     private var metadataDate = Date.now
@@ -48,10 +51,16 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
     private var isValid = true
     private var artwork: Artwork?
     @ObservationIgnored private weak var owner: (any NowPlayingPlaybackTarget)?
+    @ObservationIgnored private let cachedLogoProvider: CachedLogoProvider
 
-    init(owner: any NowPlayingPlaybackTarget, presentation: PlayerChannelPresentation) {
+    init(
+        owner: any NowPlayingPlaybackTarget,
+        presentation: PlayerChannelPresentation,
+        cachedLogoProvider: @escaping CachedLogoProvider = PlaybackNowPlayingModel.defaultCachedLogoProvider
+    ) {
         self.owner = owner
         self.presentation = presentation
+        self.cachedLogoProvider = cachedLogoProvider
         updateArtwork()
     }
 
@@ -161,15 +170,21 @@ final class PlaybackNowPlayingModel: MediaSessionRepresentable {
 
     private func updateArtwork() {
         artwork = nil
-        guard let url = presentation.logoURL,
-              let image = ChannelLogoCache.shared.memoryCachedImage(for: url),
-              let data = image.pngData(), data.count <= 1_024 * 1_024 else { return }
-        // The shared cache already downsampled this image. Retain at most one
-        // bounded encoded thumbnail; the provider performs no network work and
-        // captures neither a UIKit image nor the playback owner.
+        guard let url = presentation.logoURL else { return }
+        let cachedLogoProvider = cachedLogoProvider
+        // Resolve cached artwork lazily off MainActor. The provider reads only
+        // memory/disk caches (never the network) and captures neither a UIKit
+        // image nor the playback owner.
         artwork = Artwork(id: "\(presentation.request.channelID)/\(url.absoluteString)") { _ in
-            try ArtworkRepresentation(data: data)
+            guard let cgImage = await cachedLogoProvider(url) else {
+                throw ArtworkRepresentation.ArtworkRepresentationError.noRepresentationAvailable
+            }
+            return try ArtworkRepresentation(cgImage: cgImage)
         }
+    }
+
+    private nonisolated static func defaultCachedLogoProvider(for url: URL) async -> CGImage? {
+        await ChannelLogoCache.shared.cachedCGImage(for: url)
     }
 }
 

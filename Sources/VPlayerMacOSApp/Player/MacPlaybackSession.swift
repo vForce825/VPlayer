@@ -17,11 +17,11 @@ final class MacPlaybackSession {
     let mount: PlaybackPresentationHostMount
     let pictureInPicture: MacPictureInPictureCoordinator
     private(set) var presentation: PlayerChannelPresentation
-    var onStopped: (() -> Void)?
+    @ObservationIgnored var onStopped: (() -> Void)?
     private(set) var isClosing = false
-    private var hasStarted = false
-    private var activity: NSObjectProtocol?
-    private var closeTask: Task<Void, Never>?
+    @ObservationIgnored private var hasStarted = false
+    @ObservationIgnored private var activity: NSObjectProtocol?
+    @ObservationIgnored private var closeTask: Task<Void, Never>?
 
     init(presentation: PlayerChannelPresentation, dependencies: AppDependencies) {
         self.presentation = presentation
@@ -78,12 +78,11 @@ final class MacPlaybackSession {
         }
     }
     private func updateActivity() {
-        let playing: Bool
-        switch model.state { case .playing: playing = true; default: playing = false }
-        if playing, activity == nil {
+        let shouldKeepAwake = PlaybackIdleTimerPolicy.isDisabled(for: model.state)
+        if shouldKeepAwake, activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleDisplaySleepDisabled],
                 reason: "正在播放直播频道")
-        } else if !playing, let activity {
+        } else if !shouldKeepAwake, let activity {
             ProcessInfo.processInfo.endActivity(activity)
             self.activity = nil
         }
@@ -103,6 +102,10 @@ final class MacPlaybackSession {
         closeTask = task
         await task.value
     }
+
+    #if DEBUG
+    var holdsActivityForTesting: Bool { activity != nil }
+    #endif
 }
 
 struct MacPlaybackHostView: NSViewControllerRepresentable {

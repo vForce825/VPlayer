@@ -60,6 +60,24 @@ final class NativeHLSAdapterLifecycleTests: XCTestCase {
         }
     }
 
+    func testLiveStreamPauseResumeSkipsExactSeekAndSucceedsWithoutPausedCursor() async throws {
+        try await NativeAdapterFixture.withFixture { fixture in
+            fixture.inspector.duration = nil
+            fixture.driver.omitPausedTime = true
+            fixture.play()
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.plays, 1)
+
+            await fixture.controller.setPaused(true)
+            try await fixture.until { fixture.driver.rate == 0 && fixture.driver.disconnectedFromSystemAudio }
+
+            await fixture.controller.setPaused(false)
+            try await fixture.until { fixture.isPlaying }
+            XCTAssertEqual(fixture.driver.plays, 2)
+            XCTAssertEqual(fixture.driver.seekNativeCalls, 0)
+        }
+    }
+
     func testPendingNativeTracksExpireUnderOriginalStartupDeadline() async throws {
         let clock = ManualPlaybackClock(100)
         try await NativeAdapterFixture.withFixture(clock: clock) { fixture in
@@ -1607,7 +1625,8 @@ private final class NativeFixtureDriver: AVPlayerDriving {
     var selectedAudio = NSObject()
     var readyGate: NativeFixtureGate?, prerollGate: NativeFixtureGate?, tracksGate: NativeFixtureGate?, connectionGate: NativeFixtureGate?
     var installs = 0, prerolls = 0, plays = 0, joins = 0, selectionRevision = 0
-    var trackWaits = 0
+    var trackWaits = 0, seekNativeCalls = 0
+    var omitPausedTime = false
     var naturalEndObservations = 0, explicitEndMutations = 0
     var failReady = false
     var lastPositiveInvocation: ControlTaskRegistry.BackendPositiveRateInvocation?
@@ -1637,7 +1656,9 @@ private final class NativeFixtureDriver: AVPlayerDriving {
         guard currentItemIdentity == item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
     }
     func joinNativeCallbackTails() async { joins += 1 }
-    func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime { clock = time; return time }
+    func seekNative(to time: ExactMediaTime, item: AVPlayerItemInstanceIdentity) async throws -> ExactMediaTime {
+        seekNativeCalls += 1; clock = time; return time
+    }
     func reservePausedResumeCallbacks(item: AVPlayerItemInstanceIdentity) throws {}
     func play(invocation: ControlTaskRegistry.BackendPositiveRateInvocation, item: AVPlayerItemInstanceIdentity) async throws {
         guard invocation.revalidateCurrentAuthority(), currentItemIdentity == item else { throw AVPlayerItemCoordinatorFailure.staleIdentity }
@@ -1645,7 +1666,9 @@ private final class NativeFixtureDriver: AVPlayerDriving {
         rate = 1; timeControlStatus = .playing; plays += 1
     }
     func playbackClockObservation(item: AVPlayerItemInstanceIdentity) -> AVPlayerPlaybackClockObservation { item == currentItemIdentity ? .currentItem(clock) : .staleItem }
-    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? { item == currentItemIdentity ? clock : nil }
+    func pausedTime(item: AVPlayerItemInstanceIdentity) -> ExactMediaTime? {
+        omitPausedTime ? nil : (item == currentItemIdentity ? clock : nil)
+    }
     func pausedItemObjectIdentity(item: AVPlayerItemInstanceIdentity) -> ObjectIdentifier? { item == currentItemIdentity ? physical.map(ObjectIdentifier.init) : nil }
     func cancelPendingPrerolls(item: AVPlayerItemInstanceIdentity) {}
     func pause(item: AVPlayerItemInstanceIdentity) { if currentItemIdentity == item { rate = 0; timeControlStatus = .paused } }

@@ -2416,6 +2416,124 @@ final class FullScreenPlayerViewModelTests: XCTestCase {
         }
         return false
     }
+
+    func testInitialReplayedFailureFromPriorRequestIsIgnoredUntilPlayDispatches() async throws {
+        let priorFailure = PlaybackFailure(
+            code: "prior.failure",
+            userMessage: "旧失败",
+            retryDisposition: .retrySameRequest
+        )
+        let currentFailure = PlaybackFailure(
+            code: "current.failure",
+            userMessage: "当前失败",
+            retryDisposition: .retrySameRequest
+        )
+        let playGate = ViewModelAsyncGate()
+        let engine = ReplayingFailurePlaybackEngine(
+            initialState: .failed(priorFailure),
+            playGate: playGate
+        )
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings()
+        )
+
+        model.start()
+        try await eventually { await playGate.hasWaiter }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertNotEqual(
+            model.state,
+            .failed(priorFailure),
+            "Stale replayed .failed from a previous request must not fail the new request"
+        )
+
+        await playGate.open()
+        try await eventually { await engine.playCount == 1 }
+        await engine.emit(.failed(currentFailure))
+        try await eventually { model.state == .failed(currentFailure) }
+        await model.stop()
+    }
+
+    func testRetryImmediatelyTransitionsToPreparingAndIgnoresDuplicateTap() async throws {
+        let retryGate = ViewModelAsyncGate()
+        let engine = ControlledViewModelPlaybackEngine(
+            suspendedPlayCall: 2,
+            playGate: retryGate
+        )
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings()
+        )
+
+        model.start()
+        try await eventually { await engine.playCount == 1 }
+        let failure = retryableFailure()
+        await engine.emit(state: .failed(failure))
+        try await eventually { model.state == .failed(failure) }
+
+        model.retry()
+        XCTAssertEqual(
+            model.state,
+            .preparing(request),
+            "retry() must immediately show preparing progress"
+        )
+        // A second immediate tap while preparing must be ignored.
+        model.retry()
+        try await eventually { await retryGate.hasWaiter }
+        await retryGate.open()
+        try await eventually { await engine.playCount == 2 }
+        await model.stop()
+    }
+
+    func testPlaybackControlMessageAutoDismissesAndSupportsManualClear() async throws {
+        let engine = AcknowledgingPauseTestPlaybackEngine()
+        let request = makeRequest()
+        let model = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings(),
+            playbackControlMessageDuration: .milliseconds(80)
+        )
+
+        model.start()
+        try await eventually { await engine.playCount == 1 }
+        await engine.emit(.playing(request))
+        try await eventually { model.state == .playing(request) }
+
+        await engine.setNextResult(.rejected(.audioInterruption))
+        model.togglePause()
+        try await eventually { model.playbackControlMessage != nil }
+        // Auto-dismisses after configured duration.
+        try await eventually { model.playbackControlMessage == nil }
+
+        // Also supports immediate manual dismissal via clearPlaybackControlMessage().
+        let longModel = FullScreenPlayerViewModel(
+            request: request,
+            engine: engine,
+            presentationStreamProvider: { Self.finishedPresentationStream() },
+            settings: makeSettings(),
+            playbackControlMessageDuration: .seconds(30)
+        )
+        longModel.start()
+        try await eventually { await engine.playCount == 2 }
+        await engine.emit(.playing(request))
+        try await eventually { longModel.state == .playing(request) }
+        await engine.setNextResult(.rejected(.unavailable))
+        longModel.togglePause()
+        try await eventually { longModel.playbackControlMessage != nil }
+        longModel.clearPlaybackControlMessage()
+        XCTAssertNil(longModel.playbackControlMessage)
+
+        await model.stop()
+        await longModel.stop()
+    }
 }
 
 @MainActor
@@ -3110,4 +3228,72 @@ private actor ResetGatedViewModelPlaybackEngine: RequestScopedPlaybackControllin
         parked?.resume()
         parked = nil
     }
+}
+
+private actor ReplayingFailurePlaybackEngine: PlaybackEngine {
+    private var state: PlaybackState
+    private let playGate: ViewModelAsyncGate
+    private var continuations: [AsyncStream<PlaybackState>.Continuation] = []
+    private(set) var playCount = 0
+
+    init(initialState: PlaybackState, playGate: ViewModelAsyncGate) {
+        self.state = initialState
+        self.playGate = playGate
+    }
+
+    func events() -> AsyncStream<PlaybackState> {
+        let pair = AsyncStream.makeStream(of: PlaybackState.self)
+        continuations.append(pair.continuation)
+        pair.continuation.yield(state)
+        return pair.stream
+    }
+
+    func emit(_ newState: PlaybackState) {
+        state = newState
+        for continuation in continuations { continuation.yield(newState) }
+    }
+
+    func play(_ request: PlaybackRequest) async {
+        _ = request
+        await playGate.wait()
+        playCount += 1
+    }
+
+    func setPaused(_ paused: Bool) async { _ = paused }
+    func stop() async { emit(.stopped) }
+}
+
+private actor AcknowledgingPauseTestPlaybackEngine: PlaybackEngine, PlaybackPauseCommandAcknowledging {
+    private var continuations: [AsyncStream<PlaybackState>.Continuation] = []
+    private(set) var playCount = 0
+    private var nextResult: PlaybackPauseCommandResult = .accepted
+
+    func setNextResult(_ result: PlaybackPauseCommandResult) {
+        nextResult = result
+    }
+
+    func events() -> AsyncStream<PlaybackState> {
+        let pair = AsyncStream.makeStream(of: PlaybackState.self)
+        continuations.append(pair.continuation)
+        return pair.stream
+    }
+
+    func emit(_ newState: PlaybackState) {
+        for continuation in continuations { continuation.yield(newState) }
+    }
+
+    func play(_ request: PlaybackRequest) async {
+        _ = request
+        playCount += 1
+    }
+
+    func setPaused(_ paused: Bool) async { _ = paused }
+    func setPaused(_ paused: Bool, requestID: UUID) async { _ = paused; _ = requestID }
+    func setPausedAcknowledged(_ paused: Bool, requestID: UUID) async -> PlaybackPauseCommandResult {
+        _ = paused
+        _ = requestID
+        return nextResult
+    }
+    func stop() async { emit(.stopped) }
+    func stop(requestID: UUID) async { _ = requestID; emit(.stopped) }
 }

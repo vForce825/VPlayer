@@ -514,8 +514,12 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         let normalizedFloor = floor?.isNumeric == true ? floor : nil
         do {
             try validateReplayAccounting()
+            let protectorID = replayProtectorID(in: replay, floor: normalizedFloor)
+            let candidates = replay.filter { entry in
+                entry.retentionID == protectorID || !isPreFloorExpired(entry, floor: normalizedFloor)
+            }
             let plan = try makeReplayRetentionPlan(
-                candidates: replay,
+                candidates: candidates,
                 floor: normalizedFloor
             )
             recoveryFloor = normalizedFloor
@@ -2089,9 +2093,11 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         let protectorID = replayProtectorID(in: replay, floor: recoveryFloor)
         let candidates = replay.filter { entry in
             guard entry.retentionID != protectorID,
-                  isCompletedReplayHistory(entry),
                   let interval = replayInterval(of: entry) else { return true }
-            return CMTimeCompare(interval.end, time) > 0
+            if isCompletedReplayHistory(entry) {
+                return CMTimeCompare(interval.end, time) > 0
+            }
+            return !isPreFloorExpired(entry, floor: recoveryFloor)
         }
         let plan = try makeReplayRetentionPlan(
             candidates: candidates,
@@ -2116,7 +2122,8 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         let protectorID = replayProtectorID(in: candidates, floor: floor)
 
         func isRemovable(_ entry: ReplayEntry) -> Bool {
-            entry.retentionID != protectorID && isCompletedReplayHistory(entry)
+            entry.retentionID != protectorID
+                && (isCompletedReplayHistory(entry) || isPreFloorExpired(entry, floor: floor))
         }
 
         while true {
@@ -2219,6 +2226,15 @@ final class AudioRenderPipeline: AudioRenderPipelineProtocol, AudioRendererCover
         case .systemCompressed: entry.sentCompressed
         case .ffmpegPCM: entry.decoded
         }
+    }
+
+    /// Replay entries strictly ending at or before an active recovery floor can
+    /// never be anchored or played once readiness reopens, so they may be evicted
+    /// even if the paused/closed renderer has not yet consumed them.
+    private func isPreFloorExpired(_ entry: ReplayEntry, floor: CMTime?) -> Bool {
+        guard let floor, floor.isNumeric,
+              let interval = replayInterval(of: entry) else { return false }
+        return CMTimeCompare(interval.end, floor) <= 0
     }
 
     private func commitReplayRetentionPlan(_ plan: ReplayRetentionPlan) {

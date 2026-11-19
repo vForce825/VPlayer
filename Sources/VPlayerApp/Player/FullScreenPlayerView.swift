@@ -6,6 +6,30 @@ import SwiftUI
 import UIKit
 import VPlayerPlayback
 
+@MainActor
+final class FullScreenPlayerDismissCleanup {
+    private var activeRequestID: UUID?
+    private var cleanup: (() -> Void)?
+
+    func register(requestID: UUID, cleanup: @escaping () -> Void) {
+        activeRequestID = requestID
+        self.cleanup = cleanup
+    }
+
+    func clear(requestID: UUID) {
+        guard activeRequestID == requestID else { return }
+        activeRequestID = nil
+        cleanup = nil
+    }
+
+    func runAndClear() {
+        let action = cleanup
+        activeRequestID = nil
+        cleanup = nil
+        action?()
+    }
+}
+
 struct FullScreenPlayerView: View {
     private enum FailureControl: Hashable {
         case retry
@@ -23,11 +47,13 @@ struct FullScreenPlayerView: View {
     @State private var acceptanceDiagnostics = "init"
     #endif
     @FocusState private var failureFocus: FailureControl?
+    @FocusState private var isWakeSurfaceFocused: Bool
     private let channelPresentation: PlayerChannelPresentation
     private let settings: PlaybackSettingsStore
     private let metricsProvider: AppDependencies.PlaybackMetricsProvider
     private let acceptanceMetricsEnabled: Bool
     private let acceptanceStateEnabled: Bool
+    private let dismissCleanup: FullScreenPlayerDismissCleanup?
     private let onDismiss: () -> Void
 
     init(
@@ -41,6 +67,7 @@ struct FullScreenPlayerView: View {
         acceptanceStateEnabled: Bool,
         settings: PlaybackSettingsStore,
         nowPlaying: PlaybackNowPlayingCoordinator,
+        dismissCleanup: FullScreenPlayerDismissCleanup? = nil,
         onDismiss: @escaping () -> Void
     ) {
         let presentationHostMount = PlaybackPresentationHostMount()
@@ -61,6 +88,7 @@ struct FullScreenPlayerView: View {
         self.metricsProvider = metricsProvider
         self.acceptanceMetricsEnabled = acceptanceMetricsEnabled
         self.acceptanceStateEnabled = acceptanceStateEnabled
+        self.dismissCleanup = dismissCleanup
         self.onDismiss = onDismiss
     }
 
@@ -115,7 +143,7 @@ struct FullScreenPlayerView: View {
             }
             #endif
 
-            if shouldMountTransportOverlays {
+            if shouldMountTransportOverlays && controlsAreVisible {
                 PlayerChannelInfoOverlay(
                     presentation: channelPresentation,
                     mediaInformation: model.mediaInformation
@@ -123,13 +151,12 @@ struct FullScreenPlayerView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                 .padding(.top, 36)
                 .padding(.trailing, 56)
-                .opacity(controlsAreVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
+                .transition(.opacity)
             }
 
             statusOverlay
 
-            if shouldMountTransportOverlays {
+            if shouldMountTransportOverlays && controlsAreVisible {
                 PlayerControlsOverlay(
                     isPaused: model.isPaused,
                     canControlPlayback: model.canControlPlayback,
@@ -139,8 +166,33 @@ struct FullScreenPlayerView: View {
                     onSettings: { showsSettings = true },
                     onInteraction: wakeControls
                 )
-                .opacity(controlsAreVisible ? 1 : 0)
-                .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
+                .disabled(!controlsAreVisible)
+                .allowsHitTesting(controlsAreVisible)
+                .transition(.opacity)
+            } else if shouldMountTransportOverlays {
+                // Keep a dedicated invisible focus target while controls are
+                // hidden so Select wakes the HUD instead of blindly activating
+                // a hidden Back button.
+                Button(action: wakeControls) {
+                    Color.clear
+                }
+                .buttonStyle(.plain)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityIdentifier("player-controls-wake")
+                .accessibilityLabel("显示播放控制")
+                .focused($isWakeSurfaceFocused)
+                .defaultFocus($isWakeSurfaceFocused, true)
+                .onAppear { isWakeSurfaceFocused = true }
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: controlsAreVisible)
+        .onAppear {
+            let activeModel = model
+            let activeMount = presentationHostMount
+            dismissCleanup?.register(requestID: activeModel.request.id) {
+                UIApplication.shared.isIdleTimerDisabled = false
+                activeMount.detachAll()
+                Task { await activeModel.stop() }
             }
         }
         .onMoveCommand { _ in
@@ -176,6 +228,7 @@ struct FullScreenPlayerView: View {
             guard FullScreenPlayerLifecyclePolicy.shouldStopOnDisappear(
                 isPresentingSettings: showsSettings
             ) else { return }
+            dismissCleanup?.clear(requestID: model.request.id)
             UIApplication.shared.isIdleTimerDisabled = false
             presentationHostMount.detachAll()
             Task { await model.stop() }
@@ -288,6 +341,8 @@ struct FullScreenPlayerView: View {
     private func close() {
         guard !isClosing else { return }
         isClosing = true
+        dismissCleanup?.clear(requestID: model.request.id)
+        UIApplication.shared.isIdleTimerDisabled = false
         presentationHostMount.detachAll()
         // Return to the channel list immediately. Engine teardown continues in
         // the background (also driven by onDisappear) so a hung network stop

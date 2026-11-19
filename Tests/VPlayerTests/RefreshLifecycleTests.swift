@@ -317,9 +317,11 @@ final class RefreshLifecycleTests: XCTestCase {
         await fulfillment(of: [refreshed], timeout: 2)
         XCTAssertEqual(completions, [true, true])
         XCTAssertEqual(scheduler.submissions.map(\.earliestBeginDate), [
-            now.addingTimeInterval(3_600), now.addingTimeInterval(15 * 60),
+            now.addingTimeInterval(3_600),
+            now.addingTimeInterval(15 * 60),
+            now.addingTimeInterval(15 * 60),
         ])
-        XCTAssertEqual(scheduler.cancelledIdentifiers, Array(repeating: BackgroundRefreshRegistrar.identifier, count: 2))
+        XCTAssertEqual(scheduler.cancelledIdentifiers, Array(repeating: BackgroundRefreshRegistrar.identifier, count: 3))
         XCTAssertEqual(scheduler.maximumInFlightSubmissions, 1)
         let resources = await work.resources
         let trigger = await work.trigger
@@ -731,15 +733,56 @@ final class RefreshLifecycleTests: XCTestCase {
         let refreshTrigger = await probe.trigger
 
         XCTAssertEqual(scheduler.registrationCount, 1)
-        XCTAssertEqual(scheduler.cancelledIdentifiers, [BackgroundRefreshRegistrar.identifier])
-        XCTAssertEqual(scheduler.submissions.count, 1)
+        XCTAssertEqual(
+            scheduler.cancelledIdentifiers,
+            Array(repeating: BackgroundRefreshRegistrar.identifier, count: 2)
+        )
+        XCTAssertEqual(scheduler.submissions.count, 2)
         XCTAssertEqual(scheduler.submissions.first?.identifier, BackgroundRefreshRegistrar.identifier)
         XCTAssertEqual(scheduler.submissions.first?.earliestBeginDate, now.addingTimeInterval(15 * 60))
+        XCTAssertEqual(scheduler.submissions.last?.identifier, BackgroundRefreshRegistrar.identifier)
+        XCTAssertEqual(scheduler.submissions.last?.earliestBeginDate, now.addingTimeInterval(15 * 60))
         XCTAssertEqual(refreshedResources, [.playlist])
         guard case .background? = refreshTrigger else {
             return XCTFail("Expected a background refresh trigger")
         }
         XCTAssertEqual(task.completions, [true])
+    }
+
+    func testBackgroundRefreshReschedulesToNextIntervalAfterCompletingDueRefresh() async throws {
+        let now = Date(timeIntervalSince1970: 2_000_000_000)
+        var initialProfile = makeProfile(now: now)
+        initialProfile.m3uRefreshInterval = .sixHours
+        initialProfile.epgRefreshInterval = .manual
+        let state = BackgroundProfileState(profile: initialProfile)
+        let scheduler = BackgroundSchedulerSpy()
+        let registrar = BackgroundRefreshRegistrar(
+            scheduler: scheduler,
+            loadProfiles: { [await state.profile] },
+            refresh: { _, resources, _ in
+                await state.markPlaylistSucceeded(at: now)
+                return resources.map {
+                    RefreshOutcome(resource: $0, succeeded: true, message: nil)
+                }
+            },
+            now: { now },
+            reportStatus: { _ in XCTFail("No status error expected") }
+        )
+
+        registrar.register()
+        let task = BackgroundTaskSpy()
+        try scheduler.launch(task)
+        await eventually { task.completions.count == 1 }
+
+        XCTAssertEqual(task.completions, [true])
+        XCTAssertEqual(scheduler.submissions.map(\.earliestBeginDate), [
+            now.addingTimeInterval(15 * 60),
+            now.addingTimeInterval(6 * 3_600),
+        ])
+        XCTAssertEqual(
+            scheduler.pendingSubmission?.earliestBeginDate,
+            now.addingTimeInterval(6 * 3_600)
+        )
     }
 
     func testBackgroundProfileLoadFailureKeepsOriginalTypeAndReason() async throws {
@@ -1390,6 +1433,21 @@ private final class BackgroundTaskSpy: BackgroundRefreshTask {
 
     func expire() {
         expirationHandler?()
+    }
+}
+
+private actor BackgroundProfileState {
+    var profile: SourceProfile
+
+    init(profile: SourceProfile) {
+        self.profile = profile
+    }
+
+    func markPlaylistSucceeded(at date: Date) {
+        profile.m3uStatus.lastAttemptAt = date
+        profile.m3uStatus.lastSuccessAt = date
+        profile.m3uStatus.state = .succeeded
+        profile.m3uStatus.errorSummary = nil
     }
 }
 

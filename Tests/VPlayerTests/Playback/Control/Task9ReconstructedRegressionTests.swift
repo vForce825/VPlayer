@@ -2690,6 +2690,47 @@ final class Task9ReconstructedRegressionTests: XCTestCase {
         relay.deactivate()
     }
 
+    func testPipelineRelayCoalescesSameGenerationMediaInformationWithoutOverflow() async throws {
+        let gate = Task9OperationGate()
+        let identity = PlaybackRunIdentity(sessionID: 2, requestID: UUID())
+        let observed = PlaybackStreamRecorder<PlaybackPipelineEvent>()
+        let relay = PlaybackSessionEventRelay(identity: identity) { _, event in
+            if event == .ready(readinessCycle: 0) { await gate.enter() }
+            observed.append(event)
+        }
+        try bindOwnedRelayForTesting(.pipeline(relay), identity: identity)
+        relay.send(.ready(readinessCycle: 0))
+        await gate.waitUntilEntered()
+        // Sending 100 .mediaInformation updates for the same generation while
+        // draining is blocked must coalesce in place rather than overflowing the 32-slot ring.
+        let generation = MediaGeneration(rawValue: 1)
+        for index in 1...100 {
+            let info = PlaybackMediaInformation(
+                width: Int32(1_000 + index),
+                height: 1_080,
+                scanMode: .progressive,
+                sourceFrameRate: MediaRational(num: 60_000, den: 1_001),
+                outputFrameRate: 60_000.0 / 1_001.0,
+                isSmoothMotionEnhanced: false
+            )
+            relay.send(.mediaInformation(info, generation: generation))
+        }
+        await gate.release()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while observed.snapshot.count < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(observed.snapshot.count, 2)
+        XCTAssertFalse(observed.snapshot.contains(.failed(.controlEventCapacityExceeded)))
+        if case let .mediaInformation(finalInfo?, finalGen) = observed.snapshot.last {
+            XCTAssertEqual(finalGen, generation)
+            XCTAssertEqual(finalInfo.width, 1_100)
+        } else {
+            XCTFail("Expected coalesced final mediaInformation event")
+        }
+        relay.deactivate()
+    }
+
     func testAudioRelayOverflowProducesOneTerminalInsteadOfSilentlyDroppingEvents() async throws {
         let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
         let monitor = SystemAudioEventMonitor(safetyIngress: registry.executor.safetyIngress)

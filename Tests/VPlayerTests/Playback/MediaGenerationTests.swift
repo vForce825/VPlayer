@@ -3,6 +3,9 @@
 // SPDX-FileComment: Apple App Store distribution is additionally permitted by LICENSE.APPSTORE-EXCEPTION.
 
 import AudioToolbox
+#if os(macOS)
+import CoreAudio
+#endif
 import Foundation
 import XCTest
 @testable import VPlayerPlayback
@@ -37,6 +40,86 @@ final class MediaGenerationTests: XCTestCase {
         XCTAssertLessThan(MediaGeneration(rawValue: 1), MediaGeneration(rawValue: 2))
         XCTAssertEqual(Set([MediaGeneration(rawValue: 1), MediaGeneration(rawValue: 1)]).count, 1)
     }
+
+    #if os(macOS)
+    func testMacAudioDeviceObserverIgnoresUnrelatedDevicesAndScopesTopologyHints() {
+        let active: AudioObjectID = 42
+        let replacement: AudioObjectID = 99
+
+        // Unrelated audio device add/remove (mic, webcam, Continuity Camera) when
+        // default output is unchanged must be ignored to prevent spurious dropouts.
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioHardwarePropertyDevices,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .ignore
+        )
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioHardwarePropertyDefaultOutputDevice,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .ignore
+        )
+
+        // Default output switch must rebind and signal topology change.
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioHardwarePropertyDevices,
+                observedDevice: active,
+                currentDefaultOutput: replacement
+            ),
+            .notify(rebind: true, topologyChangeHint: true)
+        )
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioHardwarePropertyDefaultOutputDevice,
+                observedDevice: active,
+                currentDefaultOutput: replacement
+            ),
+            .notify(rebind: true, topologyChangeHint: true)
+        )
+
+        // Timing/sample-rate changes on the same active output do not set topologyChangeHint.
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioDevicePropertyLatency,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .notify(rebind: false, topologyChangeHint: false)
+        )
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioDevicePropertyBufferFrameSize,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .notify(rebind: false, topologyChangeHint: false)
+        )
+
+        // Stream configuration or device-alive loss on active device signals topology change.
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioDevicePropertyDeviceIsAlive,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .notify(rebind: false, topologyChangeHint: true)
+        )
+        XCTAssertEqual(
+            MacAudioDeviceObserver.changeDecision(
+                for: kAudioDevicePropertyStreamConfiguration,
+                observedDevice: active,
+                currentDefaultOutput: active
+            ),
+            .notify(rebind: false, topologyChangeHint: true)
+        )
+    }
+    #endif
 
     func testCanonicalFingerprintMatchesIndependentGoldenVector() throws {
         let fingerprint = try makeFingerprint()

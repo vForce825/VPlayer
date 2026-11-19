@@ -1844,6 +1844,266 @@ final class PlaybackPipelineTests: XCTestCase {
         }
     }
 
+    func testInterlacedStartupPrerollSkipsHEVCAndReleasesEarlyOnAudioBackpressure() async throws {
+        // Part A: HEVC interlaced streams do not skip the initial GOP and must NOT
+        // be delayed by H.264 interlaced startup preroll.
+        let hevcHarness = makeHarness(tuning: PlaybackTuning(videoBufferSeconds: 2))
+        let hevcTracks = DemuxTrackSet(
+            selectedProgramID: 1,
+            video: VideoTrackDescriptor(
+                streamIndex: 100,
+                codec: .hevc,
+                timeBase: MediaRational(num: 1, den: 90_000)!,
+                width: 1_920,
+                height: 1_080,
+                videoDelay: 0,
+                extradata: Data(),
+                frameRate: MediaRational(num: 25, den: 1),
+                fieldOrder: .tt
+            ),
+            audio: PlaybackFakeMedia.tracks().audio
+        )
+        hevcHarness.pipeline.start(url: makeRequest().streamURL)
+        try await eventually { hevcHarness.demux.snapshot().startedURLs.count == 1 }
+        hevcHarness.demux.emit(.tracks(hevcTracks))
+        try await eventually { (await hevcHarness.pipeline.debugSnapshot()).hasTracks }
+        let fp = MediaFormatFingerprint(bytes: Data([0xE1]))
+        var hevcFormat: CMVideoFormatDescription?
+        XCTAssertEqual(
+            CMVideoFormatDescriptionCreate(
+                allocator: kCFAllocatorDefault,
+                codecType: kCMVideoCodecType_HEVC,
+                width: 1_920,
+                height: 1_080,
+                extensions: nil,
+                formatDescriptionOut: &hevcFormat
+            ),
+            noErr
+        )
+        hevcHarness.pipeline.receive(audio: .format(try PlaybackFakeMedia.audioConfiguration(fingerprint: fp)))
+        hevcHarness.pipeline.receive(video: .format(try XCTUnwrap(hevcFormat), fp))
+        try await eventually { (await hevcHarness.pipeline.debugSnapshot()).generation.rawValue == 1 }
+        let hevcGen = await hevcHarness.pipeline.debugSnapshot().generation
+        let baseHEVC = try PlaybackFakeMedia.accessUnit(
+            id: 1,
+            generation: hevcGen,
+            randomAccess: true,
+            pts: .zero
+        )
+        let interlacedHEVC = CompressedVideoAccessUnit(
+            id: baseHEVC.id,
+            sampleBuffer: baseHEVC.sampleBuffer,
+            generation: baseHEVC.generation,
+            isRandomAccess: true,
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: .tt,
+                pictureStructure: .frame,
+                isInterlaced: true,
+                repeatFirstField: false,
+                topFieldFirst: true,
+                sourcePTS90k: nil
+            )
+        )
+        hevcHarness.pipeline.receive(video: .accessUnit(interlacedHEVC))
+        try await eventually {
+            hevcHarness.decoder.snapshot().contains {
+                if case .transitionConfigure = $0 { return true }
+                return false
+            }
+        }
+
+        // Part B: H.264 interlaced startup preroll must release early when audio becomes
+        // backpressured so long-GOP live streams cannot overflow audio.replay.capacity.
+        let h264Harness = makeHarness(tuning: PlaybackTuning(videoBufferSeconds: 4))
+        let h264Gen = try await configure(h264Harness, initialRandomAccessPTS: nil)
+        let firstBase = try PlaybackFakeMedia.accessUnit(id: 1, generation: h264Gen, randomAccess: true, pts: .zero)
+        let firstInterlaced = CompressedVideoAccessUnit(
+            id: firstBase.id,
+            sampleBuffer: firstBase.sampleBuffer,
+            generation: firstBase.generation,
+            isRandomAccess: true,
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: .tt,
+                pictureStructure: .frame,
+                isInterlaced: true,
+                repeatFirstField: false,
+                topFieldFirst: true,
+                sourcePTS90k: nil
+            )
+        )
+        h264Harness.pipeline.receive(video: .accessUnit(firstInterlaced))
+        try await Task.sleep(for: .milliseconds(20))
+        XCTAssertFalse(h264Harness.decoder.snapshot().contains {
+            if case .transitionConfigure = $0 { return true }
+            return false
+        })
+
+        h264Harness.audio.setInputBackpressured(true)
+        let secondBase = try PlaybackFakeMedia.accessUnit(
+            id: 2,
+            generation: h264Gen,
+            randomAccess: true,
+            pts: CMTime(value: 1, timescale: 1)
+        )
+        let secondInterlaced = CompressedVideoAccessUnit(
+            id: secondBase.id,
+            sampleBuffer: secondBase.sampleBuffer,
+            generation: secondBase.generation,
+            isRandomAccess: true,
+            parserMetadata: VideoParserMetadata(
+                fieldOrder: .tt,
+                pictureStructure: .frame,
+                isInterlaced: true,
+                repeatFirstField: false,
+                topFieldFirst: true,
+                sourcePTS90k: nil
+            )
+        )
+        h264Harness.pipeline.receive(video: .accessUnit(secondInterlaced))
+        try await eventually {
+            h264Harness.decoder.snapshot().contains {
+                if case .transitionConfigure = $0 { return true }
+                return false
+            }
+        }
+    }
+
+    func testDemuxNotThrottledByAudioBackpressureWhileReadinessIsClosedDuringRecovery() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+
+        // Close readiness (simulating display mode switch / recovery) while audio is backpressured.
+        harness.pipeline.displayModeSwitchStarted()
+        harness.audio.setInputBackpressured(true)
+
+        let admitted = LockedFlag()
+        let packet = PlaybackFakeMedia.videoPacket(marker: 77)
+        DispatchQueue.global().async {
+            harness.demux.emit(.packet(packet))
+            admitted.set()
+        }
+        try await eventually { admitted.value }
+        try await eventually {
+            harness.assemblers.video.packets.last?.data == packet.data
+        }
+    }
+
+    func testPlaybackPipelineAndControllerDeduplicateIdenticalMediaInformation() async throws {
+        // Part A: PlaybackPipeline emits .mediaInformation once per generation when unchanged.
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        try await eventually {
+            harness.events.snapshot().contains {
+                if case let .mediaInformation(info?, gen) = $0 { return !info.isSourceProbe && gen == generation }
+                return false
+            }
+        }
+        for index in 3...8 {
+            harness.pipeline.receive(decoder: harness.frameEvent(try PlaybackFakeMedia.decodedFrame(
+                id: UInt64(index),
+                generation: generation,
+                pts: CMTime(value: Int64(index), timescale: 25),
+                interlaced: false
+            )))
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        let resolvedInfoCount = harness.events.snapshot().filter {
+            if case let .mediaInformation(info?, gen) = $0 { return !info.isSourceProbe && gen == generation }
+            return false
+        }.count
+        XCTAssertEqual(resolvedInfoCount, 1)
+
+        // Part B: PlaybackController deduplicates identical consecutive .mediaInformation events.
+        let pipeline = FakeControllerPipeline()
+        let controller = makeRoutedPlaybackController(factory: FakeControllerPipelineFactory([pipeline]))
+        let stream = await controller.playbackMediaInformation()
+        let recorder = PlaybackStreamRecorder<PlaybackMediaInformation?>()
+        let collector = Task { for await value in stream { recorder.append(value) } }
+        defer { collector.cancel() }
+        try await eventually { recorder.snapshot.count == 1 }
+
+        await controller.play(makeRequest(title: "dedup-info"))
+        let info = PlaybackMediaInformation(
+            width: 1_920,
+            height: 1_080,
+            scanMode: .progressive,
+            sourceFrameRate: MediaRational(num: 60_000, den: 1_001),
+            outputFrameRate: 60_000.0 / 1_001.0,
+            isSmoothMotionEnhanced: false
+        )
+        for _ in 0..<5 {
+            pipeline.emit(.mediaInformation(info, generation: MediaGeneration(rawValue: 1)))
+        }
+        try await eventually { recorder.snapshot.count == 2 }
+        try await Task.sleep(for: .milliseconds(30))
+        XCTAssertEqual(recorder.snapshot.count, 2)
+        await controller.stop()
+    }
+
+    func testResumeActiveOutputFromRouteRecoveryPublishesPreparingForSampleBufferAndGuardsSystemPause() async throws {
+        let pipeline = FakeControllerPipeline()
+        let registry = ControlTaskRegistry(allocator: PlaybackIdentityAllocator())
+        let owner = try PlaybackAudioSessionOwner(
+            registry: registry,
+            sdk: FakeAudioSessionSDK(initialPorts: [.hdmi])
+        )
+        let controller = makeRoutedPlaybackController(
+            factory: FakeControllerPipelineFactory([pipeline]),
+            audioSessionOwner: owner
+        )
+        let states = PlaybackStreamRecorder<PlaybackState>()
+        let stateStream = await controller.events()
+        let collector = Task { for await value in stateStream { states.append(value) } }
+        defer { collector.cancel() }
+
+        let request = makeRequest(title: "route-recovery-sb")
+        await controller.play(request)
+        try await eventually { pipeline.snapshot().starts.count == 1 }
+        pipeline.emit(.ready(readinessCycle: 0))
+        try await eventually {
+            if case .playing = states.snapshot.last { return true }
+            return false
+        }
+
+        // Suspend output for route loss, then recover route: SampleBuffer must publish
+        // .preparing(request) rather than premature .playing(request) until pipeline emits .ready.
+        await controller.suspendActiveOutputForRouteUnavailable()
+        await controller.resumeActiveOutputFromRouteRecovery()
+        let stateAfterRecovery = await controller.currentStateForTesting
+        XCTAssertEqual(stateAfterRecovery, .preparing(request))
+
+        // Once the pipeline reopens readiness and emits .ready, state transitions to .playing.
+        let cycle = pipeline.snapshot().pauses.last?.1 ?? 0
+        pipeline.emit(.ready(readinessCycle: cycle))
+        try await eventually {
+            if case .playing = states.snapshot.last { return true }
+            return false
+        }
+        await controller.stop()
+    }
+
+    func testFailIsolatedSynchronouslyPausesClockFlushesRenderersAndClearsBuffers() async throws {
+        let harness = makeHarness()
+        let generation = try await configure(harness)
+        try await openInitialSharedTimeline(harness, generation: generation)
+        // Hold async renderer removal so we can observe synchronous cleanup before async teardown completes.
+        harness.audio.stopAutomaticallyCompletes = false
+        let pausesBefore = harness.clock.snapshot().pauses
+
+        harness.demux.emit(.failure(.demuxRead(-5)))
+        try await eventually { (await harness.pipeline.debugSnapshot()).isTerminal }
+
+        XCTAssertGreaterThan(harness.clock.snapshot().pauses, pausesBefore)
+        XCTAssertEqual(harness.clock.snapshot().rate, 0)
+        XCTAssertTrue(harness.renderer.snapshot().flushes.contains(generation))
+        XCTAssertTrue(harness.audio.snapshot().flushes.contains(generation))
+        let snapshot = await harness.pipeline.debugSnapshot()
+        XCTAssertEqual(snapshot.deferredPacketCount, 0)
+        XCTAssertEqual(snapshot.pendingVideoDecodeCount, 0)
+    }
+
     func testAudioOnlyReadinessDoesNotWaitForVideoInformation() async throws {
         let harness = makeHarness()
         harness.pipeline.start(url: makeRequest().streamURL)

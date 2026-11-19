@@ -382,6 +382,46 @@ final class URLSessionBoundedDownloaderTests: XCTestCase {
         await assertDownloadsDirectoryBecomesEmpty()
     }
 
+    func testDefaultDownloadsDirectoryIsScopedToCurrentLaunchSubdirectory() {
+        let directory = URLSessionBoundedDownloader.defaultDownloadsDirectory()
+        XCTAssertEqual(directory.lastPathComponent, URLSessionBoundedDownloader.launchDirectoryName)
+        XCTAssertEqual(directory.deletingLastPathComponent().lastPathComponent, "VPlayerDownloads")
+    }
+
+    func testPurgeOrphanedDownloadsRemovesSiblingsWhilePreservingActiveLaunchDirectory() throws {
+        let fm = FileManager.default
+        let root = downloadsDirectory.appendingPathComponent("VPlayerDownloadsRoot", isDirectory: true)
+        let activeDir = root.appendingPathComponent("active-launch", isDirectory: true)
+        let staleDir = root.appendingPathComponent("stale-launch", isDirectory: true)
+        let legacyLooseFile = root.appendingPathComponent("legacy-orphan.tmp")
+        let activeFile = activeDir.appendingPathComponent("in-progress.tmp")
+        let staleFile = staleDir.appendingPathComponent("crashed.tmp")
+
+        try fm.createDirectory(at: activeDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: staleDir, withIntermediateDirectories: true)
+        try Data("active".utf8).write(to: activeFile)
+        try Data("stale".utf8).write(to: staleFile)
+        try Data("legacy".utf8).write(to: legacyLooseFile)
+
+        URLSessionBoundedDownloader.purgeOrphanedDownloads(
+            in: root,
+            keepingDirectoryNamed: "active-launch",
+            fileManager: fm
+        )
+
+        XCTAssertTrue(fm.fileExists(atPath: activeDir.path))
+        XCTAssertTrue(fm.fileExists(atPath: activeFile.path))
+        XCTAssertFalse(fm.fileExists(atPath: staleDir.path))
+        XCTAssertFalse(fm.fileExists(atPath: legacyLooseFile.path))
+
+        // 根目录不存在时公开静态方法也应安全无副作用。
+        URLSessionBoundedDownloader.purgeOrphanedDownloads(
+            in: downloadsDirectory.appendingPathComponent("NonExistentRoot", isDirectory: true),
+            keepingDirectoryNamed: "active-launch",
+            fileManager: fm
+        )
+    }
+
     func testRedactedURLRemovesCredentialsQueryAndFragment() {
         XCTAssertEqual(
             RedactedURL.string(

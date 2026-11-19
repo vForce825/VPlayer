@@ -398,6 +398,33 @@ final class HLSResourceTransportTests: XCTestCase {
         XCTAssertNil(HLSHTTPContentRange("bytes 7-4/10"))
         XCTAssertNil(HLSHTTPContentRange("bytes 0-9223372036854775807/*"))
     }
+
+    func testGzipAndDeflateAllowedForNonRangedRequestsAndRejectedForByteRanges() async throws {
+        let reusedTransport = transport()
+        let gzip = try await reusedTransport.fetch(request("/gzip-manifest"))
+        XCTAssertEqual(gzip.completeness, .complete)
+        XCTAssertEqual(String(data: gzip.data, encoding: .utf8), "#EXTM3U\n#EXT-X-TARGETDURATION:1\n")
+
+        let deflate = try await reusedTransport.fetch(request("/deflate-manifest"))
+        XCTAssertEqual(deflate.completeness, .complete)
+        XCTAssertEqual(String(data: deflate.data, encoding: .utf8), "#EXTM3U\n#EXT-X-TARGETDURATION:2\n")
+
+        // Decoded byte limit must still be enforced on gzip responses.
+        do {
+            _ = try await reusedTransport.fetch(request("/gzip-manifest", maximumBytes: 8))
+            XCTFail("Oversized gzip body exceeded maximumBytes")
+        } catch {
+            XCTAssertEqual(error as? HLSSourceError, .byteLimit)
+        }
+
+        // Byte-range requests with Content-Encoding: gzip must still be rejected.
+        do {
+            _ = try await reusedTransport.fetch(request("/gzip-range", range: .init(offset: 0, length: 4)))
+            XCTFail("Compressed byte-range response was admitted")
+        } catch {
+            XCTAssertEqual(error as? HLSSourceError, .unsupportedMedia)
+        }
+    }
 }
 
 private final class SourceHTTPProtocol: URLProtocol, @unchecked Sendable {
@@ -416,6 +443,15 @@ private final class SourceHTTPProtocol: URLProtocol, @unchecked Sendable {
         var headers: [String: String] = [:]
         switch url.path {
         case "/encoded": body = Data("fixture".utf8); status = 200; headers["Content-Encoding"] = "private-encoding"
+        case "/gzip-manifest":
+            body = Data("#EXTM3U\n#EXT-X-TARGETDURATION:1\n".utf8); status = 200; headers["Content-Encoding"] = "gzip"
+            headers["Content-Length"] = "12"
+        case "/deflate-manifest":
+            body = Data("#EXTM3U\n#EXT-X-TARGETDURATION:2\n".utf8); status = 200; headers["Content-Encoding"] = "deflate"
+            headers["Content-Length"] = "10"
+        case "/gzip-range":
+            body = Data([4, 5, 6, 7]); status = 206; headers["Content-Encoding"] = "gzip"
+            headers["Content-Range"] = "bytes 0-3/10"
         case "/prefix-manifest", "/whole-manifest":
             body = Data("#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\npart\n".utf8)
             status = 206
@@ -425,7 +461,9 @@ private final class SourceHTTPProtocol: URLProtocol, @unchecked Sendable {
         case "/final": body = Data("clean".utf8); status = request.value(forHTTPHeaderField: "Authorization") == nil ? 200 : 400
         default: body = Data(0..<16); status = 200
         }
-        headers["Content-Length"] = String(body.count)
+        if headers["Content-Length"] == nil {
+            headers["Content-Length"] = String(body.count)
+        }
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: body)

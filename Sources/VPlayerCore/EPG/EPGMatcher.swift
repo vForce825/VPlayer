@@ -50,7 +50,9 @@ public enum EPGMatcher {
         manualMappingsByChannelID: [String: String],
         cancellationCheck: () throws -> Void
     ) rethrows -> [String: EPGMatchResult] {
-        let index = try EPGMatchIndex(
+        try cancellationCheck()
+        guard !channels.isEmpty, !epgChannels.isEmpty else { return [:] }
+        var index = try EPGMatchIndex(
             epgChannels: epgChannels,
             cancellationCheck: cancellationCheck
         )
@@ -80,7 +82,9 @@ public enum EPGMatcher {
         epgChannels: [EPGChannel],
         manualMapping: ManualEPGMapping?
     ) -> EPGMatchResult {
-        EPGMatchIndex(epgChannels: epgChannels, cancellationCheck: {}).match(
+        guard !epgChannels.isEmpty else { return .unmatched }
+        var index = EPGMatchIndex(epgChannels: epgChannels, cancellationCheck: {})
+        return index.match(
             channel: channel,
             manualMapping: manualMapping,
             cancellationCheck: {}
@@ -88,8 +92,9 @@ public enum EPGMatcher {
     }
 }
 
-/// Immutable lookup tables shared by every playlist-channel match in one
-/// library reload.
+/// Lookup tables shared by every playlist-channel match in one library reload.
+/// Fuzzy signature indices are materialized lazily on the first channel that
+/// misses manual, exact-ID, and exact-name lookups.
 private struct EPGMatchIndex: Sendable {
     private struct SubstitutionSignature: Hashable, Sendable {
         let originalLength: Int
@@ -97,10 +102,14 @@ private struct EPGMatchIndex: Sendable {
         let remainder: String
     }
 
+    private struct FuzzyTables: Sendable {
+        let candidateIDsByOneDeletion: [String: Set<String>]
+        let candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>]
+    }
+
     private let channelIDs: Set<String>
     private let candidateIDsByNormalizedName: [String: Set<String>]
-    private let candidateIDsByOneDeletion: [String: Set<String>]
-    private let candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>]
+    private var fuzzyTables: FuzzyTables?
 
     init(
         epgChannels: [EPGChannel],
@@ -108,8 +117,6 @@ private struct EPGMatchIndex: Sendable {
     ) rethrows {
         var channelIDs: Set<String> = []
         var candidateIDsByNormalizedName: [String: Set<String>] = [:]
-        var candidateIDsByOneDeletion: [String: Set<String>] = [:]
-        var candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>] = [:]
         channelIDs.reserveCapacity(epgChannels.count)
 
         try cancellationCheck()
@@ -127,34 +134,15 @@ private struct EPGMatchIndex: Sendable {
                 try cancellationCheck()
                 candidateIDsByNormalizedName[normalizedName, default: []]
                     .insert(epgChannel.id)
-                guard EPGNameNormalizer.isFuzzyMatchEligible(normalizedName) else {
-                    continue
-                }
-                let originalLength = normalizedName.count
-                try Self.forEachOneCharacterDeletion(
-                    of: normalizedName, cancellationCheck: cancellationCheck
-                ) { removedIndex, remainder in
-                    candidateIDsByOneDeletion[remainder, default: []]
-                        .insert(epgChannel.id)
-                    candidateIDsBySubstitutionSignature[
-                        SubstitutionSignature(
-                            originalLength: originalLength,
-                            removedIndex: removedIndex,
-                            remainder: remainder
-                        ),
-                        default: []
-                    ].insert(epgChannel.id)
-                }
             }
         }
 
         self.channelIDs = channelIDs
         self.candidateIDsByNormalizedName = candidateIDsByNormalizedName
-        self.candidateIDsByOneDeletion = candidateIDsByOneDeletion
-        self.candidateIDsBySubstitutionSignature = candidateIDsBySubstitutionSignature
+        fuzzyTables = nil
     }
 
-    func match(
+    mutating func match(
         channel: Channel,
         manualMapping: ManualEPGMapping?,
         cancellationCheck: () throws -> Void
@@ -184,15 +172,22 @@ private struct EPGMatchIndex: Sendable {
             return result
         }
 
-        var fuzzyCandidateIDs: Set<String> = []
+        var eligibleFuzzyNames: [String] = []
         for channelName in channelNames {
             try cancellationCheck()
-            guard EPGNameNormalizer.isFuzzyMatchEligible(channelName) else {
-                continue
+            if EPGNameNormalizer.isFuzzyMatchEligible(channelName) {
+                eligibleFuzzyNames.append(channelName)
             }
+        }
+        guard !eligibleFuzzyNames.isEmpty else { return .unmatched }
+
+        let fuzzyTables = try ensureFuzzyTables(cancellationCheck: cancellationCheck)
+        var fuzzyCandidateIDs: Set<String> = []
+        for channelName in eligibleFuzzyNames {
+            try cancellationCheck()
 
             // XMLTV name is one character longer than the playlist name.
-            fuzzyCandidateIDs.formUnion(candidateIDsByOneDeletion[channelName] ?? [])
+            fuzzyCandidateIDs.formUnion(fuzzyTables.candidateIDsByOneDeletion[channelName] ?? [])
 
             let originalLength = channelName.count
             try Self.forEachOneCharacterDeletion(
@@ -213,7 +208,7 @@ private struct EPGMatchIndex: Sendable {
                     remainder: remainder
                 )
                 fuzzyCandidateIDs.formUnion(
-                    candidateIDsBySubstitutionSignature[signature] ?? []
+                    fuzzyTables.candidateIDsBySubstitutionSignature[signature] ?? []
                 )
             }
         }
@@ -222,6 +217,41 @@ private struct EPGMatchIndex: Sendable {
         }
 
         return .unmatched
+    }
+
+    private mutating func ensureFuzzyTables(
+        cancellationCheck: () throws -> Void
+    ) rethrows -> FuzzyTables {
+        if let fuzzyTables { return fuzzyTables }
+        var candidateIDsByOneDeletion: [String: Set<String>] = [:]
+        var candidateIDsBySubstitutionSignature: [SubstitutionSignature: Set<String>] = [:]
+        for (normalizedName, ids) in candidateIDsByNormalizedName {
+            try cancellationCheck()
+            guard EPGNameNormalizer.isFuzzyMatchEligible(normalizedName) else {
+                continue
+            }
+            let originalLength = normalizedName.count
+            try Self.forEachOneCharacterDeletion(
+                of: normalizedName,
+                cancellationCheck: cancellationCheck
+            ) { removedIndex, remainder in
+                candidateIDsByOneDeletion[remainder, default: []].formUnion(ids)
+                candidateIDsBySubstitutionSignature[
+                    SubstitutionSignature(
+                        originalLength: originalLength,
+                        removedIndex: removedIndex,
+                        remainder: remainder
+                    ),
+                    default: []
+                ].formUnion(ids)
+            }
+        }
+        let built = FuzzyTables(
+            candidateIDsByOneDeletion: candidateIDsByOneDeletion,
+            candidateIDsBySubstitutionSignature: candidateIDsBySubstitutionSignature
+        )
+        fuzzyTables = built
+        return built
     }
 
     private static func normalizedNames(
@@ -247,15 +277,21 @@ private struct EPGMatchIndex: Sendable {
         // Enforce the budget before allocating or traversing grapheme clusters,
         // even if a future caller forgets to check eligibility.
         guard EPGNameNormalizer.isFuzzyMatchEligible(value) else { return }
-        let characters = Array(value)
-        for removedIndex in characters.indices {
+        var remainder = String()
+        remainder.reserveCapacity(value.utf8.count)
+        var removedIndex = 0
+        var currentIndex = value.startIndex
+        while currentIndex < value.endIndex {
             try cancellationCheck()
-            guard !EPGNameNormalizer.isProtectedSemanticCharacter(
-                characters[removedIndex]
-            ) else { continue }
-            var remainder = characters
-            remainder.remove(at: removedIndex)
-            body(removedIndex, String(remainder))
+            let nextIndex = value.index(after: currentIndex)
+            if !EPGNameNormalizer.isProtectedSemanticCharacter(value[currentIndex]) {
+                remainder.removeAll(keepingCapacity: true)
+                remainder.append(contentsOf: value[..<currentIndex])
+                remainder.append(contentsOf: value[nextIndex...])
+                body(removedIndex, remainder)
+            }
+            currentIndex = nextIndex
+            removedIndex += 1
         }
     }
 

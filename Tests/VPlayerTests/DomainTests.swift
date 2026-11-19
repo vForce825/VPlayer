@@ -91,10 +91,41 @@ final class DomainTests: XCTestCase {
             streamURL: URL(string: "http://example.com/live?a=1")!
         )
         XCTAssertEqual(first, second)
+        XCTAssertEqual(first.count, 64)
+        XCTAssertTrue(first.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) })
         XCTAssertNotEqual(first, ChannelIdentity.make(
             profileID: profileID,
             streamURL: URL(string: "http://example.com/live?a=2")!
         ))
+    }
+
+    func testChannelPrecomputedIDInitializerPreservesProvidedID() {
+        let profileID = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
+        let url = URL(string: "https://example.test/live.m3u8")!
+        let computed = Channel(
+            sourceProfileID: profileID,
+            displayName: "Live",
+            streamURL: url,
+            tvgID: "live",
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 0
+        )
+        let precomputed = Channel(
+            id: computed.id,
+            sourceProfileID: profileID,
+            displayName: "Live",
+            streamURL: url,
+            tvgID: "live",
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 0
+        )
+        XCTAssertEqual(precomputed, computed)
     }
 
     func testStreamPolicyAcceptsHTTPRelayAndRejectsMulticastSchemes() {
@@ -114,5 +145,36 @@ final class DomainTests: XCTestCase {
             ProtocolRejection.multicastUnsupported.userMessage,
             "首版暂不支持组播地址"
         )
+    }
+
+    func testBoundedDownloaderPurgeOrphanedDownloadsPreservesActiveLaunchDirectory() throws {
+        let fm = FileManager.default
+        let tempRoot = fm.temporaryDirectory
+            .appendingPathComponent("VPlayerCoreOrphanTest-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tempRoot) }
+
+        let activeDir = tempRoot.appendingPathComponent("current-launch", isDirectory: true)
+        let staleDir = tempRoot.appendingPathComponent("previous-launch", isDirectory: true)
+        let looseFile = tempRoot.appendingPathComponent("loose-orphan.tmp")
+        let activeFile = activeDir.appendingPathComponent("active.tmp")
+        try fm.createDirectory(at: activeDir, withIntermediateDirectories: true)
+        try fm.createDirectory(at: staleDir, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: activeFile)
+        try Data("drop".utf8).write(to: staleDir.appendingPathComponent("old.tmp"))
+        try Data("drop".utf8).write(to: looseFile)
+
+        let defaultDir = URLSessionBoundedDownloader.defaultDownloadsDirectory()
+        XCTAssertEqual(defaultDir.lastPathComponent, URLSessionBoundedDownloader.launchDirectoryName)
+        XCTAssertEqual(defaultDir.deletingLastPathComponent().lastPathComponent, "VPlayerDownloads")
+
+        URLSessionBoundedDownloader.purgeOrphanedDownloads(
+            in: tempRoot,
+            keepingDirectoryNamed: "current-launch",
+            fileManager: fm
+        )
+
+        XCTAssertTrue(fm.fileExists(atPath: activeFile.path))
+        XCTAssertFalse(fm.fileExists(atPath: staleDir.path))
+        XCTAssertFalse(fm.fileExists(atPath: looseFile.path))
     }
 }

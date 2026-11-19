@@ -105,8 +105,8 @@ public final class PlaybackAudioRouteService: PlaybackAudioSessionCompletionRece
                 }
                 // 先发布绑定再安装监听，安装过程中同步到达的通知也必须使旧输出失效。
                 #if os(macOS)
-                macDeviceObserver = MacAudioDeviceObserver { [weak self] in
-                    _ = self?.publishRouteIngress(topologyChangeHint: true, expectedBindingID: id)
+                macDeviceObserver = MacAudioDeviceObserver { [weak self] topologyChangeHint in
+                    _ = self?.publishRouteIngress(topologyChangeHint: topologyChangeHint, expectedBindingID: id)
                 }
                 #else
                 routeObserver = notificationCenter.addObserver(forName: AVAudioSession.routeChangeNotification,

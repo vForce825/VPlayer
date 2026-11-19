@@ -1306,10 +1306,13 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
 
     func resumeActiveOutputFromRouteRecovery() async {
         guard let request = controllerState.request,
+              let runIdentity = admittedRun,
+              isCurrent(runIdentity),
               let context = registry.outputResourceContextSnapshot(),
               context.owner == nil, context.phase == .installed, context.prepared else {
             return
         }
+        let revision = userControlRevision
         if case .backend(_, let lifecycle?, _, _, _) = registry.ownedResourceSnapshot()?.payload {
             refreshPreparedMediaInformation(for: lifecycle)
         }
@@ -1319,18 +1322,32 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
             publish(.paused(request))
             return
         }
-        registry.updatePreparedSampleBufferPause(contextNonce: context.contextNonce,
-            paused: false, readinessCycle: controllerState.readinessCycle)
+        guard !systemPauseRequired else {
+            publish(.recovering(request))
+            return
+        }
         guard let activation = try? registry.beginOutputActivation(contextNonce: context.contextNonce),
               registry.startOutputActivationOperation(activation) else {
             return
         }
         let outcome = await registry.joinOutputBackendOperation(activation)
+        guard ownsUserControl(runIdentity, revision: revision) else { return }
         switch outcome {
         case .succeeded:
-            publish(.playing(request))
+            guard !controllerState.userPaused, !systemPauseRequired else { return }
+            let awaitsPipelineReadiness = registry.updatePreparedSampleBufferPause(
+                contextNonce: context.contextNonce,
+                paused: false,
+                readinessCycle: controllerState.readinessCycle
+            )
+            // HLS activation (and non-pipeline test backends) acknowledge readiness
+            // immediately; a pipeline-backed SampleBuffer backend emits .ready after
+            // reopening its shared timebase.
+            publish(awaitsPipelineReadiness ? .preparing(request) : .playing(request))
         case .failed(let error):
-            beginOwnedBackendTerminal(context: context, terminalState: .failed(Self.failure(for: error)))
+            if let currentContext = registry.outputResourceContextSnapshot() {
+                beginOwnedBackendTerminal(context: currentContext, terminalState: .failed(Self.failure(for: error)))
+            }
         case .canceled:
             break
         }
@@ -1660,10 +1677,12 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
                     publishMediaInformation(nil)
                 }
             }
+            guard currentMediaInformation != information else { break }
             publishMediaInformation(information)
         case let .mediaInformation(information, generation: nil):
             guard finishedPresentationSession != backendIdentity.sessionIdentity else { return }
             mediaInformationLifecycle = nil
+            guard currentMediaInformation != information else { break }
             publishMediaInformation(information)
         case let .ready(eventCycle):
             let readinessResult = registry.completeSampleBufferReadiness(backendIdentity)

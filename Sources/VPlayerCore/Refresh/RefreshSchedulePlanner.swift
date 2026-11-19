@@ -11,13 +11,23 @@ public struct RefreshSchedulePlanner: Sendable {
     }
 
     private static let minimumBackgroundDelay: TimeInterval = 15 * 60
+    private static let failureBaseCooldown: TimeInterval = 15 * 60
 
     public init() {}
 
     public func dueResources(for profile: SourceProfile, now: Date) -> Set<RefreshResource> {
         Set(RefreshResource.allCases.filter { resource in
             let schedule = schedule(for: resource, in: profile)
-            return schedule.interval.isDue(lastSuccessAt: schedule.lastSuccessAt, now: now)
+            guard schedule.interval.isDue(lastSuccessAt: schedule.status.lastSuccessAt, now: now) else {
+                return false
+            }
+            if let cooldownEnd = Self.failureCooldownEnd(
+                status: schedule.status,
+                interval: schedule.interval
+            ) {
+                return now >= cooldownEnd
+            }
+            return true
         })
     }
 
@@ -41,25 +51,46 @@ public struct RefreshSchedulePlanner: Sendable {
             RefreshResource.allCases.compactMap { resource -> Date? in
                 let schedule = schedule(for: resource, in: profile)
                 guard schedule.interval != .manual else { return nil }
-                guard let lastSuccessAt = schedule.lastSuccessAt else {
-                    return earliestAllowedDate
+                let scheduledDate = schedule.status.lastSuccessAt.map {
+                    $0.addingTimeInterval(TimeInterval(schedule.interval.rawValue))
+                } ?? earliestAllowedDate
+                if let cooldownEnd = Self.failureCooldownEnd(
+                    status: schedule.status,
+                    interval: schedule.interval
+                ) {
+                    return max(scheduledDate, cooldownEnd)
                 }
-                return lastSuccessAt.addingTimeInterval(TimeInterval(schedule.interval.rawValue))
+                return scheduledDate
             }
         }
         guard let earliestCandidate = candidates.min() else { return nil }
         return max(earliestCandidate, earliestAllowedDate)
     }
 
+    private static func failureCooldownEnd(
+        status: ResourceRefreshStatus,
+        interval: RefreshInterval
+    ) -> Date? {
+        guard interval != .manual,
+              status.state == .failed,
+              let lastAttemptAt = status.lastAttemptAt else {
+            return nil
+        }
+        let cap = TimeInterval(interval.rawValue)
+        let exponent = max(0, min(status.consecutiveFailureCount - 1, 10))
+        let cooldown = min(cap, failureBaseCooldown * Double(1 << exponent))
+        return lastAttemptAt.addingTimeInterval(cooldown)
+    }
+
     private func schedule(
         for resource: RefreshResource,
         in profile: SourceProfile
-    ) -> (interval: RefreshInterval, lastSuccessAt: Date?) {
+    ) -> (interval: RefreshInterval, status: ResourceRefreshStatus) {
         switch resource {
         case .playlist:
-            return (profile.m3uRefreshInterval, profile.m3uStatus.lastSuccessAt)
+            return (profile.m3uRefreshInterval, profile.m3uStatus)
         case .epg:
-            return (profile.epgRefreshInterval, profile.epgStatus.lastSuccessAt)
+            return (profile.epgRefreshInterval, profile.epgStatus)
         }
     }
 }

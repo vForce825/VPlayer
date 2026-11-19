@@ -114,6 +114,28 @@ final class AppModelProgrammeWindowTests: XCTestCase {
         XCTAssertEqual(snapshot.profileLookupCount, 0)
     }
 
+    func testWindowRollOnlyQueriesProgrammesAndUpdatesStaleCoverageNotice() async {
+        let fixture = Fixture()
+        await fixture.model.reload()
+        let before = await fixture.repository.snapshot()
+        XCTAssertNil(fixture.model.staleEPGCoverageEnd)
+
+        // Advance past the last programme's stop time (27h after start).
+        fixture.clock.advance(28 * 3_600)
+        let refreshed = await fixture.model.refreshProgrammeWindowIfNeeded()
+
+        XCTAssertTrue(refreshed)
+        XCTAssertNotNil(fixture.model.staleEPGCoverageEnd)
+        let after = await fixture.repository.snapshot()
+        XCTAssertEqual(
+            after.profileLookupCount,
+            before.profileLookupCount,
+            "Programme window roll must reuse cached matches without re-reading profiles"
+        )
+        XCTAssertEqual(after.channelLookupCount, before.channelLookupCount)
+        XCTAssertEqual(after.programmeBatchRequests.count, before.programmeBatchRequests.count + 1)
+    }
+
     @MainActor
     private struct Fixture {
         let clock = WindowClock(Date(timeIntervalSince1970: 2_000_000_000))

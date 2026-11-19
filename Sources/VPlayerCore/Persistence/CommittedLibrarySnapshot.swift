@@ -31,6 +31,7 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
         let state: String
         let errorSummary: String?
         let attemptID: UUID?
+        let failureCount: Int
     }
 
     struct Profile: Equatable, Sendable {
@@ -54,7 +55,8 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
                 lastSuccessAt: record.m3uLastSuccessAt,
                 state: record.m3uStateRaw,
                 errorSummary: record.m3uErrorSummary,
-                attemptID: record.m3uAttemptID
+                attemptID: record.m3uAttemptID,
+                failureCount: max(0, record.m3uFailureCount ?? 0)
             )
             epg = Resource(
                 snapshotID: record.epgSnapshotID,
@@ -62,7 +64,8 @@ public struct CommittedLibrarySnapshot: Equatable, Sendable {
                 lastSuccessAt: record.epgLastSuccessAt,
                 state: record.epgStateRaw,
                 errorSummary: record.epgErrorSummary,
-                attemptID: record.epgAttemptID
+                attemptID: record.epgAttemptID,
+                failureCount: max(0, record.epgFailureCount ?? 0)
             )
             updatedAt = record.updatedAt
         }

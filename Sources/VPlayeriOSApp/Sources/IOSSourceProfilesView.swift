@@ -24,6 +24,7 @@ struct IOSSourceProfilesView: View {
                 ForEach(model.profiles) { profile in
                     Section {
                         Button {
+                            guard profile.id != model.activeProfile?.id else { return }
                             Task { _ = await model.activate(profileID: profile.id) }
                         } label: {
                             HStack {
@@ -34,6 +35,7 @@ struct IOSSourceProfilesView: View {
                                 }
                             }
                         }
+                        .disabled(model.isLoading)
                         Text(SourceProfileURLPresentation.m3uURL(profile: profile, protectsAcceptanceValue: false))
                             .font(.caption).foregroundStyle(.secondary).lineLimit(2)
                         refreshRow(profile, resource: .playlist, title: "频道列表", status: profile.m3uStatus)

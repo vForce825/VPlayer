@@ -42,6 +42,17 @@ public struct XMLTVParseLimits: Equatable, Sendable {
 public struct XMLTVParseSummary: Equatable, Sendable {
     public let channelCount: Int
     public let programmeCount: Int
+    public let coverageEnd: Date?
+
+    public init(
+        channelCount: Int,
+        programmeCount: Int,
+        coverageEnd: Date? = nil
+    ) {
+        self.channelCount = channelCount
+        self.programmeCount = programmeCount
+        self.coverageEnd = coverageEnd
+    }
 }
 
 public enum XMLTVParserError: Error, Equatable, Sendable, LocalizedError {
@@ -72,7 +83,8 @@ public final class XMLTVParser {
         limits: XMLTVParseLimits = .production,
         cancellationCheck: @escaping @Sendable () throws -> Void = {}
     ) throws -> XMLTVParseSummary {
-        guard let parser = Foundation.XMLParser(contentsOf: fileURL) else {
+        guard fileURL.isFileURL,
+              let parser = Foundation.XMLParser(contentsOf: fileURL) else {
             throw XMLTVParserError.malformed
         }
         let delegate = XMLTVDelegate(

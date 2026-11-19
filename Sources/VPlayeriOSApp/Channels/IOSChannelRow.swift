@@ -8,25 +8,23 @@ import VPlayerCore
 struct IOSChannelRow: View {
     let channel: Channel
     let programmes: [Programme]
-    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
+    let referenceDate: Date
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
-            let programme = ChannelProgrammePresentation.resolve(programmes: programmes, at: tick.date)
-            HStack(spacing: 14) {
-                ChannelLogoView(url: channel.logoURL, imagePadding: 5, placeholderVerticalPadding: 12)
-                    .frame(width: 72, height: 48)
-                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
-                VStack(alignment: .leading, spacing: 5) {
-                    Text(channel.displayName).font(.headline)
-                    Text(programme.current?.title ?? "暂无当前节目")
-                        .font(.subheadline).foregroundStyle(.secondary)
-                    if let progress = programme.progress { ProgressView(value: progress) }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+        let programme = ChannelProgrammePresentation.resolve(programmes: programmes, at: referenceDate)
+        HStack(spacing: 14) {
+            ChannelLogoView(url: channel.logoURL, imagePadding: 5, placeholderVerticalPadding: 12)
+                .frame(width: 72, height: 48)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 8))
+            VStack(alignment: .leading, spacing: 5) {
+                Text(channel.displayName).font(.headline)
+                Text(programme.current?.title ?? "暂无当前节目")
+                    .font(.subheadline).foregroundStyle(.secondary)
+                if let progress = programme.progress { ProgressView(value: progress) }
             }
-            .padding(.vertical, 5)
-            .contentShape(Rectangle())
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(.vertical, 5)
+        .contentShape(Rectangle())
     }
 }

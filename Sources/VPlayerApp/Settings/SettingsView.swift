@@ -60,18 +60,22 @@ private struct PrivacyStatementView: View {
         List {
             Section("不收集个人数据") {
                 Text("VPlayer 不包含广告、账号系统或分析跟踪功能，开发者不会通过 VPlayer 收集您的播放列表、观看记录或设备信息。")
+                    .focusable()
             }
 
             Section("本机数据") {
                 Text("您添加的播放列表与 EPG 地址、频道资料、播放设置和台标缓存保存在 Apple TV 的应用容器中。卸载 VPlayer 会删除这些本机数据。")
+                    .focusable()
             }
 
             Section("网络连接") {
                 Text("VPlayer 仅为获取您配置的播放列表、EPG、台标和媒体流而连接相应服务器。服务器可能按其自身政策处理 IP 地址和请求信息；这些服务器不由 VPlayer 开发者控制。")
+                    .focusable()
             }
 
             Section("权限") {
                 Text("当播放源位于家庭网络时，VPlayer 会请求本地网络访问权限。")
+                    .focusable()
             }
 
             Section("在线隐私政策") {

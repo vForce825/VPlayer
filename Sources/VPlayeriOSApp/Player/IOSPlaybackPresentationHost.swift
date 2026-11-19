@@ -62,17 +62,75 @@ final class IOSPlaybackHostController: PlaybackPresentationHostController {
     }
 }
 
+@MainActor
+final class IOSPlaybackHostContainerController: UIViewController {
+    private(set) weak var session: IOSPlaybackSession?
+    private var mountGeneration: UInt64 = 0
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+    }
+
+    func attach(session: IOSPlaybackSession) {
+        if let previousSession = self.session, previousSession !== session {
+            detachIfOwned()
+        }
+        let host = session.host
+        self.session = session
+        session.mount.connect(to: host)
+        if host.parent !== self {
+            if let previousParent = host.parent {
+                host.willMove(toParent: nil)
+                host.viewIfLoaded?.removeFromSuperview()
+                host.removeFromParent()
+                if let previousContainer = previousParent as? IOSPlaybackHostContainerController {
+                    previousContainer.noteHostTransferred()
+                }
+            }
+            addChild(host)
+            host.view.frame = view.bounds
+            host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            view.addSubview(host.view)
+            host.didMove(toParent: self)
+            mountGeneration = session.noteHostMounted(in: self)
+        } else if host.view.superview !== view {
+            host.view.frame = view.bounds
+            host.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            view.addSubview(host.view)
+        }
+    }
+
+    private func noteHostTransferred() {
+        mountGeneration = 0
+    }
+
+    func detachIfOwned() {
+        guard let session else { return }
+        let host = session.host
+        guard host.parent === self else { return }
+        host.willMove(toParent: nil)
+        host.viewIfLoaded?.removeFromSuperview()
+        host.removeFromParent()
+        session.noteHostUnmounted(generation: mountGeneration)
+        mountGeneration = 0
+    }
+}
+
 struct IOSPlaybackHostView: UIViewControllerRepresentable {
     let session: IOSPlaybackSession
-    func makeUIViewController(context: Context) -> IOSPlaybackHostController {
-        session.mount.connect(to: session.host)
-        return session.host
+    func makeUIViewController(context: Context) -> IOSPlaybackHostContainerController {
+        let container = IOSPlaybackHostContainerController()
+        container.attach(session: session)
+        return container
     }
-    func updateUIViewController(_ controller: IOSPlaybackHostController, context: Context) {
-        session.mount.connect(to: controller)
+    func updateUIViewController(_ controller: IOSPlaybackHostContainerController, context: Context) {
+        controller.attach(session: session)
     }
-    static func dismantleUIViewController(_ controller: IOSPlaybackHostController, coordinator: ()) {
-        // The root session owns this host while PiP minimizes the SwiftUI view.
-        // Explicit session close / accepted presentation replacement detaches it.
+    static func dismantleUIViewController(_ controller: IOSPlaybackHostContainerController, coordinator: ()) {
+        // The root session owns `session.host` while PiP minimizes the SwiftUI cover.
+        // Detach only from this container if it still owns `session.host`, never
+        // disconnecting `session.mount` or stripping a newer cover's view.
+        controller.detachIfOwned()
     }
 }

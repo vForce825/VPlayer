@@ -6,12 +6,45 @@ import SwiftUI
 import UIKit
 import VPlayerCore
 
+private struct ChannelBrowserPresentationInput: Equatable {
+    let channels: [Channel]
+    let searchText: String
+    let grouping: ChannelGrouping
+}
+
 struct IOSChannelBrowserView: View {
     @Bindable var model: AppModel
     @Bindable var browsingSettings: ChannelBrowsingSettingsStore
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var searchText = ""
     @State private var mappingChannel: Channel?
     @State private var informationChannel: Channel?
+    @State private var cachedInput: ChannelBrowserPresentationInput
+    @State private var cachedPresentation: ChannelBrowserPresentation
+
+    init(model: AppModel, browsingSettings: ChannelBrowsingSettingsStore) {
+        self.model = model
+        self.browsingSettings = browsingSettings
+        let initialInput = ChannelBrowserPresentationInput(
+            channels: model.channels,
+            searchText: "",
+            grouping: browsingSettings.grouping
+        )
+        _cachedInput = State(initialValue: initialInput)
+        _cachedPresentation = State(initialValue: ChannelBrowserPresentation(
+            channels: initialInput.channels,
+            searchText: initialInput.searchText,
+            grouping: initialInput.grouping
+        ))
+    }
+
+    private var presentationInput: ChannelBrowserPresentationInput {
+        ChannelBrowserPresentationInput(
+            channels: model.channels,
+            searchText: searchText,
+            grouping: browsingSettings.grouping
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -41,6 +74,18 @@ struct IOSChannelBrowserView: View {
                 }
                 .sharedBackgroundVisibility(.hidden)
             }
+        }
+        .onChange(of: model.activeProfile?.id) { _, _ in
+            searchText = ""
+        }
+        .onChange(of: presentationInput, initial: true) { _, input in
+            guard cachedInput != input else { return }
+            cachedInput = input
+            cachedPresentation = ChannelBrowserPresentation(
+                channels: input.channels,
+                searchText: input.searchText,
+                grouping: input.grouping
+            )
         }
         .sheet(item: $mappingChannel) { channel in
             ChannelEPGMappingView(model: model, channel: channel)
@@ -96,60 +141,82 @@ struct IOSChannelBrowserView: View {
     }
 
     private var channelList: some View {
-        let presentation = ChannelBrowserPresentation(channels: model.channels,
-            searchText: searchText, grouping: browsingSettings.grouping)
+        let presentation = cachedPresentation
         return ScrollViewReader { proxy in
             Group {
                 if presentation.sections.isEmpty {
                     ContentUnavailableView.search(text: searchText)
                 } else {
-                    List {
-                        if let end = model.staleEPGCoverageEnd {
-                            Text(EPGCoverageNotice.text(staleCoverageEnd: end))
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                        ForEach(presentation.sections) { section in
-                            Section {
-                                ForEach(section.channels) { channel in
-                                    channelRow(for: channel)
-                                        .id(channel.id)
-                                }
-                            } header: {
-                                if let title = section.title { Text(title) }
-                            }
-                            .id("channel-section.\(section.id)")
-                        }
-                    }
-                    .scrollEdgeEffectStyle(.hard, for: .top)
-                    .toolbar {
-                        if presentation.showsGroupRail {
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Menu {
-                                    ForEach(presentation.sections) { section in
-                                        Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
-                                            withAnimation {
-                                                proxy.scrollTo("channel-section.\(section.id)", anchor: .top)
+                    channelListWithSharedClock(presentation: presentation)
+                        .scrollEdgeEffectStyle(.hard, for: .top)
+                        .toolbar {
+                            if presentation.showsGroupRail {
+                                ToolbarItem(placement: .topBarTrailing) {
+                                    Menu {
+                                        ForEach(presentation.sections) { section in
+                                            Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
+                                                withAnimation {
+                                                    proxy.scrollTo("channel-section.\(section.id)", anchor: .top)
+                                                }
                                             }
+                                            .accessibilityIdentifier("channel.group.\(section.id)")
                                         }
-                                        .accessibilityIdentifier("channel.group.\(section.id)")
+                                    } label: {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "list.bullet")
+                                            Text("分组")
+                                        }
                                     }
-                                } label: {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "list.bullet")
-                                        Text("分组")
-                                    }
+                                    .accessibilityLabel("选择频道分组")
+                                    .accessibilityIdentifier("channel.groups")
                                 }
-                                .accessibilityLabel("选择频道分组")
-                                .accessibilityIdentifier("channel.groups")
                             }
                         }
-                    }
                 }
             }
         }
     }
 
-    private func channelRow(for channel: Channel) -> some View {
+    @ViewBuilder
+    private func channelListWithSharedClock(presentation: ChannelBrowserPresentation) -> some View {
+        if !model.programmesByChannelID.isEmpty {
+            TimelineView(
+                .periodic(
+                    from: Date(timeIntervalSinceReferenceDate: 0),
+                    by: reducedResourceUsage ? 120 : 30
+                )
+            ) { tick in
+                channelListContent(presentation: presentation, referenceDate: tick.date)
+            }
+        } else {
+            channelListContent(presentation: presentation, referenceDate: .now)
+        }
+    }
+
+    private func channelListContent(
+        presentation: ChannelBrowserPresentation,
+        referenceDate: Date
+    ) -> some View {
+        List {
+            if let end = model.staleEPGCoverageEnd {
+                Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(presentation.sections) { section in
+                Section {
+                    ForEach(section.channels) { channel in
+                        channelRow(for: channel, referenceDate: referenceDate)
+                            .id(channel.id)
+                    }
+                } header: {
+                    if let title = section.title { Text(title) }
+                }
+                .id("channel-section.\(section.id)")
+            }
+        }
+    }
+
+    private func channelRow(for channel: Channel, referenceDate: Date) -> some View {
         let identifier = channel.attributes["ui-test-id"] ?? "channel.\(channel.id)"
         return HStack(spacing: 8) {
             Button {
@@ -162,7 +229,8 @@ struct IOSChannelBrowserView: View {
                 #endif
             } label: {
                 IOSChannelRow(channel: channel,
-                    programmes: model.programmesByChannelID[channel.id, default: []])
+                    programmes: model.programmesByChannelID[channel.id, default: []],
+                    referenceDate: referenceDate)
             }
             .accessibilityIdentifier(identifier)
             .contextMenu {
@@ -189,91 +257,175 @@ struct IOSPlayerChannelPickerView: View {
     let grouping: ChannelGrouping
     let onSelect: (Channel) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var searchText = ""
     @State private var selectionMessage: String?
     @State private var detent: PresentationDetent = .large
+    @State private var cachedInput: ChannelBrowserPresentationInput
+    @State private var cachedPresentation: ChannelBrowserPresentation
+
+    init(model: AppModel, grouping: ChannelGrouping, onSelect: @escaping (Channel) -> Void) {
+        self.model = model
+        self.grouping = grouping
+        self.onSelect = onSelect
+        let initialInput = ChannelBrowserPresentationInput(
+            channels: model.channels,
+            searchText: "",
+            grouping: grouping
+        )
+        _cachedInput = State(initialValue: initialInput)
+        _cachedPresentation = State(initialValue: ChannelBrowserPresentation(
+            channels: initialInput.channels,
+            searchText: initialInput.searchText,
+            grouping: initialInput.grouping
+        ))
+    }
+
+    private var presentationInput: ChannelBrowserPresentationInput {
+        ChannelBrowserPresentationInput(
+            channels: model.channels,
+            searchText: searchText,
+            grouping: grouping
+        )
+    }
 
     var body: some View {
         NavigationStack {
-            let presentation = ChannelBrowserPresentation(channels: model.channels,
-                searchText: searchText, grouping: grouping)
+            let presentation = cachedPresentation
             ScrollViewReader { proxy in
-                List {
-                    if let selectionMessage {
-                        Text(selectionMessage).font(.callout).foregroundStyle(.red)
-                            .accessibilityIdentifier("player.channels.message")
-                    }
-                    if presentation.sections.isEmpty {
-                        ContentUnavailableView.search(text: searchText)
-                    }
-                    ForEach(presentation.sections) { section in
-                        Section {
-                            ForEach(section.channels) { channel in
-                                Button { select(channel) } label: {
-                                    HStack(spacing: 12) {
-                                        IOSChannelRow(channel: channel,
-                                            programmes: model.programmesByChannelID[channel.id, default: []])
-                                        if model.presentedPlaybackRequest?.channelID == channel.id {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundStyle(.tint)
-                                                .accessibilityLabel("正在播放")
-                                        }
-                                    }
+                pickerListWithSharedClock(presentation: presentation)
+                    .safeAreaInset(edge: .top, spacing: 0) {
+                        if let selectionMessage {
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.red)
+                                    .accessibilityHidden(true)
+                                Text(selectionMessage)
+                                    .font(.callout)
+                                    .foregroundStyle(.primary)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .accessibilityIdentifier("player.channels.message")
+                                Button {
+                                    self.selectionMessage = nil
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 32, minHeight: 32)
                                 }
                                 .buttonStyle(.plain)
-                                .accessibilityAddTraits(model.presentedPlaybackRequest?.channelID == channel.id ? .isSelected : [])
-                                .accessibilityIdentifier("player.switch.\(channel.attributes["ui-test-id"] ?? channel.id)")
-                                .id(channel.id)
+                                .accessibilityLabel("关闭提示")
                             }
-                        } header: {
-                            if let title = section.title { Text(title) }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(.regularMaterial)
+                            .overlay(alignment: .bottom) { Divider() }
                         }
-                        .id("player.channels.section.\(section.id)")
                     }
-                }
-                .searchable(text: $searchText,
-                    placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索频道")
-                .scrollEdgeEffectStyle(.hard, for: .top)
-                .navigationTitle("换台")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
-                .toolbarBackgroundVisibility(.visible, for: .navigationBar)
-                .task {
-                    if let currentID = model.presentedPlaybackRequest?.channelID {
-                        proxy.scrollTo(currentID, anchor: .center)
+                    .searchable(text: $searchText,
+                        placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索频道")
+                    .scrollEdgeEffectStyle(.hard, for: .top)
+                    .navigationTitle("换台")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
+                    .toolbarBackgroundVisibility(.visible, for: .navigationBar)
+                    .task {
+                        if let currentID = model.presentedPlaybackRequest?.channelID {
+                            proxy.scrollTo(currentID, anchor: .center)
+                        }
                     }
-                }
-                .toolbar {
-                    if presentation.showsGroupRail {
-                        ToolbarItem(placement: .topBarLeading) {
-                            Menu {
-                                ForEach(presentation.sections) { section in
-                                    Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
-                                        withAnimation {
-                                            proxy.scrollTo("player.channels.section.\(section.id)", anchor: .top)
+                    .toolbar {
+                        if presentation.showsGroupRail {
+                            ToolbarItem(placement: .topBarLeading) {
+                                Menu {
+                                    ForEach(presentation.sections) { section in
+                                        Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
+                                            withAnimation {
+                                                proxy.scrollTo("player.channels.section.\(section.id)", anchor: .top)
+                                            }
                                         }
+                                        .accessibilityIdentifier("player.channels.group.\(section.id)")
                                     }
-                                    .accessibilityIdentifier("player.channels.group.\(section.id)")
+                                } label: {
+                                    Label("分组", systemImage: "list.bullet")
                                 }
-                            } label: {
-                                Label("分组", systemImage: "list.bullet")
+                                .accessibilityIdentifier("player.channels.groups")
                             }
-                            .accessibilityIdentifier("player.channels.groups")
+                        }
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("完成") { dismiss() }.accessibilityIdentifier("player.channels.done")
                         }
                     }
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("完成") { dismiss() }.accessibilityIdentifier("player.channels.done")
-                    }
-                }
             }
+        }
+        .onChange(of: presentationInput, initial: true) { _, input in
+            guard cachedInput != input else { return }
+            cachedInput = input
+            cachedPresentation = ChannelBrowserPresentation(
+                channels: input.channels,
+                searchText: input.searchText,
+                grouping: input.grouping
+            )
         }
         .presentationDetents([.medium, .large], selection: $detent)
         .presentationDragIndicator(.visible)
     }
 
+    @ViewBuilder
+    private func pickerListWithSharedClock(presentation: ChannelBrowserPresentation) -> some View {
+        if !model.programmesByChannelID.isEmpty {
+            TimelineView(
+                .periodic(
+                    from: Date(timeIntervalSinceReferenceDate: 0),
+                    by: reducedResourceUsage ? 120 : 30
+                )
+            ) { tick in
+                pickerListContent(presentation: presentation, referenceDate: tick.date)
+            }
+        } else {
+            pickerListContent(presentation: presentation, referenceDate: .now)
+        }
+    }
+
+    private func pickerListContent(
+        presentation: ChannelBrowserPresentation,
+        referenceDate: Date
+    ) -> some View {
+        List {
+            if presentation.sections.isEmpty {
+                ContentUnavailableView.search(text: searchText)
+            }
+            ForEach(presentation.sections) { section in
+                Section {
+                    ForEach(section.channels) { channel in
+                        Button { select(channel) } label: {
+                            HStack(spacing: 12) {
+                                IOSChannelRow(channel: channel,
+                                    programmes: model.programmesByChannelID[channel.id, default: []],
+                                    referenceDate: referenceDate)
+                                if model.presentedPlaybackRequest?.channelID == channel.id {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(.tint)
+                                        .accessibilityLabel("正在播放")
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityAddTraits(model.presentedPlaybackRequest?.channelID == channel.id ? .isSelected : [])
+                        .accessibilityIdentifier("player.switch.\(channel.attributes["ui-test-id"] ?? channel.id)")
+                        .id(channel.id)
+                    }
+                } header: {
+                    if let title = section.title { Text(title) }
+                }
+                .id("player.channels.section.\(section.id)")
+            }
+        }
+    }
+
     private func select(_ channel: Channel) {
         switch StreamProtocolPolicy.evaluate(channel.streamURL) {
         case .allowed:
+            selectionMessage = nil
             onSelect(channel)
             dismiss()
         case let .rejected(rejection):

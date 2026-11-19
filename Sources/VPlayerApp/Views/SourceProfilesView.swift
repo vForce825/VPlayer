@@ -19,11 +19,19 @@ struct SourceProfilesView: View {
         static let cardCornerRadius: CGFloat = 28
     }
 
+    private enum FocusTarget: Hashable {
+        case add
+        case playlistRefresh(UUID)
+        case epgRefresh(UUID)
+        case activate(UUID)
+        case edit(UUID)
+    }
+
     @Bindable var model: AppModel
     @State private var editedProfile: SourceProfile?
     @State private var isAdding = false
     @State private var pendingDeletion: SourceProfile?
-    @FocusState private var focusedControl: AcceptanceFocusPolicy.SourceControl?
+    @FocusState private var focusedControl: FocusTarget?
     private let focusPolicy = AcceptanceFocusPolicy.current()
 
     var body: some View {
@@ -71,13 +79,20 @@ struct SourceProfilesView: View {
 
     @ViewBuilder
     private var focusedContent: some View {
-        if let initialControl = focusPolicy.initialSourceControl,
-           model.profiles.isEmpty {
+        if let initialControl = initialFocusTarget {
             content
                 .defaultFocus($focusedControl, initialControl)
         } else {
             content
         }
+    }
+
+    private var initialFocusTarget: FocusTarget? {
+        guard let initialControl = focusPolicy.initialSourceControl,
+              model.profiles.isEmpty else {
+            return nil
+        }
+        return focusTarget(for: initialControl)
     }
 
     private var content: some View {
@@ -160,7 +175,7 @@ struct SourceProfilesView: View {
                     status: profile.m3uStatus,
                     refreshIdentifier: "source.refresh.playlist",
                     statusIdentifier: "source.status.playlist",
-                    focusTarget: .playlistRefresh
+                    focusTarget: .playlistRefresh(profile.id)
                 ) {
                     await model.refresh(profileID: profile.id, resource: .playlist)
                 }
@@ -170,7 +185,7 @@ struct SourceProfilesView: View {
                     status: profile.epgStatus,
                     refreshIdentifier: "source.refresh.epg",
                     statusIdentifier: "source.status.epg",
-                    focusTarget: .epgRefresh,
+                    focusTarget: .epgRefresh(profile.id),
                     // Coverage is only loaded for the active playlist, so the
                     // note belongs to that card alone.
                     note: model.activeProfile?.id == profile.id
@@ -211,7 +226,21 @@ struct SourceProfilesView: View {
         Task {
             await Task.yield()
             guard !model.profiles.isEmpty else { return }
-            focusedControl = target
+            focusedControl = focusTarget(for: target)
+        }
+    }
+
+    private func focusTarget(for control: AcceptanceFocusPolicy.SourceControl) -> FocusTarget? {
+        let preferredProfileID = model.profiles.max(by: { $0.createdAt < $1.createdAt })?.id
+            ?? model.activeProfile?.id
+            ?? model.profiles.first?.id
+        switch control {
+        case .add:
+            return .add
+        case .playlistRefresh:
+            return preferredProfileID.map(FocusTarget.playlistRefresh)
+        case .epgRefresh:
+            return preferredProfileID.map(FocusTarget.epgRefresh)
         }
     }
 
@@ -246,11 +275,13 @@ struct SourceProfilesView: View {
             Spacer(minLength: Metrics.columnSpacing)
             if !isActive {
                 Button("设为当前") {
+                    focusedControl = .edit(profile.id)
                     Task {
                         await model.activate(profileID: profile.id)
                     }
                 }
                 .accessibilityIdentifier("source.activate.\(profile.id.uuidString)")
+                .focused($focusedControl, equals: .activate(profile.id))
             }
             Button {
                 editedProfile = profile
@@ -258,6 +289,7 @@ struct SourceProfilesView: View {
                 Label("编辑", systemImage: "pencil")
             }
             .accessibilityIdentifier("source.edit.\(profile.id.uuidString)")
+            .focused($focusedControl, equals: .edit(profile.id))
 
             Button(role: .destructive) {
                 pendingDeletion = profile
@@ -292,7 +324,7 @@ struct SourceProfilesView: View {
         status: ResourceRefreshStatus,
         refreshIdentifier: String,
         statusIdentifier: String,
-        focusTarget: AcceptanceFocusPolicy.SourceControl,
+        focusTarget: FocusTarget,
         note: String? = nil,
         refresh: @escaping @MainActor () async -> Void
     ) -> some View {
@@ -328,11 +360,11 @@ struct SourceProfilesView: View {
             }
             Spacer(minLength: Metrics.columnSpacing)
             Button(status.state == .refreshing ? "刷新中…" : "立即刷新") {
+                guard status.state != .refreshing else { return }
                 Task {
                     await refresh()
                 }
             }
-            .disabled(status.state == .refreshing)
             .accessibilityIdentifier(refreshIdentifier)
             .focused($focusedControl, equals: focusTarget)
         }

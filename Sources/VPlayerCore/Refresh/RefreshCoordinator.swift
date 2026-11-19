@@ -412,13 +412,19 @@ public actor RefreshCoordinator {
                     do {
                         switch resource {
                         case .playlist:
-                            let channels = (parsedChannels ?? []).map { channel in
-                                Channel(
-                                    sourceProfileID: profileID, displayName: channel.displayName,
-                                    streamURL: channel.streamURL, tvgID: channel.tvgID, tvgName: channel.tvgName,
-                                    logoURL: channel.logoURL, groupTitle: channel.groupTitle,
-                                    attributes: channel.attributes, order: channel.order
-                                )
+                            let baseChannels = parsedChannels ?? []
+                            let channels: [Channel]
+                            if profileID == initiatingProfileID {
+                                channels = baseChannels
+                            } else {
+                                channels = baseChannels.map { channel in
+                                    Channel(
+                                        sourceProfileID: profileID, displayName: channel.displayName,
+                                        streamURL: channel.streamURL, tvgID: channel.tvgID, tvgName: channel.tvgName,
+                                        logoURL: channel.logoURL, groupTitle: channel.groupTitle,
+                                        attributes: channel.attributes, order: channel.order
+                                    )
+                                }
                             }
                             try await repository.commitPlaylistRefresh(
                                 profileID: profileID, channels: channels, fetchedAt: timestamp, context: context

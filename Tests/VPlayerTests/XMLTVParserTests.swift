@@ -681,6 +681,35 @@ final class XMLTVParserTests: XCTestCase {
         XCTAssertLessThan(sink.channels.count, 3)
     }
 
+    func testRejectsNonFileURLWithoutPerformingNetworkIO() {
+        let sink = CollectingXMLTVSink()
+        let remoteURL = URL(string: "https://example.test/epg.xml")!
+
+        XCTAssertThrowsError(try XMLTVParser().parse(fileURL: remoteURL, into: sink)) { error in
+            XCTAssertEqual(error as? XMLTVParserError, .malformed)
+        }
+        XCTAssertTrue(sink.channels.isEmpty)
+        XCTAssertTrue(sink.programmes.isEmpty)
+    }
+
+    func testProgrammeDigestKeyMatchesRawDigestAndRejectsNonLowercaseHex() throws {
+        let digest = ProgrammeStableID.makeDigest(
+            channelID: "channel|one",
+            startEpochSeconds: 1_784_037_600,
+            stopEpochSeconds: 1_784_041_200,
+            title: "News|Live"
+        )
+        let hex = ProgrammeStableID.hexString(for: digest)
+        let fromDigest = ProgrammeDigestKey(digest: digest)
+        let fromHex = try XCTUnwrap(ProgrammeDigestKey(hexString: hex))
+
+        XCTAssertEqual(fromDigest, fromHex)
+        XCTAssertEqual(MemoryLayout<ProgrammeDigestKey>.size, 32)
+        XCTAssertNil(ProgrammeDigestKey(hexString: hex.uppercased()))
+        XCTAssertNil(ProgrammeDigestKey(hexString: "short"))
+        XCTAssertNil(ProgrammeDigestKey(hexString: String(repeating: "g", count: 64)))
+    }
+
     private func fixtureURL(_ relativePath: String) -> URL {
         let parts = relativePath.split(separator: "/").map(String.init)
         let filename = parts.last!

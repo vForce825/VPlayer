@@ -156,6 +156,46 @@ final class PlaybackPresentationContextTests: XCTestCase {
         ))
     }
 
+    func testCadencePolicySnapsAlternating90kHz5994TicksAndDeduplicatesDisplayCriteria() throws {
+        let pixelBuffer = try VideoTestFactories.nv12()
+        let tick1501 = presentationFrame(
+            pixelBuffer: pixelBuffer,
+            duration: .init(value: 1_501, timescale: 90_000)
+        )
+        let tick1502 = presentationFrame(
+            pixelBuffer: pixelBuffer,
+            duration: .init(value: 1_502, timescale: 90_000)
+        )
+        let expected5994 = Float(60_000.0 / 1_001.0)
+        let rateA = try XCTUnwrap(PlaybackPresentationCadencePolicy.outputFrameRate(for: tick1501, route: .progressive))
+        let rateB = try XCTUnwrap(PlaybackPresentationCadencePolicy.outputFrameRate(for: tick1502, route: .progressive))
+        XCTAssertEqual(rateA, expected5994, accuracy: 0.0001)
+        XCTAssertEqual(rateB, expected5994, accuracy: 0.0001)
+        XCTAssertEqual(rateA, rateB)
+
+        // Alternating 59.94p TS ticks must not churn preferredDisplayCriteria,
+        // while genuine 59.94 -> 60 and 23.976 -> 24 switches must still apply.
+        let managerFactory = PresentationManagerFactory()
+        let context = PlaybackPresentationContext(
+            displayManagerFactory: { window in managerFactory.make(window: window) }
+        )
+        let format = try makeFormatDescription()
+        context.attach(to: try makeWindow())
+        context.updateDisplayCriteria(formatDescription: format, outputFrameRate: 90_000.0 / 1_501.0)
+        context.updateDisplayCriteria(formatDescription: format, outputFrameRate: 90_000.0 / 1_502.0)
+        XCTAssertEqual(managerFactory.manager.nonNilAssignmentCount, 1)
+
+        context.updateDisplayCriteria(formatDescription: format, outputFrameRate: 60)
+        XCTAssertEqual(managerFactory.manager.nonNilAssignmentCount, 2)
+
+        context.updateDisplayCriteria(formatDescription: format, outputFrameRate: Float(24_000.0 / 1_001.0))
+        XCTAssertEqual(managerFactory.manager.nonNilAssignmentCount, 3)
+
+        context.updateDisplayCriteria(formatDescription: format, outputFrameRate: 24)
+        XCTAssertEqual(managerFactory.manager.nonNilAssignmentCount, 4)
+        context.teardown()
+    }
+
     private func presentationFrame(
         pixelBuffer: CVPixelBuffer,
         duration: CMTime

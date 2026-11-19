@@ -83,6 +83,11 @@ final class HLSProxyBudget: @unchecked Sendable {
             precondition(index >= 0 && index < capacity)
             storage[index] = byte
         }
+        func store(_ source: UnsafeBufferPointer<UInt8>, at offset: Int) {
+            precondition(offset >= 0 && source.count >= 0 && source.count <= capacity - offset)
+            guard let base = source.baseAddress, source.count > 0 else { return }
+            storage.advanced(by: offset).update(from: base, count: source.count)
+        }
         func borrow(offset: Int = 0, count: Int) -> Borrow {
             precondition(offset >= 0 && count > 0 && count <= capacity && offset <= capacity - count)
             return Borrow(window: self, offset: offset, count: count)
@@ -152,10 +157,13 @@ final class HLSProxyBudget: @unchecked Sendable {
         private var spaceWaiter: CheckedContinuation<Void, Never>?
         init(envelope: BodyEnvelope) { window = ReadWindow(envelope: envelope) }
         func isFull(at position: UInt64) -> Bool {
+            availableSpace(at: position) == 0
+        }
+        func availableSpace(at position: UInt64) -> Int {
             let read = consumed.load(ordering: .acquiring)
             precondition(position >= read)
             precondition(position - read <= UInt64(window.capacity))
-            return position - read == UInt64(window.capacity)
+            return window.capacity - Int(position - read)
         }
         func publish(_ byte: UInt8, at position: UInt64) throws {
             guard position < UInt64(Int64.max) else { throw HLSSourceError.byteLimit }
@@ -166,6 +174,45 @@ final class HLSProxyBudget: @unchecked Sendable {
             // sides to read old values and lose the sole empty-to-nonempty wake.
             written.store(position + 1, ordering: .sequentiallyConsistent)
             if readerWaiting.load(ordering: .sequentiallyConsistent) { wakeDataWaiter() }
+        }
+        /// Copy up to available ring space in contiguous memcpy spans (wrapping
+        /// at most once) and perform ONE SC publication + waiter check per chunk.
+        @discardableResult
+        func publish(contentsOf data: Data, from startOffset: Int = 0, at position: UInt64) throws -> Int {
+            let availableInput = data.count - startOffset
+            guard availableInput > 0 else { return 0 }
+            let space = availableSpace(at: position)
+            guard space > 0 else { return 0 }
+            let count = min(availableInput, space)
+            guard UInt64(count) <= UInt64(Int64.max) - position else { throw HLSSourceError.byteLimit }
+            let capacity = window.capacity
+            var skip = startOffset
+            var remaining = count
+            var cursor = position
+            for region in data.regions where remaining > 0 {
+                if skip >= region.count {
+                    skip -= region.count
+                    continue
+                }
+                let sliceCount = min(region.count - skip, remaining)
+                region.withUnsafeBytes { raw in
+                    guard let rawBase = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    let base = rawBase.advanced(by: skip)
+                    let offset = Int(cursor % UInt64(capacity))
+                    let firstCount = min(sliceCount, capacity - offset)
+                    window.store(UnsafeBufferPointer(start: base, count: firstCount), at: offset)
+                    let secondCount = sliceCount - firstCount
+                    if secondCount > 0 {
+                        window.store(UnsafeBufferPointer(start: base.advanced(by: firstCount), count: secondCount), at: 0)
+                    }
+                }
+                skip = 0
+                cursor += UInt64(sliceCount)
+                remaining -= sliceCount
+            }
+            written.store(position + UInt64(count), ordering: .sequentiallyConsistent)
+            if readerWaiting.load(ordering: .sequentiallyConsistent) { wakeDataWaiter() }
+            return count
         }
         func waitForSpace(at position: UInt64) async throws {
             while true {

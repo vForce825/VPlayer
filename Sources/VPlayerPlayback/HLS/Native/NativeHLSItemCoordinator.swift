@@ -135,11 +135,21 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
             return
         }
         let resuming = lastReceipt != nil
+        let isLiveStream = snapshot.duration == nil
         let cursor = pausedCursor
         if resuming {
-            guard let cursor, cursor.item == snapshot.physicalItem,
-                  driver.pausedItemObjectIdentity(item: item) == cursor.item, driver.disconnectedFromSystemAudio else {
-                throw AVPlayerItemCoordinatorFailure.seekMismatch
+            if isLiveStream {
+                // 直播流在暂停期间窗口持续推进且时间可能为 indefinite，恢复时
+                // 不要求精确的 pausedCursor，但仍须验证物理 item 与断开状态一致。
+                guard driver.pausedItemObjectIdentity(item: item) == snapshot.physicalItem,
+                      driver.disconnectedFromSystemAudio else {
+                    throw AVPlayerItemCoordinatorFailure.seekMismatch
+                }
+            } else {
+                guard let cursor, cursor.item == snapshot.physicalItem,
+                      driver.pausedItemObjectIdentity(item: item) == cursor.item, driver.disconnectedFromSystemAudio else {
+                    throw AVPlayerItemCoordinatorFailure.seekMismatch
+                }
             }
             try driver.reservePausedResumeCallbacks(item: item)
         }
@@ -151,7 +161,7 @@ final class NativeHLSItemCoordinator: PlaybackHLSProgressDeadlineReceiving {
         }
         try await driver.setDisconnectedFromSystemAudio(false, item: item)
         try validateActive(invocation)
-        if let cursor, resuming {
+        if !isLiveStream, let cursor, resuming {
             let actual = try await driver.seekNative(to: cursor.time, item: item)
             try validateActive(invocation)
             guard actual == cursor.time else { throw AVPlayerItemCoordinatorFailure.seekMismatch }

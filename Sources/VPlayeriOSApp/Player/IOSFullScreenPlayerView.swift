@@ -34,32 +34,33 @@ struct IOSFullScreenPlayerView: View {
 
     var body: some View {
         GeometryReader { geometry in
+            let isCompact = geometry.size.width > geometry.size.height
             ZStack {
                 Color.black.ignoresSafeArea()
                 IOSPlaybackHostView(session: session).ignoresSafeArea()
                 // 背景手势与控件互为兄弟，暂停、换台和面板按钮不会同时触发隐藏。
                 Color.clear.contentShape(Rectangle()).ignoresSafeArea()
-                    .onTapGesture { controls.backgroundTapped() }
+                    .onTapGesture { handleBackgroundTap() }
                     .accessibilityHidden(true)
-                centerControls
-                if areControlsVisible {
-                    VStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    if areControlsVisible {
                         topControls
-                        Spacer(minLength: 0)
-                        programmeFooter(isCompact: geometry.size.width > geometry.size.height)
                     }
-                    .foregroundStyle(.white)
+                    Spacer(minLength: 0)
+                    centerControls(isCompact: isCompact)
+                        .zIndex(1)
+                    Spacer(minLength: 0)
+                    if areControlsVisible {
+                        programmeFooter(isCompact: isCompact)
+                    }
                 }
+                .foregroundStyle(.white)
             }
         }
         .statusBarHidden(!areControlsVisible)
         .background {
             IOSStatusBarAppearanceRefresh(isHidden: !areControlsVisible)
                 .frame(width: 0, height: 0).accessibilityHidden(true)
-        }
-        .overlay(alignment: .topLeading) {
-            IOSPlaybackOrientationPreference(playback: session.settings, session: session)
-                .frame(width: 1, height: 1).allowsHitTesting(false).accessibilityHidden(true)
         }
         // Preserve individual control labels/actions. VoiceOver pins the bars,
         // and its escape gesture remains an explicit, accessible close action.
@@ -72,6 +73,13 @@ struct IOSFullScreenPlayerView: View {
         .onDisappear { IOSPlaybackRouteDiagnostics.record("cover-disappeared") }
         #endif
         .task { session.start() }
+        .task(id: session.pictureInPicture.message) {
+            guard session.pictureInPicture.message != nil else { return }
+            do { try await Task.sleep(for: .seconds(4)) }
+            catch { return }
+            guard !Task.isCancelled else { return }
+            session.pictureInPicture.clearMessage()
+        }
         .task(id: controls.timeoutToken) {
             guard let token = controls.timeoutToken else { return }
             do { try await Task.sleep(for: IOSPlayerControlsVisibility.idleTimeout) }
@@ -99,11 +107,26 @@ struct IOSFullScreenPlayerView: View {
                     library.select(channel: channel)
                 }
             case .programmes:
-                IOSProgrammeGuideView(presentation: session.presentation)
+                IOSProgrammeGuideView(
+                    presentation: session.presentation,
+                    staleEPGCoverageEnd: library.staleEPGCoverageEnd
+                )
             case .more:
                 IOSPlayerMoreView(session: session, onDismiss: dismissPanel, onClose: close)
             }
         }
+    }
+
+    private func handleBackgroundTap() {
+        let hadMessage = session.pictureInPicture.message != nil || model.playbackControlMessage != nil
+        if hadMessage {
+            session.pictureInPicture.clearMessage()
+            model.clearPlaybackControlMessage()
+            if allowsAutoHide {
+                controls.setAutoHideAllowed(true)
+            }
+        }
+        controls.backgroundTapped()
     }
 
     private var topControls: some View {
@@ -115,7 +138,7 @@ struct IOSFullScreenPlayerView: View {
                 controls.userInteracted()
                 session.pictureInPicture.start()
             } label: { controlIcon("pip.enter") }
-                .disabled(!session.pictureInPicture.isPossible)
+                .disabled(!session.pictureInPicture.isPossible || session.pictureInPicture.isActive)
                 .accessibilityLabel("画中画").accessibilityIdentifier("player-pip")
             Button { present(.more) } label: { controlIcon("ellipsis") }
                 .accessibilityLabel("更多播放操作").accessibilityIdentifier("player-more")
@@ -132,9 +155,9 @@ struct IOSFullScreenPlayerView: View {
             .background(.white.opacity(0.10), in: Circle())
     }
 
-    private var centerControls: some View {
-        VStack(spacing: 16) {
-            status
+    private func centerControls(isCompact: Bool) -> some View {
+        VStack(spacing: isCompact ? 10 : 16) {
+            status(isCompact: isCompact)
             if areControlsVisible, model.canControlPlayback {
                 Button {
                     controls.userInteracted()
@@ -148,13 +171,15 @@ struct IOSFullScreenPlayerView: View {
                 .accessibilityIdentifier("player-play-pause")
             }
         }
-        .padding(24).foregroundStyle(.white)
+        .padding(.horizontal, 24)
+        .padding(.vertical, isCompact ? 8 : 24)
+        .foregroundStyle(.white)
     }
 
     private func programmeFooter(isCompact: Bool) -> some View {
-        TimelineView(.periodic(from: .now, by: reducedResourceUsage ? 120 : 30)) { tick in
+        TimelineView(.periodic(from: Date(timeIntervalSinceReferenceDate: 0), by: reducedResourceUsage ? 120 : 30)) { tick in
             let programme = ChannelProgrammePresentation.resolve(programmes: session.presentation.programmes, at: tick.date)
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: isCompact ? 6 : 10) {
                 playbackMessages
                 if isCompact {
                     HStack(alignment: .bottom, spacing: 24) {
@@ -167,7 +192,9 @@ struct IOSFullScreenPlayerView: View {
                     footerActions
                 }
             }
-            .padding(.horizontal, 24).padding(.top, 24).padding(.bottom, 16)
+            .padding(.horizontal, 24)
+            .padding(.top, isCompact ? 12 : 24)
+            .padding(.bottom, isCompact ? 12 : 16)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .top, endPoint: .bottom))
             .contentShape(Rectangle())
@@ -185,8 +212,8 @@ struct IOSFullScreenPlayerView: View {
     }
 
     private func programmeSummary(_ programme: ChannelProgrammePresentation, isCompact: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: isCompact ? 6 : 10) {
+            VStack(alignment: .leading, spacing: isCompact ? 4 : 6) {
                 Text(session.presentation.request.title)
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(.white)
@@ -196,7 +223,7 @@ struct IOSFullScreenPlayerView: View {
                 mediaInformation
             }
             if let current = programme.current {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: isCompact ? 4 : 6) {
                     Text(current.title).font(.subheadline)
                         .foregroundStyle(.white.opacity(0.85))
                         .lineLimit(isCompact ? 1 : 2)
@@ -280,7 +307,7 @@ struct IOSFullScreenPlayerView: View {
         controls.userInteracted()
         panel = nil
     }
-    @ViewBuilder private var status: some View {
+    @ViewBuilder private func status(isCompact: Bool) -> some View {
         if model.isPaused { EmptyView() }
         else {
             switch model.state {
@@ -288,16 +315,20 @@ struct IOSFullScreenPlayerView: View {
             case .buffering: ProgressView("正在缓冲…").tint(.white)
             case .recovering: ProgressView("正在恢复播放…").tint(.white)
             case let .failed(failure):
-                VStack(spacing: 16) {
+                VStack(spacing: isCompact ? 10 : 16) {
                     Text(failure.userMessage)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(isCompact ? 3 : nil)
                     if PlayerFailureActionPolicy.showsRetry(for: failure) {
                         Button("重试") {
                             controls.userInteracted()
                             model.retry()
-                        }.accessibilityIdentifier("player-retry")
+                        }
+                        .frame(minWidth: 44, minHeight: 44)
+                        .accessibilityIdentifier("player-retry")
                     }
                 }
-                .padding(24).foregroundStyle(.white)
+                .padding(isCompact ? 14 : 24).foregroundStyle(.white)
                 .background(.black.opacity(0.8), in: RoundedRectangle(cornerRadius: 16))
             case .playing, .paused, .stopped: EmptyView()
             }

@@ -9,6 +9,12 @@ import Observation
 import VPlayerPlayback
 
 @MainActor
+@Observable
+final class IOSActivePlaybackSessionBox {
+    var session: IOSPlaybackSession?
+}
+
+@MainActor
 final class IOSApplicationDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication, configurationForConnecting connectingSceneSession: UISceneSession,
                      options: UIScene.ConnectionOptions) -> UISceneConfiguration {
@@ -29,7 +35,7 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
     private var orientationRevision: UInt64 = 0
     private var observationRevision: UInt64 = 0
     private weak var playback: PlaybackSettingsStore?
-    private weak var session: IOSPlaybackSession?
+    private weak var sessionBox: IOSActivePlaybackSessionBox?
     private weak var boundWindow: UIWindow?
     private static let logger = Logger(subsystem: "com.vforce.vplayer", category: "播放方向")
 
@@ -44,7 +50,6 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
-        if forceLandscape { UIDevice.current.endGeneratingDeviceOrientationNotifications() }
         if let windowScene = scene as? UIWindowScene { Self.delegates.removeObject(forKey: windowScene) }
         forceLandscape = false
         priorOrientation = nil
@@ -52,7 +57,7 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
         orientationRevision &+= 1
         observationRevision &+= 1
         playback = nil
-        session = nil
+        sessionBox = nil
         boundWindow = nil
     }
 
@@ -60,13 +65,13 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
         forceLandscape ? .landscape : .allButUpsideDown
     }
 
-    func bind(owner: UUID, playback: PlaybackSettingsStore, session: IOSPlaybackSession?, window: UIWindow) {
-        guard self.owner != owner || self.playback !== playback || self.session !== session || boundWindow !== window else {
+    func bind(owner: UUID, playback: PlaybackSettingsStore, sessionBox: IOSActivePlaybackSessionBox, window: UIWindow) {
+        guard self.owner != owner || self.playback !== playback || self.sessionBox !== sessionBox || boundWindow !== window else {
             return
         }
         self.owner = owner
         self.playback = playback
-        self.session = session
+        self.sessionBox = sessionBox
         boundWindow = window
         observationRevision &+= 1
         observePreference()
@@ -75,8 +80,9 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
     private func observePreference() {
         let revision = observationRevision
         let forceLandscape = withObservationTracking {
-            playback?.forceLandscapePlayback == true &&
-                session?.isFullScreenPresented == true && session?.isClosing == false
+            let activeSession = sessionBox?.session
+            return playback?.forceLandscapePlayback == true &&
+                activeSession?.isFullScreenPresented == true && activeSession?.isClosing == false
         } onChange: { [weak self] in
             Task { @MainActor [weak self] in
                 guard let self, self.observationRevision == revision else { return }
@@ -94,13 +100,11 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
         #endif
         if forceLandscape {
             priorOrientation = window.windowScene?.effectiveGeometry.interfaceOrientation
-            UIDevice.current.beginGeneratingDeviceOrientationNotifications()
         }
         self.forceLandscape = forceLandscape
         let target = forceLandscape ? UIInterfaceOrientationMask.landscape : restoredOrientation
         if !forceLandscape {
             priorOrientation = nil
-            UIDevice.current.endGeneratingDeviceOrientationNotifications()
         }
         requestOrientation(target, in: window)
     }
@@ -109,7 +113,7 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
         guard self.owner == owner else { return }
         observationRevision &+= 1
         playback = nil
-        session = nil
+        sessionBox = nil
         boundWindow = nil
         setForceLandscape(false, window: window)
         self.owner = nil
@@ -120,18 +124,19 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
         requestOrientation(.landscape, in: window)
     }
 
-    private var restoredOrientation: UIInterfaceOrientationMask {
-        switch UIDevice.current.orientation {
-        case .portrait, .portraitUpsideDown: return .portrait
-        case .landscapeLeft: return .landscapeRight
-        case .landscapeRight: return .landscapeLeft
-        default:
-            switch priorOrientation {
-            case .landscapeLeft: return .landscapeLeft
-            case .landscapeRight: return .landscapeRight
-            default: return .portrait
-            }
+    /// 退出强制横屏时优先恢复进入播放前的界面方向，避免系统开启竖排方向锁定时
+    /// 被横向握持的硬件陀螺仪方向锁死在横屏。
+    static func restoredOrientationMask(for priorOrientation: UIInterfaceOrientation?) -> UIInterfaceOrientationMask {
+        switch priorOrientation {
+        case .landscapeLeft: return .landscapeLeft
+        case .landscapeRight: return .landscapeRight
+        case .portrait, .portraitUpsideDown, .unknown, nil: return .portrait
+        @unknown default: return .portrait
         }
+    }
+
+    private var restoredOrientation: UIInterfaceOrientationMask {
+        Self.restoredOrientationMask(for: priorOrientation)
     }
 
     private func requestOrientation(_ target: UIInterfaceOrientationMask, in window: UIWindow) {
@@ -175,14 +180,15 @@ final class IOSWindowSceneDelegate: NSObject, UIWindowSceneDelegate {
     }
 }
 
-/// 由全屏播放器持有，原生场景直接观察偏好和会话，不依赖被面板遮盖的视图刷新。
+/// 挂载在全屏播放器外层（`.id(active.id)` 之外），换台时保持方向偏好与退出前方向连续，
+/// 不在会话切换间隙释放方向限制。
 struct IOSPlaybackOrientationPreference: UIViewRepresentable {
     let playback: PlaybackSettingsStore
-    let session: IOSPlaybackSession?
+    let sessionBox: IOSActivePlaybackSessionBox
 
     func makeUIView(context: Context) -> IOSPlaybackOrientationView { IOSPlaybackOrientationView() }
     func updateUIView(_ view: IOSPlaybackOrientationView, context: Context) {
-        view.update(playback: playback, session: session)
+        view.update(playback: playback, sessionBox: sessionBox)
     }
     static func dismantleUIView(_ view: IOSPlaybackOrientationView, coordinator: ()) { view.detach() }
 }
@@ -190,12 +196,12 @@ struct IOSPlaybackOrientationPreference: UIViewRepresentable {
 final class IOSPlaybackOrientationView: UIView {
     private let owner = UUID()
     private weak var playback: PlaybackSettingsStore?
-    private weak var session: IOSPlaybackSession?
+    private weak var sessionBox: IOSActivePlaybackSessionBox?
     private weak var attachedWindow: UIWindow?
 
-    func update(playback: PlaybackSettingsStore, session: IOSPlaybackSession?) {
+    func update(playback: PlaybackSettingsStore, sessionBox: IOSActivePlaybackSessionBox) {
         self.playback = playback
-        self.session = session
+        self.sessionBox = sessionBox
         applyPreference()
     }
     override func didMoveToWindow() {
@@ -214,8 +220,8 @@ final class IOSPlaybackOrientationView: UIView {
             detach()
             attachedWindow = window
         }
-        guard let window = attachedWindow, let playback else { return }
+        guard let window = attachedWindow, let playback, let sessionBox else { return }
         IOSWindowSceneDelegate.delegate(for: window.windowScene)?
-            .bind(owner: owner, playback: playback, session: session, window: window)
+            .bind(owner: owner, playback: playback, sessionBox: sessionBox, window: window)
     }
 }
