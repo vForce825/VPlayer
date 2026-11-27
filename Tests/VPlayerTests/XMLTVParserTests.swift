@@ -710,6 +710,65 @@ final class XMLTVParserTests: XCTestCase {
         XCTAssertNil(ProgrammeDigestKey(hexString: String(repeating: "g", count: 64)))
     }
 
+    func testUTF8ScannerPrunesHistoricalBackfillWhilePreservingSummaryCoverageAndActiveMetadata() throws {
+        let cutoff = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-18T10:00:00Z"))
+        var batches: [EPGPersistenceBatch] = []
+        let sink = EPGPersistenceSink(
+            batchSize: 2,
+            minimumRetainedProgrammeStop: cutoff,
+            cancellationCheck: {},
+            persistBatch: { batches.append($0) }
+        )
+
+        let xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!-- comment before root -->
+        <tv>
+          <channel id="ch-1">
+            <display-name lang="zh">综合 &amp; 高清</display-name>
+            <icon src="https://images.example/ch1.png"/>
+          </channel>
+          <programme start="20260715080000 +0000" stop="20260715090000 +0000" channel="ch-1">
+            <title>三天前节目</title>
+            <sub-title>不应入库</sub-title>
+            <desc><![CDATA[历史回看简介 & 详情]]></desc>
+            <category>历史</category>
+          </programme>
+          <programme start="20260715080000 +0000" stop="20260715090000 +0000" channel="ch-1">
+            <title>三天前节目</title>
+            <desc>重复的历史条目也只计数一次</desc>
+          </programme>
+          <programme start="20260718093000 +0000" stop="20260718103000 +0000" channel="ch-1">
+            <title>&#x4ECA;&#x65E5;直播 &amp; 访谈</title>
+            <sub-title>第一集</sub-title>
+            <desc><![CDATA[正在播出内容]]></desc>
+            <category>新闻</category>
+          </programme>
+        </tv>
+        """
+
+        try withTemporaryXML(xml) { fileURL in
+            let parseSummary = try XMLTVParser().parse(fileURL: fileURL, into: sink)
+            try sink.finish()
+            XCTAssertEqual(parseSummary.channelCount, 1)
+            XCTAssertEqual(parseSummary.programmeCount, 3)
+        }
+
+        let summary = sink.acceptedSummary
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.programmeCount, 2)
+        XCTAssertEqual(summary.coverageEnd, ISO8601DateFormatter().date(from: "2026-07-18T10:30:00Z"))
+
+        let persistedChannels = batches.flatMap(\.channels)
+        let persistedProgrammes = batches.flatMap(\.programmes)
+        XCTAssertEqual(persistedChannels.map(\.displayNames), [["综合 & 高清"]])
+        XCTAssertEqual(persistedProgrammes.count, 1)
+        XCTAssertEqual(persistedProgrammes.first?.title, "今日直播 & 访谈")
+        XCTAssertEqual(persistedProgrammes.first?.subtitle, "第一集")
+        XCTAssertEqual(persistedProgrammes.first?.summary, "正在播出内容")
+        XCTAssertEqual(persistedProgrammes.first?.categories, ["新闻"])
+    }
+
     private func fixtureURL(_ relativePath: String) -> URL {
         let parts = relativePath.split(separator: "/").map(String.init)
         let filename = parts.last!

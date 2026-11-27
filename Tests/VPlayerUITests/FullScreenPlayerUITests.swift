@@ -25,15 +25,15 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCTAssertTrue(screen.waitForExistence(timeout: 3))
         XCTAssertTrue(preparing.waitForExistence(timeout: 3))
         XCTAssertTrue(back.waitForExistence(timeout: 3))
-        XCTAssertTrue(playPause.waitForExistence(timeout: 3))
         XCTAssertTrue(settings.waitForExistence(timeout: 3))
+        XCTAssertFalse(playPause.exists)
         XCTAssertTrue(card.waitForExistence(timeout: 3))
 
         let screenFrame = screen.frame
         XCTAssertEqual(preparing.frame.midX, screenFrame.midX, accuracy: 20)
         XCTAssertEqual(preparing.frame.midY, screenFrame.midY, accuracy: 20)
 
-        let controlsFrame = back.frame.union(playPause.frame).union(settings.frame)
+        let controlsFrame = back.frame.union(settings.frame)
         XCTAssertEqual(controlsFrame.midX, screenFrame.midX, accuracy: 20)
         XCTAssertGreaterThan(controlsFrame.midY, screenFrame.midY)
 
@@ -195,6 +195,15 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCTAssertTrue(state.waitForExistence(timeout: 3))
         XCTAssertEqual(state.value as? String, "playing")
 
+        let visibility = app.otherElements["player-controls-visibility"]
+        XCTAssertTrue(visibility.waitForExistence(timeout: 1))
+
+        // Pause pins overlays visible so sequential AX queries cannot race the
+        // 3-second playing auto-hide timer.
+        XCUIRemote.shared.press(.playPause)
+        XCTAssertTrue(waitForValue(state, equals: "paused", timeout: 2))
+        XCTAssertEqual(visibility.value as? String, "visible")
+
         let card = app.otherElements["player-channel-info"]
         let current = app.otherElements.matching(
             NSPredicate(format: "label BEGINSWITH %@", "当前节目：")
@@ -220,16 +229,17 @@ final class FullScreenPlayerUITests: XCTestCase {
         XCTAssertLessThan(current.frame.height, 30)
         XCTAssertLessThan(next.frame.height, 30)
 
-        let visibility = app.otherElements["player-controls-visibility"]
-        XCTAssertTrue(visibility.waitForExistence(timeout: 1))
-        XCUIRemote.shared.press(.right)
-        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
-        XCTAssertTrue(card.waitForExistence(timeout: 1))
-
         let screenshot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
         screenshot.name = "channel-info-density"
         screenshot.lifetime = .keepAlways
         add(screenshot)
+
+        XCUIRemote.shared.press(.playPause)
+        XCTAssertTrue(waitForValue(state, equals: "playing", timeout: 2))
+        XCTAssertTrue(waitForValue(visibility, equals: "hidden", timeout: 5))
+        XCUIRemote.shared.press(.right)
+        XCTAssertTrue(waitForValue(visibility, equals: "visible", timeout: 2))
+        XCTAssertTrue(card.waitForExistence(timeout: 2))
     }
 
     @MainActor

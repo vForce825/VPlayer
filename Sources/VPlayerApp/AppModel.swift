@@ -1315,6 +1315,11 @@ final class AppModel {
         }
     }
 
+    func presentPlaybackRejection(_ message: String) {
+        alertKind = .playback
+        alertMessage = message
+    }
+
     func matchedEPGChannelID(for channel: Channel) -> String? {
         matchByChannelID[channel.id]?.xmltvChannelID
     }

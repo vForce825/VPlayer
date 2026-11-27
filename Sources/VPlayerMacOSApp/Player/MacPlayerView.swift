@@ -28,8 +28,10 @@ struct MacPlayerView: View {
                     .accessibilityIdentifier("player.interaction-surface")
                 if session.pictureInPicture.isActive {
                     pictureInPicturePlaceholder
+                        .padding(.leading, overlay.sidebarVisible ? state.sidebar.width + 8 : 0)
                 } else {
                     stateOverlay
+                        .padding(.leading, overlay.sidebarVisible ? state.sidebar.width + 8 : 0)
                 }
                 if overlay.informationVisible {
                     VStack {
@@ -66,7 +68,6 @@ struct MacPlayerView: View {
             .animation(.easeInOut(duration: 0.2), value: overlay.controlsVisible)
             .animation(.easeInOut(duration: 0.2), value: overlay.informationVisible)
         }
-        .environment(\.colorScheme, .dark)
         .onAppear {
             if !overlay.sidebarVisible { playerFocused = true }
             reveal()
@@ -83,7 +84,12 @@ struct MacPlayerView: View {
             if wasShown, !isShown { playerFocused = true }
         }
         .sheet(isPresented: $state.showsProgrammes) {
-            MacProgrammeGuideView(presentation: session.presentation)
+            MacProgrammeGuideView(
+                presentation: session.presentation,
+                staleEPGCoverageEnd: state.model?.activeProfile?.id == session.presentation.request.sourceProfileID
+                    ? state.model?.staleEPGCoverageEnd
+                    : nil
+            )
         }
         .sheet(isPresented: $showsSettings) {
             VStack(alignment: .leading, spacing: 16) {
@@ -100,6 +106,10 @@ struct MacPlayerView: View {
             updateHold()
             if wasShown, !isShown { playerFocused = true }
         }
+        .onChange(of: session.model.playbackControlMessage) { _, message in
+            updateHold()
+            if message != nil { reveal() }
+        }
         .overlay(alignment: .topLeading) {
             if let message = session.pictureInPicture.message {
                 Text(message).font(.caption).padding(10)
@@ -108,9 +118,15 @@ struct MacPlayerView: View {
                     .padding(.leading, overlay.sidebarVisible ? state.sidebar.width + 8 : 0)
             }
         }
+        .environment(\.colorScheme, .dark)
     }
     private func reveal() { overlay.interact(paused: session.model.isPaused) }
-    private func updateHold() { overlay.holdsControlsOpen = state.showsProgrammes || showsSettings; reveal() }
+    private func updateHold() {
+        overlay.holdsControlsOpen = state.showsProgrammes
+            || showsSettings
+            || session.model.playbackControlMessage != nil
+        reveal()
+    }
     private var pictureInPicturePlaceholder: some View {
         VStack(spacing: 14) {
             Image(systemName: "pip").font(.system(size: 44))
@@ -189,7 +205,10 @@ struct MacPlayerView: View {
             }.buttonStyle(.plain)
         }.padding(.horizontal, 24).padding(.bottom, 20).padding(.top, 24)
         .onHover { hovering in
-            overlay.holdsControlsOpen = hovering || state.showsProgrammes || showsSettings
+            overlay.holdsControlsOpen = hovering
+                || state.showsProgrammes
+                || showsSettings
+                || session.model.playbackControlMessage != nil
             if hovering, overlay.controlsVisible {
                 overlay.pointerMoved(to: NSEvent.mouseLocation, paused: session.model.isPaused)
             }
@@ -296,8 +315,10 @@ struct MacChannelInformationOverlay: View {
                     .frame(width: 46, height: 38)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(presentation.request.title).font(.headline).lineLimit(2)
-                    Text(PlaybackMediaInformationPresentation(information: mediaInformation).visualText)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    if mediaInformation?.isAudioOnly != true {
+                        Text(PlaybackMediaInformationPresentation(information: mediaInformation).visualText)
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                    }
                 }
                 Spacer(minLength: 0)
                 Button(action: onHide) { Image(systemName: "xmark").font(.caption) }
@@ -329,12 +350,22 @@ struct MacProgrammeGuideView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.systemPrefersReducedResourceUsage) private var prefersReducedResourceUsage
     let presentation: PlayerChannelPresentation
+    var staleEPGCoverageEnd: Date? = nil
     var body: some View {
         NavigationStack {
             Group {
                 if presentation.programmes.isEmpty {
-                    ContentUnavailableView("暂无节目单", systemImage: "list.bullet.rectangle",
-                        description: Text("请刷新节目单，或为此频道设置 EPG 映射。"))
+                    VStack(spacing: 12) {
+                        if let end = staleEPGCoverageEnd {
+                            Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .padding(.horizontal, 20)
+                                .padding(.top, 12)
+                        }
+                        ContentUnavailableView("暂无节目单", systemImage: "list.bullet.rectangle",
+                            description: Text("请刷新节目单，或为此频道设置 EPG 映射。"))
+                    }
                 } else {
                     TimelineView(
                         .periodic(
@@ -353,6 +384,11 @@ struct MacProgrammeGuideView: View {
         let current = ChannelProgrammePresentation.resolve(programmes: presentation.programmes, at: date).current
         return ScrollViewReader { proxy in
             List {
+                if let end = staleEPGCoverageEnd {
+                    Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 ForEach(presentation.programmes) { programme in
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(alignment: .top, spacing: 16) {

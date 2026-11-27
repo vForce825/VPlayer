@@ -31,7 +31,11 @@ struct IOSRootView: View {
         Group {
             if libraryReady {
                 TabView {
-                    IOSChannelBrowserView(model: model, browsingSettings: dependencies.channelBrowsingSettings)
+                    IOSChannelBrowserView(
+                        model: model,
+                        browsingSettings: dependencies.channelBrowsingSettings,
+                        onSelectChannel: selectFromBrowser
+                    )
                         .tabItem { Label("频道", systemImage: "play.rectangle") }
                     IOSSourceProfilesView(model: model)
                         .tabItem { Label("播放列表", systemImage: "play.square.stack") }
@@ -90,8 +94,10 @@ struct IOSRootView: View {
         .onChange(of: session?.isClosing) { _, closing in
             if closing == true { model.dismissPlayback() }
         }
-        .alert(model.alertTitle, isPresented: Binding(get: { model.alertMessage != nil },
-            set: { if !$0 { model.dismissAlert() } })) {
+        .alert(model.alertTitle, isPresented: Binding(
+            get: { model.alertMessage != nil && session?.isFullScreenPresented != true },
+            set: { if !$0 { model.dismissAlert() } }
+        )) {
             Button("知道了") { model.dismissAlert() }
         } message: { Text(model.alertMessage ?? "") }
         .fullScreenCover(isPresented: fullScreenBinding) {
@@ -155,6 +161,25 @@ struct IOSRootView: View {
             owner?.isFullScreenPresented = value
         })
     }
+    private func selectFromBrowser(_ channel: Channel) {
+        let action = IOSChannelBrowserSelectionPolicy.resolve(
+            channel: channel,
+            activeSessionProfileID: session?.presentation.request.sourceProfileID,
+            activeSessionChannelID: session?.presentation.request.channelID,
+            isSessionClosing: session?.isClosing ?? false,
+            isFullScreenPresented: session?.isFullScreenPresented ?? false,
+            hasPresentedPlaybackRequest: model.presentedPlaybackRequest != nil
+        )
+        switch action {
+        case .restoreFullScreen:
+            session?.showFullScreen()
+        case let .rejectPreservingPlayback(message):
+            model.presentPlaybackRejection(message)
+        case .selectInModel:
+            model.select(channel: channel)
+        }
+    }
+
     private func replaceSession(for request: PlaybackRequest?) {
         #if DEBUG
         IOSPlaybackRouteDiagnostics.record("request-change:\(request != nil)")

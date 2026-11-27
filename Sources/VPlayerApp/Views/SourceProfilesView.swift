@@ -29,6 +29,7 @@ struct SourceProfilesView: View {
 
     @Bindable var model: AppModel
     @State private var editedProfile: SourceProfile?
+    @State private var lastEditedProfileID: UUID?
     @State private var isAdding = false
     @State private var pendingDeletion: SourceProfile?
     @FocusState private var focusedControl: FocusTarget?
@@ -48,10 +49,20 @@ struct SourceProfilesView: View {
             }
         }
         #endif
-        .fullScreenCover(isPresented: $isAdding, onDismiss: focusAfterAdding) {
+        .fullScreenCover(
+            isPresented: $isAdding,
+            onDismiss: { restoreFocusAfterEditor(editedProfileID: nil) }
+        ) {
             SourceProfileEditorView(model: model, profile: nil)
         }
-        .fullScreenCover(item: $editedProfile) { profile in
+        .fullScreenCover(
+            item: $editedProfile,
+            onDismiss: {
+                let profileID = lastEditedProfileID
+                lastEditedProfileID = nil
+                restoreFocusAfterEditor(editedProfileID: profileID)
+            }
+        ) { profile in
             SourceProfileEditorView(model: model, profile: profile)
         }
         .confirmationDialog(
@@ -221,12 +232,18 @@ struct SourceProfilesView: View {
         .focused($focusedControl, equals: .add)
     }
 
-    private func focusAfterAdding() {
-        guard let target = focusPolicy.sourceControlAfterEditorDismissal else { return }
+    private func restoreFocusAfterEditor(editedProfileID: UUID?) {
         Task {
             await Task.yield()
             guard !model.profiles.isEmpty else { return }
-            focusedControl = focusTarget(for: target)
+            if let target = focusPolicy.sourceControlAfterEditorDismissal {
+                focusedControl = focusTarget(for: target)
+            } else if let editedProfileID,
+                      model.profiles.contains(where: { $0.id == editedProfileID }) {
+                focusedControl = .edit(editedProfileID)
+            } else if focusedControl == nil {
+                focusedControl = .add
+            }
         }
     }
 
@@ -284,6 +301,7 @@ struct SourceProfilesView: View {
                 .focused($focusedControl, equals: .activate(profile.id))
             }
             Button {
+                lastEditedProfileID = profile.id
                 editedProfile = profile
             } label: {
                 Label("编辑", systemImage: "pencil")

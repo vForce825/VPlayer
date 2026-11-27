@@ -20,6 +20,8 @@ private actor EPGStagingWorker {
         profileID: UUID,
         fileURL: URL,
         fetchedAt: Date,
+        batchSize: Int,
+        minimumRetainedProgrammeStop: Date?,
         epgCancellationCheck: @escaping @Sendable () throws -> Void,
         epgStagingCheckpoint: (@Sendable (EPGStagingCheckpoint) -> Void)?,
         saveFault: LibraryStoreSaveFault?,
@@ -35,15 +37,19 @@ private actor EPGStagingWorker {
                 saveContextObserver: saveContextObserver
             )
             let sink = EPGPersistenceSink(
+                batchSize: batchSize,
+                minimumRetainedProgrammeStop: minimumRetainedProgrammeStop,
                 cancellationCheck: epgCancellationCheck,
                 persistBatch: { batch in
-                    try Self.persistEPGBatch(
-                        batch,
-                        modelContainer: modelContainer,
-                        snapshotID: snapshotID,
-                        saveFault: saveFault,
-                        saveContextObserver: saveContextObserver
-                    )
+                    try autoreleasepool {
+                        try Self.persistEPGBatch(
+                            batch,
+                            modelContainer: modelContainer,
+                            snapshotID: snapshotID,
+                            saveFault: saveFault,
+                            saveContextObserver: saveContextObserver
+                        )
+                    }
                     epgStagingCheckpoint?(.afterBatchPersist)
                 },
                 batchDidPassPostPersistCancellationCheck: {
@@ -165,6 +171,8 @@ private actor EPGStagingWorker {
         saveContextObserver: LibraryStoreSaveContextObserver?
     ) throws {
         let context = ModelContext(modelContainer)
+        context.autosaveEnabled = false
+        context.undoManager = nil
         for channel in batch.channels {
             context.insert(EPGChannelRecord(
                 snapshotID: snapshotID,
@@ -276,11 +284,14 @@ typealias LibraryStoreSaveContextObserver = @Sendable (
 public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting,
     ConditionalRefreshStatusWriting, LibraryRecoveryStatusProviding {
     private static let readBatchSize = 256
+    private static let liveEPGRetentionLookbackSeconds: TimeInterval = 7_200
+    private static let liveEPGPruningMinimumFileBytes = 65_536
     private let executorQueue = DispatchSerialQueue(label: "com.vforce.vplayer.library-store")
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
         executorQueue.asUnownedSerialExecutor()
     }
     public nonisolated let modelContainer: ModelContainer
+    private let epgStagingBatchSize: Int
     private var cachedModelContext: ModelContext?
     private var modelContext: ModelContext {
         if let cachedModelContext { return cachedModelContext }
@@ -454,6 +465,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
 
     public init(modelContainer: ModelContainer) {
         self.modelContainer = modelContainer
+        epgStagingBatchSize = EPGPersistenceSink.defaultSaveBatchSize
     }
 
     /// Mirrors source configuration and manual mappings on every user edit, so
@@ -464,6 +476,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         profileMirror: SourceProfileMirror
     ) {
         self.modelContainer = modelContainer
+        epgStagingBatchSize = EPGPersistenceSink.defaultSaveBatchSize
         self.profileMirror = profileMirror
     }
 
@@ -478,6 +491,7 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         saveFault: @escaping LibraryStoreSaveFault
     ) {
         self.modelContainer = modelContainer
+        epgStagingBatchSize = EPGPersistenceSink.defaultSaveBatchSize
         self.epgCancellationCheck = epgCancellationCheck
         self.epgStagingCheckpoint = epgStagingCheckpoint
         self.saveContextObserver = saveContextObserver
@@ -1004,6 +1018,11 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
         defer { activeStagingEPGSnapshotIDs.remove(snapshotID) }
 
         let modelContainer = modelContainer
+        let batchSize = epgStagingBatchSize
+        let fileByteCount = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let minimumRetainedProgrammeStop: Date? = (recordsSuccess && fileByteCount >= Self.liveEPGPruningMinimumFileBytes)
+            ? fetchedAt.addingTimeInterval(-Self.liveEPGRetentionLookbackSeconds)
+            : nil
         let epgCancellationCheck = epgCancellationCheck
         let epgStagingCheckpoint = epgStagingCheckpoint
         let saveFault = saveFault
@@ -1014,6 +1033,8 @@ public actor SwiftDataLibraryStore: LibraryRepository, RefreshSnapshotCommitting
             profileID: profileID,
             fileURL: fileURL,
             fetchedAt: fetchedAt,
+            batchSize: batchSize,
+            minimumRetainedProgrammeStop: minimumRetainedProgrammeStop,
             epgCancellationCheck: epgCancellationCheck,
             epgStagingCheckpoint: epgStagingCheckpoint,
             saveFault: saveFault,

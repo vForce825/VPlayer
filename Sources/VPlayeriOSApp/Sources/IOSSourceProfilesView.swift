@@ -20,6 +20,7 @@ struct IOSSourceProfilesView: View {
                 if model.profiles.isEmpty {
                     ContentUnavailableView("还没有播放列表", systemImage: "play.square.stack",
                         description: Text("添加 M3U 和 EPG 地址，即可开始观看。"))
+                        .listRowBackground(Color.clear)
                 }
                 ForEach(model.profiles) { profile in
                     Section {
@@ -82,17 +83,35 @@ struct IOSSourceProfilesView: View {
 
     private func refreshRow(_ profile: SourceProfile, resource: RefreshResource,
                             title: String, status: ResourceRefreshStatus) -> some View {
-        HStack {
+        let staleNote: String? = resource == .epg && model.activeProfile?.id == profile.id
+            ? model.staleEPGCoverageEnd.map(EPGCoverageNotice.text(staleCoverageEnd:))
+            : nil
+        return HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                 Text(ResourceRefreshStatusPresentation.text(for: status))
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption)
+                    .foregroundStyle(status.state == .failed ? .red : .secondary)
+                if let error = status.errorSummary, !error.isEmpty {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                }
+                if let staleNote {
+                    Text(staleNote)
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
             }
             Spacer()
             Button { Task { await model.refresh(profileID: profile.id, resource: resource) } } label: {
                 Image(systemName: "arrow.clockwise")
+                    .frame(minWidth: 36, minHeight: 36)
+                    .contentShape(Rectangle())
             }
-            .disabled(status.state == .refreshing)
+            .buttonStyle(.borderless)
+            .disabled(status.state == .refreshing || model.isLoading)
             .accessibilityLabel("刷新\(title)")
             .accessibilityIdentifier(resource == .playlist ? "source.refresh.playlist" : "source.refresh.epg")
         }

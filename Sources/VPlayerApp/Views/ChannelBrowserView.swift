@@ -107,7 +107,7 @@ private struct ChannelBrowserGridView: View {
         .defaultFocus($focusedElement, defaultFocusElement)
         .onChange(of: focusedElement) { _, newFocus in
             guard let pendingID = pendingGroupFocusID else { return }
-            if newFocus == .channel(pendingID) || newFocus != nil {
+            if newFocus == .channel(pendingID) {
                 pendingGroupFocusID = nil
             }
         }
@@ -200,7 +200,6 @@ private struct ChannelBrowserGridView: View {
                     Button(section.title ?? "") {
                         guard let channelID = section.channels.first?.id else { return }
                         pendingGroupFocusID = channelID
-                        focusedElement = nil
                         proxy.scrollTo(sectionScrollID(for: section), anchor: .top)
                         // Try focusing after the immediate layout pass if the
                         // row is already materialized; otherwise keep
@@ -210,6 +209,10 @@ private struct ChannelBrowserGridView: View {
                             await Task.yield()
                             guard pendingGroupFocusID == channelID else { return }
                             focusedElement = .channel(channelID)
+                            try? await Task.sleep(for: .milliseconds(500))
+                            if pendingGroupFocusID == channelID {
+                                pendingGroupFocusID = nil
+                            }
                         }
                     }
                     .buttonStyle(.bordered)
@@ -243,6 +246,7 @@ private struct ChannelBrowserGridView: View {
         .onAppear {
             if pendingGroupFocusID == channel.id {
                 focusedElement = .channel(channel.id)
+                pendingGroupFocusID = nil
             }
         }
         .contextMenu {

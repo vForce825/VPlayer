@@ -131,6 +131,101 @@ final class IOSPlatformBoundaryTests: XCTestCase {
             .none
         )
     }
+
+    func testChannelBrowserSelectionRestoresSameMinimizedChannelAndPreservesPiPOnRejectedURL() {
+        let profileID = UUID()
+        let activeChannel = Channel(
+            id: "ch-1",
+            sourceProfileID: profileID,
+            displayName: "CCTV-1",
+            streamURL: URL(string: "https://example.invalid/cctv1.m3u8")!,
+            tvgID: nil,
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 0
+        )
+        let multicastChannel = Channel(
+            id: "ch-udp",
+            sourceProfileID: profileID,
+            displayName: "UDP",
+            streamURL: URL(string: "udp://239.0.0.1:1234")!,
+            tvgID: nil,
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 1
+        )
+        let otherHTTPChannel = Channel(
+            id: "ch-2",
+            sourceProfileID: profileID,
+            displayName: "CCTV-2",
+            streamURL: URL(string: "https://example.invalid/cctv2.m3u8")!,
+            tvgID: nil,
+            tvgName: nil,
+            logoURL: nil,
+            groupTitle: nil,
+            attributes: [:],
+            order: 2
+        )
+
+        XCTAssertEqual(
+            IOSChannelBrowserSelectionPolicy.resolve(
+                channel: activeChannel,
+                activeSessionProfileID: profileID,
+                activeSessionChannelID: "ch-1",
+                isSessionClosing: false,
+                isFullScreenPresented: false,
+                hasPresentedPlaybackRequest: true
+            ),
+            .restoreFullScreen
+        )
+        XCTAssertEqual(
+            IOSChannelBrowserSelectionPolicy.resolve(
+                channel: multicastChannel,
+                activeSessionProfileID: profileID,
+                activeSessionChannelID: "ch-1",
+                isSessionClosing: false,
+                isFullScreenPresented: false,
+                hasPresentedPlaybackRequest: true
+            ),
+            .rejectPreservingPlayback("首版暂不支持组播地址")
+        )
+        XCTAssertEqual(
+            IOSChannelBrowserSelectionPolicy.resolve(
+                channel: otherHTTPChannel,
+                activeSessionProfileID: profileID,
+                activeSessionChannelID: "ch-1",
+                isSessionClosing: false,
+                isFullScreenPresented: false,
+                hasPresentedPlaybackRequest: true
+            ),
+            .selectInModel
+        )
+    }
+
+    func testChannelBrowserEmptyStateDistinguishesRefreshingPlaylistFromEmptyResult() {
+        XCTAssertEqual(
+            IOSChannelBrowserEmptyState.resolve(
+                isLoading: false,
+                hasActiveProfile: true,
+                hasChannels: false,
+                playlistRefreshState: .refreshing
+            ),
+            .refreshingChannels
+        )
+        XCTAssertEqual(
+            IOSChannelBrowserEmptyState.resolve(
+                isLoading: false,
+                hasActiveProfile: true,
+                hasChannels: false,
+                playlistRefreshState: .succeeded
+            ),
+            .noChannels
+        )
+    }
 }
 
 @MainActor

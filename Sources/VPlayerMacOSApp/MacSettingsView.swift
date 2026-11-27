@@ -77,7 +77,6 @@ struct MacPlaybackSettingsForm: View {
                     identifier: "settings.buffer.deinterlace.current")
             }
             .formStyle(.grouped)
-            .frame(height: 130)
             Text("修改立即用于当前播放，并保存到本机的所有频道。")
                 .font(.caption).foregroundStyle(.secondary)
             Button("恢复播放默认设置") { settings.restoreDefaults() }
@@ -88,8 +87,29 @@ struct MacPlaybackSettingsForm: View {
             Spacer(minLength: 0)
         }
         .padding(.horizontal)
-        .frame(height: 300)
-        .popover(item: $selection) { choice in
+        .frame(minHeight: 280)
+    }
+
+    private func summary(_ choice: BufferSelection, value: String, identifier: String) -> some View {
+        Button { selection = choice } label: {
+            HStack {
+                Text(choice.rawValue)
+                Spacer()
+                Text(value).foregroundStyle(.secondary)
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(choice.rawValue)
+        .accessibilityValue(value)
+        .accessibilityIdentifier(identifier)
+        .popover(
+            isPresented: Binding(
+                get: { selection == choice },
+                set: { if !$0 && selection == choice { selection = nil } }
+            )
+        ) {
             VStack(spacing: 12) {
                 HStack {
                     Text(choice.rawValue).font(.headline)
@@ -114,22 +134,6 @@ struct MacPlaybackSettingsForm: View {
             .padding(16)
             .frame(width: 390)
         }
-    }
-
-    private func summary(_ choice: BufferSelection, value: String, identifier: String) -> some View {
-        Button { selection = choice } label: {
-            HStack {
-                Text(choice.rawValue)
-                Spacer()
-                Text(value).foregroundStyle(.secondary)
-                Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(choice.rawValue)
-        .accessibilityValue(value)
-        .accessibilityIdentifier(identifier)
     }
 
     private func explanation(_ text: String) -> some View {

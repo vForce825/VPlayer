@@ -18,6 +18,11 @@ struct MacSourceManagerView: View {
                         description: Text("添加 HTTP 或 HTTPS 的 M3U 和 XMLTV 地址。"))
                 } else {
                     List {
+                        if let warning = model.recoveryWarningMessage {
+                            Text(warning)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                         ForEach(model.profiles) { profile in
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
@@ -27,7 +32,9 @@ struct MacSourceManagerView: View {
                                     Button("使用") { Task { _ = await model.activate(profileID: profile.id) } }
                                         .disabled(profile.id == model.activeProfile?.id || model.isLoading)
                                     Button("编辑") { editing = profile }
+                                        .disabled(model.isLoading)
                                     Button("删除", role: .destructive) { deleting = profile }
+                                        .disabled(model.isLoading)
                                 }
                                 Text(RedactedURL.string(profile.m3uURL)).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                                 let m3uRefreshing = profile.m3uStatus.state == .refreshing
@@ -47,6 +54,11 @@ struct MacSourceManagerView: View {
                                             Text(error)
                                                 .foregroundStyle(.red)
                                                 .lineLimit(2)
+                                        }
+                                        if model.activeProfile?.id == profile.id,
+                                           let end = model.staleEPGCoverageEnd {
+                                            Text(EPGCoverageNotice.text(staleCoverageEnd: end))
+                                                .foregroundStyle(.orange)
                                         }
                                     }.font(.caption)
                                     Spacer()
@@ -119,10 +131,14 @@ struct MacSourceEditorView: View {
                 .foregroundStyle(.secondary)
             Form {
                 TextField("名称", text: $name).accessibilityIdentifier("source.editor.name")
-                TextField("M3U 地址", text: $playlistURL).accessibilityIdentifier("source.editor.m3u")
-                TextField("EPG 地址", text: $epgURL).accessibilityIdentifier("source.editor.epg")
-                intervalPicker("频道刷新频率", selection: $playlistInterval)
-                intervalPicker("节目单刷新频率", selection: $epgInterval)
+                TextField("M3U 地址", text: $playlistURL)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("source.editor.m3u")
+                TextField("EPG 地址", text: $epgURL)
+                    .autocorrectionDisabled()
+                    .accessibilityIdentifier("source.editor.epg")
+                intervalPicker("频道刷新频率", selection: $playlistInterval, identifier: "source.editor.interval.playlist")
+                intervalPicker("节目单刷新频率", selection: $epgInterval, identifier: "source.editor.interval.epg")
             }
             Text("播放列表与节目单地址均须为 HTTP 或 HTTPS。地址仅保存在本机。")
                 .font(.caption).foregroundStyle(.secondary)
@@ -142,10 +158,11 @@ struct MacSourceEditorView: View {
         .interactiveDismissDisabled(isSaving)
         .onDisappear { if profile == nil { model.cancelCreateAttempt(attempt) } }
     }
-    private func intervalPicker(_ title: String, selection: Binding<RefreshInterval>) -> some View {
+    private func intervalPicker(_ title: String, selection: Binding<RefreshInterval>, identifier: String) -> some View {
         Picker(title, selection: selection) {
-            ForEach(RefreshInterval.allCases, id: \.rawValue) { value in Text(value.macLabel).tag(value) }
+            ForEach(RefreshInterval.allCases, id: \.self) { value in Text(value.macLabel).tag(value) }
         }
+        .accessibilityIdentifier(identifier)
     }
     private func cancel() { if profile == nil { model.cancelCreateAttempt(attempt) }; dismiss() }
     private func save() {

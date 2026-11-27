@@ -348,6 +348,7 @@ private struct IOSPlayerMoreView: View {
     let session: IOSPlaybackSession
     let onDismiss: () -> Void
     let onClose: () -> Void
+    @State private var detent: PresentationDetent = .medium
 
     var body: some View {
         NavigationStack {
@@ -371,7 +372,7 @@ private struct IOSPlayerMoreView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { doneButton(identifier: "player.more.done") }
         }
-        .presentationDetents([.medium, .large])
+        .presentationDetents([.medium, .large], selection: $detent)
         .presentationDragIndicator(.visible)
     }
 
@@ -384,6 +385,7 @@ private struct IOSPlayerMoreView: View {
         .accessibilityIdentifier("player.settings.list")
         .navigationTitle("播放设置")
         .toolbar { doneButton(identifier: "player.settings.done") }
+        .onAppear { detent = .large }
     }
 
     private var informationView: some View {

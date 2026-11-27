@@ -81,9 +81,7 @@ final class MacApplicationDelegate: NSObject, NSApplicationDelegate {
     var openLibraryWindow: (() -> Void)?
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if let window = state?.libraryWindow, window.isVisible {
-            if window.isMiniaturized { window.deminiaturize(nil) }
-            window.makeKeyAndOrderFront(nil)
+        if let state, state.focusOrOpenLibraryWindow() {
             return false
         }
         if let openLibraryWindow {
@@ -105,34 +103,40 @@ struct MacPlayerCommands: Commands {
     var body: some Commands {
         CommandGroup(replacing: .singleWindowList) {
             Button("显示主窗口") {
-                openWindow(id: "library")
+                if !state.focusOrOpenLibraryWindow() {
+                    openWindow(id: "library")
+                }
                 NSApp.activate()
             }
             .keyboardShortcut("1", modifiers: .command)
         }
         CommandGroup(after: .newItem) {
             Button("添加播放列表…") {
-                openWindow(id: "library")
+                if !state.focusOrOpenLibraryWindow() {
+                    openWindow(id: "library")
+                }
                 NSApp.activate()
                 Task {
                     if state.model == nil { await state.load() }
-                    guard state.model != nil else { return }
+                    guard state.model != nil, !state.showsSourceManager, !state.showsProgrammes else { return }
                     state.showsAddSource = true
                 }
             }
             .keyboardShortcut("n")
-            .disabled(state.isLoading)
+            .disabled(state.isLoading || state.showsSourceManager || state.showsProgrammes)
             Button("管理播放列表…") {
-                openWindow(id: "library")
+                if !state.focusOrOpenLibraryWindow() {
+                    openWindow(id: "library")
+                }
                 NSApp.activate()
                 Task {
                     if state.model == nil { await state.load() }
-                    guard state.model != nil else { return }
+                    guard state.model != nil, !state.showsAddSource, !state.showsProgrammes else { return }
                     state.showsSourceManager = true
                 }
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(state.isLoading)
+            .disabled(state.isLoading || state.showsAddSource || state.showsProgrammes)
         }
         CommandMenu("播放") {
             Button(state.session?.model.isPaused == true ? "继续播放" : "暂停") { state.session?.model.togglePause() }
@@ -148,9 +152,9 @@ struct MacPlayerCommands: Commands {
                 session.overlay.toggleInformation(paused: session.model.isPaused)
             }.keyboardShortcut("i").disabled(state.session == nil)
             Button("节目单…") {
-                guard state.session != nil else { return }
+                guard state.session != nil, !state.showsSourceManager, !state.showsAddSource else { return }
                 state.showsProgrammes = true
-            }.keyboardShortcut("e").disabled(state.session == nil)
+            }.keyboardShortcut("e").disabled(state.session == nil || state.showsSourceManager || state.showsAddSource)
             Divider()
             Button("进入或退出全屏") { state.toggleFullScreen() }
                 .keyboardShortcut("f", modifiers: [.command, .control])

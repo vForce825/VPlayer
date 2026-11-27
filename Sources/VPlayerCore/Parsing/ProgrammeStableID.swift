@@ -6,7 +6,7 @@ import CryptoKit
 import Foundation
 
 /// 32 字节内联 SHA-256 摘要键，用于大规模 EPG 去重，避免为每个节目分配堆上字符串。
-struct ProgrammeDigestKey: Hashable, Sendable {
+public struct ProgrammeDigestKey: Hashable, Sendable {
     let a: UInt64
     let b: UInt64
     let c: UInt64
@@ -77,7 +77,30 @@ struct ProgrammeDigestKey: Hashable, Sendable {
 }
 
 enum ProgrammeStableID {
-    private static let hexDigits = Array("0123456789abcdef".utf8)
+    private static let hexDigits: [UInt8] = Array("0123456789abcdef".utf8)
+
+    static func makeDigest(
+        channelIDUTF8: UnsafeBufferPointer<UInt8>,
+        startEpochSeconds: Int64,
+        stopEpochSeconds: Int64,
+        titleUTF8: UnsafeBufferPointer<UInt8>
+    ) -> SHA256.Digest {
+        var hasher = SHA256()
+        var version: UInt8 = 1
+        var channelLength = UInt64(channelIDUTF8.count).bigEndian
+        var startBE = startEpochSeconds.bigEndian
+        var stopBE = stopEpochSeconds.bigEndian
+        var titleLength = UInt64(titleUTF8.count).bigEndian
+
+        Swift.withUnsafeBytes(of: &version) { hasher.update(bufferPointer: $0) }
+        Swift.withUnsafeBytes(of: &channelLength) { hasher.update(bufferPointer: $0) }
+        hasher.update(bufferPointer: UnsafeRawBufferPointer(channelIDUTF8))
+        Swift.withUnsafeBytes(of: &startBE) { hasher.update(bufferPointer: $0) }
+        Swift.withUnsafeBytes(of: &stopBE) { hasher.update(bufferPointer: $0) }
+        Swift.withUnsafeBytes(of: &titleLength) { hasher.update(bufferPointer: $0) }
+        hasher.update(bufferPointer: UnsafeRawBufferPointer(titleUTF8))
+        return hasher.finalize()
+    }
 
     static func makeDigest(
         channelID: String,
@@ -85,30 +108,30 @@ enum ProgrammeStableID {
         stopEpochSeconds: Int64,
         title: String
     ) -> SHA256.Digest {
-        let channelUTF8 = channelID.utf8
-        let titleUTF8 = title.utf8
-        var encoded = Data()
-        encoded.reserveCapacity(1 + 8 + channelUTF8.count + 8 + 8 + 8 + titleUTF8.count)
-        encoded.append(1)
-
-        append(UInt64(channelUTF8.count), to: &encoded)
-        encoded.append(contentsOf: channelUTF8)
-        append(startEpochSeconds, to: &encoded)
-        append(stopEpochSeconds, to: &encoded)
-        append(UInt64(titleUTF8.count), to: &encoded)
-        encoded.append(contentsOf: titleUTF8)
-
-        return SHA256.hash(data: encoded)
+        var channelCopy = channelID
+        var titleCopy = title
+        return channelCopy.withUTF8 { channelBuffer in
+            titleCopy.withUTF8 { titleBuffer in
+                makeDigest(
+                    channelIDUTF8: channelBuffer,
+                    startEpochSeconds: startEpochSeconds,
+                    stopEpochSeconds: stopEpochSeconds,
+                    titleUTF8: titleBuffer
+                )
+            }
+        }
     }
 
     static func hexString(for digest: SHA256.Digest) -> String {
-        var hex = [UInt8]()
-        hex.reserveCapacity(64)
-        for byte in digest {
-            hex.append(hexDigits[Int(byte >> 4)])
-            hex.append(hexDigits[Int(byte & 0x0F)])
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 64) { buffer in
+            var offset = 0
+            for byte in digest {
+                buffer[offset] = hexDigits[Int(byte >> 4)]
+                buffer[offset + 1] = hexDigits[Int(byte & 0x0F)]
+                offset += 2
+            }
+            return String(decoding: UnsafeBufferPointer(buffer), as: UTF8.self)
         }
-        return String(decoding: hex, as: UTF8.self)
     }
 
     static func make(
@@ -123,10 +146,5 @@ enum ProgrammeStableID {
             stopEpochSeconds: stopEpochSeconds,
             title: title
         ))
-    }
-
-    private static func append<Value: FixedWidthInteger>(_ value: Value, to data: inout Data) {
-        var bigEndian = value.bigEndian
-        Swift.withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
     }
 }

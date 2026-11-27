@@ -42,7 +42,13 @@ struct ChannelEPGMappingView: View {
                         #endif
                     } label: {
                         mappingLabel(title: "清除手动映射", selected: selection == nil)
+                            #if os(macOS)
+                            .contentShape(Rectangle())
+                            #endif
                     }
+                    #if os(macOS)
+                    .buttonStyle(.plain)
+                    #endif
                     .disabled(isSaving)
                     .accessibilityIdentifier("mapping.clear")
                 }
@@ -75,7 +81,13 @@ struct ChannelEPGMappingView: View {
                                 subtitle: subtitle(for: epgChannel),
                                 selected: selection == epgChannel.id
                             )
+                            #if os(macOS)
+                            .contentShape(Rectangle())
+                            #endif
                         }
+                        #if os(macOS)
+                        .buttonStyle(.plain)
+                        #endif
                         .disabled(isSaving)
                         .accessibilityIdentifier("mapping.\(epgChannel.id)")
                     }
@@ -83,6 +95,9 @@ struct ChannelEPGMappingView: View {
             }
             .searchable(text: $searchText, prompt: "搜索 EPG 频道")
             .navigationTitle("为“\(channel.displayName)”设置 EPG")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .interactiveDismissDisabled(isSaving)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -94,7 +109,7 @@ struct ChannelEPGMappingView: View {
                     Button("保存") {
                         save()
                     }
-                    .disabled(isSaving)
+                    .disabled(isSaving || (model.epgChannels.isEmpty && model.manualEPGChannelID(for: channel) == nil))
                     .accessibilityIdentifier("mapping.save")
                 }
                 #endif
@@ -145,6 +160,7 @@ struct ChannelEPGMappingView: View {
 
     private func save(selection overrideSelection: String?? = nil) {
         guard !isSaving else { return }
+        let previousSelection = selection
         if let overrideSelection {
             selection = overrideSelection
         }
@@ -162,6 +178,9 @@ struct ChannelEPGMappingView: View {
             if succeeded {
                 dismiss()
             } else {
+                if overrideSelection != nil {
+                    selection = previousSelection
+                }
                 errorMessage = failure ?? "未能完成保存，请重试。"
             }
         }

@@ -40,8 +40,8 @@ struct IOSSourceProfileEditorView: View {
                         .accessibilityIdentifier("source.editor.epg")
                 }
                 Section("自动刷新") {
-                    intervalPicker("频道列表", selection: $playlistInterval)
-                    intervalPicker("节目单（EPG）", selection: $epgInterval)
+                    intervalPicker("频道列表", selection: $playlistInterval, identifier: "source.editor.interval.playlist")
+                    intervalPicker("节目单（EPG）", selection: $epgInterval, identifier: "source.editor.interval.epg")
                 }
                 if let errorMessage {
                     Text(errorMessage).foregroundStyle(.red).accessibilityIdentifier("source.editor.error")
@@ -68,12 +68,13 @@ struct IOSSourceProfileEditorView: View {
         .onDisappear { if profile == nil { model.cancelCreateAttempt(attempt) } }
     }
 
-    private func intervalPicker(_ title: String, selection: Binding<RefreshInterval>) -> some View {
+    private func intervalPicker(_ title: String, selection: Binding<RefreshInterval>, identifier: String) -> some View {
         Picker(title, selection: selection) {
-            ForEach(RefreshInterval.allCases, id: \.rawValue) { value in
+            ForEach(RefreshInterval.allCases, id: \.self) { value in
                 Text(intervalTitle(value)).tag(value)
             }
         }
+        .accessibilityIdentifier(identifier)
     }
     private func intervalTitle(_ value: RefreshInterval) -> String {
         switch value {

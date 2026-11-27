@@ -12,6 +12,123 @@ public struct XMLTVTimeParser: Sendable {
     public init() {}
 
     public func parse(_ raw: String) throws -> Date {
+        if let epochSeconds = raw.utf8.withContiguousStorageIfAvailable({ Self.parseModernEpochSeconds(utf8: $0) }) ?? nil {
+            return Date(timeIntervalSince1970: TimeInterval(epochSeconds))
+        }
+        return try parseFallback(raw)
+    }
+
+    func parseEpochSeconds(utf8: UnsafeBufferPointer<UInt8>) throws -> Int64 {
+        if let fast = Self.parseModernEpochSeconds(utf8: utf8) {
+            return fast
+        }
+        let raw = String(decoding: utf8, as: UTF8.self)
+        return Int64(try parseFallback(raw).timeIntervalSince1970)
+    }
+
+    /// Zero-allocation ASCII fast path for modern proleptic Gregorian timestamps (`year >= 1583`).
+    /// Returns `nil` for pre-1583 dates, non-ASCII bytes, or invalid inputs so callers can either
+    /// skip invalid programmes or delegate to `parseFallback` for exact error/Julian-boundary behavior.
+    static func parseModernEpochSeconds(utf8: UnsafeBufferPointer<UInt8>) -> Int64? {
+        let count = utf8.count
+        var start = 0
+        var end = count
+        while start < end, isASCIIWhitespace(utf8[start]) { start += 1 }
+        while end > start, isASCIIWhitespace(utf8[end - 1]) { end -= 1 }
+        guard end - start >= 14 else { return nil }
+        // Bail out to Foundation fallback if non-ASCII whitespace or characters surround the stamp.
+        if utf8[start] >= 0x80 || utf8[end - 1] >= 0x80 { return nil }
+
+        var digits = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        for offset in 0..<14 {
+            let byte = utf8[start + offset]
+            guard byte >= 48, byte <= 57 else { return nil }
+            let d = Int(byte - 48)
+            switch offset {
+            case 0: digits.0 = d
+            case 1: digits.1 = d
+            case 2: digits.2 = d
+            case 3: digits.3 = d
+            case 4: digits.4 = d
+            case 5: digits.5 = d
+            case 6: digits.6 = d
+            case 7: digits.7 = d
+            case 8: digits.8 = d
+            case 9: digits.9 = d
+            case 10: digits.10 = d
+            case 11: digits.11 = d
+            case 12: digits.12 = d
+            default: digits.13 = d
+            }
+        }
+
+        let year = digits.0 * 1_000 + digits.1 * 100 + digits.2 * 10 + digits.3
+        guard year >= 1_583, year <= 9_999 else { return nil }
+        let month = digits.4 * 10 + digits.5
+        let day = digits.6 * 10 + digits.7
+        let hour = digits.8 * 10 + digits.9
+        let minute = digits.10 * 10 + digits.11
+        let second = digits.12 * 10 + digits.13
+        guard (1...12).contains(month),
+              (0...23).contains(hour),
+              (0...59).contains(minute),
+              (0...59).contains(second) else {
+            return nil
+        }
+        let maxDay = daysInGregorianMonth(year: year, month: month)
+        guard day >= 1, day <= maxDay else { return nil }
+
+        let secondsFromGMT: Int
+        var pos = start + 14
+        if pos == end {
+            secondsFromGMT = 0
+        } else {
+            guard isASCIIWhitespace(utf8[pos]) else { return nil }
+            while pos < end, isASCIIWhitespace(utf8[pos]) { pos += 1 }
+            let zoneLen = end - pos
+            if zoneLen == 1, utf8[pos] == 0x5A { // 'Z'
+                secondsFromGMT = 0
+            } else if zoneLen == 5 {
+                let signByte = utf8[pos]
+                guard signByte == 43 || signByte == 45 else { return nil }
+                let zh1 = utf8[pos + 1]
+                let zh2 = utf8[pos + 2]
+                let zm1 = utf8[pos + 3]
+                let zm2 = utf8[pos + 4]
+                guard zh1 >= 48, zh1 <= 57, zh2 >= 48, zh2 <= 57,
+                      zm1 >= 48, zm1 <= 57, zm2 >= 48, zm2 <= 57 else {
+                    return nil
+                }
+                let zoneHour = Int(zh1 - 48) * 10 + Int(zh2 - 48)
+                let zoneMinute = Int(zm1 - 48) * 10 + Int(zm2 - 48)
+                guard (0...23).contains(zoneHour), (0...59).contains(zoneMinute) else {
+                    return nil
+                }
+                let magnitude = (zoneHour * 60 + zoneMinute) * 60
+                guard magnitude <= 18 * 3_600 else { return nil }
+                secondsFromGMT = signByte == 45 ? -magnitude : magnitude
+            } else {
+                return nil
+            }
+        }
+
+        let adjustedYear = year - (month <= 2 ? 1 : 0)
+        let era = (adjustedYear >= 0 ? adjustedYear : adjustedYear - 399) / 400
+        let yearOfEra = adjustedYear - era * 400
+        let monthIndex = month + (month > 2 ? -3 : 9)
+        let dayOfYear = (153 * monthIndex + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        let daysSinceUnixEpoch = era * 146_097 + dayOfEra - 719_468
+        return Int64(daysSinceUnixEpoch) * 86_400
+            + Int64(hour * 3_600 + minute * 60 + second - secondsFromGMT)
+    }
+
+    @inline(__always)
+    private static func isASCIIWhitespace(_ byte: UInt8) -> Bool {
+        byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0D
+    }
+
+    private func parseFallback(_ raw: String) throws -> Date {
         let pieces = trimmedASCIIOrFoundation(raw)
             .split(whereSeparator: \.isWhitespace)
         guard pieces.count == 1 || pieces.count == 2 else {
@@ -104,8 +221,6 @@ public struct XMLTVTimeParser: Sendable {
             guard day >= 1, day <= maxDay else {
                 throw XMLTVTimeError.invalid(raw)
             }
-            // Howard Hinnant's days_from_civil avoids per-call Calendar/TimeZone
-            // allocations while matching proleptic Gregorian epochs exactly.
             let adjustedYear = year - (month <= 2 ? 1 : 0)
             let era = (adjustedYear >= 0 ? adjustedYear : adjustedYear - 399) / 400
             let yearOfEra = adjustedYear - era * 400

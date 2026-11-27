@@ -16,7 +16,7 @@ final class MacApplicationState {
     private(set) var session: MacPlaybackSession?
     private(set) var startupError: String?
     private(set) var isLibraryWindowVisible = false
-    private(set) var isRefreshing = false
+    private(set) var refreshingProfileID: UUID?
     var isLoading = false
     var showsSourceManager = false
     var showsAddSource = false
@@ -34,10 +34,15 @@ final class MacApplicationState {
     @ObservationIgnored private var programmeWindowTask: Task<Void, Never>?
     @ObservationIgnored private var isObservingModel = false
 
+    var hasActiveModalSheet: Bool {
+        showsSourceManager || showsAddSource || showsProgrammes
+    }
+
     var isActiveProfileRefreshing: Bool {
-        if isRefreshing { return true }
         guard let profile = model?.activeProfile else { return false }
-        return profile.m3uStatus.state == .refreshing || profile.epgStatus.state == .refreshing
+        return refreshingProfileID == profile.id
+            || profile.m3uStatus.state == .refreshing
+            || profile.epgStatus.state == .refreshing
     }
 
     init() {
@@ -243,21 +248,61 @@ final class MacApplicationState {
         stopModelObservers()
         refreshTask?.cancel()
         refreshTask = nil
-        isRefreshing = false
+        refreshingProfileID = nil
         dependencies?.foregroundRefreshDriver.deactivate()
         await stopPlayback()
     }
     func refresh() {
         guard !isActiveProfileRefreshing, let model, let profile = model.activeProfile else { return }
-        isRefreshing = true
+        let profileID = profile.id
+        refreshingProfileID = profileID
         refreshTask = Task { @MainActor [weak self] in
             defer {
-                self?.isRefreshing = false
+                if self?.refreshingProfileID == profileID {
+                    self?.refreshingProfileID = nil
+                }
                 self?.refreshTask = nil
             }
-            await model.refresh(profileID: profile.id, resource: .playlist)
-            guard !Task.isCancelled else { return }
-            await model.refresh(profileID: profile.id, resource: .epg)
+            await model.refresh(profileID: profileID, resource: .playlist)
+            guard !Task.isCancelled, model.profiles.contains(where: { $0.id == profileID }) else { return }
+            await model.refresh(profileID: profileID, resource: .epg)
+        }
+    }
+    enum LibraryWindowReopenAction: Equatable {
+        case deminiaturizeAndFocus
+        case focusExisting
+        case openNew
+    }
+
+    static func libraryWindowReopenAction(
+        hasWindow: Bool,
+        isVisible: Bool,
+        isMiniaturized: Bool
+    ) -> LibraryWindowReopenAction {
+        guard hasWindow else { return .openNew }
+        if isMiniaturized { return .deminiaturizeAndFocus }
+        if isVisible { return .focusExisting }
+        return .openNew
+    }
+
+    @discardableResult
+    func focusOrOpenLibraryWindow() -> Bool {
+        switch Self.libraryWindowReopenAction(
+            hasWindow: libraryWindow != nil,
+            isVisible: libraryWindow?.isVisible == true,
+            isMiniaturized: libraryWindow?.isMiniaturized == true
+        ) {
+        case .deminiaturizeAndFocus:
+            libraryWindow?.deminiaturize(nil)
+            libraryWindow?.makeKeyAndOrderFront(nil)
+            return true
+        case .focusExisting:
+            libraryWindow?.makeKeyAndOrderFront(nil)
+            return true
+        case .openNew:
+            guard let openLibraryWindow else { return false }
+            openLibraryWindow()
+            return true
         }
     }
     func registerLibraryWindow(_ window: NSWindow?) {

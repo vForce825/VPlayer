@@ -56,7 +56,8 @@ struct IOSChannelInformationView: View {
                                         .accessibilityIdentifier("channel.info.removed-notice")
                                 }
                             }
-                            if let end = model.staleEPGCoverageEnd {
+                            if model.activeProfile?.id == currentChannel.sourceProfileID,
+                               let end = model.staleEPGCoverageEnd {
                                 Section {
                                     Text(EPGCoverageNotice.text(staleCoverageEnd: end))
                                         .font(.caption).foregroundStyle(.secondary)
@@ -68,7 +69,8 @@ struct IOSChannelInformationView: View {
                             matchedProgrammeInformation(for: currentChannel)
                             originalSourceFields(for: currentChannel)
                         case .programmes:
-                            if let end = model.staleEPGCoverageEnd {
+                            if model.activeProfile?.id == currentChannel.sourceProfileID,
+                               let end = model.staleEPGCoverageEnd {
                                 Section {
                                     Text(EPGCoverageNotice.text(staleCoverageEnd: end))
                                         .font(.caption).foregroundStyle(.secondary)
@@ -221,6 +223,7 @@ struct IOSChannelInformationView: View {
                     .accessibilityIdentifier("channel.info.epg.unmatched")
             }
             Button("设置 EPG") { showsMapping = true }
+                .disabled(liveChannel == nil)
                 .accessibilityIdentifier("channel.info.mapping")
         }
     }

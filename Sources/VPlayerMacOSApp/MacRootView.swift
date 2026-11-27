@@ -172,6 +172,7 @@ struct MacRootView: View {
                 model.alertMessage != nil
                     && !state.showsSourceManager
                     && !state.showsAddSource
+                    && !state.showsProgrammes
                     && mappingChannel == nil
             },
             set: { if !$0 { model.dismissAlert() } }
@@ -559,7 +560,8 @@ enum MacPlayerKeyShortcut: Equatable {
         charactersIgnoringModifiers: String?,
         modifierFlags: NSEvent.ModifierFlags,
         isRepeat: Bool,
-        isEditingText: Bool
+        isEditingText: Bool,
+        isActivatingControl: Bool = false
     ) -> MacPlayerKeyShortcut? {
         guard modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty else {
             return nil
@@ -569,7 +571,7 @@ enum MacPlayerKeyShortcut: Equatable {
         }
         guard !isEditingText, !isRepeat else { return nil }
         if keyCode == 49 {
-            return .togglePause
+            return isActivatingControl ? nil : .togglePause
         }
         switch charactersIgnoringModifiers?.lowercased() {
         case "i": return .toggleInformation
@@ -609,12 +611,14 @@ private struct MacLibraryWindowReader: NSViewRepresentable {
                           event.window === window,
                           window.attachedSheet == nil else { return false }
                     let isEditingText = (window.firstResponder is NSTextView) || (window.firstResponder is NSTextField)
+                    let isActivatingControl = (window.firstResponder is NSButton) || (window.firstResponder is NSPopUpButton)
                     guard let shortcut = MacPlayerKeyShortcut.resolve(
                         keyCode: event.keyCode,
                         charactersIgnoringModifiers: event.charactersIgnoringModifiers,
                         modifierFlags: event.modifierFlags,
                         isRepeat: event.isARepeat,
-                        isEditingText: isEditingText
+                        isEditingText: isEditingText,
+                        isActivatingControl: isActivatingControl
                     ) else { return false }
                     return self?.handleKeyShortcut?(shortcut) == true
                 }

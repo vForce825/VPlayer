@@ -14,8 +14,12 @@ struct EPGPersistenceBatch: Sendable {
 }
 
 final class EPGPersistenceSink: XMLTVEventSink {
-    private static let saveBatchSize = 500
+    static let defaultSaveBatchSize = 500
+    private static let historicalBackfillHorizonSeconds: TimeInterval = 30 * 86_400
 
+    private let saveBatchSize: Int
+    let minimumRetainedProgrammeStop: Date?
+    private let earliestPrunableBackfillStop: Date?
     private let cancellationCheck: @Sendable () throws -> Void
     private let persistBatch: (EPGPersistenceBatch) throws -> Void
     private let batchDidPassPostPersistCancellationCheck: (() -> Void)?
@@ -35,13 +39,30 @@ final class EPGPersistenceSink: XMLTVEventSink {
     }
 
     init(
+        batchSize: Int = EPGPersistenceSink.defaultSaveBatchSize,
+        minimumRetainedProgrammeStop: Date? = nil,
         cancellationCheck: @escaping @Sendable () throws -> Void,
         persistBatch: @escaping (EPGPersistenceBatch) throws -> Void,
         batchDidPassPostPersistCancellationCheck: (() -> Void)? = nil
     ) {
+        saveBatchSize = max(1, batchSize)
+        self.minimumRetainedProgrammeStop = minimumRetainedProgrammeStop
+        earliestPrunableBackfillStop = minimumRetainedProgrammeStop?.addingTimeInterval(
+            -Self.historicalBackfillHorizonSeconds
+        )
         self.cancellationCheck = cancellationCheck
         self.persistBatch = persistBatch
         self.batchDidPassPostPersistCancellationCheck = batchDidPassPostPersistCancellationCheck
+        channels.reserveCapacity(min(saveBatchSize, 1_024))
+        programmes.reserveCapacity(saveBatchSize)
+    }
+
+    func shouldPruneHistoricalProgramme(stop: Date) -> Bool {
+        guard let cutoff = minimumRetainedProgrammeStop,
+              let horizon = earliestPrunableBackfillStop else {
+            return false
+        }
+        return stop <= cutoff && stop >= horizon
     }
 
     func accept(channel: EPGChannel) throws {
@@ -56,15 +77,35 @@ final class EPGPersistenceSink: XMLTVEventSink {
     func accept(programme: Programme) throws {
         try cancellationCheck()
         guard insertProgrammeID(programme.id) else { return }
-        if let currentMax = maxProgrammeStop {
-            if programme.stop > currentMax {
-                maxProgrammeStop = programme.stop
-            }
-        } else {
-            maxProgrammeStop = programme.stop
-        }
+        recordMaxStop(programme.stop)
+        guard !shouldPruneHistoricalProgramme(stop: programme.stop) else { return }
         programmes.append(programme)
         try flushIfNeeded()
+    }
+
+    func accept(programme: Programme, digest: ProgrammeDigestKey) throws {
+        try cancellationCheck()
+        guard programmeDigestKeys.insert(digest).inserted else { return }
+        recordMaxStop(programme.stop)
+        guard !shouldPruneHistoricalProgramme(stop: programme.stop) else { return }
+        programmes.append(programme)
+        try flushIfNeeded()
+    }
+
+    func recordExpiredProgramme(digest: ProgrammeDigestKey, stop: Date) throws {
+        try cancellationCheck()
+        guard programmeDigestKeys.insert(digest).inserted else { return }
+        recordMaxStop(stop)
+    }
+
+    private func recordMaxStop(_ stop: Date) {
+        if let currentMax = maxProgrammeStop {
+            if stop > currentMax {
+                maxProgrammeStop = stop
+            }
+        } else {
+            maxProgrammeStop = stop
+        }
     }
 
     private func insertProgrammeID(_ id: String) -> Bool {
@@ -79,7 +120,7 @@ final class EPGPersistenceSink: XMLTVEventSink {
     }
 
     private func flushIfNeeded() throws {
-        guard channels.count + programmes.count == Self.saveBatchSize else { return }
+        guard channels.count + programmes.count == saveBatchSize else { return }
         try flush()
     }
 

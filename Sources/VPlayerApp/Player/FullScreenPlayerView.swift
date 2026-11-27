@@ -37,6 +37,11 @@ private struct InvisibleWakeButtonStyle: ButtonStyle {
 }
 
 struct FullScreenPlayerView: View {
+    private struct ControlsAutoHideTaskID: Equatable {
+        let key: PlayerControlsAutoHideKey
+        let isPresentingSettings: Bool
+    }
+
     private enum FailureControl: Hashable {
         case retry
         case back
@@ -206,8 +211,12 @@ struct FullScreenPlayerView: View {
         .onMoveCommand { _ in
             wakeControls()
         }
-        .task(id: controlsAutoHideKey) {
+        .task(id: ControlsAutoHideTaskID(key: controlsAutoHideKey, isPresentingSettings: showsSettings)) {
+            guard !showsSettings else { return }
             await runControlsAutoHide(for: controlsAutoHideKey)
+        }
+        .onChange(of: showsSettings) { _, _ in
+            wakeControls()
         }
         .task { model.start() }
         .onChange(of: channelPresentation) { _, presentation in
@@ -256,6 +265,8 @@ struct FullScreenPlayerView: View {
     @ViewBuilder
     private var mountedPresentation: some View {
         PlaybackPresentationHostView(mount: presentationHostMount)
+            .allowsHitTesting(false)
+            .focusable(false)
             .ignoresSafeArea()
     }
 
@@ -299,6 +310,7 @@ struct FullScreenPlayerView: View {
                             .accessibilityIdentifier("player-back")
                             .focused($failureFocus, equals: .back)
                         Button("播放设置") { showsSettings = true }
+                            .accessibilityIdentifier("player-settings")
                             .focused($failureFocus, equals: .settings)
                     }
                     .defaultFocus($failureFocus, initialFocus)

@@ -40,10 +40,6 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertFalse(app.buttons["channel.group.测试分组"].exists,
             "This comparison requires the same flat playlist on both launches")
         let channelIDs = ["channel.http", "channel.udp", "channel.grouped", "channel.ungrouped"]
-        for identifier in channelIDs {
-            XCTAssertTrue(app.buttons[identifier].waitForExistence(timeout: 3),
-                "Fewer fixture channels must not masquerade as fewer grid columns: \(identifier)")
-        }
         let firstFrame = channel.frame
         // A focused card can be scaled and EPG text makes cards differ in
         // height. Intersecting the first card's vertical centre identifies its
@@ -53,6 +49,15 @@ final class VPlayerUITests: XCTestCase {
             return candidate.exists && candidate.frame.minY <= firstFrame.midY
                 && candidate.frame.maxY >= firstFrame.midY
         }.count
+        // At AccessibilityXXXL, single-column cards span multiple viewports so
+        // LazyVGrid realizes later fixture cards only as focus scrolls down.
+        for identifier in channelIDs where !app.buttons[identifier].exists {
+            for _ in 0..<4 where !app.buttons[identifier].exists {
+                XCUIRemote.shared.press(.down)
+            }
+            XCTAssertTrue(app.buttons[identifier].waitForExistence(timeout: 3),
+                "Fewer fixture channels must not masquerade as fewer grid columns: \(identifier)")
+        }
         return (firstRowCount, firstFrame.width)
     }
 
@@ -148,9 +153,9 @@ final class VPlayerUITests: XCTestCase {
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.otherElements["player-full-screen"].waitForExistence(timeout: 3))
         XCTAssertTrue(app.staticTexts["测试频道"].exists)
-        XCTAssertTrue(app.buttons["player-play-pause"].hasFocus)
+        XCTAssertTrue(app.buttons["player-play-pause"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.left)
-        XCTAssertTrue(app.buttons["player-back"].hasFocus)
+        XCTAssertTrue(app.buttons["player-back"].wait(for: \.hasFocus, toEqual: true, timeout: 2))
         XCUIRemote.shared.press(.select)
         XCTAssertTrue(app.buttons["channel.http"].waitForExistence(timeout: 3))
     }
@@ -284,6 +289,145 @@ final class VPlayerUITests: XCTestCase {
         XCTAssertTrue(delete.hasFocus || edit.hasFocus)
         XCUIRemote.shared.press(.up)
         XCTAssertTrue(add.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+    }
+
+    @MainActor
+    func testEditingSourceProfileAllowsSelectingRefreshIntervalsWithoutBlackScreen() {
+        let app = launchSeededApp()
+        XCTAssertTrue(app.tabBars.buttons["频道"].waitForExistence(timeout: 5))
+        selectTab(named: "播放列表", in: app)
+
+        let add = app.buttons["source.add"]
+        let edit = cardButton(prefixed: "source.edit.", in: app)
+        let delete = cardButton(prefixed: "source.delete.", in: app)
+        XCTAssertTrue(add.waitForExistence(timeout: 3))
+        XCTAssertTrue(add.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+
+        XCUIRemote.shared.press(.down)
+        XCTAssertTrue(delete.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.left)
+        XCTAssertTrue(edit.wait(for: \.hasFocus, toEqual: true, timeout: 2))
+        XCUIRemote.shared.press(.select)
+
+        let nameField = app.textFields["source.editor.name"]
+        let playlistInterval = app.buttons["source.editor.interval.playlist"]
+        let epgInterval = app.buttons["source.editor.interval.epg"]
+        XCTAssertTrue(nameField.waitForExistence(timeout: 5))
+        XCTAssertTrue(playlistInterval.waitForExistence(timeout: 3))
+        XCTAssertTrue(epgInterval.waitForExistence(timeout: 3))
+
+        let playlistCell = app.cells.containing(.button, identifier: "source.editor.interval.playlist").element
+        for _ in 0..<8 where !playlistInterval.hasFocus && !playlistCell.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(
+            playlistInterval.hasFocus || playlistCell.hasFocus,
+            "Expected focus to reach playlist refresh interval control"
+        )
+        XCUIRemote.shared.press(.select)
+
+        let hourlyOption = app.buttons["每小时"]
+        XCTAssertTrue(hourlyOption.waitForExistence(timeout: 3))
+        moveVerticallyToOption(hourlyOption, in: app)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(playlistInterval.waitForExistence(timeout: 3))
+        XCTAssertEqual(playlistInterval.value as? String, "每小时")
+
+        let epgCell = app.cells.containing(.button, identifier: "source.editor.interval.epg").element
+        for _ in 0..<4 where !epgInterval.hasFocus && !epgCell.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(
+            epgInterval.hasFocus || epgCell.hasFocus,
+            "Expected focus to reach EPG refresh interval control"
+        )
+        XCUIRemote.shared.press(.select)
+
+        let twelveHoursOption = app.buttons["每 12 小时"]
+        XCTAssertTrue(
+            twelveHoursOption.waitForExistence(timeout: 3) && twelveHoursOption.isHittable,
+            "Expected selectable refresh interval choices to appear when opening EPG interval control"
+        )
+        for label in ["仅手动", "每小时", "每 6 小时", "每 12 小时", "每天"] {
+            XCTAssertTrue(app.buttons[label].exists, "Missing refresh interval option \(label)")
+        }
+
+        let openedScreenshot = XCUIScreen.main.screenshot()
+        let attachment = XCTAttachment(screenshot: openedScreenshot)
+        attachment.name = "epg-interval-picker-opened"
+        attachment.lifetime = .keepAlways
+        self.add(attachment)
+
+        if let cgImage = openedScreenshot.image.cgImage {
+            let meanLuma = averageScreenLuminance(in: cgImage)
+            XCTAssertGreaterThan(
+                meanLuma,
+                0.05,
+                "Expected EPG refresh interval selection screen to have visible backdrop, not a black screen (meanLuma=\(meanLuma))"
+            )
+        }
+
+        moveVerticallyToOption(twelveHoursOption, in: app)
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(epgInterval.waitForExistence(timeout: 3))
+        XCTAssertEqual(epgInterval.value as? String, "每 12 小时")
+
+        let saveButton = app.buttons["source.editor.save"]
+        let saveCell = app.cells.containing(.button, identifier: "source.editor.save").element
+        for _ in 0..<6 where !saveButton.hasFocus && !saveCell.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(saveButton.hasFocus || saveCell.hasFocus)
+        XCUIRemote.shared.press(.select)
+
+        // Editor dismissal restores focus directly to the card's edit button.
+        XCTAssertTrue(edit.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            edit.wait(for: \.hasFocus, toEqual: true, timeout: 3),
+            "Expected focus to return to edit button after dismissing profile editor"
+        )
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(nameField.waitForExistence(timeout: 5))
+        XCTAssertEqual(playlistInterval.value as? String, "每小时")
+        XCTAssertEqual(epgInterval.value as? String, "每 12 小时")
+    }
+
+    @MainActor
+    private func moveVerticallyToOption(_ option: XCUIElement, in app: XCUIApplication) {
+        let cell = app.cells.containing(.button, identifier: option.identifier).element
+        for _ in 0..<6 where !option.hasFocus && !cell.hasFocus {
+            XCUIRemote.shared.press(.up)
+        }
+        for _ in 0..<8 where !option.hasFocus && !cell.hasFocus {
+            XCUIRemote.shared.press(.down)
+        }
+        XCTAssertTrue(option.hasFocus || cell.hasFocus, "Expected focus to reach \(option.label)")
+    }
+
+    private func averageScreenLuminance(in image: CGImage) -> Double {
+        let gridSize = 16
+        var pixels = [UInt8](repeating: 0, count: gridSize * gridSize * 4)
+        guard let context = CGContext(
+            data: &pixels,
+            width: gridSize,
+            height: gridSize,
+            bitsPerComponent: 8,
+            bytesPerRow: gridSize * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return 0
+        }
+        context.interpolationQuality = .low
+        context.draw(image, in: CGRect(x: 0, y: 0, width: gridSize, height: gridSize))
+        var total = 0.0
+        for idx in stride(from: 0, to: pixels.count, by: 4) {
+            let r = Double(pixels[idx]) / 255.0
+            let g = Double(pixels[idx + 1]) / 255.0
+            let b = Double(pixels[idx + 2]) / 255.0
+            total += 0.2126 * r + 0.7152 * g + 0.0722 * b
+        }
+        return total / Double(gridSize * gridSize)
     }
 
     /// Card controls carry the playlist's identifier, which the seeded fixture

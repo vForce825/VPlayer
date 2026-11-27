@@ -308,8 +308,8 @@ final class HLSProxyUpstream: @unchecked Sendable {
         // Exactly one reader task for the transfer, never one task per byte or
         // span. Cancellation-handler registration also covers an already
         // cancelled consumer racing this child task's installation.
-        let reader = Task { await self.drainChunks(into: pipe, upstream: upstream) }
         try Task.checkCancellation()
+        let reader = Task { await self.drainChunks(into: pipe, upstream: upstream) }
         releaseHeaderSuspension(upstream: upstream, resumeTask: true)
 
         try await withTaskCancellationHandler {

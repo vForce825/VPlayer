@@ -222,6 +222,27 @@ final class MacPlatformTests: XCTestCase {
         XCTAssertNil(
             MacPlayerKeyShortcut.resolve(keyCode: 34, charactersIgnoringModifiers: "i", modifierFlags: [], isRepeat: false, isEditingText: true)
         )
+        XCTAssertNil(
+            MacPlayerKeyShortcut.resolve(
+                keyCode: 49,
+                charactersIgnoringModifiers: " ",
+                modifierFlags: [],
+                isRepeat: false,
+                isEditingText: false,
+                isActivatingControl: true
+            )
+        )
+        XCTAssertEqual(
+            MacPlayerKeyShortcut.resolve(
+                keyCode: 34,
+                charactersIgnoringModifiers: "i",
+                modifierFlags: [],
+                isRepeat: false,
+                isEditingText: false,
+                isActivatingControl: true
+            ),
+            .toggleInformation
+        )
     }
 
     func testPictureInPictureClampsToContainingSecondaryMonitor() {
@@ -279,6 +300,23 @@ final class MacPlatformTests: XCTestCase {
         delegate.openLibraryWindow = { reopenCount += 1 }
         XCTAssertFalse(delegate.applicationShouldHandleReopen(app, hasVisibleWindows: true))
         XCTAssertEqual(reopenCount, 1)
+
+        XCTAssertEqual(
+            MacApplicationState.libraryWindowReopenAction(hasWindow: true, isVisible: false, isMiniaturized: true),
+            .deminiaturizeAndFocus
+        )
+        XCTAssertEqual(
+            MacApplicationState.libraryWindowReopenAction(hasWindow: true, isVisible: true, isMiniaturized: false),
+            .focusExisting
+        )
+        XCTAssertEqual(
+            MacApplicationState.libraryWindowReopenAction(hasWindow: true, isVisible: false, isMiniaturized: false),
+            .openNew
+        )
+        XCTAssertEqual(
+            MacApplicationState.libraryWindowReopenAction(hasWindow: false, isVisible: false, isMiniaturized: false),
+            .openNew
+        )
     }
     #endif
 }

@@ -3469,6 +3469,94 @@ final class SwiftDataLibraryStoreTests: XCTestCase {
         XCTAssertFalse(inventory.programmes.contains { $0.snapshotID == oldEditedSnapshotID })
     }
 
+    func testCommitEPGRefreshPrunesLargeFeedHistoricalBackfillWithoutBlockingMainRunLoop() async throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftDataLibraryStoreTests-LargeEPG-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let container = try VPlayerModelContainer.make(
+            persistentStoreURL: tempRoot.appendingPathComponent("VPlayer.store"),
+            recoveryRootURL: tempRoot.appendingPathComponent("Recovery", isDirectory: true)
+        )
+        let store = SwiftDataLibraryStore(modelContainer: container)
+        let fetchedAt = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-18T12:00:00Z"))
+        let profile = try await store.createProfile(input(name: "LargeEPG"), now: fetchedAt)
+
+        // 生成超过 64 KB 的多批次 XMLTV（600 条三天前历史节目 + 550 条当前/未来节目），
+        // 验证跨多个 500 条批次落库时：
+        // 1) 历史回看条目不写入 ProgrammeRecord，避免放大 SQLite 事务与查询扫描；
+        // 2) 快照总计数与最新覆盖时间保持完整；
+        // 3) 主线程 RunLoop 与并发读取在分批落库期间保持流畅响应。
+        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<tv>\n"
+        xml += "  <channel id=\"live-hd\"><display-name>高清综合</display-name></channel>\n"
+        for idx in 0..<600 {
+            xml += "  <programme start=\"20260715080000 +0000\" stop=\"20260715090000 +0000\" channel=\"live-hd\"><title>历史节目 \(idx)</title><desc>已结束回看内容描述文本填充以超过裁剪阈值</desc></programme>\n"
+        }
+        for idx in 0..<550 {
+            let stopStamp = idx == 549 ? "20260719060000 +0000" : "20260718150000 +0000"
+            xml += "  <programme start=\"20260718113000 +0000\" stop=\"\(stopStamp)\" channel=\"live-hd\"><title>当前与后续节目 \(idx)</title><desc>正在播出或即将播出节目详情填充文本</desc></programme>\n"
+        }
+        xml += "</tv>\n"
+
+        let epgURL = tempRoot.appendingPathComponent("large-feed.xml")
+        let xmlData = Data(xml.utf8)
+        XCTAssertGreaterThanOrEqual(xmlData.count, 65_536)
+        try xmlData.write(to: epgURL)
+
+        let context = RefreshSourceContext(
+            source: SourceURLIdentity(url: profile.epgURL),
+            attemptID: UUID()
+        )
+        let began = try await store.beginRefresh(
+            profileID: profile.id,
+            resource: .epg,
+            context: context,
+            at: fetchedAt
+        )
+        XCTAssertTrue(began)
+
+        let runLoopTicks = RunLoopTickCounter()
+        let timer = Timer(timeInterval: 0.005, repeats: true) { _ in
+            runLoopTicks.increment()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        defer { timer.invalidate() }
+        let ticksBefore = runLoopTicks.value
+
+        async let commitOutcome = store.commitEPGRefresh(
+            profileID: profile.id,
+            fileURL: epgURL,
+            fetchedAt: fetchedAt,
+            context: context
+        )
+        try await Task.sleep(for: .milliseconds(20))
+        let concurrentProfiles = try await store.profiles()
+        XCTAssertEqual(concurrentProfiles.count, 1)
+        let summary = try await commitOutcome
+
+        XCTAssertGreaterThan(runLoopTicks.value, ticksBefore)
+        XCTAssertEqual(summary.channelCount, 1)
+        XCTAssertEqual(summary.programmeCount, 1_150)
+        let expectedCoverageEnd = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-07-19T06:00:00Z"))
+        XCTAssertEqual(summary.coverageEnd, expectedCoverageEnd)
+
+        let storedCount = try await store.epgProgrammeCount(profileID: profile.id)
+        let storedCoverageEnd = try await store.epgCoverageEnd(profileID: profile.id)
+        let activeWindow = fetchedAt.addingTimeInterval(-3_600)..<fetchedAt.addingTimeInterval(24 * 3_600)
+        let activeProgrammes = try await store.programmes(
+            profileID: profile.id,
+            xmltvChannelID: "live-hd",
+            overlapping: activeWindow
+        )
+        let inventory = try snapshotInventory(container)
+
+        XCTAssertEqual(storedCount, 1_150)
+        XCTAssertEqual(storedCoverageEnd, expectedCoverageEnd)
+        XCTAssertEqual(activeProgrammes.count, 550)
+        XCTAssertEqual(inventory.programmes.count, 550)
+    }
+
     private func makeStore() throws -> (ModelContainer, SwiftDataLibraryStore) {
         let container = try VPlayerModelContainer.make(inMemory: true)
         return (container, SwiftDataLibraryStore(modelContainer: container))

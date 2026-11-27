@@ -12,9 +12,59 @@ private struct ChannelBrowserPresentationInput: Equatable {
     let grouping: ChannelGrouping
 }
 
+enum IOSChannelBrowserSelectionPolicy: Equatable {
+    case restoreFullScreen
+    case rejectPreservingPlayback(String)
+    case selectInModel
+
+    static func resolve(
+        channel: Channel,
+        activeSessionProfileID: UUID?,
+        activeSessionChannelID: String?,
+        isSessionClosing: Bool,
+        isFullScreenPresented: Bool,
+        hasPresentedPlaybackRequest: Bool
+    ) -> Self {
+        if !isSessionClosing,
+           !isFullScreenPresented,
+           activeSessionProfileID == channel.sourceProfileID,
+           activeSessionChannelID == channel.id {
+            return .restoreFullScreen
+        }
+        if hasPresentedPlaybackRequest,
+           case let .rejected(rejection) = StreamProtocolPolicy.evaluate(channel.streamURL) {
+            return .rejectPreservingPlayback(rejection.userMessage)
+        }
+        return .selectInModel
+    }
+}
+
+enum IOSChannelBrowserEmptyState: Equatable {
+    case loading
+    case noSource
+    case refreshingChannels
+    case noChannels
+    case channels
+
+    static func resolve(
+        isLoading: Bool,
+        hasActiveProfile: Bool,
+        hasChannels: Bool,
+        playlistRefreshState: RefreshState?
+    ) -> Self {
+        if isLoading { return .loading }
+        if !hasActiveProfile { return .noSource }
+        if !hasChannels {
+            return playlistRefreshState == .refreshing ? .refreshingChannels : .noChannels
+        }
+        return .channels
+    }
+}
+
 struct IOSChannelBrowserView: View {
     @Bindable var model: AppModel
     @Bindable var browsingSettings: ChannelBrowsingSettingsStore
+    let onSelectChannel: ((Channel) -> Void)?
     @Environment(\.systemPrefersReducedResourceUsage) private var reducedResourceUsage
     @State private var searchText = ""
     @State private var mappingChannel: Channel?
@@ -30,9 +80,14 @@ struct IOSChannelBrowserView: View {
         )
     }
 
-    init(model: AppModel, browsingSettings: ChannelBrowsingSettingsStore) {
+    init(
+        model: AppModel,
+        browsingSettings: ChannelBrowsingSettingsStore,
+        onSelectChannel: ((Channel) -> Void)? = nil
+    ) {
         self.model = model
         self.browsingSettings = browsingSettings
+        self.onSelectChannel = onSelectChannel
         let initialInput = ChannelBrowserPresentationInput(
             channels: model.channels,
             searchText: "",
@@ -54,18 +109,30 @@ struct IOSChannelBrowserView: View {
         )
     }
 
+    private var emptyState: IOSChannelBrowserEmptyState {
+        IOSChannelBrowserEmptyState.resolve(
+            isLoading: model.isLoading,
+            hasActiveProfile: model.activeProfile != nil,
+            hasChannels: !model.channels.isEmpty,
+            playlistRefreshState: model.activeProfile?.m3uStatus.state
+        )
+    }
+
     var body: some View {
         NavigationStack {
             Group {
-                if model.isLoading {
+                switch emptyState {
+                case .loading:
                     ProgressView("正在读取频道…")
-                } else if model.activeProfile == nil {
+                case .noSource:
                     ContentUnavailableView("还没有播放列表", systemImage: "play.square.stack",
                         description: Text("请前往“播放列表”添加 M3U 和 EPG 地址。"))
-                } else if model.channels.isEmpty {
+                case .refreshingChannels:
+                    ProgressView("正在刷新频道列表…")
+                case .noChannels:
                     ContentUnavailableView("没有频道", systemImage: "tv.slash",
                         description: Text("请在“播放列表”中刷新频道列表。"))
-                } else {
+                case .channels:
                     channelList
                         .searchable(text: $searchText,
                             placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索频道")
@@ -151,42 +218,36 @@ struct IOSChannelBrowserView: View {
     private var channelList: some View {
         let presentation = cachedPresentation
         return ScrollViewReader { proxy in
-            Group {
-                if presentation.sections.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
-                } else {
-                    channelListContent(presentation: presentation, referenceDate: programmeClockDate)
-                        .scrollEdgeEffectStyle(.hard, for: .top)
-                        .toolbar {
-                            if presentation.showsGroupRail {
-                                ToolbarItem(placement: .topBarTrailing) {
-                                    Menu {
-                                        ForEach(presentation.sections) { section in
-                                            Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
-                                                withAnimation {
-                                                    proxy.scrollTo("channel-section.\(section.id)", anchor: .top)
-                                                }
-                                            }
-                                            .accessibilityIdentifier("channel.group.\(section.id)")
-                                        }
-                                    } label: {
-                                        HStack(spacing: 6) {
-                                            Image(systemName: "list.bullet")
-                                            Text("分组")
+            channelListContent(presentation: presentation, referenceDate: programmeClockDate)
+                .scrollEdgeEffectStyle(.hard, for: .top)
+                .toolbar {
+                    if presentation.showsGroupRail {
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Menu {
+                                ForEach(presentation.sections) { section in
+                                    Button(section.title ?? ChannelSectionBuilder.ungroupedTitle) {
+                                        withAnimation {
+                                            proxy.scrollTo("channel-section.\(section.id)", anchor: .top)
                                         }
                                     }
-                                    .accessibilityLabel("选择频道分组")
-                                    .accessibilityIdentifier("channel.groups")
+                                    .accessibilityIdentifier("channel.group.\(section.id)")
+                                }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: "list.bullet")
+                                    Text("分组")
                                 }
                             }
+                            .accessibilityLabel("选择频道分组")
+                            .accessibilityIdentifier("channel.groups")
                         }
+                    }
                 }
-            }
-            .task(id: programmeClockKey) {
-                await ProgrammeClockTicker.run(for: programmeClockKey) { date in
-                    programmeClockDate = date
+                .task(id: programmeClockKey) {
+                    await ProgrammeClockTicker.run(for: programmeClockKey) { date in
+                        programmeClockDate = date
+                    }
                 }
-            }
         }
     }
 
@@ -199,16 +260,21 @@ struct IOSChannelBrowserView: View {
                 Text(EPGCoverageNotice.text(staleCoverageEnd: end))
                     .font(.caption).foregroundStyle(.secondary)
             }
-            ForEach(presentation.sections) { section in
-                Section {
-                    ForEach(section.channels) { channel in
-                        channelRow(for: channel, referenceDate: referenceDate)
-                            .id(channel.id)
+            if presentation.sections.isEmpty {
+                ContentUnavailableView.search(text: searchText)
+                    .listRowBackground(Color.clear)
+            } else {
+                ForEach(presentation.sections) { section in
+                    Section {
+                        ForEach(section.channels) { channel in
+                            channelRow(for: channel, referenceDate: referenceDate)
+                                .id(channel.id)
+                        }
+                    } header: {
+                        if let title = section.title { Text(title) }
                     }
-                } header: {
-                    if let title = section.title { Text(title) }
+                    .id("channel-section.\(section.id)")
                 }
-                .id("channel-section.\(section.id)")
             }
         }
     }
@@ -220,7 +286,11 @@ struct IOSChannelBrowserView: View {
                 #if DEBUG
                 IOSPlaybackRouteDiagnostics.record("tap:loading=\(model.isLoading):profile=\(model.activeProfile?.id == channel.sourceProfileID):channel=\(model.channels.contains { $0.id == channel.id && $0.sourceProfileID == channel.sourceProfileID })")
                 #endif
-                model.select(channel: channel)
+                if let onSelectChannel {
+                    onSelectChannel(channel)
+                } else {
+                    model.select(channel: channel)
+                }
                 #if DEBUG
                 IOSPlaybackRouteDiagnostics.record("selected:request=\(model.presentedPlaybackRequest != nil):alert=\(model.alertMessage != nil)")
                 #endif
@@ -387,6 +457,7 @@ struct IOSPlayerChannelPickerView: View {
         List {
             if presentation.sections.isEmpty {
                 ContentUnavailableView.search(text: searchText)
+                    .listRowBackground(Color.clear)
             }
             ForEach(presentation.sections) { section in
                 Section {

@@ -463,8 +463,13 @@ private final class MacFloatingPlayerContent: NSView {
         return hit
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49 { onPause?() }
-        else if event.keyCode == 53 { onRestore?() }
+        let disallowedModifiers: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+        guard event.modifierFlags.intersection(disallowedModifiers).isEmpty else {
+            super.keyDown(with: event)
+            return
+        }
+        if event.keyCode == 49, !event.isARepeat { onPause?() }
+        else if event.keyCode == 53, !event.isARepeat { onRestore?() }
         else { super.keyDown(with: event) }
     }
     private func revealControls() {

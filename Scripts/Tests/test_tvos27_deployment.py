@@ -57,9 +57,9 @@ class TVOS27DeploymentTests(unittest.TestCase):
         configured = re.findall(r'MARKETING_VERSION: "([0-9.]+)"', spec)
         generated = re.findall(r'MARKETING_VERSION = ([0-9.]+);', project)
         self.assertEqual(len(configured), 9)
-        self.assertEqual(set(configured), {'2.1.2'})
+        self.assertEqual(set(configured), {'2.1.3'})
         self.assertEqual(len(generated), 18)
-        self.assertEqual(set(generated), {'2.1.2'})
+        self.assertEqual(set(generated), {'2.1.3'})
 
     def test_standalone_builds_use_same_floor(self):
         for name in ('Scripts/build-metal-libraries.sh', 'Scripts/test-release-startup.sh'):

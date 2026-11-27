@@ -159,11 +159,29 @@ struct SourceProfileEditorView: View {
             }
 
             Section {
-                Picker("频道列表", selection: $m3uRefreshInterval) {
-                    refreshIntervalOptions
+                SettingsSummaryLink(
+                    title: "频道列表",
+                    value: m3uRefreshInterval.label,
+                    identifier: "source.editor.interval.playlist"
+                ) {
+                    RefreshIntervalSelectionView(
+                        title: "频道列表自动刷新",
+                        footer: "到达设定间隔后，VPlayer 会在前台或后台自动更新频道列表。",
+                        optionIdentifierPrefix: "source.editor.interval.playlist",
+                        selection: $m3uRefreshInterval
+                    )
                 }
-                Picker("节目单（EPG）", selection: $epgRefreshInterval) {
-                    refreshIntervalOptions
+                SettingsSummaryLink(
+                    title: "节目单（EPG）",
+                    value: epgRefreshInterval.label,
+                    identifier: "source.editor.interval.epg"
+                ) {
+                    RefreshIntervalSelectionView(
+                        title: "节目单（EPG）自动刷新",
+                        footer: "到达设定间隔后，VPlayer 会在前台或后台自动更新节目单数据。",
+                        optionIdentifierPrefix: "source.editor.interval.epg",
+                        selection: $epgRefreshInterval
+                    )
                 }
             } header: {
                 Text("自动刷新")
@@ -219,13 +237,6 @@ struct SourceProfileEditorView: View {
         }
     }
 
-    @ViewBuilder
-    private var refreshIntervalOptions: some View {
-        ForEach(RefreshInterval.allCases, id: \.rawValue) { interval in
-            Text(interval.label).tag(interval)
-        }
-    }
-
     private var input: SourceProfileInput {
         SourceProfileInput(
             name: name,
@@ -265,6 +276,7 @@ struct SourceProfileEditorView: View {
                 dismiss()
             } else {
                 validationMessage = failure ?? "未能完成保存，请重试。"
+                focusedTarget = .save
             }
         }
     }
@@ -278,6 +290,43 @@ struct SourceProfileEditorView: View {
 
     private func validationMessage(for error: any Error) -> String {
         SourceProfileValidationMessage.text(for: error) ?? "请检查输入内容。"
+    }
+}
+
+private struct RefreshIntervalSelectionView: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let footer: String
+    let optionIdentifierPrefix: String
+    @Binding var selection: RefreshInterval
+    @FocusState private var focusedInterval: RefreshInterval?
+
+    var body: some View {
+        List {
+            Section {
+                ForEach(RefreshInterval.allCases, id: \.self) { interval in
+                    Button {
+                        selection = interval
+                        dismiss()
+                    } label: {
+                        SettingsSelectionLabel(
+                            title: interval.label,
+                            isSelected: selection == interval
+                        )
+                    }
+                    .accessibilityLabel(interval.label)
+                    .accessibilityIdentifier("\(optionIdentifierPrefix).\(interval.rawValue)")
+                    .accessibilityAddTraits(selection == interval ? .isSelected : [])
+                    .focused($focusedInterval, equals: interval)
+                }
+            } footer: {
+                Text(footer)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .navigationTitle(title)
+        .defaultFocus($focusedInterval, selection)
+        .background(.thickMaterial, ignoresSafeAreaEdges: .all)
     }
 }
 

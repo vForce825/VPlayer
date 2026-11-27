@@ -13,9 +13,11 @@ struct IOSSettingsView: View {
             List {
                 PlaybackSettingsSections(playback: playback)
                 IOSPlaybackOrientationSettingsSection(playback: playback)
-                Picker("频道排列", selection: $channelBrowsing.grouping) {
-                    Text("按播放列表分组").tag(ChannelGrouping.playlistGroups)
-                    Text("按原始顺序平铺").tag(ChannelGrouping.playlistOrder)
+                Section {
+                    Picker("频道排列", selection: $channelBrowsing.grouping) {
+                        Text("按播放列表分组（默认）").tag(ChannelGrouping.playlistGroups)
+                        Text("按原始顺序平铺").tag(ChannelGrouping.playlistOrder)
+                    }
                 }
                 PlaybackSettingsResetSection(playback: playback)
                 Section("隐私") {
