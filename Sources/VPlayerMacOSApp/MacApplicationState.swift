@@ -110,7 +110,7 @@ final class MacApplicationState {
             startModelObservers()
             loaded.foregroundRefreshDriver.activate()
         } catch is CancellationError { return }
-        catch { startupError = ErrorDiagnosticSnapshot(error).summary }
+        catch { startupError = "本地资料暂时无法打开，请重试或重启应用。\(NetworkFailure.diagnosticSeparator)\(ErrorDiagnosticSnapshot(error).summary)" }
     }
     private func startModelObservers() {
         guard !isObservingModel, let model else { return }

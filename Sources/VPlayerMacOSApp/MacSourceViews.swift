@@ -44,16 +44,28 @@ struct MacSourceManagerView: View {
                                         Text("频道：\(ResourceRefreshStatusPresentation.text(for: profile.m3uStatus))")
                                             .foregroundStyle(profile.m3uStatus.state == .failed ? .red : .secondary)
                                         if let error = profile.m3uStatus.errorSummary, !error.isEmpty {
-                                            Text(error)
+                                            let parts = NetworkFailure.splitUserMessage(error)
+                                            Text(parts.headline)
                                                 .foregroundStyle(.red)
                                                 .lineLimit(2)
+                                            if let detail = parts.diagnostic {
+                                                Text("诊断详情：\(detail)")
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(2)
+                                            }
                                         }
                                         Text("节目单：\(ResourceRefreshStatusPresentation.text(for: profile.epgStatus))")
                                             .foregroundStyle(profile.epgStatus.state == .failed ? .red : .secondary)
                                         if let error = profile.epgStatus.errorSummary, !error.isEmpty {
-                                            Text(error)
+                                            let parts = NetworkFailure.splitUserMessage(error)
+                                            Text(parts.headline)
                                                 .foregroundStyle(.red)
                                                 .lineLimit(2)
+                                            if let detail = parts.diagnostic {
+                                                Text("诊断详情：\(detail)")
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(2)
+                                            }
                                         }
                                         if model.activeProfile?.id == profile.id,
                                            let end = model.staleEPGCoverageEnd {

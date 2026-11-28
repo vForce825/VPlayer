@@ -301,7 +301,7 @@ final class HLSResourceTransportTests: XCTestCase {
         do {
             _ = try await URLSessionPlaybackSourceResolver(transport: fixture.transport).resolve(context, reason: .initial)
             XCTFail("An oversized manifest must not acquire the raw TS ceiling")
-        } catch { XCTAssertEqual(error as? HLSSourceError, .incompleteEvidence) }
+        } catch { XCTAssertEqual(error as? HLSSourceError, .byteLimit) }
     }
 
     func testRequestsWithoutContinuationKeepFiniteAndMediaPrefixSemantics() async throws {

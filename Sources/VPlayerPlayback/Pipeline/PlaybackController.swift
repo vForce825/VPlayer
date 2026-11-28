@@ -1906,30 +1906,34 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
         case .videoDecoderFailure(let cause):
             videoDecoderFailure(for: cause)
         case let .videoSampleBuffer(reason):
-            PlaybackFailure(
+            detailedFailure(
                 code: "video.sample-buffer",
-                userMessage: "视频帧处理失败（\(ErrorDiagnosticSnapshot(typeName: "videoSampleBuffer", message: reason).summary)），请稍后重试。",
+                message: "视频画面处理出现异常，请稍后重试。",
+                detail: ErrorDiagnosticSnapshot(typeName: "videoSampleBuffer", message: reason).summary,
                 diagnosticCode: "video.sample-buffer.reason.\(safeRendererReason(reason))"
             )
         case let .videoRendererFailed(reason):
-            PlaybackFailure(
+            detailedFailure(
                 code: "video.renderer",
-                userMessage: "视频输出失败（\(ErrorDiagnosticSnapshot(typeName: "videoRendererFailed", message: reason).summary)），请稍后重试。",
+                message: "视频输出出现异常，请稍后重试。",
+                detail: ErrorDiagnosticSnapshot(typeName: "videoRendererFailed", message: reason).summary,
                 diagnosticCode: "video.renderer.reason.\(safeRendererReason(reason))"
             )
         case .audioFormatDescription(let status):
             detailedFailure(code: "audio.format", message: "无法解析音频格式，请尝试其他频道。",
                 detail: "系统返回码 \(status)", diagnosticCode: "audio.format.status.\(status)")
         case let .audioFallbackDecode(status):
-            PlaybackFailure(
+            detailedFailure(
                 code: "audio.decode",
-                userMessage: "音频解码失败（返回码 \(status)），请尝试其他频道。",
+                message: "音频解码失败，请尝试其他频道。",
+                detail: "返回码 \(status)",
                 diagnosticCode: "audio.decode.status.\(status)"
             )
         case let .audioRendererFailed(reason):
-            PlaybackFailure(
+            detailedFailure(
                 code: "audio.renderer",
-                userMessage: "音频输出失败（\(ErrorDiagnosticSnapshot(typeName: "audioRendererFailed", message: reason).summary)），请检查播放设备后重试。",
+                message: "音频输出失败，请检查播放设备后重试。",
+                detail: ErrorDiagnosticSnapshot(typeName: "audioRendererFailed", message: reason).summary,
                 diagnosticCode: "audio.renderer.reason.\(safeRendererReason(reason))"
             )
         case .renderTextureMapping:
@@ -1941,16 +1945,20 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
         case .cancelled:
             PlaybackFailure(code: "playback.cancelled", userMessage: "播放已取消，请重新选择频道。")
         case .controlEventCapacityExceeded:
-            PlaybackFailure(code: "playback.control-capacity", userMessage: "播放控制事件超出安全容量，播放已停止。")
+            PlaybackFailure(code: "playback.control-capacity", userMessage: "播放状态切换过于频繁，播放已安全停止，请重新选择频道。")
         case .outputActivationRejected:
-            PlaybackFailure(code: "playback.activation-rejected", userMessage: "播放器的音频输出激活授权已失效，请重新选择频道。")
+            PlaybackFailure(code: "playback.activation-rejected", userMessage: "音频输出占用已失效，请重新选择频道。")
         case .backendPublicationReplacementRejected:
-            PlaybackFailure(code: "playback.publication-replacement", userMessage: "播放器的媒体发布替换被拒绝，输出资源状态不匹配，请重新选择频道。")
+            PlaybackFailure(code: "playback.publication-replacement", userMessage: "播放器画面通道状态已变化，请重新选择频道。")
         case .presented(let failure):
             failure
         case let .unexpected(stage, diagnostic):
-            detailedFailure(code: "playback.\(stage)", message: "\(failureStageName(stage))失败，请重试。",
-                detail: diagnostic.summary, diagnosticCode: "playback.\(stage).\(diagnostic.typeName)")
+            detailedFailure(
+                code: "playback.\(stage)",
+                message: unexpectedFailureMessage(stage: stage, diagnostic: diagnostic),
+                detail: diagnostic.summary,
+                diagnosticCode: "playback.\(stage).\(diagnostic.typeName)"
+            )
         }
         return PlaybackFailure(
             code: mapped.code,
@@ -1965,28 +1973,189 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
             let message: String
             switch cause {
             case .sessionCreate:
-                code = "video.decoder.session-create"; message = "无法创建视频解码会话，请重试。"
+                code = "video.decoder.session-create"; message = "无法启动视频解码器，请重试。"
             case .badData:
-                code = "video.decoder.bad-data"; message = "视频解码输入数据无效，请尝试其他频道。"
+                code = "video.decoder.bad-data"; message = "频道视频数据异常，无法解码，请尝试其他频道。"
             case .malfunction:
-                code = "video.decoder.malfunction"; message = "视频解码会话失效，请重试。"
+                code = "video.decoder.malfunction"; message = "视频解码器意外中断，请重试。"
             case .softwareDecoder:
-                code = "video.hardware"; message = "硬件视频解码器不可用，请稍后重试。"
+                code = "video.hardware"; message = "当前设备硬件视频解码器暂不可用，请稍后重试。"
             case .backpressureTimeout:
-                code = "video.decoder.backpressure"; message = "视频解码提交等待超时，请重试。"
+                code = "video.decoder.backpressure"; message = "视频解码处理超时，请重试。"
             case .unexpected:
-                code = "video.decoder.unexpected"; message = "视频解码器遇到未识别异常，请重试。"
+                code = "video.decoder.unexpected"; message = "视频解码器发生异常，请重试。"
             }
             let diagnostic: ErrorDiagnosticSnapshot
             if case .unexpected(let original) = cause { diagnostic = original }
             else { diagnostic = .init(cause) }
-            return .init(code: code, userMessage: "\(message)（\(diagnostic.summary)）",
+            return .init(code: code, userMessage: "\(message)\(PlaybackFailure.diagnosticSeparator)\(diagnostic.summary)",
                 diagnosticCode: code, retryDisposition: PlaybackCoreError.videoDecoderFailure(cause).retryDisposition)
     }
 
     private static func detailedFailure(code: String, message: String, detail: String,
                                         diagnosticCode: String? = nil) -> PlaybackFailure {
-        .init(code: code, userMessage: "\(message)（\(detail)）", diagnosticCode: diagnosticCode ?? code)
+        .init(code: code, userMessage: "\(message)\(PlaybackFailure.diagnosticSeparator)\(detail)", diagnosticCode: diagnosticCode ?? code)
+    }
+
+    private static func unexpectedFailureMessage(stage: String, diagnostic: ErrorDiagnosticSnapshot) -> String {
+        let stagePrefix = "\(failureStageName(stage))失败"
+        let summary = diagnostic.summary
+
+        if diagnostic.typeName == "VPlayerPlayback.HLSSourceError" {
+            if let reason = humanReadableHLSSourceReason(summary: summary) {
+                return "\(stagePrefix)：\(reason)"
+            }
+        }
+        if diagnostic.typeName == "VPlayerPlayback.HLSSelectedServiceRequired" {
+            return "\(stagePrefix)：该多码率频道需要指定具体清晰度或音轨才能转码播放，请尝试其他频道。"
+        }
+        if diagnostic.typeName == "VPlayerPlayback.AVPlayerItemCoordinatorFailure" {
+            if let reason = humanReadableCoordinatorReason(summary: summary) {
+                return "\(stagePrefix)：\(reason)"
+            }
+        }
+        if let reason = humanReadableSystemDiagnosticReason(summary: summary) {
+            return "\(stagePrefix)：\(reason)"
+        }
+        return "\(stagePrefix)，请重试。"
+    }
+
+    private static func humanReadableHLSSourceReason(summary: String) -> String? {
+        if summary.contains("byteLimit") {
+            return "直播流列表或单个分片体积过大（超出安全上限），请更换线路或联系源提供方。"
+        }
+        if summary.contains("graphLimit") {
+            return "直播流包含的分片或子列表数量过多（超出安全上限），请更换线路或联系源提供方。"
+        }
+        if summary.contains("incompleteEvidence") {
+            return "直播源返回的数据不完整或传输中途断开，无法确认播放格式，请重试或更换线路。"
+        }
+        if summary.contains("malformedManifest") {
+            return "直播源返回的 M3U8 列表格式无效，无法解析，请检查频道地址或更换线路。"
+        }
+        if summary.contains("unsupportedMedia") {
+            if summary.contains("reason=http-encoding") {
+                return "直播源使用了暂不支持的 HTTP 压缩或传输方式，请尝试其他频道。"
+            }
+            if summary.contains("reason=manifest-features") || summary.contains("reason=encrypted-range")
+                || summary.contains("reason=key-length") || summary.contains("reason=aes-") {
+                return "该频道使用了暂不支持的 HLS 扩展特性或加密方式，请尝试其他频道。"
+            }
+            if summary.contains("reason=no-tracks") {
+                return "直播流中未检测到可播放的视频或音频轨道，请尝试其他频道。"
+            }
+            return "当前频道的音视频编码或封装格式暂不支持，请尝试其他频道。"
+        }
+        if let status = extractHTTPStatusCode(from: summary) {
+            switch status {
+            case 401, 403:
+                return "直播源拒绝访问（HTTP \(status)），链接可能已过期或需要鉴权，请刷新播放列表后重试。"
+            case 404, 410:
+                return "找不到该频道的直播流（HTTP \(status)），频道可能已下线或地址已失效。"
+            case 429:
+                return "直播源请求过于频繁（HTTP 429），请稍后再试。"
+            case 500...599:
+                return "直播源服务器暂时故障（HTTP \(status)），请稍后重试。"
+            default:
+                return "直播源服务器返回异常状态（HTTP \(status)），请稍后重试。"
+            }
+        }
+        if summary.contains("unauthorized") {
+            return "直播源身份验证未通过，请刷新播放列表或检查源配置后重试。"
+        }
+        if summary.contains("deadline") {
+            return "连接直播源或读取流信息超时，请检查当前网络后重试。"
+        }
+        if summary.contains("network") {
+            return "无法连接到直播源服务器，请检查网络连接后重试。"
+        }
+        if summary.contains("redirectLimit") {
+            return "直播源跳转次数过多，无法到达实际流地址，请检查频道地址。"
+        }
+        if summary.contains("invalidURL") {
+            return "频道直播地址格式无效，请检查播放列表配置。"
+        }
+        if summary.contains("invalidHeader") {
+            return "频道附加的 HTTP 请求头格式无效，请检查播放列表配置。"
+        }
+        if summary.contains("capacity") {
+            return "直播流信息超出播放器安全内存限制，请尝试其他频道。"
+        }
+        if summary.contains("sourceGenerationChanged") || summary.contains("staleResolution")
+            || summary.contains("retired") || summary.contains("unboundOwner") {
+            return "频道源状态已更新，请重新尝试播放。"
+        }
+        return nil
+    }
+
+    private static func humanReadableCoordinatorReason(summary: String) -> String? {
+        if summary.contains("readyTimeout") || summary.contains("loadedTimeout")
+            || summary.contains("prerollTimeout") || summary.contains("pausedTimeout") {
+            return "系统播放器加载或缓冲等待超时，请重试。"
+        }
+        if summary.contains("itemFailed") {
+            return "系统播放器无法播放当前直播流，请重试或尝试其他频道。"
+        }
+        if summary.contains("prerollFailed") {
+            return "播放器预缓冲未能就绪，请重试。"
+        }
+        if summary.contains("insufficientCoverage") || summary.contains("loadedRangeMismatch")
+            || summary.contains("seekMismatch") || summary.contains("invalidTimeline") {
+            return "直播流缓冲范围或时间轴异常，请重试。"
+        }
+        if summary.contains("systemAudioConnectionNotConfirmed") || summary.contains("directPauseNotConfirmed") {
+            return "音频输出设备未及时响应，请检查音频输出后重试。"
+        }
+        if summary.contains("staleIdentity") || summary.contains("selectionChanged") || summary.contains("operationInFlight") {
+            return "播放状态已切换，请重试。"
+        }
+        if summary.contains("capacityExceeded") || summary.contains("identitySpaceExhausted") {
+            return "播放器内部状态超出容量上限，请重新选择频道。"
+        }
+        if summary.contains("noCurrentItem") {
+            return "当前播放项目已失效，请重新选择频道。"
+        }
+        return nil
+    }
+
+    private static func humanReadableSystemDiagnosticReason(summary: String) -> String? {
+        if summary.contains("NSURLErrorDomain(-1001)") {
+            return "连接直播源超时，请稍后重试。"
+        }
+        if summary.contains("NSURLErrorDomain(-1003)") {
+            return "找不到直播源服务器域名，请检查网络或 DNS 设置。"
+        }
+        if summary.contains("NSURLErrorDomain(-1004)") {
+            return "无法连接到直播源服务器，服务器可能未启动或拒绝连接。"
+        }
+        if summary.contains("NSURLErrorDomain(-1005)") {
+            return "与直播源的网络连接中途断开，请重试。"
+        }
+        if summary.contains("NSURLErrorDomain(-1009)") {
+            return "当前设备未连接到网络，请检查网络设置。"
+        }
+        if summary.contains("NSURLErrorDomain(-1200)") || summary.contains("NSURLErrorDomain(-1201)")
+            || summary.contains("NSURLErrorDomain(-1202)") || summary.contains("NSURLErrorDomain(-1203)")
+            || summary.contains("NSURLErrorDomain(-1204)") || summary.contains("NSURLErrorDomain(-1206)") {
+            return "直播源 HTTPS 安全证书校验失败，无法建立安全连接。"
+        }
+        if summary.contains("AVFoundationErrorDomain(-11819)") {
+            return "系统媒体服务已重置，请重试。"
+        }
+        if summary.contains("AVFoundationErrorDomain(-11828)") {
+            return "系统播放器无法打开该媒体格式，请尝试其他频道。"
+        }
+        if summary.contains("AVFoundationErrorDomain(-11850)") {
+            return "直播源服务器配置不符合播放要求，请更换线路。"
+        }
+        return nil
+    }
+
+    private static func extractHTTPStatusCode(from summary: String) -> Int? {
+        guard let marker = summary.range(of: "httpStatus(") else { return nil }
+        let remainder = summary[marker.upperBound...]
+        guard let close = remainder.firstIndex(of: ")") else { return nil }
+        return Int(remainder[..<close])
     }
 
     private static func demuxFailure(status: Int32, opening: Bool) -> PlaybackFailure {
@@ -2032,13 +2201,19 @@ public actor PlaybackController: PlaybackEngine, PlaybackPauseCommandAcknowledgi
                 diagnosticCode: "video.annex-b.recovery-exhausted")
         case SampleBufferBuilder.invalidDataErrorCode, LiveFFmpegParserHandle.malformedFrameErrorCode,
              CompressedVideoAssembler.invalidInputErrorCode, CompressedVideoAssembler.idExhaustedErrorCode:
-            PlaybackFailure(code: "video.decode",
-                userMessage: "视频数据处理失败（内部错误码 \(status)），请尝试其他频道。",
-                diagnosticCode: "video.processing.internal.\(status)")
+            detailedFailure(
+                code: "video.decode",
+                message: "视频数据处理失败，请尝试其他频道。",
+                detail: "内部错误码 \(status)",
+                diagnosticCode: "video.processing.internal.\(status)"
+            )
         default:
-            PlaybackFailure(code: "video.decode",
-                userMessage: "视频解码失败（系统返回码 \(status)），请尝试其他频道。",
-                diagnosticCode: "video.decode.status.\(status)")
+            detailedFailure(
+                code: "video.decode",
+                message: "视频解码失败，请尝试其他频道。",
+                detail: "系统返回码 \(status)",
+                diagnosticCode: "video.decode.status.\(status)"
+            )
         }
     }
 

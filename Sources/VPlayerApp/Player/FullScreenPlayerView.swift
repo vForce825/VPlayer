@@ -299,7 +299,16 @@ struct FullScreenPlayerView: View {
                 let showsRetry = PlayerFailureActionPolicy.showsRetry(for: failure)
                 let initialFocus: FailureControl = showsRetry ? .retry : .back
                 VStack(spacing: 20) {
-                    Text(failure.userMessage)
+                    VStack(spacing: 10) {
+                        Text(failure.headlineMessage)
+                            .multilineTextAlignment(.center)
+                        if let detail = failure.diagnosticDetail {
+                            Text("诊断详情：\(detail)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                        }
+                    }
                     HStack {
                         if showsRetry {
                             Button("重试", action: model.retry)

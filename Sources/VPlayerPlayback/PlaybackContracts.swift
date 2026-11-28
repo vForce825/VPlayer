@@ -48,10 +48,22 @@ public enum PlaybackRetryDisposition: Equatable, Sendable {
 }
 
 public struct PlaybackFailure: Error, Equatable, Sendable {
+    public static let diagnosticSeparator = "\n诊断详情："
+
     public let code: String
     public let userMessage: String
     public let diagnosticCode: String?
     public let retryDisposition: PlaybackRetryDisposition
+
+    /// 面向用户的通俗错误说明（不含底层调试诊断串）。
+    public var headlineMessage: String {
+        Self.splitUserMessage(userMessage).headline
+    }
+
+    /// 用于排查问题的技术诊断详情（无诊断后缀时返回 `nil`）。
+    public var diagnosticDetail: String? {
+        Self.splitUserMessage(userMessage).diagnostic
+    }
 
     public init(
         code: String,
@@ -63,6 +75,15 @@ public struct PlaybackFailure: Error, Equatable, Sendable {
         self.userMessage = userMessage
         self.diagnosticCode = diagnosticCode
         self.retryDisposition = retryDisposition
+    }
+
+    public static func splitUserMessage(_ message: String) -> (headline: String, diagnostic: String?) {
+        if let range = message.range(of: diagnosticSeparator) {
+            let headline = String(message[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = String(message[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (headline.isEmpty ? message : headline, detail.isEmpty ? nil : detail)
+        }
+        return (message, nil)
     }
 }
 

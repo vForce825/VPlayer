@@ -1523,13 +1523,33 @@ final class AppModel {
     ) {
         if let validation = SourceProfileValidationMessage.text(for: error) {
             presentOperationMessage(validation, onError: onError)
+            return
+        }
+        let reason: String?
+        switch error {
+        case LibraryRepositoryError.profileNotFound:
+            reason = "未找到该播放列表，可能已被删除。"
+        case LibraryRepositoryError.sourceConfigurationChanged:
+            reason = "播放列表配置已变更，请重试。"
+        case LibraryRepositoryError.recoveryDataTooLarge:
+            reason = "保存的配置与手动映射过多，超出本地备份容量上限。"
+        case LibraryRepositoryError.corruptPersistedValue,
+             LibraryRepositoryError.corruptPersistedField,
+             LibraryRepositoryError.persistedValueDecodingFailed:
+            reason = "本地资料库数据读取异常，请重试或重新添加源。"
+        default:
+            reason = nil
+        }
+        let diagnostic = ErrorDiagnosticSnapshot(error).summary
+        if let reason {
+            presentOperationMessage("\(operation)：\(reason)\(NetworkFailure.diagnosticSeparator)\(diagnostic)", onError: onError)
         } else {
-            presentOperationMessage("\(operation)：\(ErrorDiagnosticSnapshot(error).summary)", onError: onError)
+            presentOperationMessage("\(operation)，请重试。\(NetworkFailure.diagnosticSeparator)\(diagnostic)", onError: onError)
         }
     }
 
     private func presentReloadFailure(_ message: String, onError: OperationErrorHandler? = nil) {
-        let detail = lastReloadFailure.map { "\n\($0.summary)" } ?? ""
+        let detail = lastReloadFailure.map { "\(NetworkFailure.diagnosticSeparator)\($0.summary)" } ?? ""
         presentOperationMessage(message + detail, onError: onError)
     }
 

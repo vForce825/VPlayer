@@ -114,6 +114,11 @@ private struct SourceGraphLoader: Sendable {
                 topology: .media(root.data), mediaCompleteness: root.completeness == .complete ? .complete : .prefix)
         }
         guard root.data.count <= HLSManifestGraph.maximumPlaylistBytes else { throw HLSSourceError.byteLimit }
+        if root.completeness == .prefix,
+           root.contentRange == nil,
+           root.data.count == HLSManifestGraph.maximumPlaylistBytes {
+            throw HLSSourceError.byteLimit
+        }
         guard root.completeness == .complete else { throw HLSSourceError.incompleteEvidence }
         let builder = SourceManifestGraphBuilder(transport: transport, context: context, deadline: deadline)
         let graph = try await builder.build(root: root)

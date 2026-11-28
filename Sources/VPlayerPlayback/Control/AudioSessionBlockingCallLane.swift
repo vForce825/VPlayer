@@ -89,7 +89,7 @@ enum AudioSessionFailurePresentation {
         } ?? ""
         return .init(
             code: code,
-            userMessage: "\(message)（系统返回码 \(detail.code)\(diagnosticDetail)），请检查音频输出后重试。",
+            userMessage: "\(message)，请检查音频输出后重试。\(PlaybackFailure.diagnosticSeparator)系统返回码 \(detail.code)\(diagnosticDetail)",
             diagnosticCode: "\(code).\(domain).\(detail.code)"
         )
     }

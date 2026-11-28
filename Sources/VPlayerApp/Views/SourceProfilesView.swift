@@ -364,10 +364,17 @@ struct SourceProfilesView: View {
                         .accessibilityIdentifier(statusIdentifier)
                 }
                 if let error = status.errorSummary {
-                    Text(error)
+                    let parts = NetworkFailure.splitUserMessage(error)
+                    Text(parts.headline)
                         .font(.caption2)
                         .foregroundStyle(.red)
                         .lineLimit(2)
+                    if let detail = parts.diagnostic {
+                        Text("诊断详情：\(detail)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
                 if let note {
                     Text(note)

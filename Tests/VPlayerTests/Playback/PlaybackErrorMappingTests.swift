@@ -148,8 +148,58 @@ final class PlaybackErrorMappingTests: XCTestCase {
         XCTAssertEqual(failure.code, "video.decode")
         XCTAssertTrue(failure.userMessage.contains("视频解码失败"))
         XCTAssertTrue(failure.userMessage.contains("-12909"))
+        XCTAssertEqual(failure.headlineMessage, "视频解码失败，请尝试其他频道。")
+        XCTAssertEqual(failure.diagnosticDetail, "系统返回码 -12909")
         XCTAssertEqual(failure.diagnosticCode, "video.decode.status.-12909")
         XCTAssertFalse(failure.diagnosticCode?.contains(secret) == true)
+    }
+
+    func testHLSSourceErrorsProducePlainChineseHeadlineAndKeepDiagnosticDetails() {
+        let cases: [(HLSSourceError, String, String)] = [
+            (.incompleteEvidence, "数据不完整", "incompleteEvidence"),
+            (.byteLimit, "体积过大", "byteLimit"),
+            (.graphLimit, "数量过多", "graphLimit"),
+            (.malformedManifest, "M3U8 列表格式无效", "malformedManifest"),
+            (.unsupportedMedia, "编码或封装格式暂不支持", "unsupportedMedia"),
+            (.httpStatus(403), "拒绝访问（HTTP 403）", "httpStatus(403)"),
+            (.httpStatus(404), "找不到该频道的直播流（HTTP 404）", "httpStatus(404)"),
+            (.httpStatus(503), "服务器暂时故障（HTTP 503）", "httpStatus(503)"),
+            (.deadline, "超时", "deadline"),
+            (.network, "无法连接到直播源服务器", "network"),
+            (.redirectLimit, "跳转次数过多", "redirectLimit"),
+            (.invalidURL, "地址格式无效", "invalidURL"),
+            (.unauthorized, "身份验证未通过", "unauthorized"),
+        ]
+
+        for (sourceError, expectedHeadlineToken, expectedDiagnosticToken) in cases {
+            let failure = PlaybackController.failure(
+                for: .capture(sourceError, stage: "backend.prepare")
+            )
+            XCTAssertEqual(failure.code, "playback.backend.prepare")
+            XCTAssertTrue(
+                failure.headlineMessage.contains("播放器准备失败") && failure.headlineMessage.contains(expectedHeadlineToken),
+                "headline for \(sourceError): \(failure.headlineMessage)"
+            )
+            XCTAssertFalse(
+                failure.headlineMessage.contains("VPlayerPlayback.HLSSourceError"),
+                "headline should stay human-friendly: \(failure.headlineMessage)"
+            )
+            XCTAssertTrue(
+                failure.diagnosticDetail?.contains("VPlayerPlayback.HLSSourceError") == true
+                    && failure.diagnosticDetail?.contains(expectedDiagnosticToken) == true,
+                "diagnostic detail for \(sourceError): \(String(describing: failure.diagnosticDetail))"
+            )
+        }
+    }
+
+    func testCoordinatorFailuresProducePlainChineseHeadlineWithoutNetworkGuess() {
+        let failure = PlaybackController.failure(
+            for: .capture(AVPlayerItemCoordinatorFailure.readyTimeout, stage: "backend.prepare")
+        )
+        XCTAssertTrue(failure.headlineMessage.contains("系统播放器加载或缓冲等待超时"), failure.headlineMessage)
+        XCTAssertFalse(failure.headlineMessage.contains("检查地址和网络"), failure.headlineMessage)
+        XCTAssertTrue(failure.diagnosticDetail?.contains("AVPlayerItemCoordinatorFailure") == true)
+        XCTAssertTrue(failure.diagnosticDetail?.contains("readyTimeout") == true)
     }
 
     func testInternalVideoDataErrorsAreNotPresentedAsSystemDecoderFailures() {

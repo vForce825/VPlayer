@@ -316,9 +316,18 @@ struct IOSFullScreenPlayerView: View {
             case .recovering: ProgressView("正在恢复播放…").tint(.white)
             case let .failed(failure):
                 VStack(spacing: isCompact ? 10 : 16) {
-                    Text(failure.userMessage)
-                        .multilineTextAlignment(.center)
-                        .lineLimit(isCompact ? 3 : nil)
+                    VStack(spacing: isCompact ? 6 : 8) {
+                        Text(failure.headlineMessage)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(isCompact ? 3 : nil)
+                        if let detail = failure.diagnosticDetail {
+                            Text("诊断详情：\(detail)")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.72))
+                                .multilineTextAlignment(.center)
+                                .lineLimit(isCompact ? 2 : 4)
+                        }
+                    }
                     if PlayerFailureActionPolicy.showsRetry(for: failure) {
                         Button("重试") {
                             controls.userInteracted()

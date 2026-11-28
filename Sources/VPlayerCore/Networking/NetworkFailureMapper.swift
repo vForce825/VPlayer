@@ -166,6 +166,8 @@ public struct ErrorDiagnosticSnapshot: Error, Equatable, Sendable, CustomStringC
 }
 
 public struct NetworkFailure: Error, Equatable, Sendable {
+    public static let diagnosticSeparator = "\n诊断详情："
+
     public let code: String
     public let message: String
     public let diagnostic: ErrorDiagnosticSnapshot?
@@ -175,7 +177,17 @@ public struct NetworkFailure: Error, Equatable, Sendable {
     public init(code: String, message: String, diagnostic: ErrorDiagnosticSnapshot? = nil) {
         self.code = code
         self.diagnostic = diagnostic
-        self.message = diagnostic.map { "\(message)\n\($0.summary)" } ?? message
+        self.message = diagnostic.map { "\(message)\(Self.diagnosticSeparator)\($0.summary)" } ?? message
+    }
+
+    /// 拆分面向用户的通俗错误说明与调试诊断明细，供三端列表和弹窗分层展示。
+    public static func splitUserMessage(_ text: String) -> (headline: String, diagnostic: String?) {
+        if let range = text.range(of: diagnosticSeparator) {
+            let headline = String(text[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            return (headline.isEmpty ? text : headline, detail.isEmpty ? nil : detail)
+        }
+        return (text, nil)
     }
 }
 
@@ -338,7 +350,7 @@ public enum NetworkFailureMapper {
         if !host.contains(".") && !host.contains(":") {
             return true
         }
-        if [".local", ".lan", ".router", ".home.arpa"].contains(where: host.hasSuffix) {
+        if [".local", ".lan", ".router", ".home", ".home.arpa"].contains(where: host.hasSuffix) {
             return true
         }
         return isLocalIPv4(host) || isLocalIPv6(host)

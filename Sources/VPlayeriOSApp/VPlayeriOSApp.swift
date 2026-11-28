@@ -70,7 +70,7 @@ private struct IOSBootstrapView: View {
             } catch is CancellationError { return }
             catch {
                 guard !Task.isCancelled else { return }
-                failure = ErrorDiagnosticSnapshot(error).summary
+                failure = "本地资料暂时无法打开，请重试或重启应用。\(NetworkFailure.diagnosticSeparator)\(ErrorDiagnosticSnapshot(error).summary)"
             }
         }
     }

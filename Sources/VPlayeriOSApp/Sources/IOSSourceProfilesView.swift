@@ -93,10 +93,17 @@ struct IOSSourceProfilesView: View {
                     .font(.caption)
                     .foregroundStyle(status.state == .failed ? .red : .secondary)
                 if let error = status.errorSummary, !error.isEmpty {
-                    Text(error)
+                    let parts = NetworkFailure.splitUserMessage(error)
+                    Text(parts.headline)
                         .font(.caption2)
                         .foregroundStyle(.red)
                         .lineLimit(2)
+                    if let detail = parts.diagnostic {
+                        Text("诊断详情：\(detail)")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
                 }
                 if let staleNote {
                     Text(staleNote)

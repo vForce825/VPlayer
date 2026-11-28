@@ -237,7 +237,16 @@ struct MacPlayerView: View {
             case .failed(let failure):
                 VStack(spacing: 16) {
                     Image(systemName: "exclamationmark.triangle").font(.largeTitle)
-                    Text(failure.userMessage).multilineTextAlignment(.center)
+                    VStack(spacing: 8) {
+                        Text(failure.headlineMessage).multilineTextAlignment(.center)
+                        if let detail = failure.diagnosticDetail {
+                            Text("诊断详情：\(detail)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .textSelection(.enabled)
+                        }
+                    }
                     if PlayerFailureActionPolicy.showsRetry(for: failure) { Button("重试") { session.model.retry() } }
                     Button("返回频道列表") { Task { await state.stopPlayback(requestID: session.model.request.id) } }
                 }.padding(28).frame(maxWidth: 420).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
